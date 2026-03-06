@@ -94,6 +94,23 @@ set_target_properties(smash PROPERTIES
   PREFIX "lib"
 )
 
+# ── Ablation defines (override config.h defaults via -DSMASH_*=value) ────────
+# Numeric overrides (only when non-empty)
+foreach(_var NUM_ARENAS COLD_TICKS VERY_COLD_TICKS DICT_TRAIN_SAMPLES
+            PREFETCH_WINDOW COMPRESSOR_WORKERS COMPRESS_STORE_SHARDS
+            LARGE_ALLOC_VM_THRESHOLD)
+  if(DEFINED SMASH_${_var} AND NOT "${SMASH_${_var}}" STREQUAL "")
+    target_compile_definitions(smash PRIVATE "SMASH_${_var}=${SMASH_${_var}}")
+  endif()
+endforeach()
+# Boolean ablation flags (define to enable, must be truthy)
+foreach(_flag ABLATION_NO_ZERO_EAGER ABLATION_NO_ZERO_DEFERRED
+              ABLATION_NO_SKIP_STATS ABLATION_NO_CHUNK_BITMAP)
+  if(SMASH_${_flag})
+    target_compile_definitions(smash PRIVATE "SMASH_${_flag}=1")
+  endif()
+endforeach()
+
 if(APPLE)
   set_target_properties(smash PROPERTIES
     SUFFIX ".dylib"

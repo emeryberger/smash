@@ -103,8 +103,12 @@ class CompressorThread {
         }
 
         bool shouldSkip() const {
+#ifdef SMASH_ABLATION_NO_SKIP_STATS
+            return false;
+#else
             return count >= kWindow / 2 &&
                    sum < static_cast<uint16_t>(count) * 13;  // 13/255 ≈ 5%
+#endif
         }
     };
 
@@ -293,6 +297,13 @@ class CompressorThread {
     // Iterate live pages in [start, end) and call fn(page_idx)
     template<typename Fn>
     void forEachLivePage(size_t start, size_t end, Fn&& fn) {
+#ifdef SMASH_ABLATION_NO_CHUNK_BITMAP
+        // Linear scan fallback (ablation: measure chunk bitmap contribution)
+        for (size_t i = start; i < end; ++i) {
+            if (states_->get(i) != PageState::EMPTY)
+                fn(i);
+        }
+#else
         size_t start_chunk = start / kChunkSize;
         size_t end_chunk = (end + kChunkSize - 1) / kChunkSize;
         for (size_t c = start_chunk; c < end_chunk; ++c) {
@@ -307,6 +318,7 @@ class CompressorThread {
                 mask &= mask - 1;  // clear lowest set bit
             }
         }
+#endif
     }
 
     // ── Phase implementations ─────────────────────────────────────────────
@@ -411,7 +423,9 @@ class CompressorThread {
         __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
 
         // Zero freed slots (for objects > kZeroOnFreeMaxSize, deferred from free())
+#ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
         zeroFreeSlots(worker.page_buf, page_idx);
+#endif
 
         // Make page inaccessible
         vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE

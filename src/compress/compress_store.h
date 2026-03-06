@@ -2,8 +2,10 @@
 //
 // Backed by its own mmap regions (NOT VmRegion — avoids recursive compression).
 // Bucket-based allocator with free lists per power-of-2 size.
+// Sharded by page index to reduce lock contention across compressor workers.
 #pragma once
 
+#include "smash/config.h"
 #include "../vm/platform_mem.h"
 #include "../util/spinlock.h"
 
@@ -31,12 +33,17 @@ class CompressStore {
     static constexpr int kNumBuckets = kMaxBucketLog - kMinBucketLog + 1;
 
     struct FreeNode { FreeNode* next; };
-    FreeNode* free_lists_[kNumBuckets]{};
 
-    Region* current_ = nullptr;
-    Spinlock lock_;
+    // Per-shard state: independent lock, free lists, and region chain
+    struct Shard {
+        FreeNode* free_lists[kNumBuckets]{};
+        Region* current = nullptr;
+        Spinlock lock;
+    };
 
-    int bucketIndex(size_t size) const {
+    Shard shards_[kCompressStoreShards];
+
+    static int bucketIndex(size_t size) {
         if (size <= (1U << kMinBucketLog)) return 0;
         // ceil(log2(size)) - kMinBucketLog
         int log2 = 64 - __builtin_clzll(size - 1);
@@ -45,11 +52,11 @@ class CompressStore {
         return idx;
     }
 
-    size_t bucketSize(int idx) const {
+    static size_t bucketSize(int idx) {
         return 1ULL << (idx + kMinBucketLog);
     }
 
-    Region* newRegion() {
+    static Region* newRegion() {
         void* mem = vm::mapPages(kRegionSize);
         if (!mem) return nullptr;
         // Store Region header at the front of the region itself
@@ -61,9 +68,9 @@ class CompressStore {
         return r;
     }
 
-    void* bumpAlloc(size_t size) {
+    static void* bumpAlloc(Shard& shard, size_t size) {
         // Try current region
-        Region* r = current_;
+        Region* r = shard.current;
         while (r) {
             size_t off = r->offset.load(std::memory_order_relaxed);
             size_t aligned = (off + 15) & ~15ULL;  // 16-byte alignment
@@ -78,8 +85,8 @@ class CompressStore {
         // Need new region
         Region* nr = newRegion();
         if (!nr) return nullptr;
-        nr->next = current_;
-        current_ = nr;
+        nr->next = shard.current;
+        shard.current = nr;
         size_t off = nr->offset.load(std::memory_order_relaxed);
         size_t aligned = (off + 15) & ~15ULL;
         nr->offset.store(aligned + size, std::memory_order_relaxed);
@@ -88,27 +95,32 @@ class CompressStore {
 
 public:
     void init() {
-        current_ = newRegion();
+        for (int s = 0; s < kCompressStoreShards; ++s)
+            shards_[s].current = newRegion();
     }
 
-    // Store a compressed blob. Returns pointer to stored data and the allocated size.
-    // The caller must save both for later release.
-    void* store(const void* data, size_t size, size_t* alloc_size) {
+    // Store a compressed blob. page_idx selects the shard.
+    // Returns pointer to stored data and the allocated size.
+    void* store(const void* data, size_t size, size_t* alloc_size,
+                size_t page_idx = 0) {
         int bucket = bucketIndex(size);
         size_t bsize = bucketSize(bucket);
         *alloc_size = bsize;
 
+        int shard_idx = static_cast<int>(page_idx % kCompressStoreShards);
+        Shard& shard = shards_[shard_idx];
+
         void* ptr = nullptr;
 
-        LockGuard guard(lock_);
+        LockGuard guard(shard.lock);
 
         // Try free list first
-        if (free_lists_[bucket]) {
-            FreeNode* node = free_lists_[bucket];
-            free_lists_[bucket] = node->next;
+        if (shard.free_lists[bucket]) {
+            FreeNode* node = shard.free_lists[bucket];
+            shard.free_lists[bucket] = node->next;
             ptr = node;
         } else {
-            ptr = bumpAlloc(bsize);
+            ptr = bumpAlloc(shard, bsize);
         }
 
         if (ptr) {
@@ -118,14 +130,17 @@ public:
     }
 
     // Release a previously stored blob back to the free list.
-    void release(void* ptr, size_t alloc_size) {
+    void release(void* ptr, size_t alloc_size, size_t page_idx = 0) {
         if (!ptr) return;
         int bucket = bucketIndex(alloc_size);
 
-        LockGuard guard(lock_);
+        int shard_idx = static_cast<int>(page_idx % kCompressStoreShards);
+        Shard& shard = shards_[shard_idx];
+
+        LockGuard guard(shard.lock);
         auto* node = static_cast<FreeNode*>(ptr);
-        node->next = free_lists_[bucket];
-        free_lists_[bucket] = node;
+        node->next = shard.free_lists[bucket];
+        shard.free_lists[bucket] = node;
     }
 };
 

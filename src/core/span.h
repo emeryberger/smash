@@ -24,6 +24,7 @@ struct Span {
     uint16_t allocated_count;
     uint8_t size_class;
     bool is_large;              // true for mmap-backed large allocations
+    uint8_t arena_id;           // which arena this span belongs to
     uint16_t free_hint_word;    // word index to start bitmap scan from
 
     // Intrusive list pointers (used by Slab's partial/full/empty lists)
@@ -37,11 +38,12 @@ struct Span {
     Span* next_free;
 
     // Initialize a slab span for the given size class
-    void init(void* base_, uint32_t pages, uint8_t sc) {
+    void init(void* base_, uint32_t pages, uint8_t sc, uint8_t arena = 0) {
         base = base_;
         page_count = pages;
         size_class = sc;
         is_large = false;
+        arena_id = arena;
         object_size = kSizeClasses[sc].size;
         object_count = static_cast<uint16_t>((pages * kPageSize) / object_size);
         allocated_count = 0;
@@ -74,6 +76,7 @@ struct Span {
         page_count = pages;
         size_class = kNumClasses;
         is_large = true;
+        arena_id = 0;
         object_size = 0;
         object_count = 0;
         allocated_count = 1;

@@ -16,6 +16,9 @@ inline constexpr size_t kMaxSmallSize = 16384;
 inline constexpr int kNumClasses = 36;
 inline constexpr size_t kMinAlignment = 16;
 
+// ── Arenas ───────────────────────────────────────────────────────────────────
+inline constexpr int kNumArenas = 4;  // must be power of 2
+
 // ── Spans ────────────────────────────────────────────────────────────────────
 inline constexpr int kTargetObjectsPerSpan = 64;
 inline constexpr int kMaxSpanPages = 8;
@@ -48,6 +51,23 @@ inline constexpr int kDictTrainSamples = 16;      // pages before dict training
 inline constexpr int kPrefetchWindow = 2;         // pages each direction on fault
 inline constexpr int kZstdNormalLevel = 3;
 inline constexpr int kZstdDeepLevel = 9;
+
+// ── Compressor parallelism ───────────────────────────────────────────────────
+inline constexpr int kCompressorWorkers = 2;         // parallel compression workers
+inline constexpr int kCompressStoreShards = 8;       // CompressStore lock shards
+inline constexpr int kChunkBits = 6;                 // 64 pages per chunk
+inline constexpr int kChunkSize = 1 << kChunkBits;   // pages per chunk
+
+// ── Zero-on-free ────────────────────────────────────────────────────────────
+inline constexpr bool kZeroOnFree = true;
+inline constexpr size_t kZeroOnFreeMaxSize = 128;  // eager memset up to this size
+
+// ── Large allocation compression ────────────────────────────────────────────
+// Only large allocations >= this size are placed in the VmRegion for
+// compression tracking.  Smaller "large" allocs (16KB–256KB) are typically
+// internal engine buffers accessed frequently; compressing them causes
+// decompression storms when they're needed again.
+inline constexpr size_t kLargeAllocVmThreshold = 1024 * 1024;  // 1 MB
 
 // ── Virtual memory region ────────────────────────────────────────────────────
 inline constexpr size_t kVmMaxPages = 1024 * 1024;  // 1M pages (~16GB on 16K pages)

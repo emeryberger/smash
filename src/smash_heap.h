@@ -25,15 +25,27 @@ namespace smash {
 // second threadInit() call, which only happens after full init is complete.
 extern std::atomic<int> g_thread_init_count;
 
+// Global pointer to the VmRegion, used by syscall wrappers to warm pages.
+// Set after SmashHeap construction when compression is enabled.
+extern VmRegion* g_smash_vm_region;
+
 inline ThreadCache*& currentThreadCache() {
     static thread_local ThreadCache* cache = nullptr;
     return cache;
 }
 
 class SmashHeap {
-    Slab slabs_[kNumClasses];
+    Slab slabs_[kNumArenas * kNumClasses];  // flat 2D: arena * kNumClasses + sc
     LargeAlloc large_alloc_;
     PageMap page_map_;
+
+    Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
+
+    static uint8_t callsiteArena() {
+        uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(1));
+        ra ^= ra >> 16;
+        return static_cast<uint8_t>(ra & (kNumArenas - 1));
+    }
 
     // Phase 2-4: compression infrastructure
     VmRegion vm_region_;
@@ -81,20 +93,35 @@ public:
             compress_engine_.init();
             compressor_.init(&vm_region_, &page_states_, &page_locks_,
                              &compress_store_, &compress_engine_,
-                             &page_map_);
+                             &page_map_, &fault_handler_);
 
-            for (int i = 0; i < kNumClasses; ++i)
-                slabs_[i].init(static_cast<uint8_t>(i), &page_map_,
-                               &vm_region_, &page_states_,
-                               releaseHook, this);
+            for (int a = 0; a < kNumArenas; ++a)
+                for (int i = 0; i < kNumClasses; ++i)
+                    slabs_[a * kNumClasses + i].init(
+                        static_cast<uint8_t>(i), &page_map_,
+                        &vm_region_, &page_states_,
+                        releaseHook, this,
+                        static_cast<uint8_t>(a));
             compression_inited_ = true;
+            g_smash_vm_region = &vm_region_;
+            vm::g_page_pins = bootstrapArray<std::atomic<uint8_t>>(
+                vm_region_.totalPages());
         } else {
             // Fallback: Phase 1 mode (no compression)
-            for (int i = 0; i < kNumClasses; ++i)
-                slabs_[i].init(static_cast<uint8_t>(i), &page_map_);
+            for (int a = 0; a < kNumArenas; ++a)
+                for (int i = 0; i < kNumClasses; ++i)
+                    slabs_[a * kNumClasses + i].init(
+                        static_cast<uint8_t>(i), &page_map_,
+                        nullptr, nullptr, nullptr, nullptr,
+                        static_cast<uint8_t>(a));
         }
 
-        large_alloc_.init(&page_map_);
+        if (compression_inited_) {
+            large_alloc_.init(&page_map_, &vm_region_, &page_states_,
+                              releaseHook, this);
+        } else {
+            large_alloc_.init(&page_map_);
+        }
     }
 
     ThreadCache* getOrCreateThreadCache() {
@@ -110,7 +137,7 @@ public:
             ThreadCache* tc = getOrCreateThreadCache();
             void* ptr = tc->allocate(sc);
             if (ptr) return ptr;
-            return tc->refill(sc, &slabs_[sc]);
+            return tc->refill(sc, &slab(callsiteArena(), sc));
         }
         return large_alloc_.allocate(size, kMinAlignment);
     }
@@ -122,8 +149,12 @@ public:
         if (!span) return;
         if (span->is_large) { large_alloc_.deallocate(span); return; }
         uint8_t sc = span->size_class;
+        if constexpr (kZeroOnFree) {
+            if (span->object_size <= kZeroOnFreeMaxSize)
+                __builtin_memset(ptr, 0, span->object_size);
+        }
         ThreadCache* tc = getOrCreateThreadCache();
-        if (!tc->deallocate(sc, ptr)) { tc->drain(sc, &slabs_[sc]); tc->deallocate(sc, ptr); }
+        if (!tc->deallocate(sc, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, ptr); }
     }
 
     void* memalign(size_t alignment, size_t size) {
@@ -141,8 +172,14 @@ public:
         return classSize(span->size_class);
     }
 
-    void lock() { for (int i = 0; i < kNumClasses; ++i) slabs_[i].lockSlab(); large_alloc_.lockAlloc(); }
-    void unlock() { large_alloc_.unlockAlloc(); for (int i = kNumClasses - 1; i >= 0; --i) slabs_[i].unlockSlab(); }
+    void lock() {
+        for (int i = 0; i < kNumArenas * kNumClasses; ++i) slabs_[i].lockSlab();
+        large_alloc_.lockAlloc();
+    }
+    void unlock() {
+        large_alloc_.unlockAlloc();
+        for (int i = kNumArenas * kNumClasses - 1; i >= 0; --i) slabs_[i].unlockSlab();
+    }
     void threadInit() {
         getOrCreateThreadCache();
         // Start compression after the second thread init call.
@@ -156,7 +193,7 @@ public:
     }
     void threadCleanup() {
         ThreadCache*& tc = currentThreadCache();
-        if (tc) { tc->drainAll(slabs_); returnThreadCache(tc); tc = nullptr; }
+        if (tc) { tc->drainAll(slabs_, &page_map_); returnThreadCache(tc); tc = nullptr; }
     }
 };
 } // namespace smash

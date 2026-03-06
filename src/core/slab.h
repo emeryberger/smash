@@ -21,6 +21,7 @@ namespace smash {
 
 class Slab {
     uint8_t size_class_;
+    uint8_t arena_id_ = 0;
     Spinlock lock_;
     IntrusiveList<Span> partial_;
     IntrusiveList<Span> full_;
@@ -50,7 +51,7 @@ class Slab {
         }
 
         Span* span = newSpanDescriptor();
-        span->init(mem, info.pages, size_class_);
+        span->init(mem, info.pages, size_class_, arena_id_);
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
     }
@@ -72,8 +73,10 @@ public:
     void init(uint8_t sc, PageMap* pm,
               VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
               void (*hook)(size_t, size_t, void*) = nullptr,
-              void* hook_ctx = nullptr) {
+              void* hook_ctx = nullptr,
+              uint8_t arena_id = 0) {
         size_class_ = sc;
+        arena_id_ = arena_id;
         page_map_ = pm;
         vm_region_ = vr;
         page_states_ = ps;

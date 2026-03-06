@@ -232,6 +232,57 @@ public:
         return size_class < kNumClasses && dicts_[size_class].trained;
     }
 
+    // Create an independent DCtx from bootstrap memory (for fault handler slots).
+    ZSTD_DCtx* createDCtx() const {
+        return ZSTD_createDCtx_advanced(customMem());
+    }
+
+    // Decompress using an externally-owned DCtx (for fault handler / prefetch).
+    size_t decompressWithDCtx(ZSTD_DCtx* dctx,
+                              const void* src, void* dst,
+                              size_t src_size, size_t dst_capacity,
+                              CompressAlgo algo, uint8_t size_class = 0) {
+        switch (algo) {
+        case CompressAlgo::LZ4: {
+            int result = LZ4_decompress_safe(
+                static_cast<const char*>(src),
+                static_cast<char*>(dst),
+                static_cast<int>(src_size),
+                static_cast<int>(dst_capacity));
+            return (result > 0) ? static_cast<size_t>(result) : 0;
+        }
+        case CompressAlgo::ZSTD: {
+            size_t result = ZSTD_decompressDCtx(
+                dctx,
+                dst, dst_capacity,
+                src, src_size);
+            return ZSTD_isError(result) ? 0 : result;
+        }
+        case CompressAlgo::ZSTD_DICT: {
+            if (size_class < kNumClasses && dicts_[size_class].ddict) {
+                size_t result = ZSTD_decompress_usingDDict(
+                    dctx,
+                    dst, dst_capacity,
+                    src, src_size,
+                    dicts_[size_class].ddict);
+                return ZSTD_isError(result) ? 0 : result;
+            }
+            size_t result = ZSTD_decompressDCtx(
+                dctx,
+                dst, dst_capacity,
+                src, src_size);
+            return ZSTD_isError(result) ? 0 : result;
+        }
+        default:
+            return 0;
+        }
+    }
+
+    // Get pre-built compression dictionary for workers with own CCtx
+    ZSTD_CDict* getCDict(uint8_t sc) const {
+        return (sc < kNumClasses && dicts_[sc].trained) ? dicts_[sc].cdict : nullptr;
+    }
+
     // Maximum compressed output size for a given input and algorithm.
     static size_t maxCompressedSize(size_t src_size, CompressAlgo algo = CompressAlgo::LZ4) {
         switch (algo) {

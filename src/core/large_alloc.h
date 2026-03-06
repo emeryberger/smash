@@ -1,4 +1,8 @@
-// smash/src/core/large_alloc.h - mmap-backed large allocations (> kMaxSmallSize)
+// smash/src/core/large_alloc.h - Large allocations (> kMaxSmallSize)
+//
+// When a VmRegion is available, large allocations are placed there so the
+// compressor thread can track and compress their pages.  Falls back to
+// direct mmap for oversized alignments or when the VmRegion is full.
 #pragma once
 
 #include "smash/config.h"
@@ -7,6 +11,8 @@
 #include "../util/spinlock.h"
 #include "../util/bitops.h"
 #include "../vm/platform_mem.h"
+#include "../vm/vm_region.h"
+#include "../vm/page_state.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,10 +22,21 @@ namespace smash {
 class LargeAlloc {
     Spinlock lock_;
     PageMap* page_map_;
+    VmRegion* vm_region_ = nullptr;
+    PageStateTable* page_states_ = nullptr;
+    void (*release_hook_)(size_t, size_t, void*) = nullptr;
+    void* release_ctx_ = nullptr;
 
 public:
-    void init(PageMap* pm) {
+    void init(PageMap* pm,
+              VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
+              void (*hook)(size_t, size_t, void*) = nullptr,
+              void* hook_ctx = nullptr) {
         page_map_ = pm;
+        vm_region_ = vr;
+        page_states_ = ps;
+        release_hook_ = hook;
+        release_ctx_ = hook_ctx;
     }
 
     void* allocate(size_t size, size_t alignment) {
@@ -27,35 +44,43 @@ public:
 
         // Round size up to page boundary
         size_t alloc_size = roundUp(size, kPageSize);
+        uint32_t num_pages = static_cast<uint32_t>(alloc_size / kPageSize);
 
-        // For large alignments, over-allocate and trim
-        void* mem;
-        size_t map_size;
-        if (alignment <= kPageSize) {
-            map_size = alloc_size;
-            mem = vm::mapPages(map_size);
-        } else {
-            // Over-allocate by alignment to guarantee we can find an aligned region
-            map_size = alloc_size + alignment;
-            mem = vm::mapPages(map_size);
-            if (!mem) return nullptr;
+        void* mem = nullptr;
 
-            auto addr = reinterpret_cast<uintptr_t>(mem);
-            auto aligned_addr = roundUp(addr, alignment);
-            size_t prefix = aligned_addr - addr;
-            size_t suffix = map_size - prefix - alloc_size;
+        // Route large-enough allocations through VmRegion for compression
+        if (vm_region_ && alignment <= kPageSize && alloc_size >= kLargeAllocVmThreshold) {
+            mem = vm_region_->allocatePages(num_pages);
+            if (mem && page_states_) {
+                size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
+                for (uint32_t p = 0; p < num_pages; ++p)
+                    page_states_->set(idx + p, PageState::ACTIVE);
+            }
+        }
 
-            // Unmap the prefix and suffix
-            if (prefix > 0) vm::unmapPages(mem, prefix);
-            if (suffix > 0) vm::unmapPages(reinterpret_cast<void*>(aligned_addr + alloc_size), suffix);
+        // Fallback to direct mmap
+        if (!mem) {
+            if (alignment <= kPageSize) {
+                mem = vm::mapPages(alloc_size);
+            } else {
+                // Over-allocate by alignment to guarantee aligned region
+                size_t map_size = alloc_size + alignment;
+                mem = vm::mapPages(map_size);
+                if (!mem) return nullptr;
 
-            mem = reinterpret_cast<void*>(aligned_addr);
-            map_size = alloc_size;
+                auto addr = reinterpret_cast<uintptr_t>(mem);
+                auto aligned_addr = roundUp(addr, alignment);
+                size_t prefix = aligned_addr - addr;
+                size_t suffix = map_size - prefix - alloc_size;
+
+                if (prefix > 0) vm::unmapPages(mem, prefix);
+                if (suffix > 0) vm::unmapPages(reinterpret_cast<void*>(aligned_addr + alloc_size), suffix);
+
+                mem = reinterpret_cast<void*>(aligned_addr);
+            }
         }
 
         if (!mem) return nullptr;
-
-        uint32_t num_pages = static_cast<uint32_t>(alloc_size / kPageSize);
 
         Span* span = newSpanDescriptor();
         span->initLarge(mem, size, num_pages);
@@ -67,14 +92,22 @@ public:
 
     void deallocate(Span* span) {
         void* base = span->base;
-        size_t map_size = static_cast<size_t>(span->page_count) * kPageSize;
+        size_t num_pages = span->page_count;
 
         {
             LockGuard guard(lock_);
-            page_map_->clearRange(reinterpret_cast<uintptr_t>(base), span->page_count);
+            page_map_->clearRange(reinterpret_cast<uintptr_t>(base), num_pages);
         }
 
-        vm::unmapPages(base, map_size);
+        if (vm_region_ && vm_region_->contains(reinterpret_cast<uintptr_t>(base))) {
+            if (release_hook_) {
+                size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(base));
+                release_hook_(idx, num_pages, release_ctx_);
+            }
+            vm_region_->releasePages(base, num_pages);
+        } else {
+            vm::unmapPages(base, num_pages * kPageSize);
+        }
     }
 
     size_t getSize(Span* span) const {

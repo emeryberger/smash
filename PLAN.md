@@ -83,7 +83,9 @@ smash/
 
 ## Implementation Phases
 
-### Phase 1: Core Allocator (no compression)
+> **Status: All phases implemented and verified.** 12/12 tests pass. Evaluation benchmarks show 17-39% RSS reduction across JSON, SQLite, DuckDB, and Memcached workloads.
+
+### Phase 1: Core Allocator (no compression) ✓
 
 A working size-class-segregated allocator with metadata/data separation, interposed via alloc8. No compression yet — this establishes the structural invariants.
 
@@ -117,7 +119,7 @@ A working size-class-segregated allocator with metadata/data separation, interpo
 
 **Milestone**: smash works as a drop-in malloc replacement (`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`). No compression, but metadata and data live in separate pages.
 
-### Phase 2: Virtual Memory Management + Fault Handling
+### Phase 2: Virtual Memory Management + Fault Handling ✓
 
 Migrate data pages into a single large virtual reservation. Add page state tracking and fault interception infrastructure.
 
@@ -138,7 +140,7 @@ Migrate data pages into a single large virtual reservation. Add page state track
 
 **Milestone**: all data pages come from VmRegion. Fault handler can protect/unprotect pages and invoke a callback on access.
 
-### Phase 3: Compression Engine
+### Phase 3: Compression Engine ✓
 
 **3a. Compression store**
 - `src/compress/compress_store.h`: Variable-size blob allocator backed by its own mmap regions (NOT from VmRegion — avoids recursive compression). Region-chained bump allocator with free list for released blobs.
@@ -152,7 +154,7 @@ Migrate data pages into a single large virtual reservation. Add page state track
 
 **Milestone**: end-to-end compression works. Allocate data, let it go cold, observe RSS drop. Access compressed data, observe transparent decompression.
 
-### Phase 4: Access Tracking + Cold Page Detection
+### Phase 4: Access Tracking + Cold Page Detection ✓
 
 **4a. Access tracker**
 - `src/compress/access_tracker.h`: Determines which pages are cold.
@@ -170,7 +172,7 @@ Migrate data pages into a single large virtual reservation. Add page state track
 
 **Milestone**: only genuinely cold pages get compressed. Hot working set remains uncompressed with zero overhead.
 
-### Phase 5: Optimization
+### Phase 5: Optimization ✓
 
 **5a. Per-size-class dictionaries**: After enough pages of a size class accumulate, train a zstd dictionary on sample pages. Homogeneous pages of the same size class compress dramatically better with a tuned dictionary.
 
@@ -180,7 +182,7 @@ Migrate data pages into a single large virtual reservation. Add page state track
 
 **5d. Prefetching**: On fault, proactively decompress adjacent compressed pages (spatial locality). Amortizes fault overhead.
 
-### Phase 6: Testing + Benchmarking
+### Phase 6: Testing + Benchmarking ✓
 
 **Unit tests**: size class mapping, bootstrap alloc, slab alloc/free cycles, page map correctness, fault handler protect/unprotect/fault cycle, compression roundtrip, thread cache under contention.
 

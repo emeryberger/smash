@@ -18,6 +18,7 @@ namespace smash {
 
 // Forward declarations
 class Slab;
+class PageMap;
 
 class ThreadCache {
     struct ClassCache {
@@ -67,11 +68,11 @@ public:
     // Returns a pointer to one allocated object (or nullptr).
     void* refill(uint8_t sc, Slab* slab);
 
-    // Drain cache for size class `sc` back to the slab.
-    void drain(uint8_t sc, Slab* slab);
+    // Drain cache for size class `sc`, routing pointers to their arena's slab.
+    void drain(uint8_t sc, Slab* all_slabs, PageMap* page_map);
 
-    // Drain all classes back to their slabs.
-    void drainAll(Slab* slabs);
+    // Drain all classes, routing pointers to their arena's slab.
+    void drainAll(Slab* all_slabs, PageMap* page_map);
 
     // Reset for reuse from pool
     void reset() {

@@ -1,0 +1,50 @@
+\section{Implementation}
+\label{sec:impl}
+
+\sys is implemented in approximately 4,000 lines of C++20 across 23
+files.  The codebase follows a header-only design: all allocator logic
+resides in header files under \texttt{src/}, with a single compiled
+translation unit (\texttt{smash\_heap.cpp}) that provides thread cache
+methods and syscall interposition definitions.  This design simplifies
+the build (only one \texttt{.o} file) and enables aggressive inlining
+of the allocation fast path.
+
+\paragraph{Dependencies.}  \sys depends on three external components:
+\textit{alloc8}, a library interposition framework that generates the
+\texttt{\_\_DATA,\_\_interpose} section on macOS (or
+\texttt{LD\_PRELOAD} wrappers on Linux); \textit{LZ4}
+v1.9.4~\cite{collet2024lz4} for fast compression; and
+\textit{Zstandard} v1.5.6~\cite{collet2024zstd} for high-ratio
+compression.  Both compression libraries are fetched automatically
+via CMake FetchContent.
+
+\paragraph{Internal memory management.}  All \sys metadata is
+allocated from a bump allocator (\texttt{BootstrapAlloc}) that obtains
+memory via \texttt{mmap}.  The initial allocation is 64\,MiB,
+expanded in 16\,MiB increments.  Zstd's internal memory allocations
+are routed to \texttt{BootstrapAlloc} via \texttt{ZSTD\_customMem},
+ensuring that compression contexts, dictionaries, and hash tables
+never touch the managed heap.
+
+\paragraph{Platform.}  The current implementation targets macOS (ARM64
+and x86-64) using DYLD interposition.  The core allocator, VM region
+management, and signal handler use POSIX APIs and are portable to
+Linux.  The syscall interposition layer requires platform-specific
+adaptation for Linux's different \texttt{FILE} struct layout and
+\texttt{LD\_PRELOAD} interposition mechanics.
+
+\paragraph{Initialization ordering.}  On macOS, the dynamic linker
+invokes \sys's constructor during early library initialization, before
+the Objective-C runtime has registered its restartable ranges.
+Starting compression threads at this point crashes
+\texttt{task\_restartable\_ranges\_register}.  \sys defers thread
+creation until the second \texttt{threadInit()} callback from alloc8,
+which occurs after the runtime is fully initialized.
+
+\paragraph{Signal handler reinstallation.}  Some applications and
+frameworks install their own signal handlers, overwriting \sys's
+SIGSEGV handler.  The compressor's periodic tick calls
+\texttt{ensureInstalled()}, which checks whether the current signal
+handler matches \sys's handler and reinstalls it if necessary,
+chaining to the overwriter's handler for signals that \sys does not
+handle.

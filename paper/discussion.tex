@@ -1,0 +1,61 @@
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Dictionary compression: explored and abandoned.}
+\sys includes infrastructure for per-size-class zstd dictionary
+training.  We conducted an extensive experimental study (6
+experiments, varying CDict level, dictionary capacity, sample count,
+and grouping strategy).  Dictionaries improve compression by up to 8\%
+at low zstd levels (1--3), but at level~9, the compressor's search
+window discovers the same patterns independently.  More critically,
+CDict objects consume 430--686\,KiB \emph{each}, and training buffers
+add 256\,KiB per size class.  With 36 size classes, the potential
+memory overhead reaches 36\,MiB, far exceeding any compression
+benefit.  Even with aggressive optimizations (CDict at level~3,
+16\,KiB dictionary capacity, maximum 8 trained classes), dictionaries
+reduce RSS savings by 8.9 percentage points on average.
+Figure~\ref{fig:dict_overhead} illustrates the tradeoff.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/dict_overhead.pdf}
+\caption{Dictionary CDict memory overhead vs.\ compression benefit
+  on JSON data.  At high compression levels (9+), dictionaries add
+  overhead without improving ratios.  At low levels (1--3), the
+  compression gain does not justify the 430--1070\,KiB per-class
+  memory cost.}
+\label{fig:dict_overhead}
+\end{figure}  \sys
+preserves the training infrastructure for future research but disables
+it by default.
+
+\paragraph{Multi-page compression.}  Compressing 2--4 contiguous
+pages as a unit improves ratios by 2--4 percentage points (e.g.,
+JSON-LZ4 from 30.2\% to 26.2\% with 4-page groups).  However, the
+implementation complexity is substantial: all pages in a group must
+be simultaneously cold, and a fault on any page requires decompressing
+the entire group.  Mixed hot/cold page groups prevent compression
+entirely.  The 2--4\pp gain does not justify the added complexity and
+worst-case decompression cost.
+
+\paragraph{WKdm is unsuitable for modern workloads.}  The macOS VM
+compressor uses WKdm, designed for 4\,KiB pages containing
+pointer-heavy C structures.  On 16\,KiB pages with text or serialized
+data, WKdm achieves 93--99\% ratios (nearly no compression).  Even on
+binary data, LZ4 outperforms WKdm (5.8\% vs.\ 15.6\% on SQLite
+pages).  This motivates \sys's use of byte-oriented compressors rather
+than word-oriented dictionary matching.
+
+\paragraph{Limitations.}  Decompression latency adds 1--10\,$\mu$s per
+fault (Table~\ref{tab:apps}).  Applications with uniform access
+patterns across the entire heap (no cold pages) gain no benefit.  The
+syscall interposition layer currently covers 20 functions; unusual
+syscalls accessing heap buffers may require additional wrappers.  The
+bootstrap allocator's memory is never freed, contributing a fixed
+overhead of $\sim$25\,MiB for page state arrays and compression
+contexts.
+
+\paragraph{Security.}  Zeroing freed objects prevents information
+leakage through stale heap data.  \sys's zero-on-free provides a
+security benefit similar to \texttt{calloc}-style clearing, though
+its primary purpose is compression effectiveness.

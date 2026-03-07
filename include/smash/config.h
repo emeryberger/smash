@@ -60,7 +60,7 @@ inline constexpr int kVeryColdTicks = 60;         // ~1 min → zstd deep
 inline constexpr int kVeryColdTicks = SMASH_VERY_COLD_TICKS;
 #endif
 #ifndef SMASH_DICT_TRAIN_SAMPLES
-inline constexpr int kDictTrainSamples = 16;      // pages before dict training
+inline constexpr int kDictTrainSamples = 0;       // disabled: dicts net-negative (see EXPERIMENTS.md)
 #else
 inline constexpr int kDictTrainSamples = SMASH_DICT_TRAIN_SAMPLES;
 #endif
@@ -71,6 +71,9 @@ inline constexpr int kPrefetchWindow = SMASH_PREFETCH_WINDOW;
 #endif
 inline constexpr int kZstdNormalLevel = 3;
 inline constexpr int kZstdDeepLevel = 9;
+inline constexpr int kDictLevel = 3;            // CDict built at level 3 (430KB vs 686KB at level 9)
+inline constexpr size_t kDictCapacity = 16 * 1024; // 16KB dict (down from 32KB)
+inline constexpr int kMaxDictClasses = 8;        // cap total dict memory overhead
 
 // ── Compressor parallelism ───────────────────────────────────────────────────
 #ifndef SMASH_COMPRESSOR_WORKERS

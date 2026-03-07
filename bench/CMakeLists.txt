@@ -74,6 +74,12 @@ endif()
 # Compression ratio comparison: LZ4 vs zstd vs zstd+dict
 smash_add_bench(bench_compression bench_compression.cpp)
 
+# Dictionary compression experiments
+smash_add_bench(bench_dict_experiment bench_dict_experiment.cpp)
+
+# Algorithm comparison: WKdm vs LZ4 vs zstd, multi-page compression
+smash_add_bench(bench_algo_compare bench_algo_compare.cpp)
+
 # RSS reduction over time
 add_executable(bench_rss
   bench_rss.cpp

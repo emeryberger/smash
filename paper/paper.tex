@@ -1,0 +1,47 @@
+\documentclass[sigplan,10pt,anonymous,review]{acmart}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\settopmatter{printfolios=true}
+
+\usepackage{booktabs}
+\usepackage{subcaption}
+\usepackage{xspace}
+\usepackage{listings}
+\usepackage{graphicx}
+
+\newcommand{\sys}{\textsc{Smash}\xspace}
+\newcommand{\pp}{\,pp\xspace}
+
+\lstset{
+  language=C++,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\bfseries,
+  commentstyle=\itshape,
+  columns=fullflexible,
+  keepspaces=true,
+  xleftmargin=1em,
+}
+
+\begin{document}
+
+\title{\sys: Compression-Aware Memory Allocation}
+
+\author{Anonymous}
+\affiliation{\institution{Anonymous Institution}}
+
+\input{abstract}
+
+\maketitle
+
+\input{introduction}
+\input{background}
+\input{design}
+\input{implementation}
+\input{evaluation}
+\input{discussion}
+\input{related}
+\input{conclusion}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}

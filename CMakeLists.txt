@@ -48,7 +48,7 @@ FetchContent_Declare(
 FetchContent_GetProperties(lz4)
 if(NOT lz4_POPULATED)
   FetchContent_Populate(lz4)
-  add_library(lz4_static STATIC ${lz4_SOURCE_DIR}/lib/lz4.c)
+  add_library(lz4_static STATIC ${lz4_SOURCE_DIR}/lib/lz4.c ${lz4_SOURCE_DIR}/lib/lz4hc.c)
   target_include_directories(lz4_static PUBLIC ${lz4_SOURCE_DIR}/lib)
   set_target_properties(lz4_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -105,7 +105,8 @@ foreach(_var NUM_ARENAS COLD_TICKS VERY_COLD_TICKS DICT_TRAIN_SAMPLES
 endforeach()
 # Boolean ablation flags (define to enable, must be truthy)
 foreach(_flag ABLATION_NO_ZERO_EAGER ABLATION_NO_ZERO_DEFERRED
-              ABLATION_NO_SKIP_STATS ABLATION_NO_CHUNK_BITMAP)
+              ABLATION_NO_SKIP_STATS ABLATION_NO_CHUNK_BITMAP
+              ABLATION_NO_CALLSITE_ARENA)
   if(SMASH_${_flag})
     target_compile_definitions(smash PRIVATE "SMASH_${_flag}=1")
   endif()

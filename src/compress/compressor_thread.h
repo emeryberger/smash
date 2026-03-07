@@ -120,6 +120,7 @@ class CompressorThread {
         ZSTD_CCtx* zstd_cctx = nullptr;
         void* page_buf = nullptr;
         void* compress_buf = nullptr;
+        void* compress_buf2 = nullptr;  // second buffer for dict try-both experiment
         SizeClassStats sc_stats[kNumClasses]{};
         size_t range_start = 0, range_end = 0;
 
@@ -183,6 +184,12 @@ class CompressorThread {
         Spinlock alloc_lock;
     };
     DictTrainState dict_train_[kNumClasses]{};
+
+    // ── Dict experiment counters (try-both) ───────────────────────────────
+    std::atomic<uint64_t> dict_win_count_{0};   // dict smaller than plain zstd
+    std::atomic<uint64_t> dict_loss_count_{0};   // dict larger than plain zstd
+    std::atomic<uint64_t> dict_tie_count_{0};    // equal size
+    std::atomic<int64_t>  dict_total_delta_{0};  // sum of (plain_size - dict_size), positive = dict wins
 
     // ── Thread management ─────────────────────────────────────────────────
     pthread_t coord_thread_{};
@@ -441,9 +448,54 @@ class CompressorThread {
 
         int zstd_level = effectiveZstdLevel(page_idx);
         size_t max_comp = CompressEngine::maxCompressedSizeAny(kPageSize);
-        size_t comp_size = worker.compress(worker.page_buf, worker.compress_buf,
-                                           kPageSize, max_comp, algo, sc,
-                                           zstd_level, engine_);
+        size_t comp_size = 0;
+
+        // Try-both experiment (opt-in): when dict is selected, also try plain
+        // ZSTD and keep the smaller result. Doubles compression CPU for
+        // very-cold pages, so only enable for experiments.
+#ifdef SMASH_DICT_TRY_BOTH
+        if (algo == CompressAlgo::ZSTD_DICT && worker.compress_buf2) {
+            size_t dict_size = worker.compress(worker.page_buf, worker.compress_buf,
+                                               kPageSize, max_comp, CompressAlgo::ZSTD_DICT,
+                                               sc, zstd_level, engine_);
+            size_t plain_size = worker.compress(worker.page_buf, worker.compress_buf2,
+                                                kPageSize, max_comp, CompressAlgo::ZSTD,
+                                                sc, zstd_level, engine_);
+            if (dict_size > 0 && plain_size > 0) {
+                int64_t delta = static_cast<int64_t>(plain_size) - static_cast<int64_t>(dict_size);
+                dict_total_delta_.fetch_add(delta, std::memory_order_relaxed);
+                if (dict_size < plain_size) {
+                    dict_win_count_.fetch_add(1, std::memory_order_relaxed);
+                    comp_size = dict_size;  // dict wins, result in compress_buf
+                } else if (dict_size > plain_size) {
+                    dict_loss_count_.fetch_add(1, std::memory_order_relaxed);
+                    algo = CompressAlgo::ZSTD;
+                    comp_size = plain_size;
+                    // plain wins — swap buffers so compress_buf has the better result
+                    void* tmp = worker.compress_buf;
+                    worker.compress_buf = worker.compress_buf2;
+                    worker.compress_buf2 = tmp;
+                } else {
+                    dict_tie_count_.fetch_add(1, std::memory_order_relaxed);
+                    comp_size = dict_size;  // tie, use dict (already in compress_buf)
+                }
+            } else {
+                // One or both failed; use whichever succeeded
+                comp_size = dict_size ? dict_size : plain_size;
+                if (!dict_size && plain_size) {
+                    algo = CompressAlgo::ZSTD;
+                    void* tmp = worker.compress_buf;
+                    worker.compress_buf = worker.compress_buf2;
+                    worker.compress_buf2 = tmp;
+                }
+            }
+        } else
+#endif
+        {
+            comp_size = worker.compress(worker.page_buf, worker.compress_buf,
+                                        kPageSize, max_comp, algo, sc,
+                                        zstd_level, engine_);
+        }
 
         if (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * kMinCompressRatio)) {
             // Not worth compressing; record poor ratio and restore page
@@ -486,6 +538,7 @@ class CompressorThread {
         if (sc >= kNumClasses) return;
         auto& dt = dict_train_[sc];
         if (dt.trained) return;
+        if (trainedDictCount() >= kMaxDictClasses) return;
 
         // Lazy-allocate sample buffers (double-checked locking)
         if (!dt.allocated) {
@@ -512,7 +565,16 @@ class CompressorThread {
         dt.sample_sizes[slot] = kPageSize;
     }
 
+    int trainedDictCount() const {
+        int n = 0;
+        for (int sc = 0; sc < kNumClasses; ++sc)
+            if (engine_->hasDictionary(sc)) ++n;
+        return n;
+    }
+
     void trainDictionaries() {
+        if (trainedDictCount() >= kMaxDictClasses) return;
+
         for (int sc = 0; sc < kNumClasses; ++sc) {
             auto& dt = dict_train_[sc];
             if (dt.trained) continue;
@@ -521,6 +583,7 @@ class CompressorThread {
             dt.trained = engine_->trainDictionary(
                 sc, dt.sample_data, dt.sample_sizes, samples);
             if (!dt.trained) dt.trained = true;
+            if (trainedDictCount() >= kMaxDictClasses) return;
         }
     }
 
@@ -742,6 +805,7 @@ public:
             auto& worker = workers_[w];
             worker.page_buf = BootstrapAlloc::instance().allocate(kPageSize, kPageSize);
             worker.compress_buf = BootstrapAlloc::instance().allocate(max_comp, 16);
+            worker.compress_buf2 = BootstrapAlloc::instance().allocate(max_comp, 16);
             worker.lz4_state = BootstrapAlloc::instance().allocate(
                 static_cast<size_t>(LZ4_sizeofState()), 16);
             worker.zstd_cctx = ZSTD_createCCtx_advanced(custom_mem);
@@ -784,6 +848,19 @@ public:
 
     // Manually trigger one compression tick (for testing/manual control)
     void compressTick() { tick(); }
+
+    // Dict experiment counters (try-both)
+    uint64_t dictWinCount() const { return dict_win_count_.load(std::memory_order_relaxed); }
+    uint64_t dictLossCount() const { return dict_loss_count_.load(std::memory_order_relaxed); }
+    uint64_t dictTieCount() const { return dict_tie_count_.load(std::memory_order_relaxed); }
+    int64_t dictTotalDelta() const { return dict_total_delta_.load(std::memory_order_relaxed); }
+
+    int dictsTrainedCount() const {
+        int count = 0;
+        for (int sc = 0; sc < kNumClasses; ++sc)
+            if (dict_train_[sc].trained) ++count;
+        return count;
+    }
 
     // Called by the fault handler when a protected page is accessed.
     // Returns true if the fault was handled (page restored).

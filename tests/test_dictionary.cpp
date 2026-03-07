@@ -181,8 +181,12 @@ static void testNoDictFallback() {
 }
 
 int main() {
-    testDictTrainingRoundtrip();
-    testDictRatioImprovement();
+    if constexpr (kDictTrainSamples > 0) {
+        testDictTrainingRoundtrip();
+        testDictRatioImprovement();
+    } else {
+        fprintf(stderr, "  (dict training disabled, skipping training tests)\n");
+    }
     testNoDictFallback();
 
     if (failures == 0) {

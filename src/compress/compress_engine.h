@@ -189,8 +189,6 @@ public:
         if (size_class >= kNumClasses) return false;
         if (dicts_[size_class].trained) return true;
 
-        // Allocate dictionary buffer from bootstrap (~32KB)
-        constexpr size_t kDictCapacity = 32 * 1024;
         void* dict_buf = BootstrapAlloc::instance().allocate(kDictCapacity, 16);
         if (!dict_buf) return false;
 
@@ -204,9 +202,9 @@ public:
 
         auto mem = customMem();
 
-        // Create compression dictionary
+        // Create compression dictionary at low level (small CDict, dict provides patterns)
         ZSTD_compressionParameters cparams = ZSTD_getCParams(
-            kZstdDeepLevel, kPageSize, dict_size);
+            kDictLevel, kPageSize, dict_size);
         ZSTD_CDict* cdict = ZSTD_createCDict_advanced(
             dict_buf, dict_size,
             ZSTD_dlm_byRef, ZSTD_dct_auto,
@@ -282,6 +280,9 @@ public:
     ZSTD_CDict* getCDict(uint8_t sc) const {
         return (sc < kNumClasses && dicts_[sc].trained) ? dicts_[sc].cdict : nullptr;
     }
+
+    // Direct access to zstd context (for experiments that need level control)
+    ZSTD_CCtx* getZstdCCtx() const { return zstd_cctx_; }
 
     // Maximum compressed output size for a given input and algorithm.
     static size_t maxCompressedSize(size_t src_size, CompressAlgo algo = CompressAlgo::LZ4) {

@@ -42,9 +42,20 @@ class SmashHeap {
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
     static uint8_t callsiteArena() {
-        uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(1));
-        ra ^= ra >> 16;
-        return static_cast<uint8_t>(ra & (kNumArenas - 1));
+#ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
+        return 0;
+#else
+        // XOR return addresses from two stack depths for arena routing.
+        // xxmalloc tail-calls SmashHeap::malloc, so:
+        //   depth 0 = app's malloc() callsite (or app wrapper)
+        //   depth 1 = caller of that function
+        // XORing both ensures different routing even through a common
+        // application-level malloc wrapper.
+        uintptr_t h = reinterpret_cast<uintptr_t>(__builtin_return_address(0))
+                    ^ reinterpret_cast<uintptr_t>(__builtin_return_address(1));
+        h ^= h >> 16;
+        return static_cast<uint8_t>(h & (kNumArenas - 1));
+#endif
     }
 
     // Phase 2-4: compression infrastructure

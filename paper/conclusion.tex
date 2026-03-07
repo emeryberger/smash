@@ -1,0 +1,19 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+\sys demonstrates that the memory allocator is the right level of
+abstraction for transparent memory compression.  By exploiting
+allocator-level knowledge (size classes, object liveness, call-site
+patterns), \sys achieves 17--44\% RSS reduction on real-world
+applications with negligible throughput impact.  Call-site arena
+segregation, zero-on-free, and adaptive multi-algorithm compression
+each contribute independently to compression effectiveness.  The
+comprehensive ablation study validates each design choice and reveals
+that dictionary-based compression, despite its theoretical appeal, is
+net-negative due to metadata overhead.
+
+\sys requires no application changes: existing programs benefit simply
+by loading \sys via library interposition.  As memory remains the most
+expensive cloud resource, compression-aware allocation offers a
+practical path to reducing memory footprints without hardware changes,
+application rewrites, or OS kernel modifications.

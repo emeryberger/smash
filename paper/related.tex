@@ -20,15 +20,31 @@ above the OS, exploiting object liveness, call-site patterns, and
 per-size-class policies for higher compression ratios.
 
 \paragraph{Userspace memory compression}
+Chen et al.~\cite{chen2003heap} compress the Java heap during garbage
+collection.  Their Mark-Compact-Compress (MCC) collector triggers
+compression reactively when allocation fails and compaction alone
+cannot free enough space; it then compresses \emph{all} live objects
+using per-object zero-byte removal (a bitmap records which bytes are
+non-zero).  Objects are accessed through a handle table; decompressing
+a compressed object requires allocating a fresh block, restoring the
+data, and updating the handle.  By contrast, \sys compresses
+\emph{proactively} on cold pages via a concurrent background thread,
+uses general-purpose compressors (LZ4/zstd) that exploit repeated
+patterns beyond just zero bytes, and decompresses transparently through
+virtual-memory faults with no handle indirection on the normal access
+path.
 Rumble~\cite{rumble2014log} describes a log-structured allocator for
 RAMCloud that compresses objects inline.  Unlike \sys, Rumble requires
 application changes to use its API and does not support transparent
 \texttt{malloc}/\texttt{free} interposition.
+Tsai and Sanchez~\cite{tsai2019compress} propose Zippads, an
+object-granularity compressed memory hierarchy that compresses objects
+rather than cache lines, achieving higher compression ratios by
+exploiting object structure.  Zippads requires hardware support
+(a compressed object cache and modified TLBs); \sys achieves similar
+object-aware benefits in software by exploiting allocator metadata.
 Plumber~\cite{ayers2019asmdb} focuses on detecting and eliminating
 memory waste rather than compressing cold data.
-Zippads~\cite{pekhimenko2015exploiting} explores compressed cache
-lines at the hardware level.  \sys operates in userspace with no
-hardware support.
 
 \paragraph{Memory-efficient allocators}
 Mesh~\cite{powers2019mesh} reduces fragmentation by physically
@@ -49,11 +65,14 @@ through segment-based allocation with free list sharding.
 \paragraph{Tiered and disaggregated memory}
 CXL-attached memory~\cite{pond2022cxl, maruf2023tpp} and
 software-defined far memory~\cite{amaro2023memory} extend available
-memory at higher access latency.  TMO~\cite{maas2020adaptive}
-proactively offloads cold pages to compressed or CXL tiers in
-Google's fleet.  These approaches are complementary: \sys could
-serve as the local-tier compressor before data moves to CXL or
-remote memory.
+memory at higher access latency.  TMO~\cite{weiner2022tmo}
+transparently offloads cold pages to compressed swap or secondary
+storage at Meta's scale, using PSI (pressure stall information) to
+balance memory savings against application performance.  TMO operates
+at the OS level on whole pages; \sys operates within the allocator,
+exploiting object liveness and structure for higher ratios.  The two
+are complementary: \sys could serve as the local-tier compressor
+before TMO offloads remaining cold pages.
 
 \paragraph{Compressed caches and memory}
 LCP~\cite{pekhimenko2012linearly} and BDI~\cite{pekhimenko2012linearly}
@@ -64,6 +83,17 @@ explores compressed main memory with hardware support.
 These hardware approaches target
 last-level cache or DRAM and require architecture changes, while \sys
 operates in userspace software.
+
+\paragraph{Pointer compression and managed heaps}
+V8's Oilpan garbage collector~\cite{nickel2024oilpan} uses pointer
+compression to reduce pointer sizes from 64 to 32 bits within a 4\,GiB
+heap cage, saving $\sim$16\% of managed-heap memory.  This reduces
+memory used by pointers but does not compress data content.
+Apache Ignite~\cite{ignite2024compression} compresses data pages when
+flushing to persistent storage using LZ4 or zstd, achieving 2--4$\times$
+compression on typical workloads; however, pages remain uncompressed in
+memory.  \sys compresses pages \emph{in memory}, reducing RSS without
+relying on disk-backed persistence.
 
 \paragraph{Zero-page optimization}
 The Linux kernel's KSM (Kernel Same-page Merging)~\cite{arcangeli2009ksm}

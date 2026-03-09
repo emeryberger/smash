@@ -1,0 +1,196 @@
+\section{Implementation}
+\label{sec:impl}
+
+\sys is implemented as a single shared library (5,200 lines of
+C++ across headers and one compilation unit) that interposes on
+\texttt{malloc}/\texttt{free} via dyld library interposition on
+macOS and \texttt{LD\_PRELOAD} on Linux.  All internal metadata
+is allocated from a bootstrap bump allocator to avoid reentrancy
+in the signal handler.
+
+\subsection{Parallel Compressor}
+\label{sec:impl:parallel}
+
+The compressor uses a coordinator-worker model with
+two parallel workers (configurable).  The coordinator thread wakes
+every second, partitions the committed page range across workers,
+and dispatches each of the three phases.
+
+\paragraph{Chunk bitmap}  Rather than scanning all committed
+pages linearly, the compressor maintains a bitmap with one bit per
+64-page chunk.  A set bit indicates at least one non-EMPTY page.
+The bitmap is rebuilt each tick.  Iteration uses
+count-trailing-zeros to jump to set bits, reducing scan time from
+$O(\text{committed})$ to $O(\text{active pages})$.
+
+\paragraph{Per-worker state}  Each worker has its own LZ4 state
+buffer, zstd compression context (\texttt{ZSTD\_CCtx}), page-sized
+scratch buffer, and compression output buffer.  Workers share only the
+dictionary lookup table (read-only during compression) and the
+sharded compressed data store.
+
+\paragraph{Sharded CompressStore}  Compressed page data is stored
+in a pool with 8~independent shards, each with its own spinlock
+and free lists.  Pages are assigned to shards by index modulo~8.
+With 2~workers and 8~shards,
+lock contention is near zero.
+
+\begin{figure}[t]
+\begin{algorithmic}[1]
+\Function{CompressorTick}{}
+  \State rebuild chunk bitmap
+  \State partition page range across workers
+  \ForAll{active pages $p$ (via chunk bitmap)}
+    \Comment{Phase 1}
+    \If{$p$ was accessed since last tick}
+      \State $\mathit{cold}[p] \gets 0$
+    \Else
+      \State $\mathit{cold}[p] \mathrel{+}= 1$
+    \EndIf
+  \EndFor
+  \ForAll{pages $p$ with $\mathit{cold}[p] \geq \textsc{ColdTicks}$}
+    \Comment{Phase 2}
+    \State \Call{CompressPage}{$p$}
+  \EndFor
+  \ForAll{remaining \textsc{active} pages $p$}
+    \Comment{Phase 3}
+    \State \Call{mprotect}{$p$, \textsc{prot\_read}}
+    \State $\mathit{state}[p] \gets$ \textsc{active\_monitoring}
+  \EndFor
+\EndFunction
+\Statex
+\Function{CompressPage}{$p$}
+  \State \Call{Lock}{$p$};\; $\mathit{state}[p] \gets$ \textsc{compressing}
+  \State $\mathit{buf} \gets$ copy page into worker scratch buffer
+  \State zero freed slots in $\mathit{buf}$ (non-temporal stores)
+  \State \Call{mprotect}{$p$, \textsc{prot\_none}}
+  \If{$\mathit{state}[p] \neq$ \textsc{compressing}}
+    \Comment{preempted by fault}
+    \State \Call{Unlock}{$p$};\; \Return
+  \EndIf
+  \State $\mathit{algo} \gets$ \textbf{if} $\mathit{cold}[p] \geq$ \textsc{VeryCold} \textbf{then} zstd-9 \textbf{else} LZ4
+  \State $\mathit{blob} \gets \Call{Compress}{\mathit{buf}, \mathit{algo}}$
+  \If{$|\mathit{blob}| > 0.75 \times \textsc{PageSize}$}
+    \State restore page;\; \Call{Unlock}{$p$};\; \Return
+  \EndIf
+  \State store $\mathit{blob}$ in sharded \textsc{CompressStore}
+  \State \Call{Decommit}{$p$};\; $\mathit{state}[p] \gets$ \textsc{compressed}
+  \State \Call{Unlock}{$p$}
+\EndFunction
+\end{algorithmic}
+\caption{\textbf{Background compressor tick}
+  (\S\ref{sec:impl:parallel}).  Three phases run in parallel
+  across disjoint page ranges.  \textsc{CompressPage} zeros freed
+  slots lazily, selects LZ4 or zstd based on cold duration (JIT
+  compression), and decommits the physical page on success.}
+\label{fig:algo:compress}
+\end{figure}
+
+\subsection{Fault Handler}
+\label{sec:impl:fault}
+
+\sys installs a signal handler for both SIGSEGV and SIGBUS.  The
+handler receives the faulting address, looks up the page index in the
+VM region, acquires the per-page lock, and takes action based on page
+state.  For a \textsc{compressed} page, the handler recommits the
+physical page, decompresses the stored data, releases the compressed
+blob, and transitions to \textsc{active}.  For a \textsc{compressing}
+page, the handler recommits the page (the compressor has a copy in its
+scratch buffer) and transitions to \textsc{active}; the compressor
+detects the state change and abandons the compression.  For an
+\textsc{active\_monitoring} page (a write to a read-only monitored
+page), the handler restores read-write permission and transitions to
+\textsc{active}.  Finally, a fault on an \textsc{active} page
+indicates a race where Phase~3's batched \texttt{mprotect} overwrote a
+per-page permission restoration from a concurrent fault handler; the
+handler simply restores write permission.
+
+\begin{figure}[t]
+\begin{algorithmic}[1]
+\Function{HandleFault}{$\mathit{addr}$}
+  \State $p \gets \Call{PageIndex}{\mathit{addr}}$
+  \State \Call{Lock}{$p$}
+  \If{$\mathit{state}[p] =$ \textsc{compressed}}
+      \State $\mathit{slot} \gets \Call{AcquireFaultSlot}{}$
+      \Comment{CAS}
+      \State \Call{Decompress}{$\mathit{slot.dctx}$, $\mathit{blob}$, $\mathit{slot.buf}$}
+      \State \Call{Recommit}{$p$};\; copy $\mathit{slot.buf} \to p$
+      \State release compressed blob;\; \Call{ReleaseFaultSlot}{$\mathit{slot}$}
+      \State $\mathit{state}[p] \gets$ \textsc{active};\; $\mathit{cold}[p] \gets 0$
+      \State \Call{PrefetchAdjacent}{$p$}
+  \ElsIf{$\mathit{state}[p] =$ \textsc{compressing}}
+      \State \Call{Recommit}{$p$}
+      \Comment{compressor detects \& aborts}
+      \State $\mathit{state}[p] \gets$ \textsc{active}
+  \ElsIf{$\mathit{state}[p] =$ \textsc{active\_monitoring}}
+      \State \Call{mprotect}{$p$, \textsc{prot\_read|write}}
+      \State $\mathit{state}[p] \gets$ \textsc{active}
+  \EndIf
+  \State \Call{Unlock}{$p$}
+\EndFunction
+\end{algorithmic}
+\caption{\textbf{Signal-handler decompression}
+  (\S\ref{sec:impl:fault}).  Each of 32~pre-allocated fault slots
+  has an independent decompression context, supporting concurrent
+  faults with no heap allocation.}
+\label{fig:algo:fault}
+\end{figure}
+
+\paragraph{Per-slot decompression contexts}
+The signal handler must not call \texttt{malloc}.  All decompression
+state is pre-allocated from a bootstrap allocator.  \sys maintains
+32~fault slots, each with a pre-allocated page buffer and an
+independent zstd decompression context.  A faulting thread atomically
+acquires a slot via compare-and-swap, decompresses into the slot's
+buffer, copies the result to the faulting page, and releases the slot.
+This design supports up to 32~concurrent page faults without data races.
+
+\paragraph{Prefetch}
+After decompressing a faulted page, the handler speculatively
+decompresses up to \texttt{kPrefetchWindow} = 2 pages in each
+direction, provided they belong to the same span and are in the
+COMPRESSED state.  Prefetch uses non-blocking \texttt{tryLock} to
+avoid deadlock with concurrent fault handlers.  Prefetch reduces
+cold-access latency in sequential access patterns; memcached's cold
+key re-access throughput improves by 54\% with prefetch enabled.
+
+\paragraph{Bootstrap allocator}
+All \sys internal metadata (page state arrays, compressed data store,
+decompression contexts, worker buffers) is allocated from a bump
+allocator (\texttt{BootstrapAlloc}) backed by \texttt{mmap}.  The
+bootstrap allocator never calls \texttt{malloc} and never frees memory.
+This design is critical for the signal handler path, which must be
+async-signal-safe.
+
+\subsection{Syscall Compatibility}
+\label{sec:impl:syscall}
+
+Kernel system calls access userspace buffers directly through
+\texttt{copyin}/\texttt{copyout}.  If \sys has marked a buffer page
+as \texttt{PROT\_READ} (monitoring) or \texttt{PROT\_NONE}
+(compressed), the kernel returns EFAULT rather than triggering a
+signal.  This behavior affects any syscall that reads from or writes to
+userspace memory: \texttt{read}, \texttt{write}, \texttt{recv},
+\texttt{send}, \texttt{kevent}, and others.
+
+\sys interposes on 20 system calls and C library I/O functions.
+Before each call, the wrapper walks the buffer's pages, touching any
+page managed by \sys to trigger decompression via the fault handler,
+then pins the pages to prevent the compressor from re-protecting them
+during the syscall.  After the syscall returns, pages are unpinned.
+
+Page pins are implemented as per-page atomic counters
+(\texttt{g\_page\_pins}).  The compressor skips pages with a nonzero
+pin count in both Phase~2 (compression) and Phase~3 (monitoring).
+
+\paragraph{Buffered I/O}  On macOS, DYLD interposition only
+intercepts cross-dylib calls.  When the application calls
+\texttt{fread}, the C library internally calls \texttt{read} within
+the same dylib (libSystem); \sys's \texttt{read} interposition does
+not see this internal call.  \sys addresses this by also interposing
+\texttt{fread}, \texttt{fgets}, \texttt{fgetc}, \texttt{fwrite}, and
+\texttt{fflush}, warming both the user buffer and the \texttt{FILE}
+struct's internal buffer (\texttt{stream->\_bf.\_base}).
+Additionally, the compressor permanently pins the internal buffers of
+\texttt{stdin}, \texttt{stdout}, and \texttt{stderr} on its first
+tick, covering the intra-libSystem blind spot for standard streams.

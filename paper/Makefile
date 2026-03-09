@@ -705,6 +705,32 @@ bench_alloc_hoard_zero/fast:
 .PHONY : bench_alloc_hoard_zero/fast
 
 #=============================================================================
+# Target rules for targets named bench_alloc_mesh
+
+# Build rule for target.
+bench_alloc_mesh: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 bench_alloc_mesh
+.PHONY : bench_alloc_mesh
+
+# fast build rule for target.
+bench_alloc_mesh/fast:
+	$(MAKE) $(MAKESILENT) -f bench/CMakeFiles/bench_alloc_mesh.dir/build.make bench/CMakeFiles/bench_alloc_mesh.dir/build
+.PHONY : bench_alloc_mesh/fast
+
+#=============================================================================
+# Target rules for targets named bench_alloc_mesh_zero
+
+# Build rule for target.
+bench_alloc_mesh_zero: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 bench_alloc_mesh_zero
+.PHONY : bench_alloc_mesh_zero
+
+# fast build rule for target.
+bench_alloc_mesh_zero/fast:
+	$(MAKE) $(MAKESILENT) -f bench/CMakeFiles/bench_alloc_mesh_zero.dir/build.make bench/CMakeFiles/bench_alloc_mesh_zero.dir/build
+.PHONY : bench_alloc_mesh_zero/fast
+
+#=============================================================================
 # Target rules for targets named bench_alloc_diehard
 
 # Build rule for target.
@@ -1035,6 +1061,8 @@ help:
 	@echo "... bench_alloc_hoard_zero"
 	@echo "... bench_alloc_jemalloc"
 	@echo "... bench_alloc_jemalloc_zero"
+	@echo "... bench_alloc_mesh"
+	@echo "... bench_alloc_mesh_zero"
 	@echo "... bench_alloc_mimalloc"
 	@echo "... bench_alloc_mimalloc_zero"
 	@echo "... bench_alloc_system"

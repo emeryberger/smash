@@ -4,15 +4,14 @@
 We structure the evaluation around six questions:
 
 \begin{enumerate}
-\item[\textbf{RQ1.}] How much does \sys reduce RSS on real
-  applications?
-\item[\textbf{RQ2.}] What is the throughput and latency cost?
-\item[\textbf{RQ3.}] How do compression algorithms compare on heap
+\item[\textbf{RQ1.}] How do compression algorithms compare on heap
   page data?
-\item[\textbf{RQ4.}] What does each optimization contribute?
-\item[\textbf{RQ5.}] How does allocator design affect page
+\item[\textbf{RQ2.}] How much does \sys reduce RSS on real
+  applications, and what is the throughput and latency cost?
+\item[\textbf{RQ3.}] What does each optimization contribute?
+\item[\textbf{RQ4.}] How does allocator design affect page
   compressibility?
-\item[\textbf{RQ6.}] How much of the benefit comes from the
+\item[\textbf{RQ5.}] How much of the benefit comes from the
   compression pipeline versus the allocator design?
 \end{enumerate}
 
@@ -25,7 +24,7 @@ interposition; baselines use the system allocator.  Each
 configuration is run three times; we report the median.
 RSS is sampled via Mach task info at 100\,ms intervals.
 
-\subsection{Algorithm Comparison (RQ3)}
+\subsection{Algorithm Comparison (RQ1)}
 \label{sec:eval:algo}
 
 Table~\ref{tab:algo_compare} compares compression ratios and
@@ -113,7 +112,7 @@ cold pages (fast enough to speculatively compress pages that may be
 accessed again soon) and zstd-9 for long-lived cold pages (where the
 higher compression ratio justifies the cost).
 
-\subsection{Application Benchmarks (RQ1, RQ2)}
+\subsection{Application Benchmarks (RQ2)}
 \label{sec:eval:apps}
 
 Table~\ref{tab:apps} summarizes RSS reduction and throughput for
@@ -316,7 +315,7 @@ leaving no partially-filled pages for Mesh to compact.
 allocator) adds $\sim$15\,MiB, offsetting the small amount
 of compression possible on this active dataset.
 
-\subsection{Ablation Study (RQ4)}
+\subsection{Ablation Study (RQ3)}
 \label{sec:eval:ablation}
 
 We run each configuration across all five applications, each with 3
@@ -380,7 +379,7 @@ entire pages, making per-page optimizations more visible.
 \label{fig:ablation}
 \end{figure}
 
-\subsection{Allocator Design Impact (RQ5)}
+\subsection{Allocator Design Impact (RQ4)}
 \label{sec:eval:allocator}
 
 The previous experiments measure \sys end-to-end.  To isolate how
@@ -496,7 +495,7 @@ deployed applications (\S\ref{sec:eval:apps}) comes from its
 compression pipeline, not from page content alone.  The next section
 quantifies this decomposition.
 
-\subsection{Pipeline vs.\ Allocator Design (RQ6)}
+\subsection{Pipeline vs.\ Allocator Design (RQ5)}
 \label{sec:eval:pipeline}
 
 To decompose the contributions of the compression pipeline and

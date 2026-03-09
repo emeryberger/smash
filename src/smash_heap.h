@@ -160,10 +160,6 @@ public:
         if (!span) return;
         if (span->is_large) { large_alloc_.deallocate(span); return; }
         uint8_t sc = span->size_class;
-        if constexpr (kZeroOnFree) {
-            if (span->object_size <= kZeroOnFreeMaxSize)
-                __builtin_memset(ptr, 0, span->object_size);
-        }
         ThreadCache* tc = getOrCreateThreadCache();
         if (!tc->deallocate(sc, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, ptr); }
     }

@@ -118,6 +118,71 @@ if(APPLE)
   )
 endif()
 
+# ── libsmash_noopt: compression without allocation optimizations ─────────────
+# Same code, but arenas=1, no zero-on-free (eager or deferred).
+# Used to isolate the contribution of Smash's allocation design.
+add_library(smash_noopt SHARED
+  src/smash_heap.cpp
+  ${ALLOC8_INTERPOSE_SOURCES}
+  ${ALLOC8_THREAD_SOURCES}
+  ${ALLOC8_COMMON_SOURCES}
+)
+
+target_include_directories(smash_noopt PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(smash_noopt PRIVATE alloc8::interpose lz4_static libzstd_static)
+
+set_target_properties(smash_noopt PROPERTIES
+  OUTPUT_NAME "smash_noopt"
+  PREFIX "lib"
+)
+
+target_compile_definitions(smash_noopt PRIVATE
+  SMASH_ABLATION_NO_CALLSITE_ARENA=1
+  SMASH_ABLATION_NO_ZERO_EAGER=1
+  SMASH_ABLATION_NO_ZERO_DEFERRED=1
+)
+
+if(APPLE)
+  set_target_properties(smash_noopt PROPERTIES SUFFIX ".dylib")
+endif()
+
+# ── libsmash_compress_only: system malloc + Smash compression ────────────────
+# Interposes malloc/free but forwards to system allocator. Tracks pages and
+# runs the compression pipeline on system-allocated memory. Measures Smash
+# compression effectiveness without Smash's allocation design.
+add_library(smash_compress_only SHARED
+  src/compress_only/co_interpose_mac.cpp
+  src/compress_only/co_interpose_linux.cpp
+)
+
+target_include_directories(smash_compress_only PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# Only needs alloc8 headers (for platform.h), NOT the interpose machinery
+target_link_libraries(smash_compress_only PRIVATE alloc8::headers lz4_static libzstd_static)
+
+set_target_properties(smash_compress_only PROPERTIES
+  OUTPUT_NAME "smash_compress_only"
+  PREFIX "lib"
+)
+
+target_compile_definitions(smash_compress_only PRIVATE SMASH_COMPRESS_ONLY=1)
+
+# No fno-builtin-malloc since we want to forward to the real system malloc
+target_compile_options(smash_compress_only PRIVATE
+  -fvisibility=hidden -Wall -Wextra -Wpedantic
+)
+
+if(APPLE)
+  set_target_properties(smash_compress_only PROPERTIES SUFFIX ".dylib")
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 option(SMASH_BUILD_TESTS "Build smash tests" ON)
 if(SMASH_BUILD_TESTS)

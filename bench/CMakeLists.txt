@@ -134,6 +134,142 @@ endif()
 smash_add_standalone_bench(bench_sqlite bench_sqlite.cpp)
 target_link_libraries(bench_sqlite PRIVATE sqlite3_static)
 
+# ── Allocator substrate comparison benchmarks ───────────────────────────────
+
+# Helper to add allocator comparison benchmark variant
+function(smash_add_alloc_bench name alloc_define)
+  smash_add_standalone_bench(${name} bench_allocator_compare.cpp)
+  target_compile_definitions(${name} PRIVATE ALLOC_NAME="${alloc_define}")
+  target_link_libraries(${name} PRIVATE lz4_static libzstd_static)
+endfunction()
+
+# Helper: allocator bench with ZERO_ON_FREE enabled (benchmark zeros before free)
+function(smash_add_alloc_bench_zero name alloc_define)
+  smash_add_alloc_bench(${name} "${alloc_define}")
+  target_compile_definitions(${name} PRIVATE ZERO_ON_FREE)
+endfunction()
+
+# System malloc (also used as Smash target via DYLD_INSERT_LIBRARIES)
+smash_add_alloc_bench(bench_alloc_system "system")
+smash_add_alloc_bench_zero(bench_alloc_system_zero "system+zero")
+
+# mimalloc
+FetchContent_Declare(mimalloc
+  GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+  GIT_TAG v2.1.2
+  GIT_SHALLOW TRUE
+)
+set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(mimalloc)
+
+smash_add_alloc_bench(bench_alloc_mimalloc "mimalloc")
+target_link_libraries(bench_alloc_mimalloc PRIVATE mimalloc-static)
+smash_add_alloc_bench_zero(bench_alloc_mimalloc_zero "mimalloc+zero")
+target_link_libraries(bench_alloc_mimalloc_zero PRIVATE mimalloc-static)
+
+# jemalloc (system install, optional)
+find_library(JEMALLOC_LIB jemalloc HINTS /opt/homebrew/lib)
+find_path(JEMALLOC_INCLUDE jemalloc/jemalloc.h HINTS /opt/homebrew/include)
+if(JEMALLOC_LIB AND JEMALLOC_INCLUDE)
+  smash_add_alloc_bench(bench_alloc_jemalloc "jemalloc")
+  target_link_libraries(bench_alloc_jemalloc PRIVATE ${JEMALLOC_LIB})
+  target_include_directories(bench_alloc_jemalloc PRIVATE ${JEMALLOC_INCLUDE})
+  smash_add_alloc_bench_zero(bench_alloc_jemalloc_zero "jemalloc+zero")
+  target_link_libraries(bench_alloc_jemalloc_zero PRIVATE ${JEMALLOC_LIB})
+  target_include_directories(bench_alloc_jemalloc_zero PRIVATE ${JEMALLOC_INCLUDE})
+  message(STATUS "jemalloc found: ${JEMALLOC_LIB}")
+else()
+  message(STATUS "jemalloc not found (optional)")
+endif()
+
+# tcmalloc (system install, optional)
+find_library(TCMALLOC_LIB tcmalloc_minimal)
+if(TCMALLOC_LIB)
+  smash_add_alloc_bench(bench_alloc_tcmalloc "tcmalloc")
+  target_link_libraries(bench_alloc_tcmalloc PRIVATE ${TCMALLOC_LIB})
+  smash_add_alloc_bench_zero(bench_alloc_tcmalloc_zero "tcmalloc+zero")
+  target_link_libraries(bench_alloc_tcmalloc_zero PRIVATE ${TCMALLOC_LIB})
+  message(STATUS "tcmalloc found: ${TCMALLOC_LIB}")
+else()
+  message(STATUS "tcmalloc not found (optional)")
+endif()
+
+# Hoard (system install, optional)
+find_library(HOARD_LIB hoard libhoard)
+if(HOARD_LIB)
+  smash_add_alloc_bench(bench_alloc_hoard "hoard")
+  target_link_libraries(bench_alloc_hoard PRIVATE ${HOARD_LIB})
+  smash_add_alloc_bench_zero(bench_alloc_hoard_zero "hoard+zero")
+  target_link_libraries(bench_alloc_hoard_zero PRIVATE ${HOARD_LIB})
+  message(STATUS "Hoard found: ${HOARD_LIB}")
+else()
+  message(STATUS "Hoard not found (optional)")
+endif()
+
+# Mesh (external metadata, virtual remapping, no zeroing) - optional
+# Prefer static lib to avoid Bazel rpath issues with the dylib
+find_library(MESH_LIB_STATIC NAMES libmesh.a HINTS /usr/local/lib)
+find_library(MESH_LIB_SHARED mesh HINTS /usr/local/lib)
+find_path(MESH_INCLUDE plasma/mesh.h HINTS /usr/local/include)
+if(MESH_LIB_STATIC)
+  set(MESH_LIB ${MESH_LIB_STATIC})
+elseif(MESH_LIB_SHARED)
+  set(MESH_LIB ${MESH_LIB_SHARED})
+endif()
+if(MESH_LIB)
+  smash_add_alloc_bench(bench_alloc_mesh "mesh")
+  target_link_libraries(bench_alloc_mesh PRIVATE ${MESH_LIB})
+  if(MESH_INCLUDE)
+    target_include_directories(bench_alloc_mesh PRIVATE ${MESH_INCLUDE})
+  endif()
+  # Mesh links against Foundation on macOS
+  if(APPLE)
+    target_link_libraries(bench_alloc_mesh PRIVATE "-framework Foundation")
+  endif()
+  smash_add_alloc_bench_zero(bench_alloc_mesh_zero "mesh+zero")
+  target_link_libraries(bench_alloc_mesh_zero PRIVATE ${MESH_LIB})
+  if(MESH_INCLUDE)
+    target_include_directories(bench_alloc_mesh_zero PRIVATE ${MESH_INCLUDE})
+  endif()
+  if(APPLE)
+    target_link_libraries(bench_alloc_mesh_zero PRIVATE "-framework Foundation")
+  endif()
+  message(STATUS "Mesh found: ${MESH_LIB}")
+else()
+  message(STATUS "Mesh not found (optional)")
+endif()
+
+# DieHard (external metadata, no zeroing) - optional
+find_library(DIEHARD_LIB diehard libdiehard)
+if(DIEHARD_LIB)
+  smash_add_alloc_bench(bench_alloc_diehard "diehard")
+  target_link_libraries(bench_alloc_diehard PRIVATE ${DIEHARD_LIB})
+  smash_add_alloc_bench_zero(bench_alloc_diehard_zero "diehard+zero")
+  target_link_libraries(bench_alloc_diehard_zero PRIVATE ${DIEHARD_LIB})
+  message(STATUS "DieHard found: ${DIEHARD_LIB}")
+else()
+  message(STATUS "DieHard not found (optional)")
+endif()
+
+# DieHarder (external metadata + security zeroing) - optional
+find_library(DIEHARDER_LIB dieharder libdieharder)
+if(DIEHARDER_LIB)
+  smash_add_alloc_bench(bench_alloc_dieharder "dieharder")
+  target_link_libraries(bench_alloc_dieharder PRIVATE ${DIEHARDER_LIB})
+  message(STATUS "DieHarder found: ${DIEHARDER_LIB}")
+else()
+  message(STATUS "DieHarder not found (optional)")
+endif()
+
+# Python runner (configure paths)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench_allocator_compare.py.in
+  ${CMAKE_CURRENT_BINARY_DIR}/bench_allocator_compare.py
+  @ONLY
+)
+
 # ── Shell script benchmarks (configure paths) ──────────────────────────────
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/bench_runner.sh.in
@@ -175,3 +311,79 @@ configure_file(
   ${CMAKE_CURRENT_BINARY_DIR}/bench_duckdb.py
   @ONLY
 )
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench_memcached_alloc.sh.in
+  ${CMAKE_CURRENT_BINARY_DIR}/bench_memcached_alloc.sh
+  @ONLY
+)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench_duckdb_alloc.sh.in
+  ${CMAKE_CURRENT_BINARY_DIR}/bench_duckdb_alloc.sh
+  @ONLY
+)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench_redis_alloc.sh.in
+  ${CMAKE_CURRENT_BINARY_DIR}/bench_redis_alloc.sh
+  @ONLY
+)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench_polars.sh.in
+  ${CMAKE_CURRENT_BINARY_DIR}/bench_polars.sh
+  @ONLY
+)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench_sklearn.sh.in
+  ${CMAKE_CURRENT_BINARY_DIR}/bench_sklearn.sh
+  @ONLY
+)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench_networkx.sh.in
+  ${CMAKE_CURRENT_BINARY_DIR}/bench_networkx.sh
+  @ONLY
+)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/bench_rocksdb.sh.in
+  ${CMAKE_CURRENT_BINARY_DIR}/bench_rocksdb.sh
+  @ONLY
+)
+
+# ── RocksDB benchmark (optional) ─────────────────────────────────────────────
+find_library(ROCKSDB_LIB rocksdb HINTS /opt/homebrew/lib)
+find_path(ROCKSDB_INCLUDE rocksdb/db.h HINTS /opt/homebrew/include)
+if(ROCKSDB_LIB AND ROCKSDB_INCLUDE)
+  smash_add_standalone_bench(bench_rocksdb bench_rocksdb.cpp)
+  target_link_libraries(bench_rocksdb PRIVATE ${ROCKSDB_LIB})
+  target_include_directories(bench_rocksdb PRIVATE ${ROCKSDB_INCLUDE})
+  message(STATUS "RocksDB found: ${ROCKSDB_LIB}")
+else()
+  message(STATUS "RocksDB not found (optional)")
+endif()
+
+# ── Heap page compression sampling ────────────────────────────────────────────
+
+# SQLite variant
+smash_add_standalone_bench(bench_heap_compress_sqlite bench_heap_compress.cpp)
+target_compile_definitions(bench_heap_compress_sqlite PRIVATE HAS_SQLITE)
+target_link_libraries(bench_heap_compress_sqlite PRIVATE sqlite3_static lz4_static libzstd_static)
+
+# Generic variant (memcached/redis/duckdb heap fill patterns)
+smash_add_standalone_bench(bench_heap_compress bench_heap_compress.cpp)
+target_link_libraries(bench_heap_compress PRIVATE lz4_static libzstd_static)
+
+# RocksDB variant (optional)
+if(ROCKSDB_LIB AND ROCKSDB_INCLUDE)
+  smash_add_standalone_bench(bench_heap_compress_rocksdb bench_heap_compress.cpp)
+  target_compile_definitions(bench_heap_compress_rocksdb PRIVATE HAS_ROCKSDB)
+  target_link_libraries(bench_heap_compress_rocksdb PRIVATE
+    ${ROCKSDB_LIB} lz4_static libzstd_static)
+  target_include_directories(bench_heap_compress_rocksdb PRIVATE ${ROCKSDB_INCLUDE})
+endif()
+
+# Remote process heap page sampler (mach_vm_read)
+smash_add_standalone_bench(sample_heap_pages sample_heap_pages.cpp)
+target_link_libraries(sample_heap_pages PRIVATE lz4_static libzstd_static)
+
+# DYLD-interposable heap sampling library (SIGUSR1 to trigger)
+add_library(sample_heap SHARED libsample_heap.cpp)
+target_link_libraries(sample_heap PRIVATE lz4_static libzstd_static)
+set_target_properties(sample_heap PROPERTIES OUTPUT_NAME sample_heap)

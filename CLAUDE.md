@@ -102,6 +102,132 @@ extern "C" ssize_t smash_read(int fd, void* buf, size_t count) {
 - **LZ4 v1.9.4**: Fast compression (fetched via CMake FetchContent)
 - **Zstandard v1.5.6**: Dictionary compression (fetched via CMake FetchContent)
 
+## Paper Experiments
+
+All experiments are run from the `build/` directory. Results go into `paper_results/`.
+
+### Prerequisites
+
+```bash
+# Build with benchmarks enabled
+cd build
+cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
+
+# External tool dependencies
+brew install memcached redis rocksdb duckdb
+# Allocator compare also needs: mimalloc, jemalloc, tcmalloc, hoard (built via FetchContent/find_library)
+```
+
+### Unified Experiment Runner (ablation + compress-only)
+
+```bash
+cd build
+
+# Run all experiments (full — for paper-quality results)
+python3 ../bench/run_paper_experiments.py --runs 3
+
+# Quick smoke test (smaller datasets, 1 run)
+python3 ../bench/run_paper_experiments.py --quick --runs 1
+
+# Ablation only
+python3 ../bench/run_paper_experiments.py --ablation-only --runs 3
+
+# Compress-only only
+python3 ../bench/run_paper_experiments.py --compress-only-only --runs 3
+
+# Subset of apps
+python3 ../bench/run_paper_experiments.py --apps sqlite,rocksdb --runs 3
+```
+
+**Ablation configs** (9 variants, each rebuilds libsmash with different CMake defines):
+- B1: Default (baseline Smash)
+- B0: System malloc (no Smash)
+- DICT: With dictionary training (`SMASH_DICT_TRAIN_SAMPLES=16`)
+- T1a: No arenas (`SMASH_NUM_ARENAS=1`)
+- T1c: LZ4 only (`SMASH_VERY_COLD_TICKS=9999`)
+- T2a: No zero-deferred (`SMASH_ABLATION_NO_ZERO_DEFERRED=ON`)
+- T1e: No prefetch (`SMASH_PREFETCH_WINDOW=0`)
+- T1f: Single worker (`SMASH_COMPRESSOR_WORKERS=1`)
+- B2: No compression (`SMASH_COLD_TICKS=9999`)
+
+**Compress-only** tests 3 configs per app: baseline (system malloc), compress-only (`libsmash_compress_only.dylib`), full Smash.
+
+**Output**: `paper_results/ablation_results.json`, `paper_results/compress_only_results.json`, `paper_results/paper_tables.txt`
+
+### Application Benchmark Shell Scripts
+
+Individual app benchmarks with detailed output (A/B comparison tables):
+
+```bash
+cd build
+
+# RocksDB (compares baseline, smash, rocksdb-lz4, rocksdb-zstd, smash+lz4)
+bash bench/bench_rocksdb.sh [--quick]
+
+# Memcached (fill → cool → serve → cold re-access)
+bash bench/bench_memcached.sh [--quick]
+
+# Redis
+bash bench/bench_redis.sh [--quick]
+
+# DuckDB (TPC-H queries)
+bash bench/bench_duckdb.sh [--quick]
+
+# Multi-allocator comparison on Redis/Memcached
+bash bench/bench_redis_alloc.sh
+bash bench/bench_memcached_alloc.sh
+bash bench/bench_duckdb_alloc.sh
+```
+
+### Allocator Substrate Comparison (RQ5)
+
+Standalone benchmark measuring page compressibility across allocators:
+
+```bash
+cd build
+
+# Run the configured Python runner
+python3 bench/bench_allocator_compare.py
+
+# Or run individual allocator benchmarks directly
+./bench/bench_alloc_system --data json --size 64 --count 100000
+./bench/bench_alloc_mimalloc --data kv --size 256
+# With Smash interposition:
+DYLD_INSERT_LIBRARIES=./libsmash.dylib ./bench/bench_alloc_system --data mixed --size 128
+```
+
+Available allocator binaries: `bench_alloc_{system,mimalloc,jemalloc,tcmalloc,hoard,diehard,dieharder}` and `*_zero` variants.
+
+### Algorithm Comparison (RQ3)
+
+```bash
+cd build
+./bench/bench_algo_compare    # Compression ratios + throughput across LZ4/zstd/WKdm
+```
+
+### In-Process Benchmarks (C++)
+
+```bash
+cd build
+./bench/bench_sqlite [--quick]    # SQLite in-memory DB benchmark
+./bench/bench_rocksdb [--quick]   # RocksDB block cache benchmark
+```
+
+### Generating Figures
+
+```bash
+cd paper/figures
+python3 plot_all.py              # Main figures (rss_reduction, ablation, algo_compare, etc.)
+python3 plot_rss_timeline.py     # RSS over time (Figure 7)
+python3 plot_cdf.py              # Cold-access latency CDF (Figure 8)
+```
+
+### Building the Paper
+
+```bash
+cd paper && pdflatex paper && bibtex paper && pdflatex paper && pdflatex paper
+```
+
 ## Config Tuning
 
 Key constants in `include/smash/config.h`:

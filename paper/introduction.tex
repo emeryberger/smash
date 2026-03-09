@@ -1,103 +1,61 @@
 \section{Introduction}
 \label{sec:intro}
 
-Memory is the binding constraint in cloud computing.  Cloud providers
-price memory at \$3--5 per GiB-month, making it 5--10$\times$ more
-expensive per byte than storage~\cite{aws2024pricing}.  Unlike CPU
-cycles, which can be time-shared across tenants, physical memory is
-exclusively held by its owner.  A virtual machine or container that
-allocates 16\,GiB of RAM blocks other tenants from using those
-physical pages, regardless of whether the application actively
-accesses them.  Studies of production workloads at Google and Microsoft
-report that 20--50\% of allocated memory is cold at any given
-moment~\cite{maas2020adaptive,amaro2023memory}.
+A significant fraction of allocated memory is cold at any given
+moment.  Studies of production workloads at Google and Microsoft
+report that 20--50\% of resident pages have not been accessed in the
+last 60 seconds~\cite{maas2020adaptive,amaro2023memory}.  This cold
+memory cannot be reclaimed without swapping, which incurs
+millisecond-scale I/O latency.
 
-Operating systems have responded with transparent memory compression.
-macOS Compressed Memory uses the WKdm algorithm to compress inactive
-pages in the VM subsystem~\cite{apple2013compressed}.  Linux zswap
-compresses pages headed for swap using LZ4 or
-zstd~\cite{jennings2013zswap}.  Windows compresses pages in its
-memory manager using the Xpress
-algorithm~\cite{microsoft2015compression}.  These mechanisms operate
-entirely below the allocator, treating each page as an opaque 4\,KiB
-or 16\,KiB byte array.
+\sys is a drop-in memory allocator that transparently compresses cold
+heap pages to reduce RSS\@.  It interposes on \texttt{malloc} and
+\texttt{free} via library interposition~\cite{berger2001composing},
+requiring no application changes.  A background thread periodically
+compresses pages that have not been accessed recently; a signal
+handler decompresses them on demand.
 
-This placement leaves substantial compression opportunity on the
-table.  The allocator possesses structural knowledge that the OS
-cannot access: it knows which bytes within a page are live objects
-versus freed slots containing stale data; it can route allocations
-from the same call site to the same physical pages, creating pages
-with structurally homogeneous content; and it tracks per-page access
-patterns at object-level granularity rather than relying on
-coarse-grained hardware access bits.
+The design incorporates three techniques.  First, the compressor
+zeros freed object slots before compressing each page, replacing stale
+data with compressible zero runs; zeroing is deferred to compression
+time using non-temporal stores, keeping \texttt{free()} on its fast
+path (\S\ref{sec:design:zero}).  Second, \sys hashes the return
+address of each allocation to route it to one of four arenas, so that
+allocations from the same call site land on the same pages, producing
+structurally homogeneous page content (\S\ref{sec:design:arenas}).
+Third, \sys applies \emph{JIT compression}: like a JIT compiler that
+applies increasing optimization to hot code, \sys applies increasing
+compression to cold data---recently cold pages are compressed with LZ4
+($\sim$1\,GB/s); pages that remain cold for 60 seconds are
+recompressed with zstd-9 for better ratios; accessed pages are
+decompressed and reset, analogous to deoptimization
+(\S\ref{sec:design:adaptive}).
 
-\sys is a compression-aware memory allocator that exploits this
-structural knowledge.  It interposes on \texttt{malloc} and
-\texttt{free} via the alloc8 interposition
-framework~\cite{berger2001composing}, requiring no application source
-changes.  A background compressor thread periodically scans the heap,
-compressing pages that have not been accessed recently.  When the
-application later accesses a compressed page, a signal handler
-transparently decompresses it.
+We evaluate \sys on five applications spanning in-memory databases,
+caches, and analytics engines.  \sys reduces RSS by 17--80\%
+depending on the workload's hot/cold partition.  Throughput impact is
+within measurement noise for most benchmarks.  An ablation study
+across 17 configurations quantifies each technique's contribution.
 
-Three techniques improve compression effectiveness over naive
-per-page compression:
+To understand how much of the benefit comes from the compression
+pipeline versus the allocator design, we build a compress-only
+variant that runs \sys's pipeline atop the unmodified system
+allocator.  This variant achieves 32--61\% RSS reduction on its own.  The
+pipeline and allocator design are synergistic: \sys's allocator further reduces RSS by 10--25\% on workloads
+dominated by large allocations, where freelist pollution and object
+mixing span entire pages, while the pipeline's overhead is lower
+when integrated into the allocator.
 
-\begin{itemize}
-\item \textbf{Call-site arena segregation.}  \sys hashes the return
-  address of each \texttt{malloc} call to select one of four arenas.
-  Allocations from the same call site land in the same arena, placing
-  structurally similar objects (e.g., all JSON parse tree nodes, all
-  B-tree entries) on the same pages.  Structurally homogeneous pages
-  compress 1.5 percentage points better than randomly mixed pages in
-  our benchmarks (\S\ref{sec:eval:ablation}).
-
-\item \textbf{Zero-on-free.}  When an object is freed, \sys zeros its
-  contents.  Small objects ($\leq$128\,B) are zeroed eagerly in
-  \texttt{free()}.  Larger objects are zeroed by the compressor thread
-  using non-temporal stores to avoid polluting the CPU cache.
-  Replacing stale data with zero runs makes partially-filled pages
-  highly compressible (\S\ref{sec:design:zero}).
-
-\item \textbf{Adaptive multi-algorithm compression.}  Newly cold pages
-  are compressed with LZ4 (1\,GB/s compression throughput).  Pages
-  that remain compressed for 60 seconds are recompressed with zstd at
-  level~9, which achieves 2--15 percentage points better compression
-  ratios (\S\ref{sec:design:adaptive}).
-\end{itemize}
-
-\sys achieves 17--44\% RSS reduction on five real-world applications
-with negligible throughput impact:
-
-\begin{itemize}
-\item \textbf{Memcached}: 25\% RSS reduction during serve phase with
-  0\% throughput loss and 54\% faster cold-key re-access
-  (\S\ref{sec:eval:apps}).
-\item \textbf{SQLite}: 39\% RSS reduction on an in-memory database
-  workload.
-\item \textbf{DuckDB}: 30\% peak RSS reduction on TPC-H analytics
-  queries.
-\item \textbf{JSON processing}: 17\% RSS reduction on a 128\,MB
-  parsed document.
-\item \textbf{Key-value store}: 33\% RSS reduction with 4\,M
-  operations per second.
-\end{itemize}
-
-This paper makes the following contributions:
+This paper makes two contributions:
 
 \begin{enumerate}
-\item The design and implementation of \sys, a drop-in replacement
-  allocator that transparently compresses cold heap pages, including
-  call-site arena segregation, adaptive multi-algorithm compression,
-  and a signal-based fault handler with per-slot decompression contexts
-  (\S\ref{sec:design}).
+\item The design and implementation of \sys, a drop-in allocator that
+  transparently compresses cold heap pages using allocator-level
+  structural knowledge, including deferred zero-on-free, call-site
+  arena segregation, and JIT compression (\S\ref{sec:design}--\ref{sec:impl}).
 
-\item A syscall compatibility layer that interposes on 20 system calls
-  and C library I/O functions to prevent kernel EFAULT errors when
-  buffer pages are under compression monitoring (\S\ref{sec:design:syscall}).
-
-\item A comprehensive evaluation on five real-world applications
-  showing 17--44\% RSS reduction (\S\ref{sec:eval}), and an ablation
-  study across 17 configurations that isolates the contribution of
-  each optimization (\S\ref{sec:eval:ablation}).
+\item An evaluation decomposing the sources of RSS reduction: the
+  compression pipeline, the allocator design, and individual
+  techniques, across five applications and eight allocator substrates
+  (\S\ref{sec:eval}).
 \end{enumerate}

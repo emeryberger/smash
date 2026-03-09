@@ -46,7 +46,8 @@ void ThreadCache::drain(uint8_t sc, Slab* all_slabs, PageMap* page_map) {
     size_t start = c.count - to_drain;
 
     // Bucket pointers by arena based on their span's arena_id
-    void* buckets[kNumArenas][kThreadCacheBatchSize];
+    // Max drained per call = ceil(kThreadCacheMaxPerClass/2)
+    void* buckets[kNumArenas][kThreadCacheMaxPerClass];
     size_t counts[kNumArenas]{};
     for (size_t i = start; i < c.count; ++i) {
         Span* span = page_map->get(reinterpret_cast<uintptr_t>(c.ptrs[i]));
@@ -64,8 +65,8 @@ void ThreadCache::drainAll(Slab* all_slabs, PageMap* page_map) {
     for (int i = 0; i < kNumClasses; ++i) {
         auto& c = caches_[i];
         if (c.count > 0) {
-            // Bucket by arena
-            void* buckets[kNumArenas][kThreadCacheBatchSize];
+            // Bucket by arena — each bucket may receive up to kThreadCacheMaxPerClass ptrs
+            void* buckets[kNumArenas][kThreadCacheMaxPerClass];
             size_t counts[kNumArenas]{};
             for (size_t j = 0; j < c.count; ++j) {
                 Span* span = page_map->get(reinterpret_cast<uintptr_t>(c.ptrs[j]));
@@ -140,8 +141,10 @@ extern "C" int smash_kevent(int kq, const struct kevent* changelist, int nchange
                             const struct timespec* timeout) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) {
-        if (changelist && nchanges > 0)
+        if (changelist && nchanges > 0) {
             smash::vm::warmPages(changelist, nchanges * sizeof(struct kevent), vm);
+            smash::vm::pinPages(changelist, nchanges * sizeof(struct kevent), vm);
+        }
         if (eventlist && nevents > 0) {
             smash::vm::warmPages(eventlist, nevents * sizeof(struct kevent), vm);
             smash::vm::pinPages(eventlist, nevents * sizeof(struct kevent), vm);
@@ -149,8 +152,12 @@ extern "C" int smash_kevent(int kq, const struct kevent* changelist, int nchange
     }
     int ret = reinterpret_cast<kevent_fn>(smash_interpose_smash_kevent.original)(
         kq, changelist, nchanges, eventlist, nevents, timeout);
-    if (vm && eventlist && nevents > 0)
-        smash::vm::unpinPages(eventlist, nevents * sizeof(struct kevent), vm);
+    if (vm) {
+        if (changelist && nchanges > 0)
+            smash::vm::unpinPages(changelist, nchanges * sizeof(struct kevent), vm);
+        if (eventlist && nevents > 0)
+            smash::vm::unpinPages(eventlist, nevents * sizeof(struct kevent), vm);
+    }
     return ret;
 }
 

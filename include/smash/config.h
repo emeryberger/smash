@@ -90,12 +90,8 @@ inline constexpr int kChunkBits = 6;                 // 64 pages per chunk
 inline constexpr int kChunkSize = 1 << kChunkBits;   // pages per chunk
 
 // ── Zero-on-free ────────────────────────────────────────────────────────────
-#ifdef SMASH_ABLATION_NO_ZERO_EAGER
-inline constexpr bool kZeroOnFree = false;
-#else
-inline constexpr bool kZeroOnFree = true;
-#endif
-inline constexpr size_t kZeroOnFreeMaxSize = 128;  // eager memset up to this size
+// All zeroing is deferred to the compressor thread (zeroFreeSlots).
+// No zeroing occurs in the free() critical path.
 
 // ── Large allocation compression ────────────────────────────────────────────
 // Only large allocations >= this size are placed in the VmRegion for

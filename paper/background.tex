@@ -1,81 +1,49 @@
 \section{Background and Motivation}
 \label{sec:background}
 
-\subsection{Memory Pressure in Modern Systems}
-
-Cloud applications routinely allocate more memory than they actively
-use.  An analysis of Google's fleet found that 30\% of allocated
-memory had not been touched in the last 60
-seconds~\cite{maas2020adaptive}.  Microsoft reported similar findings
-for Azure VMs, where 20--40\% of resident pages were
-cold~\cite{amaro2023memory}.  This cold memory cannot be reclaimed by
-the OS without swapping, which incurs millisecond-scale I/O latency on
-SSDs and second-scale latency on HDDs.  Memory overcommit can trigger
-the OOM killer, terminating processes unpredictably.
-
 \subsection{OS-Level VM Compression}
 
-Operating systems have adopted transparent memory compression as a
-middle ground between keeping cold pages resident and swapping them to
-disk.
+Operating systems compress inactive pages as a middle ground between
+keeping them resident and swapping to disk.
 
-\paragraph{macOS Compressed Memory.}  Since OS X Mavericks (2013),
-macOS compresses inactive pages using the WKdm (Wilson-Kaplan direct
-mapped) algorithm~\cite{wilson1999case,apple2013compressed}.  WKdm
-operates on 32-bit words and maintains a 16-entry dictionary of
-recently seen values.  It was designed for 4\,KiB pages containing
-pointer-heavy C data structures.  On modern 16\,KiB ARM64 pages
-containing text or serialized data, WKdm achieves poor compression:
-98.9\% ratio on JSON data and 93.7\% on key-value data (Table~\ref{tab:algo_compare}).
+\paragraph{macOS Compressed Memory.}  Since OS~X Mavericks
+(2013), macOS compresses inactive pages using
+WKdm~\cite{wilson1999case,apple2013compressed}, a 32-bit
+word-granularity dictionary compressor designed for 4\,KiB
+pointer-heavy pages.  \punt{On 16\,KiB ARM64 pages with text or
+serialized data, WKdm achieves poor compression: 98.9\% on JSON
+and 93.7\% on key-value records (Table~\ref{tab:algo_compare}).}
 
-\paragraph{Linux zswap.}  The zswap subsystem intercepts pages destined
-for swap and compresses them into a memory pool~\cite{jennings2013zswap}.
-It supports LZ4 (default), LZO, and zstd as compression backends.
-zswap operates per-page with no cross-page context and no knowledge of
-which bytes within a page are live allocator objects.
+\paragraph{Linux zswap.}  zswap intercepts pages destined for swap
+and compresses them into a memory
+pool~\cite{jennings2013zswap}.  It supports LZ4 (default), LZO, and
+zstd as backends.  zswap operates per-page with no cross-page context
+and no knowledge of which bytes within a page are live allocator
+objects.
 
-\paragraph{Windows Memory Compression.}  Windows 10 introduced
-in-memory page compression using the Xpress
-algorithm~\cite{microsoft2015compression}.  The memory manager
-compresses pages from the modified page list into a compressed store.
+\paragraph{Windows.}  Windows 10 compresses pages from the modified
+page list using the Xpress
+algorithm~\cite{microsoft2015compression}.
 
-\subsection{Why the Allocator Level Matters}
+All three mechanisms treat each page as an opaque byte array.
 
-OS VM compression treats each page as an opaque byte array.  The
-allocator possesses three types of structural knowledge that the OS
-cannot exploit:
+\subsection{What the Allocator Knows}
 
-\paragraph{Object liveness.}  A slab allocator page may contain a mix
-of live objects and freed slots.  Freed slots still hold stale data
-from their previous occupant.  The OS compressor sees this stale data
-as part of the page content and must compress it, reducing ratios.
-The allocator knows which slots are free and can zero them before
-compression.
+The allocator possesses three kinds of structural information that OS
+compressors cannot exploit.
 
-\paragraph{Allocation patterns.}  Objects allocated from the same call
-site tend to have similar structure (same fields, similar values).
-The allocator can route these allocations to dedicated pages, creating
-pages whose content has low entropy.  The OS has no visibility into
-which call site produced which allocation.
+\paragraph{Object liveness.}  A slab page may contain a mix of live
+objects and freed slots.  Freed slots hold stale data from their
+previous occupant.  The OS compressor must compress this stale data;
+the allocator can zero it first.
 
-\paragraph{Access granularity.}  The OS tracks page accesses through
-hardware accessed bits, which are set on any access to any byte in the
-page.  The allocator can track accesses at object granularity and
-knows which size class occupies each page, enabling per-size-class
-compression policies.
+\paragraph{Allocation patterns.}  Objects allocated from the same
+call site tend to have similar structure (same fields, similar
+values).  The allocator can route these allocations to dedicated
+pages.  The OS has no visibility into allocation origins.
 
-\subsection{Motivating Example}
-
-Consider a JSON processing workload that parses a large document into
-an in-memory tree.  The parser allocates string nodes, array nodes,
-and object nodes through \texttt{malloc}.  With a conventional
-allocator, these structurally different objects are interleaved on the
-same pages based on allocation order.  A page might contain a mix of
-string data, pointer arrays, and hash table buckets.
-
-With call-site arena segregation, all string node allocations (from
-the same parser call site) land in the same arena, producing pages
-that contain exclusively string data.  These pages compress to 14\%
-of their original size with zstd, compared to 23\% for mixed pages.
-The allocator ablation confirms this effect: disabling arenas reduces
-JSON RSS savings by 1.5 percentage points (\S\ref{sec:eval:ablation}).
+\paragraph{Access granularity.}  The OS tracks page access through
+hardware accessed bits, which provide one bit per page.  The
+allocator tracks which size class occupies each page, enabling
+per-size-class compression policies that skip size classes whose data
+does not compress well.

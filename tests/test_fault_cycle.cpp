@@ -68,9 +68,11 @@ static void testFaultCycleBasic() {
 
     size_t page_idx = vm.pageIndex(reinterpret_cast<uintptr_t>(page));
 
-    // Register in page map so prefetch boundary checks work
+    // Register in page map so prefetch boundary checks work.
+    // Mark as large so zeroFreeSlots skips it (this is raw test data, not a slab page).
     Span* span = newSpanDescriptor();
     span->init(page, 1, 0);
+    span->is_large = true;
     page_map.setRange(reinterpret_cast<uintptr_t>(page), 1, span);
 
     states.set(page_idx, PageState::ACTIVE);
@@ -147,6 +149,7 @@ static void testFaultCycleMultipleRounds() {
 
     Span* span = newSpanDescriptor();
     span->init(page, 1, 0);
+    span->is_large = true;
     page_map.setRange(reinterpret_cast<uintptr_t>(page), 1, span);
 
     size_t page_idx = vm.pageIndex(reinterpret_cast<uintptr_t>(page));

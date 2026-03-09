@@ -1,21 +1,25 @@
 \section{Related Work}
 \label{sec:related}
 
-\paragraph{OS VM compression.}
-macOS Compressed Memory~\cite{apple2013compressed} compresses inactive
-pages using WKdm~\cite{wilson1999case}, a word-granularity dictionary
-compressor designed for 4\,KiB pointer-heavy pages.  Linux
+\paragraph{OS VM compression}
+Operating systems compress inactive pages as a middle ground between
+keeping them resident and swapping to disk.  macOS compresses inactive
+pages using WKdm~\cite{wilson1999case,apple2013compressed}, a
+word-granularity dictionary compressor designed for 4\,KiB
+pointer-heavy pages\punt{; on 16\,KiB ARM64 pages with text or serialized
+data, WKdm achieves poor ratios (98.9\% on JSON, 93.7\% on key-value
+records; Table~\ref{tab:algo_compare})}.  Linux
 zswap~\cite{jennings2013zswap} intercepts pages heading to swap and
-compresses them using LZ4 (default), LZO, or zstd, storing them in a
-memory pool; zram~\cite{zram2024} provides a compressed block device
-backed by RAM.  Windows 10 compresses pages from the modified page
-list using the Xpress algorithm~\cite{microsoft2015compression}.
-These mechanisms operate below the allocator and treat each page as an
-opaque byte array, missing opportunities from allocator-level
-structure.  \sys operates above the OS, exploiting size class, object
-liveness, and call-site patterns to achieve higher compression ratios.
+compresses them with LZ4, LZO, or zstd, operating per-page with no
+cross-page context and no knowledge of which bytes are live objects;
+zram~\cite{zram2024} provides a compressed block device in RAM\@.
+Windows~10 compresses pages from the modified page list using the
+Xpress algorithm~\cite{microsoft2015compression}.  All three
+mechanisms treat each page as an opaque byte array.  \sys operates
+above the OS, exploiting object liveness, call-site patterns, and
+per-size-class policies for higher compression ratios.
 
-\paragraph{Userspace memory compression.}
+\paragraph{Userspace memory compression}
 Rumble~\cite{rumble2014log} describes a log-structured allocator for
 RAMCloud that compresses objects inline.  Unlike \sys, Rumble requires
 application changes to use its API and does not support transparent
@@ -26,29 +30,32 @@ Zippads~\cite{pekhimenko2015exploiting} explores compressed cache
 lines at the hardware level.  \sys operates in userspace with no
 hardware support.
 
-\paragraph{Memory-efficient allocators.}
+\paragraph{Memory-efficient allocators}
 Mesh~\cite{powers2019mesh} reduces fragmentation by physically
-merging pages that have non-overlapping live objects, using virtual
-memory remapping.  Mesh complements \sys: Mesh reduces fragmentation
-(eliminating internal waste), while \sys compresses the remaining cold
-data.  Hoard~\cite{berger2000hoard} and
-jemalloc~\cite{evans2015jemalloc} use arena-based allocation for
-thread scalability; \sys repurposes arenas for data homogeneity.
+merging pages with non-overlapping live objects via virtual memory
+remapping.  In our evaluation (\S\ref{sec:eval:apps}), Mesh
+reduces RSS on workloads with sparse pages (35\% on RocksDB, 42\%
+on DuckDB) but not on workloads where pages remain fully occupied.
+The two techniques are complementary: Mesh eliminates internal
+waste, while \sys compresses cold data.
+Hoard~\cite{berger2000hoard} and
+jemalloc~\cite{evans2015jemalloc} use arenas for thread
+scalability; \sys repurposes arenas for data homogeneity.
 tcmalloc~\cite{google2024tcmalloc} uses per-CPU caches and size
 classes similar to \sys but does not compress cold pages.
 mimalloc~\cite{leijen2019mimalloc} achieves excellent performance
 through segment-based allocation with free list sharding.
 
-\paragraph{Tiered and disaggregated memory.}
+\paragraph{Tiered and disaggregated memory}
 CXL-attached memory~\cite{pond2022cxl, maruf2023tpp} and
 software-defined far memory~\cite{amaro2023memory} extend available
-memory capacity at higher access latency.  TMO~\cite{maas2020adaptive}
+memory at higher access latency.  TMO~\cite{maas2020adaptive}
 proactively offloads cold pages to compressed or CXL tiers in
-Google's fleet.  These approaches are complementary: \sys could serve
-as the local-tier compressor before data moves to CXL or remote
-memory.
+Google's fleet.  These approaches are complementary: \sys could
+serve as the local-tier compressor before data moves to CXL or
+remote memory.
 
-\paragraph{Compressed caches and memory.}
+\paragraph{Compressed caches and memory}
 LCP~\cite{pekhimenko2012linearly} and BDI~\cite{pekhimenko2012linearly}
 compress cache lines at the hardware level.  Linearly compressed
 pages~\cite{pekhimenko2012linearly} pack compressed cache lines
@@ -58,9 +65,11 @@ These hardware approaches target
 last-level cache or DRAM and require architecture changes, while \sys
 operates in userspace software.
 
-\paragraph{Zero-page optimization.}
+\paragraph{Zero-page optimization}
 The Linux kernel's KSM (Kernel Same-page Merging)~\cite{arcangeli2009ksm}
-deduplicates identical pages, including zero pages.  \sys's
-zero-on-free creates zero runs within partially-filled pages,
-improving compression ratios rather than relying on whole-page
-deduplication.
+deduplicates identical pages, including zero pages.
+Chow et al.~\cite{chow2005shredding} proposed \emph{secure
+deallocation}---zeroing freed memory to limit the lifetime of
+sensitive data.  \sys's zero-on-free serves a dual purpose:
+creating compressible zero runs within partially-filled pages
+while also limiting data lifetime.

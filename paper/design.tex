@@ -1,15 +1,49 @@
 \section{Design}
 \label{sec:design}
 
-\subsection{Architecture Overview}
+\subsection{Design Overview}
 \label{sec:design:arch}
 
-\sys is a slab-based memory allocator with integrated compression
-support.  It interposes on \texttt{malloc}, \texttt{free},
-\texttt{realloc}, and related functions via the alloc8 interposition
-framework, which uses \texttt{DYLD\_INSERT\_LIBRARIES} on macOS and
-\texttt{LD\_PRELOAD} on Linux.  Applications link against the system
-allocator normally; \sys replaces it at load time.
+\sys is designed around the principle that a memory allocator possesses
+structural knowledge that can dramatically improve page
+compressibility.  A slab page may contain a mix of live objects and
+freed slots holding stale data from previous occupants; the allocator
+knows which slots are free and can zero them before compression.
+Objects allocated from the same call site tend to have similar
+structure; the allocator can route these allocations to dedicated
+pages.  The allocator also tracks which size class occupies each page,
+enabling per-size-class compression policies that skip data patterns
+that do not compress well.  \sys exploits all three forms of knowledge
+to achieve high compression ratios with little impact on latency or
+throughput: it defers zeroing of freed slots to compression time to
+create compressible runs, routes allocations by call site to produce
+homogeneous pages, and applies progressively stronger compression to
+longer-idle pages.
+
+\sys is a slab-based allocator that interposes on \texttt{malloc},
+\texttt{free}, \texttt{realloc}, and related functions via the alloc8
+interposition framework~\cite{berger2025alloc8}, which uses
+\texttt{DYLD\_INSERT\_LIBRARIES} on macOS and \texttt{LD\_PRELOAD} on
+Linux.  Applications link against the system allocator normally; \sys
+replaces it at load time.
+
+\paragraph{Scalability}  \sys avoids global locks on the
+allocation fast path.  Each application thread has a private
+thread cache that satisfies most \texttt{malloc} and \texttt{free}
+calls without any synchronization.  When the cache must be refilled
+or drained, it accesses per-arena, per-size-class slab free lists
+protected by fine-grained spinlocks; four arenas spread contention
+across 144 independent lists ($4 \times 36$ size classes).
+When a thread cache drains, freed objects are returned to the
+global slab free lists (bucketed by arena), where any thread can
+reuse them; this approach avoids memory
+blowup~\cite{berger2000hoard} despite per-thread caching.  The
+background compressor partitions work across parallel workers, each
+with private compression state, and stores compressed data in an
+8-shard pool to avoid serialization.  Signal-handler
+decompression uses 32 pre-allocated fault slots acquired via
+compare-and-swap, supporting 32~concurrent page faults with no shared
+mutable state.
 
 Figure~\ref{fig:arch} shows the high-level architecture.  The
 allocator manages heap pages through a virtual memory region (up to
@@ -30,25 +64,41 @@ allocator manages heap pages through a virtual memory region (up to
 
 \begin{figure}[t]
 \centering
-\small
-\begin{verbatim}
- EMPTY --> ACTIVE --> ACTIVE_MONITORING
-             ^              |
-             |              v
-             +-------- COMPRESSING
-             |              |
-             |              v
-             +-------- COMPRESSED
-\end{verbatim}
-\caption{Page state machine.  Transitions from COMPRESSED or
-  ACTIVE\_MONITORING back to ACTIVE are triggered by the signal
-  handler on page fault.  The COMPRESSING $\to$ ACTIVE transition
-  occurs when a fault preempts an in-progress compression.}
+\begin{tikzpicture}[
+  state/.style={draw, rounded corners, font=\footnotesize\ttfamily,
+                minimum width=1.6cm, minimum height=0.6cm,
+                fill=black!5},
+  every edge/.style={draw, ->, >=stealth, thick},
+  fault/.style={dashed, color=black!60},
+  node distance=1.2cm and 1.2cm
+]
+  \node[state] (empty)   {EMPTY};
+  \node[state, right=of empty] (active) {ACTIVE};
+  \node[state, right=of active] (monitor) {\shortstack{ACTIVE\_\\[-2pt]MONITOR}};
+  \node[state, below=of monitor] (compressing) {COMPRESS};
+  \node[state, below=of compressing] (compressed) {COMPRESSED};
+
+  % Forward transitions (compressor thread)
+  \draw (empty) edge node[above, font=\scriptsize] {alloc} (active);
+  \draw (active) edge node[above, font=\scriptsize] {phase 3} (monitor);
+  \draw (monitor) edge node[right, font=\scriptsize] {phase 2} (compressing);
+  \draw (compressing) edge node[right, font=\scriptsize] {done} (compressed);
+
+  % Fault handler transitions (back to ACTIVE)
+  \draw[fault] (monitor) edge[bend left=30]
+    node[left, font=\scriptsize, text=black!60] {write fault} (active);
+  \draw[fault] (compressing) edge[bend left=15]
+    node[left, font=\scriptsize, text=black!60, align=right] {fault\\(preempt)} (active);
+  \draw[fault] (compressed) edge[bend left=50]
+    node[left, font=\scriptsize, text=black!60, align=right] {read fault\\(decompress)} (active);
+\end{tikzpicture}
+\caption{\textbf{Five page states mediate compression and access}
+  (\S\ref{sec:design:arch}).
+  Solid: compressor thread.  Dashed: signal handler.}
 \label{fig:arch}
 \end{figure}
 
-A background compressor thread wakes every second
-(\texttt{kCompressIntervalMs} = 1000\,ms) and executes three phases:
+A background compressor thread wakes every second and executes three phases:
 (1)~update per-page cold counts based on access bits,
 (2)~compress pages whose cold count exceeds a threshold, and
 (3)~set up monitoring (\texttt{PROT\_READ}) on remaining active pages.
@@ -58,13 +108,56 @@ SIGSEGV or SIGBUS signal fires.  The fault handler decompresses the
 page (or restores write permission for monitored pages) and returns,
 allowing the faulting instruction to retry transparently.
 
+\begin{figure}[t]
+\begin{algorithmic}[1]
+\Function{Malloc}{$\mathit{size}$}
+  \State $\mathit{sc} \gets \Call{SizeToClass}{\mathit{size}}$
+  \State $\mathit{tc} \gets$ thread-local cache
+  \If{$\mathit{sc} < \textsc{NumClasses}$}
+    \State $\mathit{ptr} \gets tc.\Call{Allocate}{\mathit{sc}}$
+    \Comment{no lock}
+    \If{$\mathit{ptr} = \textsc{null}$}
+      \Comment{cache miss}
+      \State $a \gets \Call{CallsiteArena}{}$
+      \Comment{hash return address}
+      \State $\mathit{ptr} \gets tc.\Call{Refill}{\mathit{sc},\; \mathit{slabs}[a][\mathit{sc}]}$
+    \EndIf
+  \Else
+    \State $\mathit{ptr} \gets \Call{LargeAlloc}{\mathit{size}}$
+  \EndIf
+  \State \Return $\mathit{ptr}$
+\EndFunction
+\Statex
+\Function{Free}{$\mathit{ptr}$}
+  \State $\mathit{span} \gets \Call{PageMap.Get}{\mathit{ptr}}$
+  \State $\mathit{sc} \gets \mathit{span}.\mathit{size\_class}$
+  \State $\mathit{tc} \gets$ thread-local cache
+  \If{$tc$ is full}
+    \State $tc.\Call{Drain}{\mathit{sc},\; \mathit{slabs},\; \mathit{page\_map}}$
+    \Comment{return to global slabs}
+  \EndIf
+  \State $tc.\Call{Push}{\mathit{sc},\; \mathit{ptr}}$
+  \Comment{$\sim$21\,ns, no zeroing}
+\EndFunction
+\end{algorithmic}
+\caption{\textbf{Allocation and deallocation}
+  (\S\ref{sec:design:arch}).  \texttt{free} is lazy: it pushes the
+  pointer into the thread cache with no zeroing or lock acquisition.
+  On cache miss, \textsc{Refill} batch-allocates from the arena
+  selected by the call site.}
+\label{fig:algo:malloc}
+\end{figure}
+
 \subsection{Call-Site Arena Segregation}
 \label{sec:design:arenas}
 
-\sys maintains four arenas (\texttt{kNumArenas} = 4, configurable as a
-power of two).  Each arena has independent slab free lists for all 36
-size classes, organized as a flat array
-\texttt{slabs\_[kNumArenas $\times$ kNumClasses]}.
+\sys uses 36 size classes with sub-linear spacing: every 16
+bytes from 16--128\,B, then four classes per power-of-two group
+(e.g., 160/192/224/256) up to 16\,KiB.  This spacing follows standard
+allocator practice~\cite{berger2001composing}.  \sys maintains
+four arenas (configurable as a power of two).  Each arena has
+independent slab free lists for all 36 size classes, organized as
+a flat array indexed by arena and class.
 
 On each \texttt{malloc} call, \sys selects an arena by hashing the
 return address:
@@ -85,30 +178,28 @@ arena, producing pages with structurally homogeneous content.
 
 On \texttt{free}, the thread cache drains objects back to their
 originating arena by looking up each pointer's span in the page map
-and reading the span's \texttt{arena\_id} field.  This prevents arena
+and reading the span's \texttt{arena\_id} field.  This routing prevents arena
 mixing during deallocation.
 
-\subsection{Adaptive Multi-Algorithm Compression}
+\subsection{JIT Compression}
 \label{sec:design:adaptive}
 
-\sys uses a two-tier compression strategy based on how long a page has
-been cold:
+Just as a JIT compiler applies increasing levels of optimization to
+hot code, \sys applies increasing levels of compression to cold
+data.  A page progresses through two tiers as it remains unaccessed.
+Pages idle for at least 2~seconds are compressed with LZ4 at
+acceleration level~1; LZ4 compresses at $\sim$1\,GB/s and decompresses
+at $\sim$4--6\,GB/s, making it suitable for pages that may be accessed
+again soon.  Pages that remain cold for at least 1~minute are
+recompressed with zstd at level~9, which achieves 2--15\% better
+compression than LZ4 on structured data
+(Table~\ref{tab:algo_compare}) at 10$\times$ lower throughput;
+decompression speed is comparable across levels (1.2--1.8\,GB/s).  If
+a compressed page is accessed, it is decompressed and its cold count
+resets to zero---analogous to a JIT deoptimization.  The page will be
+recompressed only if it goes cold again.
 
-\begin{itemize}
-\item \textbf{Cold} ($\geq$ \texttt{kColdTicks} = 2 ticks, i.e.,
-  2 seconds): Compress with LZ4 at acceleration level~1.  LZ4
-  compresses at $\sim$1\,GB/s and decompresses at $\sim$4--6\,GB/s,
-  making it suitable for pages that may be accessed again soon.
-
-\item \textbf{Very cold} ($\geq$ \texttt{kVeryColdTicks} = 60 ticks,
-  i.e., 1 minute): Recompress with zstd at level~9.  zstd achieves
-  2--15 percentage points better compression than LZ4 on structured
-  data (Table~\ref{tab:algo_compare}), at the cost of 10$\times$
-  slower compression.  Decompression speed is comparable across
-  levels (1.2--1.8\,GB/s).
-\end{itemize}
-
-\paragraph{Per-size-class skip statistics.}
+\paragraph{Per-size-class skip statistics}
 Not all size classes compress well.  \sys maintains a 64-entry sliding
 window of compression ratios for each size class.  The window records
 the compression ratio (0--255, mapping to 0--100\%) of each attempted
@@ -118,66 +209,105 @@ size class.  The sliding window allows recovery: if the data pattern
 changes and new pages compress well, the old poor-ratio samples age
 out.
 
-\subsection{Zero-on-Free}
+\subsection{Lazy Free and Zero-on-Free}
 \label{sec:design:zero}
 
-When an object is freed, \sys replaces its contents with zeros.  This
-optimization targets partially-filled slab pages, where freed slots
-would otherwise contain stale data from their previous occupant.
-Zeroed regions form long runs that LZ4 and zstd compress extremely
-efficiently.
+\sys's \texttt{free()} is lazy: it returns the pointer to a
+per-thread cache and returns immediately ($\sim$21\,ns).  No
+zeroing, no lock acquisition, and no interaction with the
+compressor occur on the free path.  Freed slots are not reclaimed
+by the slab until the thread cache drains a batch.
 
-\sys uses a two-tier zeroing strategy to minimize the performance
-impact on \texttt{free}:
+Partially-filled slab pages therefore contain a mix of live objects
+and freed slots.  Freed slots hold stale data from their previous
+occupants, which reduces compression ratios.  \sys zeros freed
+slots \emph{lazily at compression time}, replacing stale data with
+zero runs that LZ4 and zstd compress efficiently.
 
-\begin{itemize}
-\item \textbf{Eager zeroing} ($\leq$128\,B): Small objects are zeroed
-  with \texttt{memset} directly in \texttt{free()}.  The 128-byte
-  threshold (\texttt{kZeroOnFreeMaxSize}) was chosen because objects
-  this small are typically already in the L1 cache at free time, so
-  zeroing adds negligible latency ($\sim$2\,ns on our test hardware).
-
-\item \textbf{Deferred zeroing} ($>$128\,B): The compressor thread
-  zeros freed slots in its scratch buffer after copying the page data
-  but before compressing.  Zeroing uses non-temporal stores
-  (\texttt{\_\_builtin\_nontemporal\_store}, compiled to ARM64
-  \texttt{stnp} instructions) to avoid polluting the data cache with
-  cold page contents.
-\end{itemize}
-
-The deferred strategy is critical for large objects.  Unconditional
-zeroing of a 16\,KiB object in \texttt{free()} would add
-$\sim$1.5\,$\mu$s of latency, a 70$\times$ increase over the baseline
-21\,ns.  The threshold-based approach keeps \texttt{free()} latency
-constant at $\sim$23\,ns across all size classes.
+Before compressing a page, the compressor copies the page into a
+scratch buffer, iterates the span's free bitmap to identify freed
+slots, and zeros them using non-temporal stores
+(\texttt{stnp}/\texttt{movnti}) to avoid cache pollution.  Deferring all zeroing to
+compression time keeps the free path fast regardless of object
+size.
 
 \subsection{Parallel Compressor}
 \label{sec:design:parallel}
 
 The compressor uses a coordinator-worker model with
-\texttt{kCompressorWorkers} = 2 parallel workers (configurable).  The
-coordinator thread wakes every second, partitions the committed page
-range across workers, and dispatches each of the three phases.
+two parallel workers (configurable).  The coordinator thread wakes
+every second, partitions the committed page range across workers,
+and dispatches each of the three phases.
 
-\paragraph{Chunk bitmap.}  Rather than scanning all committed pages
-linearly, the compressor maintains a bitmap with one bit per page in
-64-page chunks.  A set bit indicates the page is non-EMPTY.  The
-bitmap is rebuilt at each tick by scanning page states.  Iteration
-uses \texttt{\_\_builtin\_ctzll} (count trailing zeros) to jump
-directly to set bits, skipping large EMPTY regions in
-$O(\text{active pages})$ rather than $O(\text{committed pages})$.
+\paragraph{Chunk bitmap}  Rather than scanning all committed
+pages linearly, the compressor maintains a bitmap with one bit per
+64-page chunk.  A set bit indicates at least one non-EMPTY page.
+The bitmap is rebuilt each tick.  Iteration uses
+count-trailing-zeros to jump to set bits, reducing scan time from
+$O(\text{committed})$ to $O(\text{active pages})$.
 
-\paragraph{Per-worker state.}  Each worker has its own LZ4 state
+\paragraph{Per-worker state}  Each worker has its own LZ4 state
 buffer, zstd compression context (\texttt{ZSTD\_CCtx}), page-sized
 scratch buffer, and compression output buffer.  Workers share only the
 dictionary lookup table (read-only during compression) and the
 sharded compressed data store.
 
-\paragraph{Sharded CompressStore.}  Compressed page data is stored in
-a pool with \texttt{kCompressStoreShards} = 8 independent shards,
-each with its own spinlock and free lists.  Pages are assigned to
-shards by \texttt{page\_idx \% 8}.  With 2 workers and 8 shards,
+\paragraph{Sharded CompressStore}  Compressed page data is stored
+in a pool with 8~independent shards, each with its own spinlock
+and free lists.  Pages are assigned to shards by index modulo~8.
+With 2~workers and 8~shards,
 lock contention is near zero.
+
+\begin{figure}[t]
+\begin{algorithmic}[1]
+\Function{CompressorTick}{}
+  \State rebuild chunk bitmap
+  \State partition page range across workers
+  \ForAll{active pages $p$ (via chunk bitmap)}
+    \Comment{Phase 1}
+    \If{$p$ was accessed since last tick}
+      \State $\mathit{cold}[p] \gets 0$
+    \Else
+      \State $\mathit{cold}[p] \mathrel{+}= 1$
+    \EndIf
+  \EndFor
+  \ForAll{pages $p$ with $\mathit{cold}[p] \geq \textsc{ColdTicks}$}
+    \Comment{Phase 2}
+    \State \Call{CompressPage}{$p$}
+  \EndFor
+  \ForAll{remaining \textsc{active} pages $p$}
+    \Comment{Phase 3}
+    \State \Call{mprotect}{$p$, \textsc{prot\_read}}
+    \State $\mathit{state}[p] \gets$ \textsc{active\_monitoring}
+  \EndFor
+\EndFunction
+\Statex
+\Function{CompressPage}{$p$}
+  \State \Call{Lock}{$p$};\; $\mathit{state}[p] \gets$ \textsc{compressing}
+  \State $\mathit{buf} \gets$ copy page into worker scratch buffer
+  \State zero freed slots in $\mathit{buf}$ (non-temporal stores)
+  \State \Call{mprotect}{$p$, \textsc{prot\_none}}
+  \If{$\mathit{state}[p] \neq$ \textsc{compressing}}
+    \Comment{preempted by fault}
+    \State \Call{Unlock}{$p$};\; \Return
+  \EndIf
+  \State $\mathit{algo} \gets$ \textbf{if} $\mathit{cold}[p] \geq$ \textsc{VeryCold} \textbf{then} zstd-9 \textbf{else} LZ4
+  \State $\mathit{blob} \gets \Call{Compress}{\mathit{buf}, \mathit{algo}}$
+  \If{$|\mathit{blob}| > 0.75 \times \textsc{PageSize}$}
+    \State restore page;\; \Call{Unlock}{$p$};\; \Return
+  \EndIf
+  \State store $\mathit{blob}$ in sharded \textsc{CompressStore}
+  \State \Call{Decommit}{$p$};\; $\mathit{state}[p] \gets$ \textsc{compressed}
+  \State \Call{Unlock}{$p$}
+\EndFunction
+\end{algorithmic}
+\caption{\textbf{Background compressor tick}
+  (\S\ref{sec:design:parallel}).  Three phases run in parallel
+  across disjoint page ranges.  \textsc{CompressPage} zeros freed
+  slots lazily, selects LZ4 or zstd based on cold duration (JIT
+  compression), and decommits the physical page on success.}
+\label{fig:algo:compress}
+\end{figure}
 
 \subsection{Fault Handler}
 \label{sec:design:fault}
@@ -185,35 +315,60 @@ lock contention is near zero.
 \sys installs a signal handler for both SIGSEGV and SIGBUS.  The
 handler receives the faulting address, looks up the page index in the
 VM region, acquires the per-page lock, and takes action based on page
-state:
+state.  For a \textsc{compressed} page, the handler recommits the
+physical page, decompresses the stored data, releases the compressed
+blob, and transitions to \textsc{active}.  For a \textsc{compressing}
+page, the handler recommits the page (the compressor has a copy in its
+scratch buffer) and transitions to \textsc{active}; the compressor
+detects the state change and abandons the compression.  For an
+\textsc{active\_monitoring} page (a write to a read-only monitored
+page), the handler restores read-write permission and transitions to
+\textsc{active}.  Finally, a fault on an \textsc{active} page
+indicates a race where Phase~3's batched \texttt{mprotect} overwrote a
+per-page permission restoration from a concurrent fault handler; the
+handler simply restores write permission.
 
-\begin{itemize}
-\item \textbf{COMPRESSED}: Recommit the physical page, decompress the
-  stored data, release the compressed blob, transition to ACTIVE.
-\item \textbf{COMPRESSING}: The compressor is mid-compression.
-  Recommit the page (the compressor has a copy in its scratch buffer)
-  and transition to ACTIVE.  The compressor detects the state change
-  and abandons the compression.
-\item \textbf{ACTIVE\_MONITORING}: A write to a read-only monitored
-  page.  Restore \texttt{PROT\_READ|PROT\_WRITE}, mark the page as
-  accessed, transition to ACTIVE.
-\item \textbf{ACTIVE}: A race condition where Phase~3's batched
-  \texttt{mprotect} (which sets \texttt{PROT\_READ} on a range of
-  pages) overwrites a per-page \texttt{PROT\_RW} restoration from a
-  concurrent fault handler.  Restore write permission.
-\end{itemize}
+\begin{figure}[t]
+\begin{algorithmic}[1]
+\Function{HandleFault}{$\mathit{addr}$}
+  \State $p \gets \Call{PageIndex}{\mathit{addr}}$
+  \State \Call{Lock}{$p$}
+  \If{$\mathit{state}[p] =$ \textsc{compressed}}
+      \State $\mathit{slot} \gets \Call{AcquireFaultSlot}{}$
+      \Comment{CAS}
+      \State \Call{Decompress}{$\mathit{slot.dctx}$, $\mathit{blob}$, $\mathit{slot.buf}$}
+      \State \Call{Recommit}{$p$};\; copy $\mathit{slot.buf} \to p$
+      \State release compressed blob;\; \Call{ReleaseFaultSlot}{$\mathit{slot}$}
+      \State $\mathit{state}[p] \gets$ \textsc{active};\; $\mathit{cold}[p] \gets 0$
+      \State \Call{PrefetchAdjacent}{$p$}
+  \ElsIf{$\mathit{state}[p] =$ \textsc{compressing}}
+      \State \Call{Recommit}{$p$}
+      \Comment{compressor detects \& aborts}
+      \State $\mathit{state}[p] \gets$ \textsc{active}
+  \ElsIf{$\mathit{state}[p] =$ \textsc{active\_monitoring}}
+      \State \Call{mprotect}{$p$, \textsc{prot\_read|write}}
+      \State $\mathit{state}[p] \gets$ \textsc{active}
+  \EndIf
+  \State \Call{Unlock}{$p$}
+\EndFunction
+\end{algorithmic}
+\caption{\textbf{Signal-handler decompression}
+  (\S\ref{sec:design:fault}).  Each of 32~pre-allocated fault slots
+  has an independent decompression context, supporting concurrent
+  faults with no heap allocation.}
+\label{fig:algo:fault}
+\end{figure}
 
-\paragraph{Per-slot decompression contexts.}
+\paragraph{Per-slot decompression contexts}
 The signal handler must not call \texttt{malloc}.  All decompression
-state is pre-allocated from a bootstrap allocator.  \sys maintains 32
-fault slots, each with a pre-allocated page buffer and an independent
-\texttt{ZSTD\_DCtx}.  A faulting thread atomically acquires a slot via
-compare-and-swap, decompresses into the slot's buffer, copies the
-result to the faulting page, and releases the slot.  This design
-supports up to 32 concurrent page faults without data races between
-decompression contexts.
+state is pre-allocated from a bootstrap allocator.  \sys maintains
+32~fault slots, each with a pre-allocated page buffer and an
+independent zstd decompression context.  A faulting thread atomically
+acquires a slot via compare-and-swap, decompresses into the slot's
+buffer, copies the result to the faulting page, and releases the slot.
+This design supports up to 32~concurrent page faults without data races.
 
-\paragraph{Prefetch.}
+\paragraph{Prefetch}
 After decompressing a faulted page, the handler speculatively
 decompresses up to \texttt{kPrefetchWindow} = 2 pages in each
 direction, provided they belong to the same span and are in the
@@ -222,7 +377,7 @@ avoid deadlock with concurrent fault handlers.  Prefetch reduces
 cold-access latency in sequential access patterns; memcached's cold
 key re-access throughput improves by 54\% with prefetch enabled.
 
-\paragraph{Bootstrap allocator.}
+\paragraph{Bootstrap allocator}
 All \sys internal metadata (page state arrays, compressed data store,
 decompression contexts, worker buffers) is allocated from a bump
 allocator (\texttt{BootstrapAlloc}) backed by \texttt{mmap}.  The
@@ -237,7 +392,7 @@ Kernel system calls access userspace buffers directly through
 \texttt{copyin}/\texttt{copyout}.  If \sys has marked a buffer page
 as \texttt{PROT\_READ} (monitoring) or \texttt{PROT\_NONE}
 (compressed), the kernel returns EFAULT rather than triggering a
-signal.  This affects any syscall that reads from or writes to
+signal.  This behavior affects any syscall that reads from or writes to
 userspace memory: \texttt{read}, \texttt{write}, \texttt{recv},
 \texttt{send}, \texttt{kevent}, and others.
 
@@ -251,7 +406,7 @@ Page pins are implemented as per-page atomic counters
 (\texttt{g\_page\_pins}).  The compressor skips pages with a nonzero
 pin count in both Phase~2 (compression) and Phase~3 (monitoring).
 
-\paragraph{Buffered I/O.}  On macOS, DYLD interposition only
+\paragraph{Buffered I/O}  On macOS, DYLD interposition only
 intercepts cross-dylib calls.  When the application calls
 \texttt{fread}, the C library internally calls \texttt{read} within
 the same dylib (libSystem); \sys's \texttt{read} interposition does

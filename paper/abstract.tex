@@ -1,30 +1,18 @@
 \begin{abstract}
-Memory is the most expensive and constrained resource in cloud
-computing.  Operating systems provide transparent memory compression
-(macOS Compressed Memory, Linux zswap), but these mechanisms operate
-below the allocator and cannot exploit allocator-level structure such
-as size classes, object liveness, or allocation-site patterns.
+This paper presents \sys, a drop-in memory allocator that
+transparently compresses cold heap pages by exploiting domain
+knowledge invisible to the rest of the system.  At compression time,
+it zeroes freed slots to create compressible runs, routes allocations
+by call site so that
+similar objects share pages, and applies \emph{JIT compression}: fast
+LZ4 for recently cold pages, zstd for long-lived cold data, with
+signal-based decompression on demand.
 
-This paper presents \sys, a compression-aware memory allocator that
-transparently compresses cold heap pages to reduce resident set size
-(RSS).  \sys interposes on \texttt{malloc}/\texttt{free} via library
-interposition, requiring no application changes.  Three key techniques
-improve compression effectiveness: (1)~call-site arena segregation
-routes allocations from the same call site to the same arena, placing
-structurally similar objects on the same pages; (2)~zero-on-free
-clears deallocated slots, replacing stale data with highly
-compressible zero runs; and (3)~adaptive multi-algorithm compression
-uses fast LZ4 for newly cold pages and escalates to zstd for
-long-lived cold data.  A signal-based fault handler transparently
-decompresses pages on access, with per-slot decompression contexts to
-support concurrent faults.
-
-Evaluation on five real-world applications shows that \sys reduces RSS
-by 17--44\% with negligible throughput impact: memcached serves
-requests at full throughput with 25\% lower RSS, SQLite reduces
-in-memory database RSS by 39\%, and DuckDB analytics queries complete
-with 30\% lower peak memory.  An ablation study across 17
-configurations isolates each optimization's contribution and confirms
-that call-site segregation, adaptive compression, and zero-on-free are
-each independently beneficial.
+Across five applications---memcached, RocksDB, DuckDB,
+SQLite, and Redis---\sys reduces resident set size (RSS) by 17--80\% with negligible throughput
+impact.  A decomposition experiment shows that the compression
+pipeline and allocator design are synergistic: the pipeline achieves
+32--61\% RSS reduction even atop an unmodified system allocator,
+while \sys's allocator design further reduces RSS by
+10--25\% on large-object workloads.
 \end{abstract}

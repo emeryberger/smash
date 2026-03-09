@@ -1,4 +1,4 @@
-\documentclass[sigplan,10pt,anonymous,review]{acmart}
+\documentclass[sigplan,10pt,review]{acmart}
 \renewcommand\footnotetextcopyrightpermission[1]{}
 \settopmatter{printfolios=true}
 
@@ -6,10 +6,17 @@
 \usepackage{subcaption}
 \usepackage{xspace}
 \usepackage{listings}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
 \usepackage{graphicx}
+\usepackage{pifont}
+\usepackage{multirow}
+\usepackage{tikz}
+\usetikzlibrary{positioning}
 
 \newcommand{\sys}{\textsc{Smash}\xspace}
-\newcommand{\pp}{\,pp\xspace}
+\newcommand{\pp}{\%\xspace}
+\newcommand{\punt}[1]{}
 
 \lstset{
   language=C++,
@@ -25,21 +32,28 @@
 
 \title{\sys: Compression-Aware Memory Allocation}
 
-\author{Anonymous}
-\affiliation{\institution{Anonymous Institution}}
+\author{Emery D. Berger}
+\affiliation{\institution{University of Massachusetts Amherst / Amazon Web Services}
+\country{USA}}
+\email{emery@cs.umass.edu}
 
 \input{abstract}
 
 \maketitle
 
 \input{introduction}
-\input{background}
 \input{design}
 \input{implementation}
 \input{evaluation}
 \input{discussion}
 \input{related}
 \input{conclusion}
+
+\begin{acks}
+Claude was utilized to generate sections of this Work, including text, tables, graphs,
+code, data, citations, etc.
+
+\end{acks}
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}

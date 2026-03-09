@@ -56,6 +56,7 @@ static void testPrefetchAdjacentPages() {
     // Create a span descriptor and register in page map
     Span* span = newSpanDescriptor();
     span->init(span_base, kSpanPages, 0);
+    span->is_large = true;  // not a real slab page; prevent zeroFreeSlots from zeroing test data
     page_map.setRange(reinterpret_cast<uintptr_t>(span_base), kSpanPages, span);
 
     size_t base_idx = vm.pageIndex(reinterpret_cast<uintptr_t>(span_base));
@@ -159,10 +160,12 @@ static void testPrefetchBoundaryClipping() {
 
     Span* span1 = newSpanDescriptor();
     span1->init(span1_base, 4, 0);
+    span1->is_large = true;
     page_map.setRange(reinterpret_cast<uintptr_t>(span1_base), 4, span1);
 
     Span* span2 = newSpanDescriptor();
     span2->init(span2_base, 4, 1);
+    span2->is_large = true;
     page_map.setRange(reinterpret_cast<uintptr_t>(span2_base), 4, span2);
 
     size_t s1_base = vm.pageIndex(reinterpret_cast<uintptr_t>(span1_base));

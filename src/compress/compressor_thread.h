@@ -45,6 +45,10 @@ class CompressorThread {
     PageMap* page_map_ = nullptr;
     vm::FaultHandler* fault_handler_ = nullptr;
 
+    // Optional pre-tick callback (e.g., for VM region scanning in compress-only mode)
+    using PreTickFn = void(*)();
+    PreTickFn pre_tick_fn_ = nullptr;
+
     // Per-page metadata (allocated from bootstrap, indexed by VmRegion page index)
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
@@ -232,13 +236,12 @@ class CompressorThread {
     }
 
     // Zero freed slots in the scratch buffer before compression.
-    // Only applies to objects > kZeroOnFreeMaxSize (smaller ones are zeroed eagerly in free()).
+    // All freed slots are zeroed here (deferred from free() to avoid critical-path overhead).
     void zeroFreeSlots(void* page_buf, size_t page_idx) {
         if (!page_map_) return;
         void* page_addr = vm_->pageAddress(page_idx);
         Span* span = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
         if (!span || span->is_large || span->object_size == 0) return;
-        if (span->object_size <= kZeroOnFreeMaxSize) return;  // already zeroed on free
 
         uintptr_t span_base = reinterpret_cast<uintptr_t>(span->base);
         uintptr_t page_start = reinterpret_cast<uintptr_t>(page_addr);
@@ -370,8 +373,10 @@ class CompressorThread {
                 if (!in_run) {
                     run_start = i;
                     in_run = true;
-                } else if (i != last_in_run + 1) {
-                    // Gap — flush previous run
+                } else if (i != last_in_run + 1 ||
+                           reinterpret_cast<uintptr_t>(vm_->pageAddress(i)) !=
+                           reinterpret_cast<uintptr_t>(vm_->pageAddress(last_in_run)) + kPageSize) {
+                    // Gap or non-contiguous addresses — flush previous run
                     vm::protectPages(vm_->pageAddress(run_start),
                                     (last_in_run - run_start + 1) * kPageSize, true, false);
                     run_start = i;
@@ -429,7 +434,7 @@ class CompressorThread {
         // Copy page data into worker's scratch buffer
         __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
 
-        // Zero freed slots (for objects > kZeroOnFreeMaxSize, deferred from free())
+        // Zero freed slots in scratch buffer before compression
 #ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
         zeroFreeSlots(worker.page_buf, page_idx);
 #endif
@@ -694,6 +699,7 @@ class CompressorThread {
     // ── Tick ──────────────────────────────────────────────────────────────
 
     void tick() {
+        if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
 
         // Pin stdio buffers once (they don't move after first use)
@@ -781,6 +787,7 @@ public:
         engine_ = engine;
         page_map_ = page_map;
         fault_handler_ = fault_handler;
+        pre_tick_fn_ = nullptr;
 
         size_t max_pages = vm->totalPages();
         compressed_ = bootstrapArray<CompressedPageInfo>(max_pages);
@@ -817,6 +824,8 @@ public:
             fault_slots_[i].dctx = ZSTD_createDCtx_advanced(custom_mem);
         }
     }
+
+    void setPreTickCallback(PreTickFn fn) { pre_tick_fn_ = fn; }
 
     void start() {
         running_.store(true, std::memory_order_release);

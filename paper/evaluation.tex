@@ -23,6 +23,13 @@ All experiments run on an Apple M1 Max (64\,GiB RAM,
 interposition; baselines use the system allocator.  Each
 configuration is run three times; we report the median.
 RSS is sampled via Mach task info at 100\,ms intervals.
+We have also verified \sys on Linux aarch64 (Ubuntu~24.04,
+glibc~2.39, 4\,KiB pages) via \texttt{LD\_PRELOAD}, where it
+achieves 45--63\% RSS reduction on the same workloads.  Linux
+results are comparable to macOS despite the 4$\times$ smaller
+page size; Linux's \texttt{madvise} immediately releases
+physical pages (versus macOS's lazy free), so RSS drops appear
+more promptly after data goes~cold.
 
 \subsection{Algorithm Comparison (RQ1)}
 \label{sec:eval:algo}

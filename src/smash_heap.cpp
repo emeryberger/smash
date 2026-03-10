@@ -465,6 +465,8 @@ extern "C" int smash_fflush(FILE* stream) {
 
 #endif // __APPLE__
 
+// Linux syscall interposition is in src/linux_syscall_wrappers.cpp
+
 // ── alloc8 integration ───────────────────────────────────────────────────────
 
 // Required by alloc8's thread interposition for thread-created flag
@@ -474,3 +476,15 @@ volatile int xxthread_created_flag = 0;
 
 using SmashRedirect = alloc8::HeapRedirect<smash::SmashHeap>;
 ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);
+
+// ── Linux: start compressor from constructor ─────────────────────────────────
+// On macOS, the ObjC runtime creates threads during early init, which triggers
+// threadInit() via pthread_create interposition. On Linux, no threads are
+// created during LD_PRELOAD init, so single-threaded programs never get
+// threadInit() called. We use a constructor to call it for the main thread.
+#ifdef __linux__
+__attribute__((constructor(201)))  // After alloc8 pthread hooks init (200)
+static void smash_start_main_thread() {
+    xxthread_init();
+}
+#endif

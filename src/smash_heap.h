@@ -189,12 +189,18 @@ public:
     }
     void threadInit() {
         getOrCreateThreadCache();
-        // Start compression after the second thread init call.
-        // The first call is the main thread during early library init
+        // Start compression after the second thread init call on macOS.
+        // The first call is the main thread during early DYLD_INSERT init
         // (before _objc_init). Subsequent calls happen after init is safe.
+        // On Linux, LD_PRELOAD init is complete before threadInit is called,
+        // so we can start immediately on the first call.
         if (compression_inited_ &&
-            !compression_started_.load(std::memory_order_acquire) &&
-            g_thread_init_count.fetch_add(1, std::memory_order_acq_rel) >= 1) {
+            !compression_started_.load(std::memory_order_acquire)) {
+#ifdef __APPLE__
+            if (g_thread_init_count.fetch_add(1, std::memory_order_acq_rel) >= 1)
+#else
+            g_thread_init_count.fetch_add(1, std::memory_order_acq_rel);
+#endif
             startCompression();
         }
     }

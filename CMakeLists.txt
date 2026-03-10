@@ -84,6 +84,7 @@ endif()
 
 add_library(smash SHARED
   src/smash_heap.cpp
+  src/linux_syscall_wrappers.cpp
   ${ALLOC8_INTERPOSE_SOURCES}
   ${ALLOC8_THREAD_SOURCES}
   ${_SMASH_COMMON_SOURCES}
@@ -130,6 +131,7 @@ endif()
 # Used to isolate the contribution of Smash's allocation design.
 add_library(smash_noopt SHARED
   src/smash_heap.cpp
+  src/linux_syscall_wrappers.cpp
   ${ALLOC8_INTERPOSE_SOURCES}
   ${ALLOC8_THREAD_SOURCES}
   ${_SMASH_COMMON_SOURCES}

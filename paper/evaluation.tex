@@ -569,14 +569,14 @@ compression across each page.
 
 On SQLite and Redis, compress-only achieves \emph{higher} RSS
 reduction than full \sys (47.5\% vs.\ 43.7\% and 49.2\% vs.\ 14.9\%,
-respectively).  System malloc's sequential magazine layout can
+respectively). MacOS's malloc's sequential magazine layout can
 produce more compressible pages for small objects than \sys's
 arena-based layout, due to different alignment padding and object
 clustering.  Redis shows the largest gap: its small, uniform values
 compress well under any layout, but \sys's metadata overhead
 (page-state tracking, arena routing) offsets the benefit for this
-workload.  These results suggest that the relationship between
-allocator layout and compressibility is workload-dependent rather than~monotonic.
+workload.  These results show that the relationship between
+allocator layout and compressibility is workload-dependent.
 
 On memcached, compress-only achieves 20\% reduction versus 25\%
 for full \sys; the 5\pp gap reflects \sys's zero-on-free

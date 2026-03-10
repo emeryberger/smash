@@ -29,9 +29,14 @@
 #include <cstring>
 #include <unistd.h>
 
+#include <cstdio>
 #include <lz4.h>
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>  // _mm_stream_si64, _mm_sfence
+#endif
 
 namespace smash {
 
@@ -227,12 +232,24 @@ class CompressorThread {
     // Non-temporal zero: avoids cache pollution when zeroing cold page data.
     // All object slots are 16-byte aligned with sizes that are multiples of 16.
     static void ntZeroMemory(void* dst, size_t size) {
+#if defined(__clang__)
         auto* p = static_cast<uint64_t*>(dst);
         size_t n = size / 8;  // always even since size % 16 == 0
         for (size_t i = 0; i < n; i += 2) {
             __builtin_nontemporal_store(static_cast<uint64_t>(0), &p[i]);
             __builtin_nontemporal_store(static_cast<uint64_t>(0), &p[i + 1]);
         }
+#elif defined(__x86_64__) || defined(_M_X64)
+        auto* p = static_cast<uint64_t*>(dst);
+        size_t n = size / 8;
+        for (size_t i = 0; i < n; i += 2) {
+            _mm_stream_si64(reinterpret_cast<long long*>(&p[i]), 0);
+            _mm_stream_si64(reinterpret_cast<long long*>(&p[i + 1]), 0);
+        }
+        _mm_sfence();
+#else
+        std::memset(dst, 0, size);
+#endif
     }
 
     // Zero freed slots in the scratch buffer before compression.
@@ -651,6 +668,10 @@ class CompressorThread {
     // ── stdio buffer pinning ──────────────────────────────────────────────
 
     void pinStdioBuffers() {
+#ifdef __APPLE__
+        // macOS only: DYLD interposition can't intercept intra-libSystem calls,
+        // so we must pin stdio buffers explicitly. On Linux, LD_PRELOAD
+        // intercepts all calls including intra-libc, so this isn't needed.
         if (!vm::g_page_pins) return;
         FILE* streams[] = { stdin, stdout, stderr };
         for (FILE* f : streams) {
@@ -660,6 +681,7 @@ class CompressorThread {
             smash::vm::warmPages(f, sizeof(FILE), vm_);
             smash::vm::pinPages(f, sizeof(FILE), vm_);
         }
+#endif
     }
 
     // ── Parallel dispatch ─────────────────────────────────────────────────

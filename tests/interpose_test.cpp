@@ -1,5 +1,6 @@
 // Simple program to test smash interposition via DYLD_INSERT_LIBRARIES
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 

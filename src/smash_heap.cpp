@@ -467,8 +467,10 @@ extern "C" int smash_fflush(FILE* stream) {
 
 // ── alloc8 integration ───────────────────────────────────────────────────────
 
-// Required by alloc8's mac_threads.cpp for thread-created flag
-extern "C" volatile int xxthread_created_flag = 0;
+// Required by alloc8's thread interposition for thread-created flag
+extern "C" {
+volatile int xxthread_created_flag = 0;
+}
 
 using SmashRedirect = alloc8::HeapRedirect<smash::SmashHeap>;
 ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);

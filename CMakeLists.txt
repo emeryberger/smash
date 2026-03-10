@@ -75,11 +75,18 @@ if(ipo_supported)
 endif()
 
 # ── libsmash shared library ──────────────────────────────────────────────────
+# On Linux, gnu_wrapper.cpp already #includes new_delete.inc, so linking
+# ALLOC8_COMMON_SOURCES (which contains new_delete.cpp) causes duplicate
+# operator new/delete definitions. Only include common sources on non-Linux.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(_SMASH_COMMON_SOURCES ${ALLOC8_COMMON_SOURCES})
+endif()
+
 add_library(smash SHARED
   src/smash_heap.cpp
   ${ALLOC8_INTERPOSE_SOURCES}
   ${ALLOC8_THREAD_SOURCES}
-  ${ALLOC8_COMMON_SOURCES}
+  ${_SMASH_COMMON_SOURCES}
 )
 
 target_include_directories(smash PRIVATE
@@ -125,7 +132,7 @@ add_library(smash_noopt SHARED
   src/smash_heap.cpp
   ${ALLOC8_INTERPOSE_SOURCES}
   ${ALLOC8_THREAD_SOURCES}
-  ${ALLOC8_COMMON_SOURCES}
+  ${_SMASH_COMMON_SOURCES}
 )
 
 target_include_directories(smash_noopt PRIVATE

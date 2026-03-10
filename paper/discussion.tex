@@ -13,8 +13,9 @@ overhead.  More importantly, CDict objects consume 430--686\,KiB
 each, and training buffers add 256\,KiB per size class.  Even with
 aggressive optimizations (CDict at level~3, 16\,KiB capacity,
 maximum 8 trained classes), dictionaries reduce RSS savings by
-8.9\pp on average (Figure~\ref{fig:dict_overhead}).  \sys preserves
-the training infrastructure but disables it by default.
+8.9\pp on average (Figure~\ref{fig:dict_overhead}).
+%\sys preserves
+%the training infrastructure but disables it by default.
 
 \begin{figure}[t]
 \centering
@@ -25,7 +26,8 @@ the training infrastructure but disables it by default.
 \label{fig:dict_overhead}
 \end{figure}
 
-\paragraph{Multi-page compression}  Compressing 2--4 contiguous
+\punt{
+  \paragraph{Multi-page compression}  Compressing 2--4 contiguous
 pages as a unit improves ratios by 2--4\pp (e.g., JSON-LZ4 from
 30.2\% to 26.2\% with 4-page groups).  However, all pages in a
 group must be simultaneously cold, and a fault on any page requires
@@ -39,6 +41,7 @@ structures.  On 16\,KiB pages with text or serialized data, WKdm
 achieves 93--99\% ratios.  Even on binary data, LZ4 outperforms WKdm
 (5.8\% vs.\ 15.6\% on SQLite pages).  This gap motivates
 byte-oriented compressors for heap data.}
+}
 
 \paragraph{Design principles for compressible pages}
 The allocator substrate comparison (\S\ref{sec:eval:allocator})
@@ -93,6 +96,7 @@ remapping helps on workloads with sparse pages (35\% on RocksDB,
 occupied.  Without a compression
 pipeline, an allocator can only return empty pages to the OS.
 
+\punt{
 \paragraph{Limitations}  Decompression adds 1--10\,$\mu$s per
 fault (Table~\ref{tab:apps}).  Workloads with uniform access
 patterns across the entire heap (no cold pages) see no benefit.
@@ -101,7 +105,9 @@ syscalls accessing heap buffers may require additional wrappers.
 The bootstrap allocator's memory is never freed, contributing a
 fixed overhead of $\sim$25\,MiB for page state arrays and
 compression contexts.
+}
 
+\punt{
 \paragraph{Adaptive size classes}  \sys uses a conventional
 36-class scheme designed to bound internal fragmentation.  An
 alternative would split size classes further based on compression
@@ -112,9 +118,12 @@ approximates this by routing call sites to separate arenas,
 creating $4 \times 36 = 144$ effective buckets.  Finer splitting
 could help but increases the number of live spans and thus
 external fragmentation; we leave this tradeoff to future work.
+}
 
+\punt{
 \paragraph{Security}  Zeroing freed objects prevents information
 leakage through stale heap data, a concern first addressed by
 Chow et al.'s \emph{secure deallocation}~\cite{chow2005shredding}.
 \sys's zero-on-free provides a similar security benefit, though
 its primary purpose is compression effectiveness.
+}

@@ -365,7 +365,7 @@ frame overhead ($\sim$13 bytes) without improving ratios.  The
 effect is worst on memcached ($-$24.5\,\pp) and Redis ($-$30.2\,\pp),
 where the CDict memory overhead exceeds the small compressed-data
 savings.  \sys therefore disables dictionaries by
-default~(\S\ref{sec:discussion}).
+default. % ~(\S\ref{sec:discussion}).
 
 Disabling compression entirely ($-$45.7\,\pp average) confirms that
 compression is the dominant mechanism; without it, \sys reduces to
@@ -425,7 +425,7 @@ DieHarder     & \ding{51} & \ding{51} &  \\
 \end{tabular}
 \end{table}
 
-\begin{figure*}[t]
+  \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/allocator_compare.pdf}
 \caption{\textbf{Zero-on-free is the single most important
@@ -557,7 +557,7 @@ Benchmark & Config & Cool RSS & Reduction & Ops/s \\
 \end{table}
 
 Table~\ref{tab:compress_only} presents the results.  The
-compress-only variant achieves 20--61\% RSS reduction,
+compress-only variant reduces RSS by 20--61\%,
 demonstrating that the compression pipeline accounts for the
 majority of \sys's~benefit.
 

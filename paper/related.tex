@@ -22,7 +22,7 @@ and per-size-class policies for higher~ratios.
 \paragraph{Userspace memory compression}
 Chen et al.~\cite{chen2003heap} compress the Java heap during garbage
 collection.  Their Mark-Compact-Compress (MCC) collector triggers
-compression reactively when allocation fails and compaction alone
+compression when allocation fails and compaction alone
 cannot free enough space; it then compresses \emph{all} live objects
 using per-object zero-byte removal (a bitmap records which bytes are
 non-zero).  Objects are accessed through a handle table; decompressing
@@ -30,18 +30,17 @@ a compressed object requires allocating a fresh block, restoring the
 data, and updating the handle.  By contrast, \sys compresses
 \emph{proactively} on cold pages via a concurrent background thread,
 uses general-purpose compressors (LZ4/zstd) that exploit repeated
-patterns beyond just zero bytes, and decompresses transparently through
+patterns beyond zeros, and decompresses transparently through
 virtual-memory faults with no handle indirection on the normal access
 path.
 Rumble~\cite{rumble2014log} describes a log-structured allocator for
 RAMCloud that compresses objects inline.  Unlike \sys, Rumble requires
 application changes to use its API and does not support transparent
 \texttt{malloc}/\texttt{free} interposition.
-Tsai and Sanchez~\cite{tsai2019compress} propose Zippads, an
-object-granularity compressed memory hierarchy that compresses objects
+Tsai and Sanchez~\cite{tsai2019compress} propose Zippads, a hardware-based
+compression scheme that compresses objects
 rather than cache lines, achieving higher compression ratios by
-exploiting object structure.  Zippads requires hardware support
-(a compressed object cache and modified TLBs); \sys achieves similar
+exploiting object structure. \sys achieves similar
 object-aware benefits in software by exploiting allocator metadata.
 Plumber~\cite{ayers2019asmdb} focuses on detecting and eliminating
 memory waste rather than compressing cold data.
@@ -96,10 +95,10 @@ memory.  \sys compresses pages \emph{in memory}, reducing RSS without
 relying on disk-backed persistence.
 
 \paragraph{Zero-page optimization}
-The Linux kernel's KSM (Kernel Same-page Merging)~\cite{arcangeli2009ksm}
-deduplicates identical pages, including zero pages.
-Chow et al.~\cite{chow2005shredding} proposed \emph{secure
-deallocation}---zeroing freed memory to limit the lifetime of
-sensitive data.  \sys's zero-on-free serves a dual purpose:
-creating compressible zero runs within partially-filled pages
-while also limiting data lifetime.
+The Linux kernel's KSM (Kernel Same-page
+Merging)~\cite{arcangeli2009ksm} deduplicates identical pages,
+including zero pages.  Chow et al.~\cite{chow2005shredding} proposed
+\emph{secure deallocation}---zeroing freed memory to limit the risk of
+information leakage through stale heap data.  \sys's zero-on-free
+serves a dual purpose: creating compressible zero runs within
+partially-filled pages while also limiting data lifetime.

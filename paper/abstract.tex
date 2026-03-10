@@ -6,7 +6,7 @@ it zeroes freed slots to create compressible runs, routes allocations
 by call site so that
 similar objects share pages, and applies \emph{JIT compression}: fast
 LZ4 for recently cold pages, zstd for long-lived cold data, with
-signal-based decompression on demand.
+signal-based decompression on~demand.
 
 Across five applications---memcached, RocksDB, DuckDB,
 SQLite, and Redis---\sys reduces resident set size (RSS) by 17--80\% with negligible throughput

@@ -4,16 +4,15 @@
 A significant fraction of allocated memory is cold at any given
 moment.  Studies of production workloads at Google and Microsoft
 report that 20--50\% of resident pages have not been accessed in the
-last 60 seconds~\cite{maas2020adaptive,amaro2023memory}.  This cold
-memory cannot be reclaimed without swapping, which incurs
-millisecond-scale I/O latency.
+last 60 seconds~\cite{maas2020adaptive,amaro2023memory}.  This cold memory cannot be reclaimed without swapping, which incurs
+millisecond-scale I/O~latency.
 
 \sys is a drop-in memory allocator that transparently compresses cold
 heap pages to reduce RSS\@.  It interposes on \texttt{malloc} and
 \texttt{free} via library interposition~\cite{berger2001composing},
 requiring no application changes.  A background thread periodically
 compresses pages that have not been accessed recently; a signal
-handler decompresses them on demand.
+handler decompresses them on~demand.
 
 The design incorporates three techniques.  First, the compressor
 zeros freed object slots before compressing each page, replacing stale
@@ -33,18 +32,17 @@ decompressed and reset, analogous to deoptimization
 
 We evaluate \sys on five applications spanning in-memory databases,
 caches, and analytics engines.  \sys reduces RSS by 17--80\%
-depending on the workload's hot/cold partition.  Throughput impact is
-within measurement noise for most benchmarks.  An ablation study
-across 17 configurations quantifies each technique's contribution.
+depending on the workload's hot/cold partition.  Throughput impact is negligible for most benchmarks.  An ablation
+study across 17 configurations quantifies each technique's
+contribution.
 
-To understand how much of the benefit comes from the compression
-pipeline versus the allocator design, we build a compress-only
-variant that runs \sys's pipeline atop the unmodified system
-allocator.  This variant achieves 32--61\% RSS reduction on its own.  The
+To tease apart the compression pipeline and allocator design,
+we build a compress-only variant that runs \sys's pipeline atop
+the unmodified system allocator.  This variant achieves 32--61\% RSS reduction on its own.  The
 pipeline and allocator design are synergistic: \sys's allocator further reduces RSS by 10--25\% on workloads
-dominated by large allocations, where freelist pollution and object
-mixing span entire pages, while the pipeline's overhead is lower
-when integrated into the allocator.
+dominated by large allocations, where freelist pollution spans entire
+pages, while pipeline overhead is lower when integrated into
+the~allocator.
 
 This paper makes two contributions:
 

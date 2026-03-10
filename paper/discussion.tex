@@ -64,7 +64,7 @@ compression more than metadata placement: system malloc's sequential
 layout compresses better than DieHard's randomized layout despite
 embedded freelists.  Mesh confirms this: it shares DieHard's
 external bitmap metadata but uses a conventional layout, achieving
-compressibility on par with system malloc (7.9\% vs.\ 7.4\%).
+compressibility on par with system malloc (7.9\% vs.~7.4\%).
 
 These findings generalize beyond \sys: any system that compresses
 heap pages (including OS-level compressors) would benefit from

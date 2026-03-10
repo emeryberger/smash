@@ -4,8 +4,8 @@
 \subsection{Design Overview}
 \label{sec:design:arch}
 
-\sys is designed around the principle that a memory allocator possesses
-structural knowledge that can dramatically improve page
+\sys is designed around the principle that a memory allocator
+possesses structural knowledge that dramatically improves page
 compressibility.  A slab page may contain a mix of live objects and
 freed slots holding stale data from previous occupants; the allocator
 knows which slots are free and can zero them before compression.
@@ -13,19 +13,19 @@ Objects allocated from the same call site tend to have similar
 structure; the allocator can route these allocations to dedicated
 pages.  The allocator also tracks which size class occupies each page,
 enabling per-size-class compression policies that skip data patterns
-that do not compress well.  \sys exploits all three forms of knowledge
-to achieve high compression ratios with little impact on latency or
-throughput: it defers zeroing of freed slots to compression time to
+that do not compress well.  \sys exploits all three to achieve high
+compression ratios with little impact on latency or throughput: it
+defers zeroing of freed slots to compression time to
 create compressible runs, routes allocations by call site to produce
 homogeneous pages, and applies progressively stronger compression to
-longer-idle pages.
+longer-idle~pages.
 
 \sys is a slab-based allocator that interposes on \texttt{malloc},
 \texttt{free}, \texttt{realloc}, and related functions via the alloc8
 interposition framework~\cite{berger2025alloc8}, which uses
 \texttt{DYLD\_INSERT\_LIBRARIES} on macOS and \texttt{LD\_PRELOAD} on
 Linux.  Applications link against the system allocator normally; \sys
-replaces it at load time.
+replaces it at load~time.
 
 \paragraph{Scalability}  \sys avoids global locks on the
 allocation fast path.  Each application thread has a private
@@ -36,14 +36,14 @@ protected by fine-grained spinlocks; four arenas spread contention
 across 144 independent lists ($4 \times 36$ size classes).
 When a thread cache drains, freed objects are returned to the
 global slab free lists (bucketed by arena), where any thread can
-reuse them; this approach avoids memory
+reuse them, avoiding memory
 blowup~\cite{berger2000hoard} despite per-thread caching.  The
 background compressor partitions work across parallel workers, each
 with private compression state, and stores compressed data in an
 8-shard pool to avoid serialization.  Signal-handler
 decompression uses 32 pre-allocated fault slots acquired via
 compare-and-swap, supporting 32~concurrent page faults with no shared
-mutable state.
+mutable~state.
 
 Figure~\ref{fig:arch} shows the high-level architecture.  The
 allocator manages heap pages through a virtual memory region (up to
@@ -106,7 +106,7 @@ A background compressor thread wakes every second and executes three phases:
 When the application accesses a compressed or monitored page, a
 SIGSEGV or SIGBUS signal fires.  The fault handler decompresses the
 page (or restores write permission for monitored pages) and returns,
-allowing the faulting instruction to retry transparently.
+allowing the faulting instruction to retry~transparently.
 
 \begin{figure}[t]
 \begin{algorithmic}[1]
@@ -137,7 +137,7 @@ allowing the faulting instruction to retry transparently.
     \Comment{return to global slabs}
   \EndIf
   \State $tc.\Call{Push}{\mathit{sc},\; \mathit{ptr}}$
-  \Comment{$\sim$21\,ns, no zeroing}
+  \Comment{no zeroing}
 \EndFunction
 \end{algorithmic}
 \caption{\textbf{Allocation and deallocation}
@@ -156,8 +156,8 @@ bytes from 16--128\,B, then four classes per power-of-two group
 (e.g., 160/192/224/256) up to 16\,KiB.  This spacing follows standard
 allocator practice~\cite{berger2001composing}.  \sys maintains
 four arenas (configurable as a power of two).  Each arena has
-independent slab free lists for all 36 size classes, organized as
-a flat array indexed by arena and class.
+independent slab free lists for all 36 size classes in a flat
+array indexed by arena and~class.
 
 On each \texttt{malloc} call, \sys selects an arena by hashing the
 return address:
@@ -174,12 +174,11 @@ XORing two stack depths ensures different arena routing even when
 allocations pass through a common wrapper function.  The hash maps
 each unique (caller, grandcaller) pair to a deterministic arena.
 Allocations from the same call site consistently land in the same
-arena, producing pages with structurally homogeneous content.
+arena, producing structurally homogeneous page~content.
 
 On \texttt{free}, the thread cache drains objects back to their
 originating arena by looking up each pointer's span in the page map
-and reading the span's \texttt{arena\_id} field.  This routing prevents arena
-mixing during deallocation.
+and reading the span's \texttt{arena\_id} field.  This prevents arena mixing at deallocation~time.
 
 \subsection{JIT Compression}
 \label{sec:design:adaptive}
@@ -197,7 +196,7 @@ compression than LZ4 on structured data
 decompression speed is comparable across levels (1.2--1.8\,GB/s).  If
 a compressed page is accessed, it is decompressed and its cold count
 resets to zero---analogous to a JIT deoptimization.  The page will be
-recompressed only if it goes cold again.
+recompressed only if it goes cold~again.
 
 \paragraph{Per-size-class skip statistics}
 Not all size classes compress well.  \sys maintains a 64-entry sliding
@@ -206,8 +205,8 @@ the compression ratio (0--255, mapping to 0--100\%) of each attempted
 compression.  If the average ratio across at least 32 samples falls
 below 5\% space savings, \sys skips LZ4 compression attempts for that
 size class.  The sliding window allows recovery: if the data pattern
-changes and new pages compress well, the old poor-ratio samples age
-out.
+changes and new pages compress well, the old poor-ratio samples
+age~out.
 
 \subsection{Lazy Free and Zero-on-Free}
 \label{sec:design:zero}
@@ -216,7 +215,7 @@ out.
 per-thread cache and returns immediately ($\sim$21\,ns).  No
 zeroing, no lock acquisition, and no interaction with the
 compressor occur on the free path.  Freed slots are not reclaimed
-by the slab until the thread cache drains a batch.
+by the slab until the thread cache drains a~batch.
 
 Partially-filled slab pages therefore contain a mix of live objects
 and freed slots.  Freed slots hold stale data from their previous
@@ -228,6 +227,5 @@ Before compressing a page, the compressor copies the page into a
 scratch buffer, iterates the span's free bitmap to identify freed
 slots, and zeros them using non-temporal stores
 (\texttt{stnp}/\texttt{movnti}) to avoid cache pollution.  Deferring all zeroing to
-compression time keeps the free path fast regardless of object
-size.
+compression time keeps the free path fast regardless of object~size.
 

@@ -25,7 +25,7 @@ objects.
 page list using the Xpress
 algorithm~\cite{microsoft2015compression}.
 
-All three mechanisms treat each page as an opaque byte array.
+All three mechanisms treat each page as an opaque byte~array.
 
 \subsection{What the Allocator Knows}
 
@@ -40,10 +40,10 @@ the allocator can zero it first.
 \paragraph{Allocation patterns.}  Objects allocated from the same
 call site tend to have similar structure (same fields, similar
 values).  The allocator can route these allocations to dedicated
-pages.  The OS has no visibility into allocation origins.
+pages.  The OS has no visibility into allocation~origins.
 
 \paragraph{Access granularity.}  The OS tracks page access through
 hardware accessed bits, which provide one bit per page.  The
 allocator tracks which size class occupies each page, enabling
 per-size-class compression policies that skip size classes whose data
-does not compress well.
+does not compress~well.

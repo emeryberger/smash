@@ -14,6 +14,6 @@ unmodified system allocator achieves 32--61\% RSS reduction, while
 large-object workloads and lowers pipeline overhead.  Among the allocator design
 choices, zero-on-free contributes most, followed by external metadata
 and arena segregation.
-The evaluation also shows that dictionary compression, despite
-theoretical appeal, is net-negative due to metadata overhead---a
-finding that required systematic experimentation to uncover.
+Dictionary compression, despite theoretical appeal, is net-negative
+due to metadata overhead---a finding revealed only through systematic
+experimentation.

@@ -16,8 +16,8 @@ zram~\cite{zram2024} provides a compressed block device in RAM\@.
 Windows~10 compresses pages from the modified page list using the
 Xpress algorithm~\cite{microsoft2015compression}.  All three
 mechanisms treat each page as an opaque byte array.  \sys operates
-above the OS, exploiting object liveness, call-site patterns, and
-per-size-class policies for higher compression ratios.
+above the OS, exploiting object liveness, call-site patterns,
+and per-size-class policies for higher~ratios.
 
 \paragraph{Userspace memory compression}
 Chen et al.~\cite{chen2003heap} compress the Java heap during garbage
@@ -71,8 +71,8 @@ storage at Meta's scale, using PSI (pressure stall information) to
 balance memory savings against application performance.  TMO operates
 at the OS level on whole pages; \sys operates within the allocator,
 exploiting object liveness and structure for higher ratios.  The two
-are complementary: \sys could serve as the local-tier compressor
-before TMO offloads remaining cold pages.
+are complementary: \sys could compress locally before TMO offloads
+remaining cold~pages.
 
 \paragraph{Compressed caches and memory}
 LCP~\cite{pekhimenko2012linearly} and BDI~\cite{pekhimenko2012linearly}

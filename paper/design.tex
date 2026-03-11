@@ -115,7 +115,7 @@ allowing the faulting instruction to retry~transparently.
   \State $\mathit{tc} \gets$ thread-local cache
   \If{$\mathit{sc} < \textsc{NumClasses}$}
     \State $\mathit{ptr} \gets tc.\Call{Allocate}{\mathit{sc}}$
-    \Comment{no lock}
+    $\triangleright$ \textit{no lock}
     \If{$\mathit{ptr} = \textsc{null}$}
       \Comment{cache miss}
       \State $a \gets \Call{CallsiteArena}{}$

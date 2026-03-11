@@ -10,9 +10,9 @@ signal-based decompression on~demand.
 
 Across five applications---memcached, RocksDB, DuckDB,
 SQLite, and Redis---\sys reduces resident set size (RSS) by 17--80\% with negligible throughput
-impact.  A decomposition experiment shows that the compression
-pipeline and allocator design are synergistic: the pipeline achieves
+impact. We show that \sys{}'s compression
+pipeline and allocator design are synergistic: its pipeline achieves
 32--61\% RSS reduction even atop an unmodified system allocator,
-while \sys's allocator design further reduces RSS by
+while its allocator design further reduces RSS by
 10--25\% on large-object workloads.
 \end{abstract}

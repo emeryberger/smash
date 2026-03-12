@@ -1,11 +1,11 @@
 \begin{abstract}
 This paper presents \sys, a drop-in memory allocator that
 transparently compresses cold heap pages by exploiting domain
-knowledge invisible to the rest of the system.  At compression time,
-it zeroes freed slots to create compressible runs, routes allocations
-by call site so that
-similar objects share pages, and applies \emph{JIT compression}: fast
-LZ4 for recently cold pages, zstd for long-lived cold data, with
+knowledge invisible to the rest of the system. \sys{} organizes
+allocations by call site so that similar objects share pages At
+compression time, it zeroes freed slots to increase compressiblility,
+and applies \emph{JIT compression}: fast LZ4 for recently cold pages,
+zstd (slower, higher compression ratio) for long-lived cold data, with
 signal-based decompression on~demand.
 
 Across five applications---memcached, RocksDB, DuckDB,

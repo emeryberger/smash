@@ -1,0 +1,53 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  state/.style={draw, rounded corners, font=\footnotesize\ttfamily,
+                minimum width=1.6cm, minimum height=0.6cm,
+                fill=black!5},
+  every edge/.style={draw, ->, >=stealth, thick},
+  fault/.style={dashed, color=black!60},
+  plbl/.style={circle, draw, inner sep=1pt, font=\scriptsize\bfseries,
+               fill=white, minimum size=0.4cm},
+  node distance=1.1cm and 1.1cm
+]
+  \node[state] (empty)   {EMPTY};
+  \node[state, right=of empty] (active) {ACTIVE};
+  \node[state, right=of active, minimum width=2.0cm] (monitor) {\shortstack{MONITORING}};
+  \node[state, below=of monitor] (compressing) {COMPRESS};
+  \node[state, below left=1.1cm and 0.1cm of compressing] (lz4)
+    {\shortstack{COMPRESSED\\[-2pt]\scriptsize(LZ4)}};
+  \node[state, below right=1.1cm and 0.1cm of compressing] (zstd)
+    {\shortstack{COMPRESSED\\[-2pt]\scriptsize(zstd)}};
+
+  % Forward transitions (compressor thread) with phase labels
+  \draw (empty) edge node[above, font=\scriptsize] {alloc} (active);
+  \draw (active) edge node[plbl] {3} (monitor);
+  \draw (monitor) edge node[plbl] {2} (compressing);
+  \draw (compressing) edge node[left, font=\scriptsize] {LZ4} (lz4);
+
+  % Phase 1 self-loop on monitor (update cold counts)
+  \draw (monitor) edge[loop above, looseness=5, min distance=8mm]
+    node[plbl, above=0.1cm] {1} (monitor);
+
+  % JIT escalation: LZ4 → zstd (also phase 2)
+  \draw (lz4) edge node[plbl] {2} (zstd);
+
+  % Fault handler transitions (back to ACTIVE) — signal handler
+  \draw[fault] (monitor) edge[bend left=30]
+    node[left, font=\scriptsize, text=black!60] {fault} (active);
+  \draw[fault] (compressing) edge[bend left=15]
+    node[left, font=\scriptsize, text=black!60] {fault} (active);
+  \draw[fault] (lz4) edge[bend left=55]
+    node[left, font=\scriptsize, text=black!60] {fault} (active);
+  \draw[fault] (zstd) edge[bend right=70]
+    node[right, font=\scriptsize, text=black!60] {fault} (active);
+\end{tikzpicture}
+\caption{\textbf{Page state machine with JIT compression}
+  (\S\ref{sec:design:arch}, \S\ref{sec:design:adaptive}).
+  Circled numbers denote the three phases of each background
+  compressor tick: \textcircled{\small 1}~update cold counts,
+  \textcircled{\small 2}~compress cold pages or recompress very cold pages,
+  \textcircled{\small 3}~monitor remaining active pages.
+  Dashed arrows: signal-handler transitions back to ACTIVE.}
+\label{fig:arch}
+\end{figure}

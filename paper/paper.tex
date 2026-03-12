@@ -12,7 +12,8 @@
 \usepackage{pifont}
 \usepackage{multirow}
 \usepackage{tikz}
-\usetikzlibrary{positioning}
+\usepackage{stfloats}
+\usetikzlibrary{positioning,fit,calc,arrows.meta,patterns}
 
 \newcommand{\sys}{\textsc{Smash}\xspace}
 \newcommand{\pp}{\%\xspace}
@@ -42,10 +43,11 @@
 \maketitle
 
 \input{introduction}
+\input{fig_heap_org}
 \input{design}
 \input{implementation}
 \input{evaluation}
-\input{discussion}
+% \input{discussion}
 \input{related}
 \input{conclusion}
 

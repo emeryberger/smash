@@ -190,7 +190,7 @@ signal.  This affects any syscall that accesses userspace memory:
 \texttt{read}, \texttt{write}, \texttt{recv}, \texttt{send},
 \texttt{kevent}, and~others.
 
-\sys interposes on $\sim{}20$ system calls and C library I/O functions.
+\sys interposes on $\sim20$ system calls and C library I/O functions.
 Before each call, the wrapper walks the buffer's pages, touching any
 page managed by \sys to trigger decompression via the fault handler,
 then pins the pages to prevent the compressor from re-protecting them

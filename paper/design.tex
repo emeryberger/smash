@@ -27,126 +27,54 @@ interposition framework~\cite{berger2025alloc8}, which uses
 Linux.  Applications link against the system allocator normally; \sys
 replaces it at load~time.
 
-\paragraph{Scalability}  \sys avoids global locks on the
-allocation fast path.  Each application thread has a private
-thread cache that satisfies most \texttt{malloc} and \texttt{free}
-calls without any synchronization.  When the cache must be refilled
-or drained, it accesses per-arena, per-size-class slab free lists
-protected by fine-grained spinlocks; four arenas spread contention
-across 144 independent lists ($4 \times 36$ size classes).
-When a thread cache drains, freed objects are returned to the
-global slab free lists (bucketed by arena), where any thread can
-reuse them, avoiding memory
-blowup~\cite{berger2000hoard} despite per-thread caching.  The
-background compressor partitions work across parallel workers, each
-with private compression state, and stores compressed data in an
-8-shard pool to avoid serialization.  Signal-handler
-decompression uses 32 pre-allocated fault slots acquired via
-compare-and-swap, supporting 32~concurrent page faults with no shared
-mutable~state.
-
-Figure~\ref{fig:arch} shows the high-level architecture.  The
+Figure~\ref{fig:heap_org} shows the heap organization and key data
+structures; Figure~\ref{fig:arch} shows the page state machine.  The
 allocator manages heap pages through a virtual memory region (up to
-16\,GiB).  Each page transitions through a state machine:
+16\,GiB).  Each page transitions through six states:
+(1)~\textbf{EMPTY}: never allocated or returned to the OS;
+(2)~\textbf{ACTIVE}: contains live objects with full read/write
+access;
+(3)~\textbf{MONITORING}: marked read-only
+(\texttt{PROT\_READ}) to detect future writes;
+(4)~\textbf{COMPRESSING}: being compressed by a background worker;
+(5)~\textbf{COMPRESSED (LZ4)}: compressed with LZ4 after
+$\geq$2\,s idle, physical page decommitted; and
+(6)~\textbf{COMPRESSED (zstd)}: recompressed with zstd-9 after
+$\geq$1\,min idle for a higher compression ratio.
 
-\begin{itemize}
-\item \textbf{EMPTY}: Page has never been allocated or has been
-  returned to the OS.
-\item \textbf{ACTIVE}: Page contains live objects with full
-  read/write access.
-\item \textbf{ACTIVE\_MONITORING}: Page marked read-only
-  (\texttt{PROT\_READ}) to detect future writes.
-\item \textbf{COMPRESSING}: Page is being compressed by a
-  background worker.
-\item \textbf{COMPRESSED}: Page data stored in compressed form;
-  physical page decommitted.
-\end{itemize}
+\input{fig_arch}
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[
-  state/.style={draw, rounded corners, font=\footnotesize\ttfamily,
-                minimum width=1.6cm, minimum height=0.6cm,
-                fill=black!5},
-  every edge/.style={draw, ->, >=stealth, thick},
-  fault/.style={dashed, color=black!60},
-  node distance=1.2cm and 1.2cm
-]
-  \node[state] (empty)   {EMPTY};
-  \node[state, right=of empty] (active) {ACTIVE};
-  \node[state, right=of active] (monitor) {\shortstack{ACTIVE\_\\[-2pt]MONITOR}};
-  \node[state, below=of monitor] (compressing) {COMPRESS};
-  \node[state, below=of compressing] (compressed) {COMPRESSED};
+A background compressor thread wakes every second and executes three
+phases (Figure~\ref{fig:arch}).  \emph{Phase~1} updates per-page
+cold counts: for each active or monitored page, if the page was
+accessed since the last tick its cold count resets to zero; otherwise
+the count increments.  \emph{Phase~2} compresses pages whose cold
+count exceeds a threshold---LZ4 for recently cold pages, zstd for
+long-cold pages (\S\ref{sec:design:adaptive}).  \emph{Phase~3}
+marks all remaining ACTIVE pages read-only (\texttt{PROT\_READ}),
+transitioning them to MONITORING.  This is how \sys detects writes:
+when the application writes to a monitored page, a write fault fires,
+the handler restores write permission and sets the page's access bit,
+and the faulting instruction retries transparently.
 
-  % Forward transitions (compressor thread)
-  \draw (empty) edge node[above, font=\scriptsize] {alloc} (active);
-  \draw (active) edge node[above, font=\scriptsize] {phase 3} (monitor);
-  \draw (monitor) edge node[right, font=\scriptsize] {phase 2} (compressing);
-  \draw (compressing) edge node[right, font=\scriptsize] {done} (compressed);
+Phase~3's per-tick \texttt{mprotect} is the most
+frequent system call \sys issues.  Three factors keep its cost low.
+First, contiguous active pages are coalesced into runs, so a heap
+with thousands of active pages may require only a handful of
+\texttt{mprotect} calls.  Second, hot pages fault immediately on
+their next write, restoring \texttt{PROT\_RW} within
+$\sim$1\,$\mu$s---no decompression, just a permission change---and
+remain writable until the next tick.  Third, only pages tracked in
+the chunk bitmap are visited, making the scan proportional to active
+pages rather than the full VM region.  The net effect is negligible:
+benchmarks show $\leq$0.4\% throughput overhead even on
+write-intensive workloads (\S\ref{sec:eval:apps}).
 
-  % Fault handler transitions (back to ACTIVE)
-  \draw[fault] (monitor) edge[bend left=30]
-    node[left, font=\scriptsize, text=black!60] {write fault} (active);
-  \draw[fault] (compressing) edge[bend left=15]
-    node[left, font=\scriptsize, text=black!60, align=right] {fault\\(preempt)} (active);
-  \draw[fault] (compressed) edge[bend left=50]
-    node[left, font=\scriptsize, text=black!60, align=right] {read fault\\(decompress)} (active);
-\end{tikzpicture}
-\caption{\textbf{Five page states mediate compression and access}
-  (\S\ref{sec:design:arch}).
-  Solid: compressor thread.  Dashed: signal handler.}
-\label{fig:arch}
-\end{figure}
-
-A background compressor thread wakes every second and executes three phases:
-(1)~update per-page cold counts based on access bits,
-(2)~compress pages whose cold count exceeds a threshold, and
-(3)~set up monitoring (\texttt{PROT\_READ}) on remaining active pages.
-
-When the application accesses a compressed or monitored page, a
-SIGSEGV or SIGBUS signal fires.  The fault handler decompresses the
-page (or restores write permission for monitored pages) and returns,
-allowing the faulting instruction to retry~transparently.
-
-\begin{figure}[t]
-\begin{algorithmic}[1]
-\Function{Malloc}{$\mathit{size}$}
-  \State $\mathit{sc} \gets \Call{SizeToClass}{\mathit{size}}$
-  \State $\mathit{tc} \gets$ thread-local cache
-  \If{$\mathit{sc} < \textsc{NumClasses}$}
-    \State $\mathit{ptr} \gets tc.\Call{Allocate}{\mathit{sc}}$
-    $\triangleright$ \textit{no lock}
-    \If{$\mathit{ptr} = \textsc{null}$}
-      \Comment{cache miss}
-      \State $a \gets \Call{CallsiteArena}{}$
-      \Comment{hash return address}
-      \State $\mathit{ptr} \gets tc.\Call{Refill}{\mathit{sc},\; \mathit{slabs}[a][\mathit{sc}]}$
-    \EndIf
-  \Else
-    \State $\mathit{ptr} \gets \Call{LargeAlloc}{\mathit{size}}$
-  \EndIf
-  \State \Return $\mathit{ptr}$
-\EndFunction
-\Statex
-\Function{Free}{$\mathit{ptr}$}
-  \State $\mathit{span} \gets \Call{PageMap.Get}{\mathit{ptr}}$
-  \State $\mathit{sc} \gets \mathit{span}.\mathit{size\_class}$
-  \State $\mathit{tc} \gets$ thread-local cache
-  \If{$tc$ is full}
-    \State $tc.\Call{Drain}{\mathit{sc},\; \mathit{slabs},\; \mathit{page\_map}}$
-    \Comment{return to global slabs}
-  \EndIf
-  \State $tc.\Call{Push}{\mathit{sc},\; \mathit{ptr}}$
-  \Comment{no zeroing}
-\EndFunction
-\end{algorithmic}
-\caption{\textbf{Allocation and deallocation}
-  (\S\ref{sec:design:arch}).  \texttt{free} is lazy: it pushes the
-  pointer into the thread cache with no zeroing or lock acquisition.
-  On cache miss, \textsc{Refill} batch-allocates from the arena
-  selected by the call site.}
-\label{fig:algo:malloc}
-\end{figure}
+When the application accesses a \emph{compressed} page, a page
+fault signal fires.  The fault handler decompresses the page
+(regardless of algorithm), resets its cold count to zero---analogous
+to a JIT deoptimization---and returns, allowing the faulting
+instruction to retry~transparently.
 
 \subsection{Call-Site Arena Segregation}
 \label{sec:design:arenas}
@@ -212,7 +140,7 @@ age~out.
 \label{sec:design:zero}
 
 \sys's \texttt{free()} is lazy: it returns the pointer to a
-per-thread cache and returns immediately ($\sim$21\,ns).  No
+per-thread cache and returns immediately.  No
 zeroing, no lock acquisition, and no interaction with the
 compressor occur on the free path.  Freed slots are not reclaimed
 by the slab until the thread cache drains a~batch.
@@ -228,4 +156,63 @@ scratch buffer, iterates the span's free bitmap to identify freed
 slots, and zeros them using non-temporal stores
 (\texttt{stnp}/\texttt{movnti}) to avoid cache pollution.  Deferring all zeroing to
 compression time keeps the free path fast regardless of object~size.
+
+\begin{figure}[t]
+\begin{algorithmic}[1]
+\Function{Malloc}{$\mathit{size}$}
+  \State $\mathit{sc} \gets \Call{SizeToClass}{\mathit{size}}$
+  \State $\mathit{tc} \gets$ thread-local cache
+  \If{$\mathit{sc} < \textsc{NumClasses}$}
+    \State $\mathit{ptr} \gets tc.\Call{Allocate}{\mathit{sc}}$
+    $\triangleright$ \textit{no lock}
+    \If{$\mathit{ptr} = \textsc{null}$}
+      \Comment{cache miss}
+      \State $a \gets \Call{CallsiteArena}{}$
+      \Comment{hash return address}
+      \State $\mathit{ptr} \gets tc.\Call{Refill}{\mathit{sc},\; \mathit{slabs}[a][\mathit{sc}]}$
+    \EndIf
+  \Else
+    \State $\mathit{ptr} \gets \Call{LargeAlloc}{\mathit{size}}$
+  \EndIf
+  \State \Return $\mathit{ptr}$
+\EndFunction
+\Statex
+\Function{Free}{$\mathit{ptr}$}
+  \State $\mathit{span} \gets \Call{PageMap.Get}{\mathit{ptr}}$
+  \State $\mathit{sc} \gets \mathit{span}.\mathit{size\_class}$
+  \State $\mathit{tc} \gets$ thread-local cache
+  \If{$tc$ is full}
+    \State $tc.\Call{Drain}{\mathit{sc},\; \mathit{slabs},\; \mathit{page\_map}}$
+    \Comment{return to global slabs}
+  \EndIf
+  \State $tc.\Call{Push}{\mathit{sc},\; \mathit{ptr}}$
+  \Comment{no zeroing}
+\EndFunction
+\end{algorithmic}
+\caption{\textbf{Allocation and deallocation}
+  (\S\ref{sec:design:arch}).  \texttt{free} is lazy: it pushes the
+  pointer into the thread cache with no zeroing or lock acquisition.
+  On cache miss, \textsc{Refill} batch-allocates from the arena
+  selected by the call site.}
+\label{fig:algo:malloc}
+\end{figure}
+
+\subsection{Scalability}
+\label{sec:design:scalability}
+
+\sys avoids global locks on the allocation fast path.  Each
+application thread has a private thread cache that satisfies most
+\texttt{malloc} and \texttt{free} calls without any synchronization.
+When the cache must be refilled or drained, it accesses per-arena,
+per-size-class slab free lists protected by fine-grained spinlocks;
+four arenas spread contention across 144 independent lists ($4 \times
+36$ size classes).  When a thread cache drains, freed objects are
+returned to the global slab free lists (bucketed by arena), where any
+thread can reuse them, avoiding memory
+blowup~\cite{berger2000hoard} despite per-thread caching.  The
+background compressor partitions work across parallel workers, each
+with private compression state, and stores compressed data in an
+8-shard pool to avoid serialization.  Signal-handler decompression
+uses 32 pre-allocated fault slots acquired via compare-and-swap,
+supporting 32~concurrent page faults with no shared mutable~state.
 

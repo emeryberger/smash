@@ -1,19 +1,17 @@
 \section{Conclusion}
 \label{sec:conclusion}
 
-\sys demonstrates that the memory allocator is a natural point to
-implement transparent memory compression.  By exploiting
-allocator-level knowledge---object liveness, call-site patterns, and
-size classes---\sys reduces RSS by 17--80\% on real applications with
-no source changes required.
+By integrating JIT compression with an allocator that exploits
+allocator-level knowledge to enhance compressibility, \sys reduces RSS
+by 17--80\% on real applications. The evaluation demonstrates that
+\sys{}'s compression pipeline and allocator design are synergistic: A
+compress-only variant running atop an unmodified system allocator
+achieves 32--61\% RSS reduction, while \sys's allocator design further
+reduces RSS by 10--25\% on large-object workloads while lowering
+pipeline overhead.  Among the allocator design choices, zero-on-free
+contributes most to its effectiveness, followed by external metadata
+and arena segregation. We plan to release \sys{} as an open-source project.
 
-The evaluation reveals that the compression pipeline and allocator
-design are synergistic.  A compress-only variant running atop an
-unmodified system allocator achieves 32--61\% RSS reduction, while
-\sys's allocator design further reduces RSS by 10--25\% on
-large-object workloads and lowers pipeline overhead.  Among the allocator design
-choices, zero-on-free contributes most, followed by external metadata
-and arena segregation.
-Dictionary compression, despite theoretical appeal, is net-negative
-due to metadata overhead---a finding revealed only through systematic
-experimentation.
+%Dictionary compression, despite theoretical appeal, is net-negative
+%due to metadata overhead---a finding revealed only through systematic
+%experimentation.

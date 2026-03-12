@@ -1,13 +1,13 @@
 \section{Evaluation}
 \label{sec:eval}
 
-We structure the evaluation around six questions:
+We structure the evaluation around five questions:
 
 \begin{enumerate}
-\item[\textbf{RQ1.}] How do compression algorithms compare on heap
-  page data?
-\item[\textbf{RQ2.}] How much does \sys reduce RSS on real
+\item[\textbf{RQ1.}] How much does \sys reduce RSS on real
   applications, and what is the throughput and latency cost?
+\item[\textbf{RQ2.}] How do compression algorithms compare on heap
+  page data?
 \item[\textbf{RQ3.}] What does each optimization contribute?
 \item[\textbf{RQ4.}] How does allocator design affect page
   compressibility?
@@ -31,99 +31,13 @@ page size; Linux's \texttt{madvise} immediately releases
 physical pages (versus macOS's lazy free), so RSS drops appear
 more promptly after data goes~cold.
 
-\subsection{Algorithm Comparison (RQ1)}
-\label{sec:eval:algo}
-
-Table~\ref{tab:algo_compare} compares compression ratios and
-throughput across algorithms on 16\,KiB pages captured from real
-application heaps.  \punt{WKdm, the macOS VM compressor, achieves 93--99\% ratios
-on text data because its 32-bit word-granularity dictionary cannot
-match byte-level patterns.  It performs adequately on binary data
-(15.6\% on SQLite pages).  }LZ4 achieves 8--21\% ratios on key-value workloads at
-$\sim$3\,GB/s compression throughput.
-DuckDB's columnar data is less compressible (49\% LZ4)
-because its internal representation already packs values densely.
-zstd-9 achieves the best
-ratios (5--33\%) at lower~throughput.
-
-\begin{table}[t]
-\caption{\textbf{LZ4 and zstd compress real application heap pages well}
-  (\S\ref{sec:eval:algo}).  Average compression ratio
-  (lower is better) on 16\,KiB heap pages sampled from each application.}
-\label{tab:algo_compare}
-\centering\small
-\begin{tabular}{lrrrrr}
-\toprule
-Algorithm & SQLite & RocksDB & Memcached & Redis & DuckDB \\
-\midrule
-LZ4    & 8.1\%  & 11.6\% & 21.3\% & 15.9\%  & 48.6\% \\
-zstd-1 & 4.9\%  & 6.5\%  & 11.4\%  & 8.5\%  & 35.7\% \\
-zstd-3 & 4.9\%  & 6.4\%  & 10.8\%  & 8.4\%  & 34.9\% \\
-zstd-9 & \textbf{4.8\%} & \textbf{6.0\%} & \textbf{10.8\%} & \textbf{7.9\%} & \textbf{33.4\%} \\
-\bottomrule
-\end{tabular}
-\punt{%% Full table with synthetic data:
-\begin{tabular}{lrrrr}
-\toprule
-Algorithm & JSON & KV & SQLite & Zeroed \\
-\midrule
-WKdm       & 98.9\% & 93.7\% & 15.6\% & 6.8\% \\
-LZ4        & 30.2\% & 30.8\% & 5.8\%  & 1.6\% \\
-zstd-1     & 14.6\% & 23.2\% & 4.2\%  & 1.1\% \\
-zstd-3     & 15.6\% & 23.3\% & 4.1\%  & 1.1\% \\
-zstd-9     & 14.2\% & 21.0\% & 4.0\%  & 1.0\% \\
-\bottomrule
-\end{tabular}}
-\end{table}
-
-\begin{table}[t]
-\caption{\textbf{LZ4 provides the best throughput--ratio trade-off}
-  (\S\ref{sec:eval:algo}).  Throughput in MB/s on SQLite heap pages.}
-\label{tab:algo_throughput}
-\centering\small
-\begin{tabular}{lrr}
-\toprule
-Algorithm & Compression & Decompression \\
-\midrule
-LZ4    & \textbf{2955} & \textbf{4184} \\
-zstd-3 & 1252 & 1768 \\
-zstd-9 & 731  & 1823 \\
-\bottomrule
-\end{tabular}
-\punt{%% Full table with JSON and WKdm:
-\begin{tabular}{lrrrr}
-\toprule
- & \multicolumn{2}{c}{Compression} & \multicolumn{2}{c}{Decompression} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-5}
-Algorithm & JSON & SQLite & JSON & SQLite \\
-\midrule
-WKdm   & 1865 & 1819 & 10077 & 5269 \\
-LZ4    & 1004 & 2955 & 6064  & 4184 \\
-zstd-3 & 553  & 1252 & 1498  & 1768 \\
-zstd-9 & 90   & 731  & 1437  & 1823 \\
-\bottomrule
-\end{tabular}}
-\end{table}
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/algo_compare.pdf}
-\caption{\textbf{LZ4 and zstd compress most application heap pages
-  to under 22\%; DuckDB's columnar data is less compressible}
-  (\S\ref{sec:eval:algo}).  Log scale.}
-\label{fig:algo_compare}
-\end{figure}
-
-These results motivate \sys's JIT compression strategy: LZ4 for recently
-cold pages (fast enough to speculatively compress pages that may be
-accessed again soon) and zstd-9 for long-lived cold pages (where the
-higher compression ratio justifies the~cost).
-
-\subsection{Application Benchmarks (RQ2)}
+\subsection{Application Benchmarks (RQ1)}
 \label{sec:eval:apps}
 
-Table~\ref{tab:apps} summarizes RSS reduction and throughput for
-five applications.
+We evaluate \sys's RSS reduction, throughput overhead, and
+cold-access latency on five real applications spanning key-value
+stores, relational databases, and columnar analytics.
+Table~\ref{tab:apps} summarizes the results.
 
 \begin{table}[t]
 \caption{\textbf{\sys reduces RSS by 17--80\% with negligible throughput cost}
@@ -178,7 +92,7 @@ decompression).  Under \sys, the median cold access is under
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\columnwidth]{figures/cdf_cold_combined.pdf}
+\includegraphics[width=0.81\columnwidth]{figures/cdf_cold_combined.pdf}
 \caption{\textbf{Cold-access latency is under 10\,$\mu$s at the
   median for all workloads} (\S\ref{sec:eval:apps}).  Tail reflects
   zstd decompression of large objects.}
@@ -265,17 +179,17 @@ Mesh    & 429   & 281   & 772   & 59   & 241 \\
 \end{table}
 
 \paragraph{Mesh-paper Redis workload}
-Powers et al.~\cite{powers2019mesh} report that Mesh reduces
-Redis RSS by 39\% on a workload that induces fragmentation:
-700K keys with 240-byte values followed by 170K keys with
-492-byte values, under a 100\,MiB LRU cap.  The size change
-plus eviction creates partially-filled pages ideal for meshing.
-We replicate this workload on our platform
-(Table~\ref{tab:redis_mesh}).
+Powers et al.~\cite{powers2019mesh} report that Mesh reduces Redis
+RSS by 39\% on a workload designed to induce fragmentation: 700K
+keys with 240-byte values followed by 170K keys with 492-byte
+values, under a 100\,MiB LRU cap.  We replicate this workload
+(Table~\ref{tab:redis_mesh}).  No allocator---including Mesh,
+jemalloc's activedefrag, and \sys---reduces RSS.  All
+configurations show a $\sim$1.9$\times$ fragmentation ratio.
 
 \begin{table}[t]
-\caption{\textbf{Mesh's Redis result does not reproduce on modern
-  systems} (\S\ref{sec:eval:apps}).
+\caption{\textbf{Mesh's Redis fragmentation result does not
+  reproduce on modern systems} (\S\ref{sec:eval:apps}).
   RSS (MiB) on the Mesh-paper Redis workload
   (700K$\times$240\,B + 170K$\times$492\,B, maxmemory=100\,MiB LRU).
   Frag = fragmentation ratio (RSS / used).}
@@ -294,37 +208,129 @@ Mesh                     & 194  & $-$1\% & 1.94 \\
 \end{tabular}
 \end{table}
 
-Neither Mesh, jemalloc's activedefrag, nor \sys reduces RSS.
-All configurations show the same $\sim$1.9$\times$ fragmentation ratio.
-Three factors explain the discrepancy with the original result:
-%
-\begin{enumerate}
-\item \textbf{Redis version.}  Powers et al.\ used Redis~4.0.2;
-  we use 8.6.1.  Redis has substantially improved its internal
-  memory management across five major versions.
-\item \textbf{jemalloc version.}  The original used jemalloc~3.6.0;
-  Redis~8.6.1 bundles jemalloc~5.3.0, which handles size-class
-  transitions with much less fragmentation.
-\item \textbf{Page size.}  macOS on Apple Silicon uses 16\,KiB pages
-  versus 4\,KiB on x86 Linux.  Larger pages hold more objects per
-  page, reducing external fragmentation: a page containing both
-  240-byte and 492-byte objects is less likely to become a meshing
-  candidate.
-\end{enumerate}
-%
-The $\sim$1.9$\times$ fragmentation ratio reflects allocation
-metadata overhead (SDS headers, dict entries, alignment padding),
-not empty holes amenable to meshing or defragmentation.
-This workload keeps pages fully occupied: LRU eviction frees
-objects that are immediately replaced by new insertions,
-leaving no partially-filled pages for Mesh to compact.
-\sys's metadata overhead (page-state tracking, bootstrap
-allocator) adds $\sim$15\,MiB, offsetting the small amount
-of compression possible on this active~dataset.
+The root cause is that the fragmentation Mesh exploited no longer
+occurs.  The original experiment used Redis~4.0.2 with
+jemalloc~3.6.0; we use Redis~8.6.1 with jemalloc~5.3.0.  Modern
+jemalloc handles size-class transitions (240\,B $\to$ 492\,B) with
+far less fragmentation, and Redis itself has improved its internal
+memory management over five major versions.  The result is that LRU
+eviction immediately replaces freed objects with new insertions,
+keeping pages fully occupied---there are no partially-filled pages
+for Mesh to compact and no cold pages for \sys to compress.  The
+$\sim$1.9$\times$ ratio reflects fixed per-object metadata overhead
+(SDS headers, dict entries, alignment padding), not reclaimable
+holes.  \sys's own metadata (page-state tracking, bootstrap
+allocator) adds $\sim$15\,MiB, slightly increasing RSS on this
+fully-active dataset.
+
+\paragraph{Summary}
+\sys reduces RSS by 17--80\% across five applications with
+negligible throughput cost ($\leq$0.4\%) and sub-10\,$\mu$s median
+cold-access latency.  The benefit scales with the fraction of cold
+data: RocksDB's large, mostly-idle block cache sees the greatest
+reduction, while Redis's small, actively-served dataset sees the
+least.  Compression---not allocator choice---drives the savings:
+Mesh achieves comparable RSS only on workloads with significant
+fragmentation.
+
+\subsection{Algorithm Comparison (RQ2)}
+\label{sec:eval:algo}
+
+To understand which compression algorithms are best suited to heap
+page data, we compare LZ4 and zstd at several levels on 16\,KiB
+pages captured from the five application heaps.
+Table~\ref{tab:algo_compare} presents compression ratios and
+Table~\ref{tab:algo_throughput} presents throughput.  \punt{WKdm, the macOS VM compressor, achieves 93--99\% ratios
+on text data because its 32-bit word-granularity dictionary cannot
+match byte-level patterns.  It performs adequately on binary data
+(15.6\% on SQLite pages).  }LZ4 achieves 8--21\% ratios on key-value workloads at
+$\sim$3\,GB/s compression throughput.
+DuckDB's columnar data is less compressible (49\% LZ4)
+because its internal representation already packs values densely.
+zstd-9 achieves the best
+ratios (5--33\%) at lower~throughput.
+
+\begin{table}[t]
+\caption{\textbf{LZ4 and zstd compress real application heap pages well}
+  (\S\ref{sec:eval:algo}).  Average compression ratio
+  (lower is better) on 16\,KiB heap pages sampled from each application.}
+\label{tab:algo_compare}
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+Algorithm & SQLite & RocksDB & Memcached & Redis & DuckDB \\
+\midrule
+LZ4    & 8.1\%  & 11.6\% & 21.3\% & 15.9\%  & 48.6\% \\
+zstd-1 & 4.9\%  & 6.5\%  & 11.4\%  & 8.5\%  & 35.7\% \\
+zstd-3 & 4.9\%  & 6.4\%  & 10.8\%  & 8.4\%  & 34.9\% \\
+zstd-9 & \textbf{4.8\%} & \textbf{6.0\%} & \textbf{10.8\%} & \textbf{7.9\%} & \textbf{33.4\%} \\
+\bottomrule
+\end{tabular}
+\punt{%% Full table with synthetic data:
+\begin{tabular}{lrrrr}
+\toprule
+Algorithm & JSON & KV & SQLite & Zeroed \\
+\midrule
+WKdm       & 98.9\% & 93.7\% & 15.6\% & 6.8\% \\
+LZ4        & 30.2\% & 30.8\% & 5.8\%  & 1.6\% \\
+zstd-1     & 14.6\% & 23.2\% & 4.2\%  & 1.1\% \\
+zstd-3     & 15.6\% & 23.3\% & 4.1\%  & 1.1\% \\
+zstd-9     & 14.2\% & 21.0\% & 4.0\%  & 1.0\% \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[t]
+\caption{\textbf{LZ4 provides the best throughput--ratio trade-off}
+  (\S\ref{sec:eval:algo}).  Throughput in MB/s on SQLite heap pages.}
+\label{tab:algo_throughput}
+\centering\small
+\begin{tabular}{lrr}
+\toprule
+Algorithm & Compression & Decompression \\
+\midrule
+LZ4    & \textbf{2955} & \textbf{4184} \\
+zstd-3 & 1252 & 1768 \\
+zstd-9 & 731  & 1823 \\
+\bottomrule
+\end{tabular}
+\punt{%% Full table with JSON and WKdm:
+\begin{tabular}{lrrrr}
+\toprule
+ & \multicolumn{2}{c}{Compression} & \multicolumn{2}{c}{Decompression} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Algorithm & JSON & SQLite & JSON & SQLite \\
+\midrule
+WKdm   & 1865 & 1819 & 10077 & 5269 \\
+LZ4    & 1004 & 2955 & 6064  & 4184 \\
+zstd-3 & 553  & 1252 & 1498  & 1768 \\
+zstd-9 & 90   & 731  & 1437  & 1823 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/algo_compare.pdf}
+\caption{\textbf{LZ4 and zstd compress most application heap pages
+  to under 22\%; DuckDB's columnar data is less compressible}
+  (\S\ref{sec:eval:algo}).  Log scale.}
+\label{fig:algo_compare}
+\end{figure}
+
+\paragraph{Summary}
+Heap pages compress well: LZ4 achieves 8--21\% ratios at
+$\sim$3\,GB/s, and zstd-9 reaches 5--11\% on structured data at
+lower throughput.  These results motivate \sys's JIT compression
+strategy: LZ4 for recently cold pages (fast enough to speculatively
+compress pages that may be accessed again soon) and zstd-9 for
+long-lived cold pages (where the higher ratio justifies the~cost).
 
 \subsection{Ablation Study (RQ3)}
 \label{sec:eval:ablation}
 
+To quantify what each optimization contributes, we selectively
+disable individual features and measure the change in RSS reduction.
 We run each configuration across all five applications, each with 3
 runs.  Ablation requires rebuilding \sys with different compile-time
 constants; external-process benchmarks (memcached, Redis) are run
@@ -386,12 +392,20 @@ entire pages, making per-page optimizations more visible.
 \label{fig:ablation}
 \end{figure}
 
+\paragraph{Summary}
+Compression is the dominant mechanism: disabling it eliminates
+virtually all RSS savings ($-$45.7\,\pp).  Dictionaries are
+actively harmful ($-$16.9\,\pp average) due to CDict memory
+overhead.  The remaining optimizations each contribute less than
+1.5\,\pp individually, confirming that \sys's default configuration
+is close to~optimal.
+
 \subsection{Allocator Design Impact (RQ4)}
 \label{sec:eval:allocator}
 
-The previous experiments measure \sys end-to-end.  To isolate how
-allocator design affects page compressibility \emph{independently} of
-the compression pipeline, we run a standalone benchmark that allocates
+The previous experiments measure \sys end-to-end.  We now ask how
+allocator design alone affects page compressibility, independent of
+any compression pipeline.  We run a standalone benchmark that allocates
 100K objects through nine allocators, fills them with realistic data,
 frees 50\% in an alternating pattern, and compresses the resulting
 pages with zstd-9.  This experiment measures static page content compressibility.
@@ -500,11 +514,23 @@ compressibility---DieHarder and jemalloc+zero both reach 6.1\%.
 Static page content is only one component; \sys's advantage in
 applications (\S\ref{sec:eval:apps}) comes from its compression~pipeline.
 
+\paragraph{Summary}
+Zero-on-free is the single most important allocator design choice
+for compressibility, improving every allocator by 2--4\,\pp.
+Embedded freelists and metadata placement have modest effects
+($\sim$2\,\pp).  Allocation layout (sequential vs.\ randomized)
+matters more than whether metadata is stored in-band or externally.
+No single allocator dominates: the best static compressibility
+depends on data patterns, underscoring the need for a runtime
+compression pipeline.
+
 \subsection{Pipeline vs.\ Allocator Design (RQ5)}
 \label{sec:eval:pipeline}
 
-To decompose the contributions of the compression pipeline and
-the allocator design, we build a \emph{compress-only} library
+Finally, we ask how much of \sys's benefit comes from the
+compression pipeline versus its allocator design choices.
+To decompose these contributions, we build a \emph{compress-only}
+library
 that adds \sys's compression pipeline \emph{on top of} the
 unmodified system allocator.  This library interposes
 \texttt{malloc}/\texttt{free} solely to discover which pages
@@ -587,3 +613,13 @@ due to hash-map-based page tracking and periodic VM region
 scanning.  \sys's integrated design avoids this overhead.
 Redis and memcached show negligible throughput impact ($<$1\%)
 for both configurations.
+
+\paragraph{Summary}
+The compression pipeline accounts for the majority of \sys's RSS
+reduction (20--61\% even atop unmodified system malloc).  The
+allocator design contributes most when objects span full pages
+(+25\,\pp on RocksDB), but on workloads with small, uniform objects,
+system malloc's layout can compress equally well or better.  The
+two components are complementary: the pipeline provides the
+compression infrastructure, while the allocator design maximizes
+its effectiveness on structured, page-spanning~data.

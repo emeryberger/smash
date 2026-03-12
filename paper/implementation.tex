@@ -7,12 +7,13 @@ C++ across headers and one compilation unit) that interposes on
 macOS and \texttt{LD\_PRELOAD} on Linux.  On macOS, the
 \texttt{\_\_interpose} section redirects cross-dylib GOT entries;
 on Linux, strong symbol definitions in the preloaded library
-override glibc's weak defaults.  The Linux version uses an
-unversioned linker script (no \texttt{GLIBC\_2.x} tags) so that a
-single binary works across architectures---x86\_64 expects version
-\texttt{2.2.5} while aarch64 expects \texttt{2.17}.  All internal
-metadata is allocated from a bootstrap bump allocator to avoid signal-handler
-reentrancy.
+override glibc's weak defaults.
+% The Linux version uses an
+% unversioned linker script (no \texttt{GLIBC\_2.x} tags) so that a
+% single binary works across architectures---x86\_64 expects version
+% \texttt{2.2.5} while aarch64 expects \texttt{2.17}.
+% All internal
+% metadata is allocated from a bootstrap bump allocator.
 
 \subsection{Parallel Compressor}
 \label{sec:impl:parallel}
@@ -45,7 +46,7 @@ With two workers and eight shards, lock contention is near~zero.
 \Function{CompressorTick}{}
   \State rebuild chunk bitmap
   \State partition page range across workers
-  \Statex \Comment{Phase 1: update cold counts}
+  \State $\triangleright$ \textit{Phase 1: update cold counts}
   \ForAll{active pages $p$ (via chunk bitmap)}
     \If{$p$ was accessed since last tick}
       \State $\mathit{cold}[p] \gets 0$
@@ -53,11 +54,11 @@ With two workers and eight shards, lock contention is near~zero.
       \State $\mathit{cold}[p] \mathrel{+}= 1$
     \EndIf
   \EndFor
-  \Statex \Comment{Phase 2: compress cold pages}
+  \State $\triangleright$ \textit{Phase 2: compress cold pages}
   \ForAll{pages $p$ with $\mathit{cold}[p] \geq \textsc{ColdTicks}$}
     \State \Call{CompressPage}{$p$}
   \EndFor
-  \Statex \Comment{Phase 3: set up access monitoring}
+  \State $\triangleright$ \textit{Phase 3: set up access monitoring}
   \ForAll{remaining \textsc{active} pages $p$}
     \State \Call{mprotect}{$p$, \textsc{prot\_read}}
     \State $\mathit{state}[p] \gets$ \textsc{active\_monitoring}
@@ -70,7 +71,7 @@ With two workers and eight shards, lock contention is near~zero.
   \State zero freed slots in $\mathit{buf}$ (non-temporal stores)
   \State \Call{mprotect}{$p$, \textsc{prot\_none}}
   \If{$\mathit{state}[p] \neq$ \textsc{compressing}}
-    \Comment{preempted by fault}
+    $\triangleright$ \textit{preempted by fault}
     \State \Call{Unlock}{$p$};\; \Return
   \EndIf
   \State $\mathit{algo} \gets$ \textbf{if} $\mathit{cold}[p] \geq$ \textsc{VeryCold} \textbf{then} zstd-9 \textbf{else} LZ4
@@ -117,7 +118,7 @@ handler restores write~permission.
   \State \Call{Lock}{$p$}
   \If{$\mathit{state}[p] =$ \textsc{compressed}}
       \State $\mathit{slot} \gets \Call{AcquireFaultSlot}{}$
-      \Comment{CAS}
+      $\triangleright$ \textit{CAS}
       \State \Call{Decompress}{$\mathit{slot.dctx}$, $\mathit{blob}$, $\mathit{slot.buf}$}
       \State \Call{Recommit}{$p$};\; copy $\mathit{slot.buf} \to p$
       \State release compressed blob;\; \Call{ReleaseFaultSlot}{$\mathit{slot}$}
@@ -125,7 +126,7 @@ handler restores write~permission.
       \State \Call{PrefetchAdjacent}{$p$}
   \ElsIf{$\mathit{state}[p] =$ \textsc{compressing}}
       \State \Call{Recommit}{$p$}
-      \Comment{compressor detects \& aborts}
+      $\triangleright$ \textit{compressor detects \& aborts}
       \State $\mathit{state}[p] \gets$ \textsc{active}
   \ElsIf{$\mathit{state}[p] =$ \textsc{active\_monitoring}}
       \State \Call{mprotect}{$p$, \textsc{prot\_read|write}}
@@ -189,7 +190,7 @@ signal.  This affects any syscall that accesses userspace memory:
 \texttt{read}, \texttt{write}, \texttt{recv}, \texttt{send},
 \texttt{kevent}, and~others.
 
-\sys interposes on 20 system calls and C library I/O functions.
+\sys interposes on $\sim20$ system calls and C library I/O functions.
 Before each call, the wrapper walks the buffer's pages, touching any
 page managed by \sys to trigger decompression via the fault handler,
 then pins the pages to prevent the compressor from re-protecting them

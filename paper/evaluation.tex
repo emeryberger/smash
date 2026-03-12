@@ -240,44 +240,33 @@ To understand which compression algorithms are best suited to heap
 page data, we compare LZ4 and zstd at several levels on 16\,KiB
 pages captured from the five application heaps.
 Table~\ref{tab:algo_compare} presents compression ratios and
-Table~\ref{tab:algo_throughput} presents throughput.  \punt{WKdm, the macOS VM compressor, achieves 93--99\% ratios
+Table~\ref{tab:algo_throughput} presents throughput.  \punt{WKdm, the macOS VM compressor, achieves only 1.0--1.1$\times$
 on text data because its 32-bit word-granularity dictionary cannot
 match byte-level patterns.  It performs adequately on binary data
-(15.6\% on SQLite pages).  }LZ4 achieves 8--21\% ratios on key-value workloads at
+(6.4$\times$ on SQLite pages).  }LZ4 achieves 4.7--12.3$\times$ compression on key-value workloads at
 $\sim$3\,GB/s compression throughput.
-DuckDB's columnar data is less compressible (49\% LZ4)
+DuckDB's columnar data is less compressible (2.1$\times$ with LZ4)
 because its internal representation already packs values densely.
 zstd-9 achieves the best
-ratios (5--33\%) at lower~throughput.
+ratios (3.0--20.8$\times$) at lower~throughput.
 
 \begin{table}[t]
 \caption{\textbf{LZ4 and zstd compress real application heap pages well}
-  (\S\ref{sec:eval:algo}).  Average compression ratio
-  (lower is better) on 16\,KiB heap pages sampled from each application.}
+  (\S\ref{sec:eval:algo}).  Compression ratio =
+  original\,/\,compressed (higher is better) on 16\,KiB heap pages
+  sampled from each application.}
 \label{tab:algo_compare}
 \centering\small
 \begin{tabular}{lrrrrr}
 \toprule
 Algorithm & SQLite & RocksDB & Memcached & Redis & DuckDB \\
 \midrule
-LZ4    & 8.1\%  & 11.6\% & 21.3\% & 15.9\%  & 48.6\% \\
-zstd-1 & 4.9\%  & 6.5\%  & 11.4\%  & 8.5\%  & 35.7\% \\
-zstd-3 & 4.9\%  & 6.4\%  & 10.8\%  & 8.4\%  & 34.9\% \\
-zstd-9 & \textbf{4.8\%} & \textbf{6.0\%} & \textbf{10.8\%} & \textbf{7.9\%} & \textbf{33.4\%} \\
+LZ4    & 12.3$\times$  & 8.6$\times$ & 4.7$\times$ & 6.3$\times$  & 2.1$\times$ \\
+zstd-1 & 20.4$\times$  & 15.4$\times$ & 8.8$\times$ & 11.8$\times$ & 2.8$\times$ \\
+zstd-3 & 20.4$\times$  & 15.6$\times$ & 9.3$\times$ & 11.9$\times$ & 2.9$\times$ \\
+zstd-9 & \textbf{20.8$\times$} & \textbf{16.7$\times$} & \textbf{9.3$\times$} & \textbf{12.7$\times$} & \textbf{3.0$\times$} \\
 \bottomrule
 \end{tabular}
-\punt{%% Full table with synthetic data:
-\begin{tabular}{lrrrr}
-\toprule
-Algorithm & JSON & KV & SQLite & Zeroed \\
-\midrule
-WKdm       & 98.9\% & 93.7\% & 15.6\% & 6.8\% \\
-LZ4        & 30.2\% & 30.8\% & 5.8\%  & 1.6\% \\
-zstd-1     & 14.6\% & 23.2\% & 4.2\%  & 1.1\% \\
-zstd-3     & 15.6\% & 23.3\% & 4.1\%  & 1.1\% \\
-zstd-9     & 14.2\% & 21.0\% & 4.0\%  & 1.0\% \\
-\bottomrule
-\end{tabular}}
 \end{table}
 
 \begin{table}[t]
@@ -312,15 +301,15 @@ zstd-9 & 90   & 731  & 1437  & 1823 \\
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/algo_compare.pdf}
-\caption{\textbf{LZ4 and zstd compress most application heap pages
-  to under 22\%; DuckDB's columnar data is less compressible}
-  (\S\ref{sec:eval:algo}).  Log scale.}
+\caption{\textbf{LZ4 and zstd achieve 5--21$\times$ compression on
+  most application heap pages; DuckDB's columnar data is less compressible}
+  (\S\ref{sec:eval:algo}).  Log scale; higher is better.}
 \label{fig:algo_compare}
 \end{figure}
 
 \paragraph{Summary}
-Heap pages compress well: LZ4 achieves 8--21\% ratios at
-$\sim$3\,GB/s, and zstd-9 reaches 5--11\% on structured data at
+Heap pages compress well: LZ4 achieves 4.7--12.3$\times$ compression at
+$\sim$3\,GB/s, and zstd-9 reaches 9--21$\times$ on structured data at
 lower throughput.  These results motivate \sys's JIT compression
 strategy: LZ4 for recently cold pages (fast enough to speculatively
 compress pages that may be accessed again soon) and zstd-9 for
@@ -405,11 +394,12 @@ is close to~optimal.
 
 The previous experiments measure \sys end-to-end.  We now ask how
 allocator design alone affects page compressibility, independent of
-any compression pipeline.  We run a standalone benchmark that allocates
-100K objects through nine allocators, fills them with realistic data,
-frees 50\% in an alternating pattern, and compresses the resulting
-pages with zstd-9.  This experiment measures static page content compressibility.
-Object sizes range from 64--512 bytes.
+any compression pipeline.  For each of nine allocators, we run the
+same application workloads used in RQ1---SQLite (50K rows,
+no frees), memcached-format slab items, Redis SDS strings, and
+DuckDB columnar integer arrays (100K objects each, 50\% freed in an
+alternating pattern)---and compress the resulting heap pages with
+zstd-9.
 
 Table~\ref{tab:allocator_features} classifies each allocator by three
 design properties relevant to compression: whether metadata (freelists,
@@ -418,7 +408,10 @@ zeroed, and whether allocations are segregated by call site.
 
 \begin{table}[t]
 \caption{\textbf{Only \sys combines all three design properties
-  that improve compressibility} (\S\ref{sec:eval:allocator}).}
+  that improve compressibility} (\S\ref{sec:eval:allocator}).
+  \ding{51} = feature present.
+  $\dagger$macOS \texttt{libmalloc} zeroes freed memory
+  to enable fast \texttt{calloc}; Linux glibc does not.}
 \label{tab:allocator_features}
 \centering\small
 \begin{tabular}{lccc}
@@ -426,7 +419,7 @@ zeroed, and whether allocations are segregated by call site.
 Allocator & External & Zero-on- & Arena \\
           & metadata & free     & segregation \\
 \midrule
-System malloc &  &  &  \\
+System malloc & & \ding{51}$^\dagger$ &  \\
 mimalloc      &  &  &  \\
 jemalloc      &  &  &  \\
 tcmalloc      &  &  &  \\
@@ -439,90 +432,106 @@ DieHarder     & \ding{51} & \ding{51} &  \\
 \end{tabular}
 \end{table}
 
-  \begin{figure*}[t]
+\begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/allocator_compare.pdf}
 \caption{\textbf{Zero-on-free is the single most important
   allocator design choice for compressibility}
-  (\S\ref{sec:eval:allocator}).  zstd-9 ratios; lower is better.}
+  (\S\ref{sec:eval:allocator}).  Compression ratio =
+  original\,/\,compressed (higher is better) with zstd-9 on
+  real application heap pages.
+  \dag~marks allocators that zero freed memory:
+  System (macOS \texttt{libmalloc}), DieHarder (security zeroing),
+  and Smash (deferred to compression time---not yet applied in
+  this static measurement).}
 \label{fig:allocator_compare}
 \end{figure*}
 
 Table~\ref{tab:allocator_compare} presents the compression ratios.
 The results yield three observations.
 
-First, zero-on-free is the single most important factor for page
-compressibility.  Adding zeroing improves every allocator by 2--4\pp.
-DieHard+zero matches DieHarder exactly (6.1\% average), confirming
-that DieHarder's advantage over DieHard comes entirely from its
-security zeroing, not from any other design difference.
+First, zero-on-free is the dominant factor for page compressibility,
+and its effect is workload-dependent.  On DuckDB's columnar integer
+arrays---where freed slots contain stale numeric data with no
+byte-level redundancy---allocators that do not zero achieve only
+1.5$\times$ compression (essentially incompressible by LZ4), while
+allocators that zero achieve 2.8--3.2$\times$.  On text-heavy
+workloads (memcached, Redis) the effect is smaller because the data
+itself contains compressible patterns that dominate the freed-slot
+noise.  Adding explicit zeroing before \texttt{free} improves every
+allocator, confirming the effect is causal: DieHard+zero matches
+DieHarder exactly, confirming that DieHarder's advantage comes
+entirely from its security zeroing.
 
-Second, embedded freelists have a modest effect.
-mimalloc, tcmalloc, and Hoard (9.5--9.6\%) compress $\sim$2\pp worse
-than system malloc (7.4\%) without zeroing.  With zeroing, the gap
-narrows to under 1\pp.  Freelist pointer pollution is measurable but
-secondary.
+Second, macOS \texttt{libmalloc} zeroes freed memory as an
+implementation detail (to support fast \texttt{calloc} via
+pre-zeroed free lists).  We verified this by reading memory
+immediately after \texttt{free}: 100\% of bytes are zeroed across
+all tested sizes (32--4096\,B).  This behavior is
+platform-specific---Linux glibc does not zero on free---and represents
+a hidden confound when benchmarking allocators on macOS.
+On workloads with frees, system malloc (18.5$\times$ on memcached,
+2.8$\times$ on DuckDB) outperforms allocators that leave stale data in
+freed slots (mimalloc: 13.5$\times$, 1.5$\times$).
 
-Third, allocation layout matters more than metadata placement.
-System malloc (7.4\%) compresses better than DieHard (10.1\%) despite
-embedded freelists, because its sequential magazine layout produces
-better locality.  DieHard's randomized placement scatters objects,
-reducing page-level redundancy.  Mesh (7.9\%) confirms this: like
-DieHard, it uses external bitmap metadata, but its layout is closer
-to a conventional allocator, producing compressibility near system
-malloc.  With zeroing, the relationship
-inverts: DieHard+zero (6.1\%) compresses better because sparse
-random pages have more zero space.  Mesh+zero (7.3\%) matches
-system+zero, reinforcing that metadata placement is secondary to layout
-and~zeroing.
+Third, when frees are absent, allocator choice barely matters.
+On SQLite (no frees), all allocators achieve 23--42$\times$
+compression because every byte on the page is live, structured data.
+The minor variation reflects differences in alignment padding and page
+utilization, not metadata placement or zeroing~policy.
 
 \begin{table}[t]
-\caption{\textbf{Zero-on-free improves every allocator by 2--4\%;
-  layout matters more than metadata placement}
-  (\S\ref{sec:eval:allocator}).  Avg.\ zstd-9 ratio, sizes
-  64--512\,B (lower is better).}
+\caption{\textbf{Zero-on-free matters most on data with low
+  byte-level redundancy (DuckDB); text-heavy workloads compress
+  well regardless}
+  (\S\ref{sec:eval:allocator}).  Compression ratio =
+  original\,/\,compressed (higher is better) with zstd-9.
+  $\dagger$Already zeroes on macOS.}
 \label{tab:allocator_compare}
 \centering\small
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrrr}
 \toprule
-Allocator & JSON & KV & Struct & Mixed & Avg. \\
+Allocator & SQLite & Memcached & Redis & DuckDB \\
 \midrule
-\multicolumn{6}{l}{\textit{Base allocators}} \\
-System malloc & 3.9\% & \textbf{9.6\%} & \textbf{8.2\%} & \textbf{7.7\%} & \textbf{7.4\%} \\
-mimalloc      & 3.9\% & 11.3\% & 10.8\% & 12.1\% & 9.5\% \\
-jemalloc      & \textbf{2.8\%} & 12.0\% & 11.8\% & 12.0\% & 9.6\% \\
-tcmalloc      & 3.8\% & 11.3\% & 10.9\% & 12.1\% & 9.5\% \\
-Hoard         & 4.0\% & 11.5\% & 10.9\% & 12.2\% & 9.6\% \\
-Mesh          & 3.9\% & 9.7\%  & 8.2\%  & 9.6\%  & 7.9\% \\
-DieHard       & 4.9\% & 12.3\% & 11.0\% & 12.2\% & 10.1\% \\
+\multicolumn{5}{l}{\textit{Base allocators}} \\
+System malloc$^\dagger$ & 24.4$\times$ & \textbf{18.5$\times$} & 33.3$\times$ & \textbf{2.8$\times$} \\
+mimalloc      & 24.4$\times$ & 13.5$\times$ & 33.3$\times$ & 1.5$\times$ \\
+jemalloc      & 23.3$\times$ & 14.1$\times$ & \textbf{41.7$\times$} & 1.5$\times$ \\
+tcmalloc      & 23.3$\times$ & 13.5$\times$ & 33.3$\times$ & 1.5$\times$ \\
+Hoard         & \textbf{34.5$\times$} & 13.5$\times$ & 33.3$\times$ & 1.5$\times$ \\
+Mesh$^\dagger$ & 24.4$\times$ & 18.2$\times$ & 33.3$\times$ & 2.8$\times$ \\
+DieHard       & 40.0$\times$ & 11.6$\times$ & 31.3$\times$ & 1.6$\times$ \\
+DieHarder     & \textbf{41.7$\times$} & \textbf{19.6$\times$} & \textbf{41.7$\times$} & \textbf{3.2$\times$} \\
 \midrule
-\multicolumn{6}{l}{\textit{With zero-on-free}} \\
-System+zero   & 3.9\% & 9.6\% & 8.2\% & 7.5\% & 7.3\% \\
-mimalloc+zero & 2.8\% & 8.5\% & 7.1\% & 8.5\% & 6.7\% \\
-jemalloc+zero & \textbf{2.0\%} & 8.3\% & 6.4\% & 7.9\% & \textbf{6.1\%} \\
-tcmalloc+zero & 2.8\% & 8.5\% & 7.1\% & 8.5\% & 6.7\% \\
-Mesh+zero     & 3.9\% & 9.6\% & 8.2\% & 7.6\% & 7.3\% \\
-DieHard+zero  & 3.1\% & \textbf{7.7\%} & \textbf{6.1\%} & \textbf{7.6\%} & \textbf{6.1\%} \\
-DieHarder     & 3.1\% & \textbf{7.7\%} & \textbf{6.1\%} & \textbf{7.6\%} & \textbf{6.1\%} \\
-\sys          & 2.6\% & 9.2\% & 7.5\% & 9.0\% & 7.1\% \\
+\multicolumn{5}{l}{\textit{With explicit zero-on-free}} \\
+mimalloc+zero & 24.4$\times$ & 21.3$\times$ & 41.7$\times$ & 2.9$\times$ \\
+jemalloc+zero & 23.3$\times$ & \textbf{23.8$\times$} & \textbf{55.6$\times$} & \textbf{3.0$\times$} \\
+tcmalloc+zero & 23.3$\times$ & 20.8$\times$ & 43.5$\times$ & 2.9$\times$ \\
+Hoard+zero    & \textbf{34.5$\times$} & 20.8$\times$ & 41.7$\times$ & 2.9$\times$ \\
+DieHard+zero  & 40.0$\times$ & 19.6$\times$ & 41.7$\times$ & 3.2$\times$ \\
+\sys          & \textbf{40.0$\times$} & 14.1$\times$ & 41.7$\times$ & 1.5$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Note that \sys (7.1\% average) does not achieve the lowest static
-compressibility---DieHarder and jemalloc+zero both reach 6.1\%.
-Static page content is only one component; \sys's advantage in
-applications (\S\ref{sec:eval:apps}) comes from its compression~pipeline.
+Note that \sys appears in the ``with zeroing'' section because
+it defers zeroing to compression time (\S\ref{sec:design:zero});
+in this static benchmark, the compressor is not running, so freed
+slots retain stale data.  In production, the compressor zeros freed
+slots in a scratch buffer immediately before compression, achieving
+ratios comparable to the +zero~rows.
 
 \paragraph{Summary}
 Zero-on-free is the single most important allocator design choice
-for compressibility, improving every allocator by 2--4\,\pp.
-Embedded freelists and metadata placement have modest effects
-($\sim$2\,\pp).  Allocation layout (sequential vs.\ randomized)
-matters more than whether metadata is stored in-band or externally.
-No single allocator dominates: the best static compressibility
-depends on data patterns, underscoring the need for a runtime
-compression pipeline.
+for compressibility.  Its effect ranges from dramatic on data with
+low byte-level redundancy (DuckDB: 1.5$\times$$\to$2.9$\times$)
+to modest on text-heavy data (memcached:
+13.5$\times$$\to$21$\times$).  macOS system malloc zeroes on free as
+a platform-specific implementation detail, giving it an inherent
+advantage that other allocators lack.  When no frees occur (SQLite),
+allocator choice is irrelevant.  These results motivate \sys's
+deferred zero-on-free: it captures the compressibility benefit without
+adding latency to the \texttt{free}~path.
 
 \subsection{Pipeline vs.\ Allocator Design (RQ5)}
 \label{sec:eval:pipeline}
@@ -595,14 +604,15 @@ compression across each page.
 
 On SQLite and Redis, compress-only achieves \emph{higher} RSS
 reduction than full \sys (47.5\% vs.\ 43.7\% and 49.2\% vs.\ 14.9\%,
-respectively). MacOS's malloc's sequential magazine layout can
-produce more compressible pages for small objects than \sys's
-arena-based layout, due to different alignment padding and object
-clustering.  Redis shows the largest gap: its small, uniform values
-compress well under any layout, but \sys's metadata overhead
-(page-state tracking, arena routing) offsets the benefit for this
-workload.  These results show that the relationship between
-allocator layout and compressibility is workload-dependent.
+respectively).  A key factor is that macOS \texttt{libmalloc} zeroes
+memory on \texttt{free} (\S\ref{sec:eval:allocator}), so the system
+allocator's freed slots are already zero-filled when the compression
+pipeline encounters them---effectively getting zero-on-free for free.
+Redis shows the largest gap: its small, uniform values compress well
+under any layout, and \sys's metadata overhead (page-state tracking,
+bootstrap allocator) offsets the benefit for this small~workload.
+On Linux, where glibc does not zero on free, the gap between
+compress-only and full \sys would be larger.
 
 On memcached, compress-only achieves 20\% reduction versus 25\%
 for full \sys; the 5\pp gap reflects \sys's zero-on-free

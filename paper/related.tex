@@ -7,8 +7,8 @@ keeping them resident and swapping to disk.  macOS compresses inactive
 pages using WKdm~\cite{wilson1999case,apple2013compressed}, a
 word-granularity dictionary compressor designed for 4\,KiB
 pointer-heavy pages\punt{; on 16\,KiB ARM64 pages with text or serialized
-data, WKdm achieves poor ratios (98.9\% on JSON, 93.7\% on key-value
-records; Table~\ref{tab:algo_compare})}.  Linux
+data, WKdm achieves poor ratios (only 1.01$\times$ on JSON,
+1.07$\times$ on key-value records; Table~\ref{tab:algo_compare})}.  Linux
 zswap~\cite{jennings2013zswap} intercepts pages heading to swap and
 compresses them with LZ4, LZO, or zstd, operating per-page with no
 cross-page context and no knowledge of which bytes are live objects;

@@ -139,8 +139,8 @@ target_link_libraries(bench_sqlite PRIVATE sqlite3_static)
 # Helper to add allocator comparison benchmark variant
 function(smash_add_alloc_bench name alloc_define)
   smash_add_standalone_bench(${name} bench_allocator_compare.cpp)
-  target_compile_definitions(${name} PRIVATE ALLOC_NAME="${alloc_define}")
-  target_link_libraries(${name} PRIVATE lz4_static libzstd_static)
+  target_compile_definitions(${name} PRIVATE ALLOC_NAME="${alloc_define}" HAS_SQLITE)
+  target_link_libraries(${name} PRIVATE lz4_static libzstd_static sqlite3_static)
 endfunction()
 
 # Helper: allocator bench with ZERO_ON_FREE enabled (benchmark zeros before free)

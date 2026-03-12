@@ -118,8 +118,8 @@ Pages idle for at least 2~seconds are compressed with LZ4 at
 acceleration level~1; LZ4 compresses at $\sim$1\,GB/s and decompresses
 at $\sim$4--6\,GB/s, making it suitable for pages that may be accessed
 again soon.  Pages that remain cold for at least 1~minute are
-recompressed with zstd at level~9, which achieves 2--15\% better
-compression than LZ4 on structured data
+recompressed with zstd at level~9, which achieves 1.5--2$\times$
+higher compression ratios than LZ4 on structured data
 (Table~\ref{tab:algo_compare}) at 10$\times$ lower throughput;
 decompression speed is comparable across levels (1.2--1.8\,GB/s).  If
 a compressed page is accessed, it is decompressed and its cold count
@@ -129,9 +129,9 @@ recompressed only if it goes cold~again.
 \paragraph{Per-size-class skip statistics}
 Not all size classes compress well.  \sys maintains a 64-entry sliding
 window of compression ratios for each size class.  The window records
-the compression ratio (0--255, mapping to 0--100\%) of each attempted
-compression.  If the average ratio across at least 32 samples falls
-below 5\% space savings, \sys skips LZ4 compression attempts for that
+the compressed-to-original ratio (0--255, mapping to 0--100\%) of each
+attempted compression.  If the average indicates less than 5\% space
+savings, \sys skips LZ4 compression attempts for that
 size class.  The sliding window allows recovery: if the data pattern
 changes and new pages compress well, the old poor-ratio samples
 age~out.
@@ -147,7 +147,7 @@ by the slab until the thread cache drains a~batch.
 
 Partially-filled slab pages therefore contain a mix of live objects
 and freed slots.  Freed slots hold stale data from their previous
-occupants, which reduces compression ratios.  \sys zeros freed
+occupants, which lowers compression ratios.  \sys zeros freed
 slots \emph{lazily at compression time}, replacing stale data with
 zero runs that LZ4 and zstd compress efficiently.
 

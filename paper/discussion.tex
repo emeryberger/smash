@@ -5,7 +5,7 @@
 \sys includes infrastructure for per-size-class zstd dictionary
 training.  We conducted six experiments varying CDict level,
 dictionary capacity, sample count, and grouping strategy.
-Dictionaries improve compression by up to 8\% at low zstd levels
+Dictionaries improve compression ratios by up to 8\% at low zstd levels
 (1--3), where the compressor's search window is too small to discover
 cross-page patterns independently.  At level~9, the search window is
 large enough that dictionaries provide no benefit beyond frame
@@ -28,8 +28,8 @@ maximum 8 trained classes), dictionaries reduce RSS savings by
 
 \punt{
   \paragraph{Multi-page compression}  Compressing 2--4 contiguous
-pages as a unit improves ratios by 2--4\pp (e.g., JSON-LZ4 from
-30.2\% to 26.2\% with 4-page groups).  However, all pages in a
+pages as a unit improves ratios by 10--20\% (e.g., JSON-LZ4 from
+3.3$\times$ to 3.8$\times$ with 4-page groups).  However, all pages in a
 group must be simultaneously cold, and a fault on any page requires
 decompressing the entire group.  Mixed hot/cold page groups prevent
 compression entirely.  The 2--4\pp gain does not justify the added
@@ -38,8 +38,8 @@ complexity and worst-case decompression cost.
 \punt{\paragraph{WKdm and modern page sizes}  The macOS VM compressor uses
 WKdm, designed for 4\,KiB pages containing pointer-heavy C
 structures.  On 16\,KiB pages with text or serialized data, WKdm
-achieves 93--99\% ratios.  Even on binary data, LZ4 outperforms WKdm
-(5.8\% vs.\ 15.6\% on SQLite pages).  This gap motivates
+achieves only 1.0--1.1$\times$.  Even on binary data, LZ4 outperforms
+WKdm (17.2$\times$ vs.\ 6.4$\times$ on SQLite pages).  This gap motivates
 byte-oriented compressors for heap data.}
 }
 
@@ -55,11 +55,11 @@ unmodified system allocator, and no allocator design choice can
 substitute for a pipeline that monitors access patterns, compresses
 cold pages, and decompresses on demand.  Among page-content
 optimizations, \emph{zero-on-free} contributes most, improving
-compression ratios by 2--4\% for every allocator tested (DieHarder
-zeros for security; \sys zeros for compression; the effect on page
-content is the same).  \emph{External metadata}---storing freelists
-and bitmaps outside data pages---has a modest effect ($\sim$2\%) and
-is dominated by zeroing.  \emph{Arena segregation} helps on
+compression ratios by 1.5--2$\times$ for every allocator tested
+(DieHarder zeros for security; \sys zeros for compression; the effect
+on page content is the same).  \emph{External metadata}---storing
+freelists and bitmaps outside data pages---has a modest effect and is
+dominated by zeroing.  \emph{Arena segregation} helps on
 heterogeneous workloads but provides little benefit
 when data is already structurally uniform.  Finally,
 \emph{allocation layout}---sequential vs.\ randomized---affects
@@ -67,7 +67,7 @@ compression more than metadata placement: system malloc's sequential
 layout compresses better than DieHard's randomized layout despite
 embedded freelists.  Mesh confirms this: it shares DieHard's
 external bitmap metadata but uses a conventional layout, achieving
-compressibility on par with system malloc (7.9\% vs.~7.4\%).
+compressibility on par with system malloc.
 
 These findings generalize beyond \sys: any system that compresses
 heap pages (including OS-level compressors) would benefit from

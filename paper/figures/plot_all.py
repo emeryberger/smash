@@ -63,16 +63,17 @@ def fig_rss_reduction():
 
 
 def fig_algo_compare():
-    """Figure 2: Compression ratio comparison across algorithms."""
+    """Figure 2: Compression ratio comparison across algorithms.
+    Compression ratio = original / compressed (higher = better)."""
     algos = ['LZ4', 'zstd-1', 'zstd-3', 'zstd-9']
     apps = ['SQLite', 'RocksDB', 'Memcached', 'Redis', 'DuckDB']
 
-    # Average compression ratio (%) from real application heap page sampling
+    # Compression ratio (original/compressed, ×) from real application heap page sampling
     ratios = {
-        'LZ4':    [8.1,  11.6, 21.3, 15.9, 48.6],
-        'zstd-1': [4.9,  6.5,  11.4, 8.5,  35.7],
-        'zstd-3': [4.9,  6.4,  10.8, 8.4,  34.9],
-        'zstd-9': [4.8,  6.0,  10.8, 7.9,  33.4],
+        'LZ4':    [100/8.1,  100/11.6, 100/21.3, 100/15.9, 100/48.6],
+        'zstd-1': [100/4.9,  100/6.5,  100/11.4, 100/8.5,  100/35.7],
+        'zstd-3': [100/4.9,  100/6.4,  100/10.8, 100/8.4,  100/34.9],
+        'zstd-9': [100/4.8,  100/6.0,  100/10.8, 100/7.9,  100/33.4],
     }
 
     fig, ax = plt.subplots(figsize=(4.5, 2.8))
@@ -83,15 +84,15 @@ def fig_algo_compare():
     algo_colors = [COLORS[0], COLORS[1], COLORS[2], COLORS[3]]
 
     for i, algo in enumerate(algos):
-        bars = ax.bar(x + offsets[i]*width, ratios[algo], width,
-                      label=algo, color=algo_colors[i], edgecolor='white',
-                      linewidth=0.3, zorder=3)
+        ax.bar(x + offsets[i]*width, ratios[algo], width,
+               label=algo, color=algo_colors[i], edgecolor='white',
+               linewidth=0.3, zorder=3)
 
-    ax.set_ylabel('Compression Ratio (%)\n(lower = better)')
+    ax.set_ylabel('Compression Ratio\n(higher = better)')
     ax.set_xticks(x)
     ax.set_xticklabels(apps)
     ax.set_yscale('log')
-    ax.set_ylim(0.5, 200)
+    ax.set_ylim(1, 30)
     ax.legend(ncol=5, loc='upper center', frameon=True, framealpha=0.9,
               bbox_to_anchor=(0.5, 1.12), fontsize=8)
     ax.yaxis.grid(True, alpha=0.3)
@@ -226,12 +227,12 @@ def fig_ablation():
 
 
 def fig_multipage():
-    """Figure 6: Multi-page compression ratios."""
+    """Figure 6: Multi-page compression ratios (original/compressed)."""
     groups = ['1x16K', '2x16K', '4x16K']
 
     data = {
-        'SQLite-LZ4':    [5.8,  5.3,  5.0],
-        'SQLite-zstd-9': [4.0,  3.4,  3.0],
+        'SQLite-LZ4':    [100/5.8,  100/5.3,  100/5.0],
+        'SQLite-zstd-9': [100/4.0,  100/3.4,  100/3.0],
     }
 
     fig, ax = plt.subplots(figsize=(4.5, 2.8))
@@ -246,13 +247,13 @@ def fig_multipage():
                 linestyle=line_styles[i], linewidth=1.5, markersize=5,
                 label=label, zorder=3)
 
-    ax.set_ylabel('Compression Ratio (%)\n(lower = better)')
+    ax.set_ylabel('Compression Ratio\n(higher = better)')
     ax.set_title('Multi-Page Compression')
     ax.set_xticks(x)
     ax.set_xticklabels(groups)
     ax.set_xlabel('Pages per compression unit')
     ax.legend(ncol=2, fontsize=8, frameon=True, framealpha=0.9,
-              loc='upper right')
+              loc='lower right')
     ax.yaxis.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
     sns.despine(left=False, bottom=False)
@@ -268,75 +269,50 @@ def fig_state_machine():
 
 
 def fig_allocator_compare():
-    """Figure: Page compression ratios across allocator substrates.
-    Data from bench_allocator_compare.cpp, avg across sizes 64-512B, zstd-9.
-    Two panels: base allocators (left) and +zero variants (right)."""
-    # Panel 1: Base allocators
-    base_allocs = ['System', 'mimalloc', 'jemalloc', 'tcmalloc', 'Hoard', 'Mesh', 'DieHard']
-    # Panel 2: With zeroing  (+DieHarder which has built-in zeroing, +Smash)
-    zero_allocs = ['System+z', 'mimalloc+z', 'jemalloc+z', 'tcmalloc+z',
-                   'Mesh+z', 'DieHard+z', 'DieHarder', 'Smash']
+    """Figure: Compression ratios (original/compressed) across allocator substrates.
+    Data from bench_allocator_compare.cpp with real application workloads, zstd-9.
+    Single graph; dagger marks allocators that zero freed memory."""
+    # Allocators in order; dagger for those that zero on free
+    allocs = ['System\u2020', 'mimalloc', 'jemalloc', 'tcmalloc',
+              'Hoard', 'Mesh', 'DieHard', 'DieHarder\u2020', 'Smash\u2020']
 
-    data_types = ['JSON', 'KV', 'Struct', 'Mixed']
+    apps = ['SQLite', 'Memcached', 'Redis', 'DuckDB']
 
-    # Real measured data: avg zstd-9 ratio across obj sizes 64/128/256/512
-    base_ratios = {
-        'JSON':   [0.039, 0.039, 0.028, 0.038, 0.040, 0.039, 0.049],
-        'KV':     [0.096, 0.113, 0.120, 0.113, 0.115, 0.097, 0.123],
-        'Struct': [0.082, 0.108, 0.118, 0.109, 0.109, 0.082, 0.110],
-        'Mixed':  [0.077, 0.121, 0.120, 0.121, 0.122, 0.096, 0.122],
-    }
-    zero_ratios = {
-        'JSON':   [0.039, 0.028, 0.020, 0.028, 0.039, 0.031, 0.031, 0.026],
-        'KV':     [0.096, 0.085, 0.083, 0.085, 0.096, 0.077, 0.077, 0.092],
-        'Struct': [0.082, 0.071, 0.064, 0.071, 0.082, 0.061, 0.061, 0.075],
-        'Mixed':  [0.075, 0.085, 0.079, 0.085, 0.076, 0.076, 0.076, 0.090],
+    # Real measured data: compression ratio = 1/ratio (original/compressed)
+    # SQLite: 50K rows, no frees; others: 100K objects, 256B, 50% freed
+    # System zeroes on macOS; DieHarder zeroes for security; Smash defers to compress time
+    ratios = {
+        'SQLite':    [1/0.041, 1/0.041, 1/0.043, 1/0.043, 1/0.029, 1/0.041, 1/0.025, 1/0.024, 1/0.025],
+        'Memcached': [1/0.054, 1/0.074, 1/0.071, 1/0.074, 1/0.074, 1/0.055, 1/0.086, 1/0.051, 1/0.071],
+        'Redis':     [1/0.030, 1/0.030, 1/0.024, 1/0.030, 1/0.030, 1/0.030, 1/0.032, 1/0.024, 1/0.024],
+        'DuckDB':    [1/0.352, 1/0.682, 1/0.686, 1/0.685, 1/0.685, 1/0.352, 1/0.642, 1/0.313, 1/0.681],
     }
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.0, 3.5),
-                                    gridspec_kw={'width_ratios': [7, 8]})
+    fig, ax = plt.subplots(1, 1, figsize=(7.0, 3.5))
 
-    dt_colors = [COLORS[0], COLORS[1], COLORS[2], COLORS[3]]
+    app_colors = [COLORS[0], COLORS[1], COLORS[2], COLORS[3]]
     width = 0.18
 
-    # Panel 1: Base allocators
-    x1 = np.arange(len(base_allocs))
-    offsets = np.arange(len(data_types)) - len(data_types)/2 + 0.5
-    for i, dt in enumerate(data_types):
-        ax1.bar(x1 + offsets[i]*width, base_ratios[dt], width,
-                label=dt, color=dt_colors[i], edgecolor='white',
-                linewidth=0.3, zorder=3)
-    ax1.set_ylabel('Compression Ratio (zstd-9)\n(lower = better)', fontsize=10)
-    ax1.set_xticks(x1)
-    ax1.set_xticklabels(base_allocs, fontsize=9, rotation=25, ha='right')
-    ax1.set_ylim(0, 0.15)
-    ax1.set_title('Base allocators', fontsize=11)
-    ax1.yaxis.grid(True, alpha=0.3)
-    ax1.set_axisbelow(True)
-    ax1.tick_params(axis='y', labelsize=9)
+    x = np.arange(len(allocs))
+    offsets = np.arange(len(apps)) - len(apps)/2 + 0.5
+    for i, app in enumerate(apps):
+        ax.bar(x + offsets[i]*width, ratios[app], width,
+               label=app, color=app_colors[i], edgecolor='white',
+               linewidth=0.3, zorder=3)
 
-    # Panel 2: +zero variants
-    x2 = np.arange(len(zero_allocs))
-    for i, dt in enumerate(data_types):
-        ax2.bar(x2 + offsets[i]*width, zero_ratios[dt], width,
-                color=dt_colors[i], edgecolor='white',
-                linewidth=0.3, zorder=3)
-    ax2.set_xticks(x2)
-    ax2.set_xticklabels(zero_allocs, fontsize=9, rotation=25, ha='right')
-    ax2.set_ylim(0, 0.15)
-    ax2.set_title('With zero-on-free', fontsize=11)
-    ax2.yaxis.grid(True, alpha=0.3)
-    ax2.set_axisbelow(True)
-    ax2.tick_params(axis='y', labelsize=9)
+    ax.set_ylabel('Compression Ratio (zstd-9)\n(higher = better)', fontsize=10)
+    ax.set_xticks(x)
+    ax.set_xticklabels(allocs, fontsize=9, rotation=25, ha='right')
+    ax.set_yscale('log')
+    ax.set_ylim(1, 50)
+    ax.yaxis.grid(True, alpha=0.3)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis='y', labelsize=9)
 
-    # Shared legend
-    fig.legend(data_types, ncol=4, loc='upper center', frameon=True,
-               framealpha=0.9, bbox_to_anchor=(0.5, 1.05), fontsize=9)
+    ax.legend(apps, ncol=4, loc='upper left', frameon=True,
+              framealpha=0.9, fontsize=9)
 
-    fig.suptitle('Page Compressibility Across Allocators', fontsize=12, y=1.10)
-
-    for ax in (ax1, ax2):
-        sns.despine(ax=ax, left=False, bottom=False)
+    sns.despine(ax=ax, left=False, bottom=False)
 
     fig.tight_layout()
     fig.savefig(os.path.join(OUTDIR, 'allocator_compare.pdf'))

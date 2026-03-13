@@ -120,7 +120,7 @@ at $\sim$4--6\,GB/s, making it suitable for pages that may be accessed
 again soon.  Pages that remain cold for at least 1~minute are
 recompressed with zstd at level~9, which achieves 1.5--2$\times$
 higher compression ratios than LZ4 on structured data
-(Table~\ref{tab:algo_compare}) at 10$\times$ lower throughput;
+(Figure~\ref{fig:algo_compare}) at 10$\times$ lower throughput;
 decompression speed is comparable across levels (1.2--1.8\,GB/s).  If
 a compressed page is accessed, it is decompressed and its cold count
 resets to zero---analogous to a JIT deoptimization.  The page will be

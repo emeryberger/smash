@@ -37,22 +37,25 @@ more promptly after data goes~cold.
 We evaluate \sys's RSS reduction, throughput overhead, and
 cold-access latency on five real applications spanning key-value
 stores, relational databases, and columnar analytics.
-Table~\ref{tab:apps} summarizes the results.
+Table~\ref{tab:apps_summary} summarizes the results.
 
 \begin{table}[t]
-\caption{\textbf{\sys reduces RSS by 17--80\% with negligible throughput cost}
-  (\S\ref{sec:eval:apps}).  Serve-phase RSS reduction.}
-\label{tab:apps}
+\caption{\textbf{\sys reduces RSS by 17--80\%; compression drives savings}
+  (\S\ref{sec:eval:apps}).  Post-cooling RSS (MiB) across allocators;
+  throughput change and cold-access latency for \sys.}
+\label{tab:apps_summary}
 \centering\small
-\begin{tabular}{lrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-Application & RSS Reduction & Throughput & Cold p50 \\
+ & \multicolumn{3}{c}{RSS (MiB)} & Tput & Cold \\
+\cmidrule(lr){2-4}
+Application & Sys & Mesh & \sys & $\Delta$ & p50 \\
 \midrule
-RocksDB         & \textbf{80.0\%}  & +2\%       & \textbf{0.8}\,$\mu$s \\
-SQLite          & 43.8\%  & $-$0.4\%   & 0.9\,$\mu$s \\
-DuckDB          & 31.6\%  & \textbf{0\%}        & --- \\
-Memcached       & 25.0\%  & \textbf{0\%}        & --- \\
-Redis           & 17.0\%  & \textbf{0\%}        & --- \\
+RocksDB   & 434  & 281  & \textbf{56}  & +2\%     & 0.8\,$\mu$s \\
+SQLite    & 424  & 429  & \textbf{239} & $-$0.4\% & 0.9\,$\mu$s \\
+DuckDB    & 1322 & 772  & \textbf{915} & 0\%      & --- \\
+Memcached & 240  & 241  & \textbf{175} & 0\%      & --- \\
+Redis     & 55   & 59   & \textbf{47}  & 0\%      & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -107,15 +110,6 @@ vs.\ 498 GET/s on the hot set).  Cold-key re-access is 54\% faster
 (828K vs.\ 536K GET/s) because \sys prefetches adjacent pages on
 fault.
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/memcached.pdf}
-\caption{\textbf{Memcached RSS drops 25\% during serve as idle
-  data compresses} (\S\ref{sec:eval:apps}).  Fill-phase RSS is
-  higher due to metadata overhead.}
-\label{fig:memcached}
-\end{figure}
-
 Fill-phase RSS is 11\% higher (260 vs.\ 233\,MiB) due to the
 bootstrap allocator, page state arrays, and compression contexts.
 This fixed overhead is amortized as the working set~grows.
@@ -148,7 +142,7 @@ storage~hierarchy.
 To confirm that compression, not allocator choice, drives the
 RSS reduction, we run all five benchmarks with
 Mesh~\cite{powers2019mesh} as a representative alternative allocator
-(Table~\ref{tab:multi_alloc_apps}).  Mesh uses external metadata and virtual-memory
+(Table~\ref{tab:apps_summary}).  Mesh uses external metadata and virtual-memory
 remapping to compact partially-filled pages.
 On RocksDB, Mesh reduces RSS 35\% below system malloc (281 vs.\
 434\,MiB) through meshing, and on DuckDB by 42\% (772 vs.\
@@ -161,23 +155,7 @@ occupancy, and these workloads keep most pages fully occupied.
 Without a compression pipeline, even Mesh's aggressive page
 remapping cannot reclaim space from pages with live~objects.
 
-\begin{table}[t]
-\caption{\textbf{Only \sys reduces RSS below fill level}
-  (\S\ref{sec:eval:apps}).  Post-cooling RSS (MiB) across all five
-  applications.}
-\label{tab:multi_alloc_apps}
-\centering\small
-\begin{tabular}{lrrrrr}
-\toprule
-Allocator & SQLite & RocksDB & DuckDB & Redis & Memcached \\
-\midrule
-System  & 424   & 434   & 1322  & 55   & 240 \\
-Mesh    & 429   & 281   & 772   & 59   & 241 \\
-\sys    & \textbf{239} & \textbf{56} & \textbf{915} & \textbf{47} & \textbf{175} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
+\punt{
 \paragraph{Mesh-paper Redis workload}
 Powers et al.~\cite{powers2019mesh} report that Mesh reduces Redis
 RSS by 39\% on a workload designed to induce fragmentation: 700K
@@ -222,6 +200,7 @@ $\sim$1.9$\times$ ratio reflects fixed per-object metadata overhead
 holes.  \sys's own metadata (page-state tracking, bootstrap
 allocator) adds $\sim$15\,MiB, slightly increasing RSS on this
 fully-active dataset.
+}
 
 \paragraph{Summary}
 \sys reduces RSS by 17--80\% across five applications with
@@ -239,7 +218,7 @@ fragmentation.
 To understand which compression algorithms are best suited to heap
 page data, we compare LZ4 and zstd at several levels on 16\,KiB
 pages captured from the five application heaps.
-Table~\ref{tab:algo_compare} presents compression ratios and
+Figure~\ref{fig:algo_compare} presents compression ratios and
 Table~\ref{tab:algo_throughput} presents throughput.  \punt{WKdm, the macOS VM compressor, achieves only 1.0--1.1$\times$
 on text data because its 32-bit word-granularity dictionary cannot
 match byte-level patterns.  It performs adequately on binary data
@@ -249,25 +228,6 @@ DuckDB's columnar data is less compressible (2.1$\times$ with LZ4)
 because its internal representation already packs values densely.
 zstd-9 achieves the best
 ratios (3.0--20.8$\times$) at lower~throughput.
-
-\begin{table}[t]
-\caption{\textbf{LZ4 and zstd compress real application heap pages well}
-  (\S\ref{sec:eval:algo}).  Compression ratio =
-  original\,/\,compressed (higher is better) on 16\,KiB heap pages
-  sampled from each application.}
-\label{tab:algo_compare}
-\centering\small
-\begin{tabular}{lrrrrr}
-\toprule
-Algorithm & SQLite & RocksDB & Memcached & Redis & DuckDB \\
-\midrule
-LZ4    & 12.3$\times$  & 8.6$\times$ & 4.7$\times$ & 6.3$\times$  & 2.1$\times$ \\
-zstd-1 & 20.4$\times$  & 15.4$\times$ & 8.8$\times$ & 11.8$\times$ & 2.8$\times$ \\
-zstd-3 & 20.4$\times$  & 15.6$\times$ & 9.3$\times$ & 11.9$\times$ & 2.9$\times$ \\
-zstd-9 & \textbf{20.8$\times$} & \textbf{16.7$\times$} & \textbf{9.3$\times$} & \textbf{12.7$\times$} & \textbf{3.0$\times$} \\
-\bottomrule
-\end{tabular}
-\end{table}
 
 \begin{table}[t]
 \caption{\textbf{LZ4 provides the best throughput--ratio trade-off}
@@ -303,7 +263,7 @@ zstd-9 & 90   & 731  & 1437  & 1823 \\
 \includegraphics[width=\columnwidth]{figures/algo_compare.pdf}
 \caption{\textbf{LZ4 and zstd achieve 5--21$\times$ compression on
   most application heap pages; DuckDB's columnar data is less compressible}
-  (\S\ref{sec:eval:algo}).  Log scale; higher is better.}
+  (\S\ref{sec:eval:algo}).  Higher is better.}
 \label{fig:algo_compare}
 \end{figure}
 
@@ -324,52 +284,21 @@ We run each configuration across all five applications, each with 3
 runs.  Ablation requires rebuilding \sys with different compile-time
 constants; external-process benchmarks (memcached, Redis) are run
 via dyld library interposition against each rebuilt library.
-Table~\ref{tab:ablation} shows the~results.
-
-\begin{table*}[t]
-\caption{\textbf{Dictionaries hurt; compression is the dominant
-  mechanism} (\S\ref{sec:eval:ablation}).  Default row: RSS
-  reduction (\%); other rows: change in percentage points
-  ($\Delta$\,\pp) from default.}
-\label{tab:ablation}
-\centering\small
-\begin{tabular}{llrrrrr}
-\toprule
- & Configuration & SQLite & RocksDB & Memcached & Redis & Avg.\ $\Delta$ \\
-\midrule
-    & \textbf{Default}  & \textbf{43.8\%}  & \textbf{80.0\%}  & \textbf{25.0\%} & \textbf{17.0\%} & --- \\
-    & System malloc      & $-$17.6 & $-$80.3 & $-$42.3 & $-$42.3 & $-$45.6 \\
-\midrule
-    & With dicts         & $-$5.1  & $-$7.7  & $-$24.5 & $-$30.2 & $-$16.9 \\
-    & No arenas          & 0.0     & $-$0.6  & $-$0.1  & $-$0.2  & $-$0.2 \\
-    & LZ4 only           & 0.0     & $-$1.2  & 0.0     & $-$0.1  & $-$0.3 \\
-    & No zero-deferred   & 0.0     & $-$1.5  & 0.0     & $-$0.2  & $-$0.4 \\
-    & No prefetch        & 0.0     & $-$1.1  & 0.0     & +0.1    & $-$0.3 \\
-    & Single worker      & 0.0     & $-$0.9  & +0.2    & +0.1    & $-$0.2 \\
-    & No compression     & $-$20.3 & $-$80.3 & $-$40.0 & $-$42.3 & $-$45.7 \\
-\bottomrule
-\end{tabular}
-\end{table*}
+Figure~\ref{fig:ablation} shows the~results.
 
 The most striking result is that enabling dictionaries
 \emph{reduces} RSS savings by 5--30\,\pp across all benchmarks.
 CDict objects consume 686\,KiB each at level~9, and at that
 compression level, zstd's search window already captures the
-patterns a dictionary would provide.  The dictionary adds only
-frame overhead ($\sim$13 bytes) without improving ratios.  The
-effect is worst on memcached ($-$24.5\,\pp) and Redis ($-$30.2\,\pp),
-where the CDict memory overhead exceeds the small compressed-data
-savings.  \sys therefore disables dictionaries by
-default. % ~(\S\ref{sec:discussion}).
+patterns a dictionary would provide.  \sys therefore disables
+dictionaries by default.
 
 Disabling compression entirely ($-$45.7\,\pp average) confirms that
 compression is the dominant mechanism; without it, \sys reduces to
 a standard allocator with no RSS benefit beyond what the allocator
 design alone provides.  The remaining optimizations---arenas, LZ4-only
 mode, deferred zeroing, prefetch, and parallelism---each contribute
-less than 1.5\,\pp individually.  RocksDB shows the largest marginal
-effects (1--2\,\pp) because its 16\,KiB block cache entries span
-entire pages, making per-page optimizations more visible.
+less than 1.5\,\pp individually.
 
 \begin{figure}[t]
 \centering
@@ -447,91 +376,33 @@ DieHarder     & \ding{51} & \ding{51} &  \\
 \label{fig:allocator_compare}
 \end{figure*}
 
-Table~\ref{tab:allocator_compare} presents the compression ratios.
+Figure~\ref{fig:allocator_compare} presents the compression ratios.
 The results yield three observations.
 
 First, zero-on-free is the dominant factor for page compressibility,
-and its effect is workload-dependent.  On DuckDB's columnar integer
-arrays---where freed slots contain stale numeric data with no
-byte-level redundancy---allocators that do not zero achieve only
-1.5$\times$ compression (essentially incompressible by LZ4), while
-allocators that zero achieve 2.8--3.2$\times$.  On text-heavy
-workloads (memcached, Redis) the effect is smaller because the data
-itself contains compressible patterns that dominate the freed-slot
-noise.  Adding explicit zeroing before \texttt{free} improves every
-allocator, confirming the effect is causal: DieHard+zero matches
-DieHarder exactly, confirming that DieHarder's advantage comes
-entirely from its security zeroing.
+and its effect is workload-dependent.  Adding explicit zeroing before
+\texttt{free} improves every allocator, confirming the effect is
+causal.
 
 Second, macOS \texttt{libmalloc} zeroes freed memory as an
 implementation detail (to support fast \texttt{calloc} via
-pre-zeroed free lists).  We verified this by reading memory
-immediately after \texttt{free}: 100\% of bytes are zeroed across
-all tested sizes (32--4096\,B).  This behavior is
-platform-specific---Linux glibc does not zero on free---and represents
-a hidden confound when benchmarking allocators on macOS.
-On workloads with frees, system malloc (18.5$\times$ on memcached,
-2.8$\times$ on DuckDB) outperforms allocators that leave stale data in
-freed slots (mimalloc: 13.5$\times$, 1.5$\times$).
+pre-zeroed free lists), giving it an inherent advantage that other
+allocators lack.  This behavior is platform-specific---Linux glibc
+does not zero on free---and represents a hidden confound when
+benchmarking allocators on macOS.
 
 Third, when frees are absent, allocator choice barely matters.
-On SQLite (no frees), all allocators achieve 23--42$\times$
-compression because every byte on the page is live, structured data.
-The minor variation reflects differences in alignment padding and page
-utilization, not metadata placement or zeroing~policy.
-
-\begin{table}[t]
-\caption{\textbf{Zero-on-free matters most on data with low
-  byte-level redundancy (DuckDB); text-heavy workloads compress
-  well regardless}
-  (\S\ref{sec:eval:allocator}).  Compression ratio =
-  original\,/\,compressed (higher is better) with zstd-9.
-  $\dagger$Already zeroes on macOS.}
-\label{tab:allocator_compare}
-\centering\small
-\begin{tabular}{lrrrr}
-\toprule
-Allocator & SQLite & Memcached & Redis & DuckDB \\
-\midrule
-\multicolumn{5}{l}{\textit{Base allocators}} \\
-System malloc$^\dagger$ & 24.4$\times$ & \textbf{18.5$\times$} & 33.3$\times$ & \textbf{2.8$\times$} \\
-mimalloc      & 24.4$\times$ & 13.5$\times$ & 33.3$\times$ & 1.5$\times$ \\
-jemalloc      & 23.3$\times$ & 14.1$\times$ & \textbf{41.7$\times$} & 1.5$\times$ \\
-tcmalloc      & 23.3$\times$ & 13.5$\times$ & 33.3$\times$ & 1.5$\times$ \\
-Hoard         & \textbf{34.5$\times$} & 13.5$\times$ & 33.3$\times$ & 1.5$\times$ \\
-Mesh$^\dagger$ & 24.4$\times$ & 18.2$\times$ & 33.3$\times$ & 2.8$\times$ \\
-DieHard       & 40.0$\times$ & 11.6$\times$ & 31.3$\times$ & 1.6$\times$ \\
-DieHarder     & \textbf{41.7$\times$} & \textbf{19.6$\times$} & \textbf{41.7$\times$} & \textbf{3.2$\times$} \\
-\midrule
-\multicolumn{5}{l}{\textit{With explicit zero-on-free}} \\
-mimalloc+zero & 24.4$\times$ & 21.3$\times$ & 41.7$\times$ & 2.9$\times$ \\
-jemalloc+zero & 23.3$\times$ & \textbf{23.8$\times$} & \textbf{55.6$\times$} & \textbf{3.0$\times$} \\
-tcmalloc+zero & 23.3$\times$ & 20.8$\times$ & 43.5$\times$ & 2.9$\times$ \\
-Hoard+zero    & \textbf{34.5$\times$} & 20.8$\times$ & 41.7$\times$ & 2.9$\times$ \\
-DieHard+zero  & 40.0$\times$ & 19.6$\times$ & 41.7$\times$ & 3.2$\times$ \\
-\sys          & \textbf{40.0$\times$} & 14.1$\times$ & 41.7$\times$ & 1.5$\times$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Note that \sys appears in the ``with zeroing'' section because
-it defers zeroing to compression time (\S\ref{sec:design:zero});
-in this static benchmark, the compressor is not running, so freed
-slots retain stale data.  In production, the compressor zeros freed
-slots in a scratch buffer immediately before compression, achieving
-ratios comparable to the +zero~rows.
+All allocators achieve similar compression because every byte on the
+page is live, structured data.
 
 \paragraph{Summary}
 Zero-on-free is the single most important allocator design choice
-for compressibility.  Its effect ranges from dramatic on data with
-low byte-level redundancy (DuckDB: 1.5$\times$$\to$2.9$\times$)
-to modest on text-heavy data (memcached:
-13.5$\times$$\to$21$\times$).  macOS system malloc zeroes on free as
-a platform-specific implementation detail, giving it an inherent
-advantage that other allocators lack.  When no frees occur (SQLite),
-allocator choice is irrelevant.  These results motivate \sys's
-deferred zero-on-free: it captures the compressibility benefit without
-adding latency to the \texttt{free}~path.
+for compressibility, with dramatic effects on data with low
+byte-level redundancy and modest effects on text-heavy data.
+When no frees occur, allocator choice is irrelevant.
+These results motivate \sys's deferred zero-on-free: it captures the
+compressibility benefit without adding latency to the
+\texttt{free}~path.
 
 \subsection{Pipeline vs.\ Allocator Design (RQ5)}
 \label{sec:eval:pipeline}

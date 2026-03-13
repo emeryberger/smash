@@ -91,8 +91,7 @@ def fig_algo_compare():
     ax.set_ylabel('Compression Ratio\n(higher = better)')
     ax.set_xticks(x)
     ax.set_xticklabels(apps)
-    ax.set_yscale('log')
-    ax.set_ylim(1, 30)
+    ax.set_ylim(0, 22)
     ax.legend(ncol=5, loc='upper center', frameon=True, framealpha=0.9,
               bbox_to_anchor=(0.5, 1.12), fontsize=8)
     ax.yaxis.grid(True, alpha=0.3)

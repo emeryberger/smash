@@ -13,6 +13,7 @@
 #include "smash/config.h"
 #include "compress_store.h"
 #include "compress_engine.h"
+#include "compression_roi.h"
 #include "../vm/vm_region.h"
 #include "../vm/page_state.h"
 #include "../vm/platform_mem.h"
@@ -111,14 +112,6 @@ class CompressorThread {
             head = static_cast<uint8_t>((head + 1) % kWindow);
         }
 
-        bool shouldSkip() const {
-#ifdef SMASH_ABLATION_NO_SKIP_STATS
-            return false;
-#else
-            return count >= kWindow / 2 &&
-                   sum < static_cast<uint16_t>(count) * 13;  // 13/255 ≈ 5%
-#endif
-        }
     };
 
     // ── Per-worker compression state ──────────────────────────────────────
@@ -288,22 +281,6 @@ class CompressorThread {
         }
     }
 
-    CompressAlgo selectAlgorithm(size_t page_idx) {
-        uint8_t cold = cold_count_[page_idx];
-        if (cold >= kVeryColdTicks) {
-            uint8_t sc = lookupSizeClass(page_idx);
-            if (engine_->hasDictionary(sc))
-                return CompressAlgo::ZSTD_DICT;
-            return CompressAlgo::ZSTD;
-        }
-        return CompressAlgo::LZ4;
-    }
-
-    int effectiveZstdLevel(size_t page_idx) {
-        return (cold_count_[page_idx] >= kVeryColdTicks)
-            ? kZstdDeepLevel : kZstdNormalLevel;
-    }
-
     // ── Chunk bitmap management ───────────────────────────────────────────
 
     void rebuildChunkBitmap(size_t committed) {
@@ -367,8 +344,9 @@ class CompressorThread {
 
     // Phase 2: Compress cold pages
     void phase2Range(int worker_id, size_t start, size_t end) {
+        uint32_t floor = ROIConfig::instance().cold_ticks_floor;
         forEachLivePage(start, end, [&](size_t i) {
-            if (cold_count_[i] < kColdTicks) return;
+            if (cold_count_[i] < floor) return;
             PageState st = states_->get(i);
             if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING)
                 return;
@@ -433,16 +411,20 @@ class CompressorThread {
         // Mark as compressing
         states_->set(page_idx, PageState::COMPRESSING);
 
-        // Adaptive skip: if recent attempts for this size class have poor ratios
-        CompressAlgo algo = selectAlgorithm(page_idx);
+        // ROI-based compression decision (replaces fixed shouldSkip + selectAlgorithm)
         uint8_t sc = lookupSizeClass(page_idx);
-        if (algo == CompressAlgo::LZ4 && sc < kNumClasses) {
-            if (worker.sc_stats[sc].shouldSkip()) {
-                states_->set(page_idx, PageState::ACTIVE);
-                locks_->unlock(page_idx);
-                return false;
-            }
+        uint8_t stats_count = (sc < kNumClasses) ? worker.sc_stats[sc].count : 0;
+        uint16_t stats_sum = (sc < kNumClasses) ? worker.sc_stats[sc].sum : 0;
+
+        if (!CompressionROI::shouldCompress(cold_count_[page_idx],
+                                             stats_count, stats_sum)) {
+            states_->set(page_idx, PageState::ACTIVE);
+            locks_->unlock(page_idx);
+            return false;
         }
+
+        CompressAlgo algo = CompressionROI::selectAlgorithm(
+            cold_count_[page_idx], stats_count, stats_sum, engine_, sc);
 
         // Make page read-only to get a consistent snapshot
         void* page_addr = vm_->pageAddress(page_idx);
@@ -468,7 +450,7 @@ class CompressorThread {
         // Collect sample for dictionary training (page data in worker's buf)
         collectDictSample(page_idx, sc, worker.page_buf);
 
-        int zstd_level = effectiveZstdLevel(page_idx);
+        int zstd_level = kZstdDeepLevel;
         size_t max_comp = CompressEngine::maxCompressedSizeAny(kPageSize);
         size_t comp_size = 0;
 
@@ -519,7 +501,7 @@ class CompressorThread {
                                         zstd_level, engine_);
         }
 
-        if (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * kMinCompressRatio)) {
+        if (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * ROIConfig::instance().min_compress_ratio)) {
             // Not worth compressing; record poor ratio and restore page
             if (sc < kNumClasses) worker.sc_stats[sc].record(comp_size ? comp_size : kPageSize, kPageSize);
             vm::protectPages(page_addr, kPageSize, true, true);
@@ -845,6 +827,9 @@ public:
             fault_slots_[i].buf = BootstrapAlloc::instance().allocate(kPageSize, kPageSize);
             fault_slots_[i].dctx = ZSTD_createDCtx_advanced(custom_mem);
         }
+
+        // Initialize ROI model (auto-calibrate throughput, read env vars)
+        ROIConfig::instance().init(engine_);
     }
 
     void setPreTickCallback(PreTickFn fn) { pre_tick_fn_ = fn; }

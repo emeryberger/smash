@@ -30,17 +30,16 @@ replaces it at load~time.
 Figure~\ref{fig:heap_org} shows the heap organization and key data
 structures; Figure~\ref{fig:arch} shows the page state machine.  The
 allocator manages heap pages through a virtual memory region (up to
-16\,GiB).  Each page transitions through six states:
+16\,GiB).  Each page transitions through five states:
 (1)~\textbf{EMPTY}: never allocated or returned to the OS;
 (2)~\textbf{ACTIVE}: contains live objects with full read/write
 access;
 (3)~\textbf{MONITORING}: marked read-only
 (\texttt{PROT\_READ}) to detect future writes;
 (4)~\textbf{COMPRESSING}: being compressed by a background worker;
-(5)~\textbf{COMPRESSED (LZ4)}: compressed with LZ4 after
-$\geq$2\,s idle, physical page decommitted; and
-(6)~\textbf{COMPRESSED (zstd)}: recompressed with zstd-9 after
-$\geq$1\,min idle for a higher compression ratio.
+and
+(5)~\textbf{COMPRESSED}: compressed with LZ4 or zstd (selected by
+ROI; \S\ref{sec:design:adaptive}), physical page decommitted.
 
 \input{fig_arch}
 
@@ -48,9 +47,9 @@ A background compressor thread wakes every second and executes three
 phases (Figure~\ref{fig:arch}).  \emph{Phase~1} updates per-page
 cold counts: for each active or monitored page, if the page was
 accessed since the last tick its cold count resets to zero; otherwise
-the count increments.  \emph{Phase~2} compresses pages whose cold
-count exceeds a threshold---LZ4 for recently cold pages, zstd for
-long-cold pages (\S\ref{sec:design:adaptive}).  \emph{Phase~3}
+the count increments.  \emph{Phase~2} compresses pages whose ROI exceeds a
+threshold, selecting LZ4 or zstd based on the cost--benefit
+model (\S\ref{sec:design:adaptive}).  \emph{Phase~3}
 marks all remaining ACTIVE pages read-only (\texttt{PROT\_READ}),
 transitioning them to MONITORING.  This is how \sys detects writes:
 when the application writes to a monitored page, a write fault fires,
@@ -87,20 +86,23 @@ four arenas (configurable as a power of two).  Each arena has
 independent slab free lists for all 36 size classes in a flat
 array indexed by arena and~class.
 
-On each \texttt{malloc} call, \sys selects an arena by hashing the
-return address:
+On each \texttt{malloc} call, \sys selects an arena using a
+stack hash inspired by LLAMA~\cite{maas2020adaptive}:
 
 \begin{lstlisting}
-uintptr_t h =
-    __builtin_return_address(0) ^
-    __builtin_return_address(1);
+uintptr_t ra = return_address(0);
+uintptr_t sh = frame_address(0);
+uintptr_t h = ra ^ (sh >> 4) ^ size_class;
 h ^= h >> 16;
 arena = h & (kNumArenas - 1);
 \end{lstlisting}
 
-XORing two stack depths ensures different arena routing even when
-allocations pass through a common wrapper function.  The hash maps
-each unique (caller, grandcaller) pair to a deterministic arena.
+The hash combines three signals: the return address identifies the
+immediate call site, the stack height (via the frame pointer)
+distinguishes calls through different wrapper chains that share the
+same immediate caller, and the size class adds object-type context.
+This avoids walking the stack beyond depth~0, which would require
+frame pointers and triggers compiler warnings.
 Allocations from the same call site consistently land in the same
 arena, producing structurally homogeneous page~content.
 
@@ -111,30 +113,96 @@ and reading the span's \texttt{arena\_id} field.  This prevents arena mixing at 
 \subsection{JIT Compression}
 \label{sec:design:adaptive}
 
-Just as a JIT compiler applies increasing levels of optimization to
-hot code, \sys applies increasing levels of compression to cold
-data.  A page progresses through two tiers as it remains unaccessed.
-Pages idle for at least 2~seconds are compressed with LZ4 at
-acceleration level~1; LZ4 compresses at $\sim$1\,GB/s and decompresses
-at $\sim$4--6\,GB/s, making it suitable for pages that may be accessed
-again soon.  Pages that remain cold for at least 1~minute are
-recompressed with zstd at level~9, which achieves 1.5--2$\times$
-higher compression ratios than LZ4 on structured data
-(Figure~\ref{fig:algo_compare}) at 10$\times$ lower throughput;
-decompression speed is comparable across levels (1.2--1.8\,GB/s).  If
-a compressed page is accessed, it is decompressed and its cold count
-resets to zero---analogous to a JIT deoptimization.  The page will be
-recompressed only if it goes cold~again.
+Just as a JIT compiler uses profiling data to decide which methods to
+optimize and at what level, \sys uses per-size-class compression
+statistics to decide \emph{whether} and \emph{how} to compress each
+cold page.  The decision is driven by a \emph{return-on-investment}
+(ROI) model that weighs the CPU cost of compression against the
+expected RSS savings.
 
-\paragraph{Per-size-class skip statistics}
+\paragraph{ROI model}
+For each candidate page, \sys estimates two quantities.  The
+\emph{cost} is the CPU time (in microseconds) to compress and later
+decompress the page, which depends on both the algorithm and the data:
+empirically, highly compressible data is cheaper to process, while
+poorly-compressible data is slower.  \sys models throughput as a
+linear function of the compression ratio, calibrated at startup by
+compressing synthetic test pages (all-zeros and pseudo-random) with
+each algorithm.  The \emph{benefit} is the RSS saved while the page remains
+compressed: $\mathit{PageSize} \times (1 - R) \times E[T_{\mathit{remain}}]$,
+where $R$ is the compressed-to-original ratio and
+$E[T_{\mathit{remain}}]$ is the expected remaining cold duration.
+Estimating $E[T_{\mathit{remain}}]$ requires a model of page idle
+times.  Empirical studies of production
+workloads~\cite{maas2020adaptive,amaro2023memory} show that page
+inter-access times are heavy-tailed: most pages are either
+frequently accessed or idle for long periods, with few in between.
+For any distribution whose hazard rate $h(t) = f(t)/\bar{F}(t)$ is
+non-increasing---a property called \emph{Decreasing Failure Rate}
+(DFR), which holds for all heavy-tailed families including
+Pareto, log-normal, and Weibull with shape~$< 1$---the expected
+remaining lifetime given survival to~$N$ satisfies
+$E[T - N \mid T > N] \geq E[T]$ and grows with~$N$.  For the
+Pareto distribution specifically,
+$E[T - N \mid T > N] = N/(\alpha - 1)$: the expected remaining
+cold time is \emph{proportional} to the observed cold time.
+\sys adopts this proportionality as a simple, conservative
+model:
+\[
+\mathit{ROI} = \frac{\mathit{PageSize} \times (1 - R) \times N}
+                     {\mathit{cost}_{\mathit{comp}} + \mathit{cost}_{\mathit{decomp}}}
+\]
+where $N$ is the cold count (ticks idle).  The model is
+conservative because we use the \emph{already-observed} cold
+duration~$N$ rather than a speculative future estimate, and
+the proportionality constant is absorbed into the tunable ROI
+threshold.  Because both cost terms increase with $R$ (worse
+ratio $\to$ slower throughput) and the savings $(1 - R)$
+decreases, the ROI is steeply sensitive to the compression
+ratio.  Well-compressing pages (low $R$) have low cost and high
+savings, so they are compressed early; poorly-compressing pages
+(high $R$) have high cost and low savings, so they require a long
+cold duration---or are skipped entirely.
+
+\paragraph{Algorithm selection}
+\sys maintains throughput profiles for LZ4 and zstd-9.  For each
+candidate page, it computes the ROI for every registered algorithm and
+selects whichever has the highest ROI above a configurable threshold.
+LZ4 compresses at $\sim$1\,GB/s and decompresses at
+$\sim$4--6\,GB/s; zstd-9 achieves 1.5--2$\times$ higher compression
+ratios (Figure~\ref{fig:algo_compare}) at 10$\times$ lower
+compression throughput, but comparable decompression speed
+(1.2--1.8\,GB/s).  Because zstd's higher compression cost requires
+more cold ticks to amortize, LZ4 dominates for recently-cold pages
+and zstd wins only for long-idle pages where the better ratio justifies
+the extra CPU.  This naturally reproduces tiered behavior without
+hard-coded time~thresholds.
+
+If a compressed page is accessed, it is decompressed and its cold
+count resets to zero---analogous to a JIT deoptimization.  The page
+will be recompressed only if it goes cold~again.
+
+\paragraph{Auto-calibration}
+At startup, \sys benchmarks LZ4 and zstd-9 on two synthetic pages
+(all-zeros and pseudo-random) to measure per-machine throughput,
+taking the median of 10 iterations per algorithm per page
+($\sim$1\,ms total).  The results populate the throughput profile
+table.  On subsequent runs, calibration results can be cached to a
+JSON file and reloaded, skipping recalibration.  Individual throughput
+values and the ROI threshold can also be overridden via environment
+variables, enabling tuning without recompilation.
+
+\paragraph{Per-size-class statistics}
 Not all size classes compress well.  \sys maintains a 64-entry sliding
-window of compression ratios for each size class.  The window records
-the compressed-to-original ratio (0--255, mapping to 0--100\%) of each
-attempted compression.  If the average indicates less than 5\% space
-savings, \sys skips LZ4 compression attempts for that
-size class.  The sliding window allows recovery: if the data pattern
-changes and new pages compress well, the old poor-ratio samples
-age~out.
+window of compression ratios for each size class and worker.  The
+window records the compressed-to-original ratio (0--255, mapping to
+0--100\%) of each attempted compression.  These statistics feed the
+ROI model: the average ratio from the sliding window serves as the
+estimate of $R$ for future pages of the same size class.
+With fewer than 8 samples, \sys falls back to optimistic compression
+(compress anything past the cold-tick floor).  The sliding window
+allows recovery: if data patterns change and new pages compress well,
+old poor-ratio samples age~out.
 
 \subsection{Lazy Free and Zero-on-Free}
 \label{sec:design:zero}

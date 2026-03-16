@@ -111,6 +111,9 @@ target_link_libraries(bench_json PRIVATE cjson_static)
 # Key-value store simulation (unordered_map with Zipfian access)
 smash_add_standalone_bench(bench_kv_store bench_kv_store.cpp)
 
+# Configurable cold/hot mix microbenchmark (raw malloc/free)
+smash_add_standalone_bench(bench_coldhotmix bench_coldhotmix.cpp)
+
 # ── SQLite amalgamation (for bench_sqlite) ─────────────────────────────────
 FetchContent_Declare(
   sqlite3

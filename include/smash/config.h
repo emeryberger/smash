@@ -44,6 +44,9 @@ inline constexpr size_t kPageMapL2Size = 1ULL << kPageMapL2Bits;
 inline constexpr int kPageMapL1Bits = kAddressBits - kPageShift - kPageMapL2Bits;
 inline constexpr size_t kPageMapL1Size = 1ULL << kPageMapL1Bits;
 
+// ── ROI model defaults (overridable via SMASH_ROI_THRESHOLD env var) ─────────
+inline constexpr int kRoiThresholdDefault = 1024;
+
 // ── Compression (Phase 3+) ───────────────────────────────────────────────────
 inline constexpr int kCompressIntervalMs = 1000;
 #ifndef SMASH_COLD_TICKS

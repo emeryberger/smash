@@ -35,8 +35,8 @@ ACCENT_COLOR = COLORS[3]     # red
 
 def fig_rss_reduction():
     """Figure 1: RSS reduction across applications (grouped bar chart)."""
-    apps = ['RocksDB', 'SQLite', 'DuckDB', 'Memcached', 'Redis']
-    smash_rss = [80.0, 43.8, 31.6, 25.0, 17.0]
+    apps = ['RocksDB', 'Redis', 'Redis-ext', 'SQLite', 'DuckDB', 'Memcached']
+    smash_rss = [87.1, 63.9, 64.5, 43.6, 30.8, 27.1]
 
     fig, ax = plt.subplots(figsize=(3.5, 2.2))
     x = np.arange(len(apps))

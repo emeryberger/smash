@@ -10,36 +10,37 @@ were merged into Table~\ref{tab:apps_summary}.
 \subsection{Application Benchmarks}
 
 \begin{table}[h]
-\caption{\textbf{\sys reduces RSS by 17--80\% with negligible throughput cost}
-  (\S\ref{sec:eval:apps}).  Serve-phase RSS reduction.}
+\caption{\textbf{\sys reduces RSS by 27--87\% with negligible throughput cost}
+  (\S\ref{sec:eval:apps}).  Cool-phase RSS reduction.}
 \label{tab:apps}
 \centering\small
 \begin{tabular}{lrrr}
 \toprule
 Application & RSS Reduction & Throughput & Cold p50 \\
 \midrule
-RocksDB         & \textbf{80.0\%}  & +2\%       & \textbf{0.8}\,$\mu$s \\
-SQLite          & 43.8\%  & $-$0.4\%   & 0.9\,$\mu$s \\
-DuckDB          & 31.6\%  & \textbf{0\%}        & --- \\
-Memcached       & 25.0\%  & \textbf{0\%}        & --- \\
-Redis           & 17.0\%  & \textbf{0\%}        & --- \\
+RocksDB         & \textbf{87.1\%}  & +2\%       & \textbf{0.8}\,$\mu$s \\
+Redis           & 63.9\%  & \textbf{0\%}        & --- \\
+Redis-ext       & 64.5\%  & \textbf{0\%}        & --- \\
+SQLite          & 43.6\%  & $-$0.4\%   & 0.9\,$\mu$s \\
+DuckDB          & 30.8\%  & \textbf{0\%}        & --- \\
+Memcached       & 27.1\%  & \textbf{0\%}        & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{table}[h]
 \caption{\textbf{Only \sys reduces RSS below fill level}
-  (\S\ref{sec:eval:apps}).  Post-cooling RSS (MiB) across all five
-  applications.}
+  (\S\ref{sec:eval:apps}).  Cool-phase RSS (MiB) across all six
+  workloads.}
 \label{tab:multi_alloc_apps}
 \centering\small
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrrrrr}
 \toprule
-Allocator & SQLite & RocksDB & DuckDB & Redis & Memcached \\
+Allocator & SQLite & RocksDB & DuckDB & Redis & Redis-ext & Memcached \\
 \midrule
-System  & 424   & 434   & 1322  & 55   & 240 \\
-Mesh    & 429   & 281   & 772   & 59   & 241 \\
-\sys    & \textbf{239} & \textbf{56} & \textbf{915} & \textbf{47} & \textbf{175} \\
+System  & 424   & 434   & 1322  & 122  & 121  & 240 \\
+Mesh    & 429   & 281   & 772   & 96   & 74   & 241 \\
+\sys    & \textbf{239} & \textbf{56} & \textbf{915} & \textbf{44} & \textbf{43} & \textbf{175} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -87,7 +88,7 @@ zstd-9 & \textbf{20.8$\times$} & \textbf{16.7$\times$} & \textbf{9.3$\times$} & 
 \toprule
  & Configuration & SQLite & RocksDB & Memcached & Redis & Avg.\ $\Delta$ \\
 \midrule
-    & \textbf{Default}  & \textbf{43.8\%}  & \textbf{80.0\%}  & \textbf{25.0\%} & \textbf{17.0\%} & --- \\
+    & \textbf{Default}  & \textbf{43.8\%}  & \textbf{87.1\%}  & \textbf{27.1\%} & \textbf{63.9\%} & --- \\
     & System malloc      & $-$17.6 & $-$80.3 & $-$42.3 & $-$42.3 & $-$45.6 \\
 \midrule
     & With dicts         & $-$5.1  & $-$7.7  & $-$24.5 & $-$30.2 & $-$16.9 \\

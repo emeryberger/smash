@@ -55,7 +55,7 @@ With two workers and eight shards, lock contention is near~zero.
     \EndIf
   \EndFor
   \State $\triangleright$ \textit{Phase 2: compress cold pages}
-  \ForAll{pages $p$ with $\mathit{cold}[p] \geq \textsc{ColdTicks}$}
+  \ForAll{pages $p$ with $\mathit{cold}[p] \geq \textsc{ColdFloor}$}
     \State \Call{CompressPage}{$p$}
   \EndFor
   \State $\triangleright$ \textit{Phase 3: set up access monitoring}
@@ -74,9 +74,15 @@ With two workers and eight shards, lock contention is near~zero.
     $\triangleright$ \textit{preempted by fault}
     \State \Call{Unlock}{$p$};\; \Return
   \EndIf
-  \State $\mathit{algo} \gets$ \textbf{if} $\mathit{cold}[p] \geq$ \textsc{VeryCold} \textbf{then} zstd-9 \textbf{else} LZ4
+  \State $R \gets \Call{AvgRatio}{\mathit{sc}}$
+  \Comment{from sliding window}
+  \If{$\Call{ROI}{\mathit{cold}[p], R} < \textsc{Threshold}$}
+    \State restore page;\; \Call{Unlock}{$p$};\; \Return
+  \EndIf
+  \State $\mathit{algo} \gets \Call{BestAlgo}{\mathit{cold}[p], R}$
+  \Comment{highest-ROI algorithm}
   \State $\mathit{blob} \gets \Call{Compress}{\mathit{buf}, \mathit{algo}}$
-  \If{$|\mathit{blob}| > 0.75 \times \textsc{PageSize}$}
+  \If{$|\mathit{blob}| > \textsc{MinRatio} \times \textsc{PageSize}$}
     \State restore page;\; \Call{Unlock}{$p$};\; \Return
   \EndIf
   \State store $\mathit{blob}$ in sharded \textsc{CompressStore}
@@ -87,8 +93,9 @@ With two workers and eight shards, lock contention is near~zero.
 \caption{\textbf{Background compressor tick}
   (\S\ref{sec:impl:parallel}).  Three phases run in parallel
   across disjoint page ranges.  \textsc{CompressPage} zeros freed
-  slots lazily, selects LZ4 or zstd based on cold duration (JIT
-  compression), and decommits the physical page on success.}
+  slots lazily, uses the ROI model to decide whether to compress
+  and which algorithm to use, and decommits the physical page on
+  success.}
 \label{fig:algo:compress}
 \end{figure}
 

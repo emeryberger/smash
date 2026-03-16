@@ -23,26 +23,28 @@ address of each allocation to route it to one of four arenas, so that
 allocations from the same call site land on the same pages, producing
 structurally homogeneous page content (\S\ref{sec:design:arenas}).
 Third, \sys applies \emph{JIT compression}: like a JIT compiler that
-applies increasing optimization to hot code, \sys applies increasing
-compression to cold data---recently cold pages are compressed with LZ4
-($\sim$1\,GB/s); pages that remain cold for 60 seconds are
-recompressed with zstd-9 for better ratios; accessed pages are
-decompressed and reset, analogous to deoptimization
+uses profiling to decide which methods to optimize and at what level,
+\sys uses per-size-class compression statistics and a
+return-on-investment (ROI) model to decide whether to compress each
+cold page and which algorithm to use---LZ4 ($\sim$1\,GB/s) for
+recently cold pages where fast compression minimizes risk, zstd-9 for
+long-idle pages where the better ratio justifies the higher CPU cost;
+accessed pages are decompressed and reset, analogous to deoptimization
 (\S\ref{sec:design:adaptive}).
 
 We evaluate \sys on five applications spanning in-memory databases,
-caches, and analytics engines.  \sys reduces RSS by 17--80\%
+caches, and analytics engines.  \sys reduces RSS by 27--87\%
 depending on the workload's hot/cold partition.  Throughput impact is negligible for most benchmarks.  An ablation
 study across 17 configurations quantifies each technique's
 contribution.
 
 To tease apart the compression pipeline and allocator design,
 we build a compress-only variant that runs \sys's pipeline atop
-the unmodified system allocator.  This variant achieves 32--61\% RSS reduction on its own.  The
+the unmodified system allocator.  This variant achieves 20--61\% RSS reduction on its own.  The
 pipeline and allocator design are synergistic: \sys's allocator further reduces RSS by 10--25\% on workloads
 dominated by large allocations, where freelist pollution spans entire
-pages, while pipeline overhead is lower when integrated into
-the~allocator.
+pages, while allocator-level page tracking is critical for workloads
+like Redis where external VM scanning cannot detect cold~pages.
 
 This paper makes two contributions:
 

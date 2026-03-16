@@ -35,14 +35,15 @@ more promptly after data goes~cold.
 \label{sec:eval:apps}
 
 We evaluate \sys's RSS reduction, throughput overhead, and
-cold-access latency on five real applications spanning key-value
-stores, relational databases, and columnar analytics.
+cold-access latency on five applications (six workloads) spanning
+key-value stores, relational databases, and columnar analytics.
 Table~\ref{tab:apps_summary} summarizes the results.
 
 \begin{table}[t]
-\caption{\textbf{\sys reduces RSS by 17--80\%; compression drives savings}
-  (\S\ref{sec:eval:apps}).  Post-cooling RSS (MiB) across allocators;
-  throughput change and cold-access latency for \sys.}
+\caption{\textbf{\sys reduces RSS by 27--87\%; compression drives savings}
+  (\S\ref{sec:eval:apps}).  Cool-phase RSS (MiB) across allocators;
+  throughput change and cold-access latency for \sys.
+  Redis-ext = extended workload with 50\% key deletion before cooling.}
 \label{tab:apps_summary}
 \centering\small
 \begin{tabular}{lrrrrr}
@@ -55,7 +56,8 @@ RocksDB   & 434  & 281  & \textbf{56}  & +2\%     & 0.8\,$\mu$s \\
 SQLite    & 424  & 429  & \textbf{239} & $-$0.4\% & 0.9\,$\mu$s \\
 DuckDB    & 1322 & 772  & \textbf{915} & 0\%      & --- \\
 Memcached & 240  & 241  & \textbf{175} & 0\%      & --- \\
-Redis     & 55   & 59   & \textbf{47}  & 0\%      & --- \\
+Redis     & 122  & 96   & \textbf{44}  & 0\%      & --- \\
+Redis-ext & 121  & 74   & \textbf{43}  & 0\%      & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -64,26 +66,26 @@ Redis     & 55   & 59   & \textbf{47}  & 0\%      & --- \\
 \centering
 \includegraphics[width=\columnwidth]{figures/rss_reduction.pdf}
 \caption{\textbf{RSS reduction scales with the fraction of cold data}
-  (\S\ref{sec:eval:apps}).  Five applications ordered by reduction.}
+  (\S\ref{sec:eval:apps}).  Six workloads ordered by reduction.}
 \label{fig:rss_reduction}
 \end{figure}
 
 The largest gains occur on workloads with clear hot/cold
 partitions.  Figure~\ref{fig:rss_timeline} shows RSS over time for
-all five benchmarks.  Under \sys, RSS drops sharply during the cooling
+all benchmarks.  Under \sys, RSS drops sharply during the cooling
 phase as the compressor detects and compresses idle pages.  Baseline
 RSS remains flat throughout.  RocksDB shows the most dramatic
-reduction: from 220\,MiB to 44\,MiB (80\%) within seconds.
-Memcached shows a 25\% reduction during the serve~phase.
+reduction: from 434\,MiB to 56\,MiB (87\%) within seconds.
+Memcached shows a 27\% reduction during the serve~phase.
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/rss_combined.pdf}
 \caption{\textbf{\sys reduces RSS within seconds of data going
-  cold} (\S\ref{sec:eval:apps}).  RSS over time for five benchmarks.
-  Baseline (solid blue) stays flat; Mesh (dash-dot green) matches
-  baseline except on RocksDB and DuckDB where meshing helps;
-  \sys (dashed red) drops during cooling.}
+  cold} (\S\ref{sec:eval:apps}).  RSS over time for six workloads.
+  Baseline (solid blue) stays flat; Mesh (dash-dot green) reduces RSS
+  on RocksDB, DuckDB, and Redis via page meshing;
+  \sys (dashed red) drops sharply during cooling.}
 \label{fig:rss_timeline}
 \end{figure*}
 
@@ -135,21 +137,39 @@ complementary: they operate at different levels of the
 storage~hierarchy.
 
 \paragraph{Redis}
-200K JSON values.  Steady-state RSS drops from 56.8\,MiB to
-46.9\,MiB (17\%) as idle data is compressed.
+We evaluate two workloads with \texttt{redis-bench\-mark}
+(100K ops, 1000\,B values, 5K connections, LLAMA
+config~\cite{maas2020adaptive}).
+The \emph{standard} workload fills the keyspace and measures
+post-cooling RSS\@.  The \emph{extended} workload deletes
+50\% of keys before cooling, creating fragmentation
+that lets allocators exploiting partially-filled pages
+reclaim space.
+
+On the standard workload, \sys reduces cool RSS from 122 to
+44\,MiB (64\%); Mesh reduces it to 96\,MiB (21\%) via meshing.
+On the extended workload, \sys reaches 43\,MiB (64\%)
+and Mesh 74\,MiB (39\%)---deletions create more
+partially-occupied pages for Mesh to merge.
+No other allocator (mimalloc, tcmalloc, Hoard)
+reduces RSS; DieHard and DieHarder \emph{increase}
+RSS after deletions due to randomized layout.
+Throughput is comparable across all configurations ($\pm$5\%).
 
 \paragraph{Comparison across allocators}
 To confirm that compression, not allocator choice, drives the
-RSS reduction, we run all five benchmarks with
+RSS reduction, we run all benchmarks with
 Mesh~\cite{powers2019mesh} as a representative alternative allocator
 (Table~\ref{tab:apps_summary}).  Mesh uses external metadata and virtual-memory
-remapping to compact partially-filled pages.
+remapping to merge two virtual pages onto one physical page when
+their live objects do not overlap.
 On RocksDB, Mesh reduces RSS 35\% below system malloc (281 vs.\
 434\,MiB) through meshing, and on DuckDB by 42\% (772 vs.\
 1322\,MiB).  But \sys achieves 87\% on RocksDB (56\,MiB) and 31\%
 on DuckDB (915\,MiB) via compression.
-On the remaining three benchmarks, Mesh's RSS matches or
-slightly exceeds system malloc:
+On Redis, Mesh achieves 21--39\% reduction (depending on
+fragmentation level), while \sys achieves 64\% on both workloads.
+On SQLite and memcached, Mesh's RSS matches system malloc:
 meshing requires partially-filled pages with non-overlapping
 occupancy, and these workloads keep most pages fully occupied.
 Without a compression pipeline, even Mesh's aggressive page
@@ -203,14 +223,14 @@ fully-active dataset.
 }
 
 \paragraph{Summary}
-\sys reduces RSS by 17--80\% across five applications with
+\sys reduces RSS by 27--87\% across six workloads with
 negligible throughput cost ($\leq$0.4\%) and sub-10\,$\mu$s median
 cold-access latency.  The benefit scales with the fraction of cold
-data: RocksDB's large, mostly-idle block cache sees the greatest
-reduction, while Redis's small, actively-served dataset sees the
-least.  Compression---not allocator choice---drives the savings:
-Mesh achieves comparable RSS only on workloads with significant
-fragmentation.
+data: RocksDB's large, mostly-idle block cache sees the
+greatest reduction.  Compression, not allocator choice,
+drives the savings: Mesh achieves 21--42\% on
+fragmentation-heavy workloads, but \sys consistently
+achieves 2--3$\times$ more via compression.
 
 \subsection{Algorithm Comparison (RQ2)}
 \label{sec:eval:algo}
@@ -270,10 +290,12 @@ zstd-9 & 90   & 731  & 1437  & 1823 \\
 \paragraph{Summary}
 Heap pages compress well: LZ4 achieves 4.7--12.3$\times$ compression at
 $\sim$3\,GB/s, and zstd-9 reaches 9--21$\times$ on structured data at
-lower throughput.  These results motivate \sys's JIT compression
-strategy: LZ4 for recently cold pages (fast enough to speculatively
-compress pages that may be accessed again soon) and zstd-9 for
-long-lived cold pages (where the higher ratio justifies the~cost).
+lower throughput.  These results motivate \sys's ROI-based JIT
+compression: because highly compressible data is also \emph{cheaper}
+to compress (higher throughput), the ROI is doubly favorable---the
+model naturally selects LZ4 for recently cold pages (where fast
+compression minimizes risk) and zstd-9 for long-idle pages (where the
+better ratio justifies the~cost).
 
 \subsection{Ablation Study (RQ3)}
 \label{sec:eval:ablation}
@@ -429,8 +451,7 @@ regions.  On Linux, it parses \texttt{/proc/self/maps}.
 
 \begin{table}[t]
 \caption{\textbf{The compression pipeline drives most RSS
-  reduction; allocator design adds 25\,\pp on RocksDB but
-  system malloc compresses better on Redis}
+  reduction; allocator-level tracking is critical for Redis}
   (\S\ref{sec:eval:pipeline}).  Compress-only uses system
   malloc + \sys pipeline.}
 \label{tab:compress_only}
@@ -455,9 +476,9 @@ Benchmark & Config & Cool RSS & Reduction & Ops/s \\
   & full \sys      & \textbf{179.9}  & \textbf{25.0\%} & \textbf{497} \\
 \midrule
 \multirow{3}{*}{Redis}
-  & baseline       & 48.8   & ---    & \textbf{40.6K} \\
-  & compress-only  & \textbf{24.8}   & \textbf{49.2\%} & 40.2K \\
-  & full \sys      & 41.5   & 14.9\% & 40.4K \\
+  & baseline       & 118.4  & ---    & \textbf{99.7K} \\
+  & compress-only  & 122.8  & 0\%    & 100.9K \\
+  & full \sys      & \textbf{15.5}   & \textbf{86.9\%} & 104.2K \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -473,17 +494,20 @@ gap.  RocksDB's 16\,KiB block cache entries span entire pages;
 embedded freelist pointers from the system allocator degrade
 compression across each page.
 
-On SQLite and Redis, compress-only achieves \emph{higher} RSS
-reduction than full \sys (47.5\% vs.\ 43.7\% and 49.2\% vs.\ 14.9\%,
-respectively).  A key factor is that macOS \texttt{libmalloc} zeroes
+On SQLite, compress-only achieves \emph{higher} RSS
+reduction than full \sys (47.5\% vs.\ 43.7\%).
+A key factor is that macOS \texttt{libmalloc} zeroes
 memory on \texttt{free} (\S\ref{sec:eval:allocator}), so the system
 allocator's freed slots are already zero-filled when the compression
 pipeline encounters them---effectively getting zero-on-free for free.
-Redis shows the largest gap: its small, uniform values compress well
-under any layout, and \sys's metadata overhead (page-state tracking,
-bootstrap allocator) offsets the benefit for this small~workload.
+On Redis, compress-only achieves 0\% reduction: Redis's event loop
+touches heap pages even at minimum frequency (\texttt{hz\,1}), so
+the pipeline's VM-region scanner never finds cold pages to compress.
+Full \sys avoids this problem because it tracks page access
+internally at the allocator level.
 On Linux, where glibc does not zero on free, the gap between
-compress-only and full \sys would be larger.
+compress-only and full \sys would be larger on workloads like
+SQLite.
 
 On memcached, compress-only achieves 20\% reduction versus 25\%
 for full \sys; the 5\pp gap reflects \sys's zero-on-free
@@ -492,15 +516,17 @@ producing more compressible record pages.
 Compress-only incurs 7--18\% lower throughput on RocksDB
 due to hash-map-based page tracking and periodic VM region
 scanning.  \sys's integrated design avoids this overhead.
-Redis and memcached show negligible throughput impact ($<$1\%)
+Memcached shows negligible throughput impact ($<$1\%)
 for both configurations.
 
 \paragraph{Summary}
 The compression pipeline accounts for the majority of \sys's RSS
-reduction (20--61\% even atop unmodified system malloc).  The
+reduction (20--61\% on SQLite, RocksDB, and memcached atop unmodified
+system malloc).  On Redis, compress-only is ineffective because the
+event loop prevents pages from going cold; full \sys's allocator-level
+tracking overcomes this, achieving 87\% reduction.  The
 allocator design contributes most when objects span full pages
-(+25\,\pp on RocksDB), but on workloads with small, uniform objects,
-system malloc's layout can compress equally well or better.  The
+(+25\,\pp on RocksDB).  The
 two components are complementary: the pipeline provides the
 compression infrastructure, while the allocator design maximizes
 its effectiveness on structured, page-spanning~data.

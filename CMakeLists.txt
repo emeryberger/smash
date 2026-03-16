@@ -15,6 +15,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ── macOS: build fat arm64+arm64e so interposition works with all binaries ───
+# System binaries (ls, cat, etc.) are arm64e (pointer authentication).
+# DYLD_INSERT_LIBRARIES requires the dylib to match the process architecture.
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+  if("${CMAKE_OSX_ARCHITECTURES}" STREQUAL "")
+    set(CMAKE_OSX_ARCHITECTURES "arm64;arm64e" CACHE STRING
+        "Build universal arm64+arm64e for dyld interposition" FORCE)
+  endif()
+endif()
+
 # ── Compiler flags ────────────────────────────────────────────────────────────
 if(NOT WIN32)
   add_compile_options(

@@ -338,19 +338,26 @@ class CompressorThread {
                 } else {
                     if (cold_count_[i] < 255) cold_count_[i]++;
                 }
+            } else if (st == PageState::COMPRESSED) {
+                // Keep counting for compressed pages so zstd upgrade can trigger
+                if (cold_count_[i] < 255) cold_count_[i]++;
             }
         });
     }
 
-    // Phase 2: Compress cold pages
+    // Phase 2: Compress cold pages and upgrade LZ4→zstd
     void phase2Range(int worker_id, size_t start, size_t end) {
         uint32_t floor = ROIConfig::instance().cold_ticks_floor;
+        uint32_t upgrade_ticks = ROIConfig::instance().very_cold_ticks;
         forEachLivePage(start, end, [&](size_t i) {
             if (cold_count_[i] < floor) return;
             PageState st = states_->get(i);
-            if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING)
-                return;
-            compressPage(i, workers_[worker_id]);
+            if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+                compressPage(i, workers_[worker_id]);
+            } else if (st == PageState::COMPRESSED &&
+                       cold_count_[i] >= upgrade_ticks) {
+                upgradePage(i, workers_[worker_id]);
+            }
         });
     }
 
@@ -450,9 +457,24 @@ class CompressorThread {
         // Collect sample for dictionary training (page data in worker's buf)
         collectDictSample(page_idx, sc, worker.page_buf);
 
-        int zstd_level = kZstdDeepLevel;
         size_t max_comp = CompressEngine::maxCompressedSizeAny(kPageSize);
         size_t comp_size = 0;
+
+        // Determine compression tier and level.
+        // In zstd-first mode (default): LZ4 selection from ROI → zstd-1 (fast)
+        //                               ZSTD selection from ROI → zstd-9 (deep)
+        // In LZ4 mode (SMASH_USE_LZ4):  LZ4 stays LZ4, ZSTD stays zstd-9
+        int zstd_level = kZstdDeepLevel;
+        bool is_fast_tier = false;
+        if constexpr (!kUseLz4FastTier) {
+            if (algo == CompressAlgo::LZ4) {
+                algo = CompressAlgo::ZSTD;
+                zstd_level = kZstdFastLevel;
+                is_fast_tier = true;
+            }
+        } else {
+            is_fast_tier = (algo == CompressAlgo::LZ4);
+        }
 
         // Try-both experiment (opt-in): when dict is selected, also try plain
         // ZSTD and keep the smaller result. Doubles compression CPU for
@@ -470,21 +492,19 @@ class CompressorThread {
                 dict_total_delta_.fetch_add(delta, std::memory_order_relaxed);
                 if (dict_size < plain_size) {
                     dict_win_count_.fetch_add(1, std::memory_order_relaxed);
-                    comp_size = dict_size;  // dict wins, result in compress_buf
+                    comp_size = dict_size;
                 } else if (dict_size > plain_size) {
                     dict_loss_count_.fetch_add(1, std::memory_order_relaxed);
                     algo = CompressAlgo::ZSTD;
                     comp_size = plain_size;
-                    // plain wins — swap buffers so compress_buf has the better result
                     void* tmp = worker.compress_buf;
                     worker.compress_buf = worker.compress_buf2;
                     worker.compress_buf2 = tmp;
                 } else {
                     dict_tie_count_.fetch_add(1, std::memory_order_relaxed);
-                    comp_size = dict_size;  // tie, use dict (already in compress_buf)
+                    comp_size = dict_size;
                 }
             } else {
-                // One or both failed; use whichever succeeded
                 comp_size = dict_size ? dict_size : plain_size;
                 if (!dict_size && plain_size) {
                     algo = CompressAlgo::ZSTD;
@@ -501,7 +521,21 @@ class CompressorThread {
                                         zstd_level, engine_);
         }
 
-        if (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * ROIConfig::instance().min_compress_ratio)) {
+        double min_ratio = ROIConfig::instance().min_compress_ratio;
+
+        // If fast tier failed the ratio gate, fall back to deep compression.
+        // zstd-9 often compresses 30-50% better than zstd-1/LZ4 due to
+        // better match finding and larger search window.
+        if (is_fast_tier &&
+            (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio))) {
+            algo = CompressAlgo::ZSTD;
+            zstd_level = kZstdDeepLevel;
+            comp_size = worker.compress(worker.page_buf, worker.compress_buf,
+                                        kPageSize, max_comp, algo, sc,
+                                        zstd_level, engine_);
+        }
+
+        if (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio)) {
             // Not worth compressing; record poor ratio and restore page
             if (sc < kNumClasses) worker.sc_stats[sc].record(comp_size ? comp_size : kPageSize, kPageSize);
             vm::protectPages(page_addr, kPageSize, true, true);
@@ -532,6 +566,96 @@ class CompressorThread {
         vm::decommitPages(page_addr, kPageSize);
 
         states_->set(page_idx, PageState::COMPRESSED);
+        locks_->unlock(page_idx);
+        return true;
+    }
+
+    // ── Upgrade compressed pages to zstd deep (level 9) ─────────────────
+    //
+    // Handles both LZ4→zstd-9 and zstd-1→zstd-9 upgrades.
+    // With exact-size CompressStore allocation, release-then-store
+    // saves the full size difference (no bucket rounding to eat it).
+
+    bool upgradePage(size_t page_idx, CompressWorker& worker) {
+        // Skip pinned pages
+        if (vm::g_page_pins && vm::g_page_pins[page_idx].load(std::memory_order_relaxed) > 0)
+            return false;
+
+        locks_->lock(page_idx);
+
+        // Verify still compressed (any algorithm)
+        PageState st = states_->get(page_idx);
+        if (st != PageState::COMPRESSED) {
+            locks_->unlock(page_idx);
+            return false;
+        }
+
+        void* old_data = compressed_[page_idx].data;
+        size_t old_comp_size = compressed_[page_idx].compressedSize();
+        size_t old_alloc_size = compressed_[page_idx].alloc_size;
+        CompressAlgo old_algo = compressed_[page_idx].algorithm();
+
+        // In zstd-first mode, initial compression uses zstd-1 (stored as ZSTD).
+        // In LZ4 mode, initial uses LZ4. Either way, we try zstd-9 upgrade.
+        // After upgrade, cold_count is reset to prevent re-processing.
+
+        // Decompress existing blob (LZ4 or zstd-1) into worker scratch buffer
+        bool ok = false;
+        if (old_algo == CompressAlgo::LZ4) {
+            size_t decomp_size = LZ4_decompress_safe(
+                static_cast<const char*>(old_data),
+                static_cast<char*>(worker.page_buf),
+                static_cast<int>(old_comp_size),
+                static_cast<int>(kPageSize));
+            ok = (decomp_size == kPageSize);
+        } else {
+            int slot = acquireFaultSlot();
+            if (slot >= 0) {
+                size_t decomp_size = engine_->decompressWithDCtx(
+                    fault_slots_[slot].dctx,
+                    old_data, fault_slots_[slot].buf,
+                    old_comp_size, kPageSize,
+                    old_algo, lookupSizeClass(page_idx));
+                if (decomp_size == kPageSize)
+                    __builtin_memcpy(worker.page_buf, fault_slots_[slot].buf, kPageSize);
+                ok = (decomp_size == kPageSize);
+                releaseFaultSlot(slot);
+            }
+        }
+        if (!ok) {
+            locks_->unlock(page_idx);
+            return false;
+        }
+
+        // Re-compress with zstd deep
+        size_t max_comp = CompressEngine::maxCompressedSizeAny(kPageSize);
+        uint8_t sc = lookupSizeClass(page_idx);
+        CompressAlgo new_algo = CompressAlgo::ZSTD;
+        if (engine_ && engine_->hasDictionary(sc))
+            new_algo = CompressAlgo::ZSTD_DICT;
+
+        size_t new_comp_size = worker.compress(
+            worker.page_buf, worker.compress_buf,
+            kPageSize, max_comp, new_algo, sc,
+            kZstdDeepLevel, engine_);
+
+        if (new_comp_size == 0 || new_comp_size >= old_comp_size) {
+            // zstd-9 not better — skip this page
+            cold_count_[page_idx] = 0;  // prevent re-processing
+            locks_->unlock(page_idx);
+            return false;
+        }
+
+        // In-place overwrite: new blob fits in old allocation (always true
+        // since new_comp_size < old_comp_size <= old_alloc_size).
+        // This avoids CompressStore fragmentation — no release/store cycle.
+        // The allocation stays the same size (wasted tail), but RSS is unchanged.
+        __builtin_memcpy(old_data, worker.compress_buf, new_comp_size);
+        compressed_[page_idx].set(old_data, new_comp_size, old_alloc_size, new_algo);
+
+        // Reset cold count to prevent re-upgrade on subsequent ticks.
+        cold_count_[page_idx] = 0;
+
         locks_->unlock(page_idx);
         return true;
     }
@@ -735,6 +859,7 @@ class CompressorThread {
         }
 
         dispatch(1);  // Phase 1: access tracking
+
         dispatch(2);  // Phase 2: compression
         dispatch(3);  // Phase 3: monitoring
 

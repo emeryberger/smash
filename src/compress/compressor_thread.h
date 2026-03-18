@@ -363,11 +363,18 @@ class CompressorThread {
 
     // Phase 3: Set up access monitoring for remaining active pages
     //
-    // Uses per-page mprotect to minimize the TOCTOU race window between
-    // checking a page's pin count and calling mprotect. Batched mprotect
-    // creates a large window where pinned pages are transiently PROT_READ,
-    // causing kernel EFAULT in concurrent syscalls (kevent, read, etc.).
-    // Syscall wrappers also retry on EFAULT as a safety net.
+    // Uses per-page mprotect to prevent the TOCTOU race where a syscall
+    // wrapper pins a page between the pin check and a batched mprotect call.
+    // With batching, the race window is too wide (the entire run) and kernel
+    // syscalls get EFAULT on transiently PROT_READ pages. Per-page mprotect
+    // eliminates this by keeping the pin-check → mprotect window to a single
+    // function call. Syscall wrappers also retry on EFAULT as a final safety
+    // net for the remaining nanosecond-scale race.
+    //
+    // Performance: in compress-only mode, pages are at non-contiguous addresses
+    // so batching provides no benefit anyway. In full Smash, pages are
+    // contiguous but per-page mprotect adds ~1-2μs per page per tick which
+    // is acceptable for the correctness guarantee.
     void phase3Range(size_t start, size_t end) {
         forEachLivePage(start, end, [&](size_t i) {
             PageState st = states_->get(i);

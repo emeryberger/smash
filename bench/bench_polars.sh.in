@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# bench_polars.sh - Polars (Rust DataFrame) A/B comparison
+#
+# Polars is a Rust DataFrame library that uses the system allocator.
+# DYLD_INSERT_LIBRARIES works to interpose malloc. The workload creates
+# large DataFrames, does groupby/join/filter operations on hot columns,
+# leaving cold columns compressible.
+#
+# Requires python3 with polars installed. Skips gracefully if absent.
+#
+# Usage:
+#   bash bench_polars.sh [--quick]
+
+set -euo pipefail
+
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+NUM_ROWS=2000000
+COOL_DURATION=10
+SERVE_DURATION=20
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_ROWS=500000
+            COOL_DURATION=5
+            SERVE_DURATION=10
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+if ! command -v python3 &>/dev/null; then
+    echo "SKIP: python3 not found"
+    exit 0
+fi
+if ! python3 -c "import polars" &>/dev/null; then
+    echo "SKIP: polars not installed (pip3 install polars)"
+    exit 0
+fi
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    exit 1
+fi
+
+TMPDIR_BENCH=$(mktemp -d)
+BASELINE_FILE="${TMPDIR_BENCH}/baseline.txt"
+SMASH_FILE="${TMPDIR_BENCH}/smash.txt"
+trap "rm -rf ${TMPDIR_BENCH}" EXIT
+
+PYSCRIPT="${TMPDIR_BENCH}/bench_polars.py"
+cat > "$PYSCRIPT" << 'PYEOF'
+import sys, time, os
+import polars as pl
+import numpy as np
+
+num_rows = int(sys.argv[1])
+cool_duration = int(sys.argv[2])
+serve_duration = int(sys.argv[3])
+
+def get_rss_mb():
+    """Get current RSS in MB."""
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        class mach_task_basic_info(ctypes.Structure):
+            _fields_ = [
+                ("virtual_size", ctypes.c_uint64),
+                ("resident_size", ctypes.c_uint64),
+                ("resident_size_max", ctypes.c_uint64),
+                ("user_time_seconds", ctypes.c_uint32),
+                ("user_time_microseconds", ctypes.c_uint32),
+                ("system_time_seconds", ctypes.c_uint32),
+                ("system_time_microseconds", ctypes.c_uint32),
+                ("policy", ctypes.c_int32),
+                ("suspend_count", ctypes.c_int32),
+            ]
+        MACH_TASK_BASIC_INFO = 20
+        info = mach_task_basic_info()
+        count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+        libc.task_info(libc.mach_task_self(), MACH_TASK_BASIC_INFO,
+                       ctypes.byref(info), ctypes.byref(count))
+        return info.resident_size / (1024 * 1024)
+    except Exception:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == "darwin":
+            return ru.ru_maxrss / (1024 * 1024)
+        return ru.ru_maxrss / 1024
+
+print(f"=== Polars (Rust) DataFrame Benchmark ===", file=sys.stderr)
+print(f"Rows: {num_rows}\n", file=sys.stderr)
+
+# ── Fill: Create large DataFrames ──
+print("Creating DataFrames...", file=sys.stderr)
+t0 = time.monotonic()
+np.random.seed(42)
+
+# Main fact table (like TPC-H lineitem)
+df = pl.DataFrame({
+    "order_id": np.arange(num_rows, dtype=np.int64),
+    "customer_id": np.random.randint(0, num_rows // 10, num_rows, dtype=np.int64),
+    "product_id": np.random.randint(0, 50000, num_rows, dtype=np.int64),
+    "quantity": np.random.randint(1, 50, num_rows, dtype=np.int32),
+    "price": np.random.rand(num_rows).astype(np.float64) * 1000,
+    "discount": np.random.rand(num_rows).astype(np.float64) * 0.3,
+    "tax": np.random.rand(num_rows).astype(np.float64) * 0.1,
+    "status": np.random.choice(["pending", "shipped", "delivered", "returned"], num_rows),
+    "priority": np.random.choice(["1-URGENT", "2-HIGH", "3-MEDIUM", "4-LOW", "5-ROUTINE"], num_rows),
+    "ship_mode": np.random.choice(["AIR", "RAIL", "SHIP", "TRUCK", "MAIL"], num_rows),
+    "comment": [f"order comment text padding data entry record {i}" for i in range(num_rows)],
+    "notes": [f"additional notes field value store cache index {i * 3 + 7}" for i in range(num_rows)],
+})
+
+# Dimension table (customers)
+n_cust = num_rows // 10
+customers = pl.DataFrame({
+    "cust_id": np.arange(n_cust, dtype=np.int64),
+    "name": [f"Customer_{i:07d}" for i in range(n_cust)],
+    "segment": np.random.choice(["AUTOMOBILE", "BUILDING", "FURNITURE", "MACHINERY", "HOUSEHOLD"], n_cust),
+    "balance": np.random.rand(n_cust).astype(np.float64) * 10000,
+    "address": [f"{i} Main St, City {i % 500}, State {i % 50}" for i in range(n_cust)],
+    "phone": [f"+1-{i % 1000:03d}-{i % 10000:04d}" for i in range(n_cust)],
+})
+
+fill_sec = time.monotonic() - t0
+peak_rss = get_rss_mb()
+print(f"Created in {fill_sec:.2f}s, RSS: {peak_rss:.1f} MB\n", file=sys.stderr)
+print(f"METRIC fill_time_sec {fill_sec:.2f}")
+print(f"METRIC peak_rss_mb {peak_rss:.1f}")
+
+# ── Cool ──
+print(f"Cooling for {cool_duration}s...", file=sys.stderr)
+for sec in range(1, cool_duration + 1):
+    time.sleep(1)
+    rss = get_rss_mb()
+    if sec % 3 == 0 or sec == 1:
+        print(f"  t={sec}s: RSS={rss:.1f} MB", file=sys.stderr)
+
+cool_rss = get_rss_mb()
+print(f"METRIC cool_rss_mb {cool_rss:.1f}")
+
+# ── Serve: Hot queries on subset of columns ──
+print(f"Serve phase: {serve_duration}s (hot queries on recent orders)...", file=sys.stderr)
+hot_df = df.filter(pl.col("order_id") > num_rows * 0.9)
+total_ops = 0
+min_rss = get_rss_mb()
+
+for sec in range(serve_duration):
+    ops = 0
+    sec_start = time.monotonic()
+    while time.monotonic() - sec_start < 1.0:
+        r = np.random.randint(0, 100)
+        if r < 30:
+            _ = hot_df.group_by("status").agg(pl.col("price").sum(), pl.col("quantity").mean())
+        elif r < 55:
+            _ = hot_df.filter(pl.col("discount") > 0.1).select("order_id", "price", "discount")
+        elif r < 75:
+            _ = hot_df.sort("price", descending=True).head(100)
+        elif r < 90:
+            _ = hot_df.group_by("priority", "ship_mode").agg(pl.col("price").mean())
+        else:
+            _ = hot_df.join(customers, left_on="customer_id", right_on="cust_id", how="inner").head(1000)
+        ops += 1
+    total_ops += ops
+    rss = get_rss_mb()
+    if rss < min_rss:
+        min_rss = rss
+    if (sec + 1) % 5 == 0:
+        print(f"  t={sec+1}s: RSS={rss:.1f} MB ops={ops}", file=sys.stderr)
+
+steady_rss = get_rss_mb()
+ops_per_sec = total_ops / serve_duration
+print(f"METRIC serve_rss_mb {steady_rss:.1f}")
+print(f"METRIC min_rss_mb {min_rss:.1f}")
+print(f"METRIC ops_per_sec {ops_per_sec:.0f}")
+
+# ── Cold re-access ──
+print("\nCold re-access: full join + scan all columns...", file=sys.stderr)
+t0 = time.monotonic()
+result = df.join(customers, left_on="customer_id", right_on="cust_id", how="inner")
+_ = result.select(pl.col(pl.Float64, pl.Int64, pl.Int32).sum())
+_ = result.group_by("segment").agg(
+    pl.col("price").sum(),
+    pl.col("comment").first(),
+    pl.col("notes").first(),
+)
+cold_sec = time.monotonic() - t0
+cold_rss = get_rss_mb()
+print(f"Cold access: {cold_sec:.3f}s, RSS: {cold_rss:.1f} MB", file=sys.stderr)
+print(f"METRIC cold_sec {cold_sec:.3f}")
+print(f"METRIC cold_rss_mb {cold_rss:.1f}")
+
+sys.stdout.flush()
+PYEOF
+
+metric_val() {
+    local file="$1" name="$2"
+    awk -v m="$name" '$1=="METRIC" && $2==m {print $3}' "$file"
+}
+
+print_row() {
+    local label="$1" metric="$2" unit="$3"
+    local base smash
+    base=$(metric_val "$BASELINE_FILE" "$metric")
+    smash=$(metric_val "$SMASH_FILE" "$metric")
+    base="${base:-N/A}"; smash="${smash:-N/A}"
+    if [[ "$base" == "N/A" || "$smash" == "N/A" || "$base" == "0" ]]; then
+        printf "  %-25s %12s %12s %10s\n" "$label" "$base" "$smash" "N/A"
+        return
+    fi
+    local delta
+    delta=$(echo "scale=1; (($smash - $base) / $base) * 100" | bc -l 2>/dev/null || echo "N/A")
+    printf "  %-25s %10s%-2s %10s%-2s %9s%%\n" "$label" "$base" "$unit" "$smash" "$unit" "$delta"
+}
+
+echo ""
+echo "========================================================================"
+echo "  Polars (Rust) DataFrame A/B Comparison"
+echo "========================================================================"
+echo "Rows: ${NUM_ROWS}, Cool: ${COOL_DURATION}s, Serve: ${SERVE_DURATION}s"
+echo ""
+
+echo "Running baseline..."
+python3 "$PYSCRIPT" "$NUM_ROWS" "$COOL_DURATION" "$SERVE_DURATION" \
+    2>/dev/null | grep '^METRIC ' > "$BASELINE_FILE" || true
+
+echo "Running with Smash..."
+env "${PRELOAD_VAR}=${SMASH_LIB}" \
+    python3 "$PYSCRIPT" "$NUM_ROWS" "$COOL_DURATION" "$SERVE_DURATION" \
+    2>/dev/null | grep '^METRIC ' > "$SMASH_FILE" || true
+
+echo ""
+printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+echo "  ------------------------------------------------------------------------"
+
+print_row "Fill time"         fill_time_sec  "s"
+print_row "Peak RSS"          peak_rss_mb    "MB"
+print_row "Post-cool RSS"     cool_rss_mb    "MB"
+print_row "Serve RSS"         serve_rss_mb   "MB"
+print_row "Min RSS"           min_rss_mb     "MB"
+print_row "Ops/sec"           ops_per_sec    ""
+print_row "Cold access time"  cold_sec       "s"
+print_row "Cold RSS"          cold_rss_mb    "MB"
+
+echo ""
+echo "Done."

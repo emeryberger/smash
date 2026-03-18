@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# bench_sort.sh - GNU sort large file workload: system malloc vs Smash
+#
+# GNU coreutils sort uses system malloc for its merge-sort buffers. Sorting a
+# large file creates massive temporary allocations with clear phase transitions.
+#
+# Usage:
+#   bash bench_sort.sh [--quick]
+#
+# Compatible with bash 3.2+ (macOS default).
+
+set -euo pipefail
+
+# ── Paths (substituted by CMake configure_file) ─────────────────────────────
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+# ── Platform detection ───────────────────────────────────────────────────────
+TIME_CMD="/usr/bin/time"
+RSS_FORMAT=""
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+    # macOS /usr/bin/time -l reports "maximum resident set size" in bytes
+    RSS_FORMAT="darwin"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+    # GNU /usr/bin/time -v reports "Maximum resident set size (kbytes)"
+    RSS_FORMAT="linux"
+fi
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+NUM_LINES=50000000
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_LINES=5000000
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+# ── Check prerequisites ─────────────────────────────────────────────────────
+if ! command -v sort &>/dev/null; then
+    echo "SKIP: sort not found in PATH"
+    exit 0
+fi
+
+if [[ ! -x "$TIME_CMD" ]]; then
+    echo "SKIP: $TIME_CMD not found or not executable"
+    exit 0
+fi
+
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON && make -j"
+    exit 1
+fi
+
+# ── Temp files ──────────────────────────────────────────────────────────────
+TMPDIR_BENCH=$(mktemp -d)
+INPUT_FILE="${TMPDIR_BENCH}/input.txt"
+OUTPUT_FILE="${TMPDIR_BENCH}/output.txt"
+TIME_BASELINE="${TMPDIR_BENCH}/time_baseline.txt"
+TIME_SMASH="${TMPDIR_BENCH}/time_smash.txt"
+trap "rm -rf ${TMPDIR_BENCH}" EXIT
+
+# ── Generate input data ─────────────────────────────────────────────────────
+echo ""
+echo "========================================================================"
+echo "  GNU Sort A/B Comparison"
+echo "========================================================================"
+echo ""
+echo "Lines: ${NUM_LINES}"
+echo ""
+
+echo "Generating ${NUM_LINES} lines of random data..."
+t_gen_start=$(date +%s)
+
+# Use awk for fast deterministic data generation (bash 3.2 compatible)
+awk -v n="$NUM_LINES" 'BEGIN {
+    srand(42);
+    words[0] = "the"; words[1] = "data"; words[2] = "value";
+    words[3] = "store"; words[4] = "cache"; words[5] = "entry";
+    words[6] = "record"; words[7] = "field"; words[8] = "index";
+    words[9] = "query";
+    for (i = 0; i < n; i++) {
+        line = "";
+        for (w = 0; w < 8; w++) {
+            if (w > 0) line = line " ";
+            line = line words[int(rand() * 10)] "_" int(rand() * 100000);
+        }
+        print line;
+    }
+}' > "$INPUT_FILE"
+
+t_gen_end=$(date +%s)
+gen_sec=$((t_gen_end - t_gen_start))
+input_size_bytes=$(wc -c < "$INPUT_FILE" | tr -d ' ')
+input_size_mb=$(echo "scale=1; $input_size_bytes / 1048576" | bc -l)
+
+echo "Generated ${input_size_mb} MB in ${gen_sec}s"
+echo ""
+
+# ── Helper: extract RSS from /usr/bin/time output ───────────────────────────
+extract_rss_mb() {
+    local time_file="$1"
+    local rss_kb=0
+    if [[ "$RSS_FORMAT" == "darwin" ]]; then
+        # macOS: "NNN maximum resident set size" (in bytes)
+        local rss_bytes
+        rss_bytes=$(grep "maximum resident set size" "$time_file" | awk '{print $1}' || echo "0")
+        rss_bytes="${rss_bytes:-0}"
+        echo "scale=1; $rss_bytes / 1048576" | bc -l
+    else
+        # Linux: "Maximum resident set size (kbytes): NNN"
+        rss_kb=$(grep "Maximum resident set size" "$time_file" | awk -F: '{print $2}' | tr -d ' ' || echo "0")
+        rss_kb="${rss_kb:-0}"
+        echo "scale=1; $rss_kb / 1024" | bc -l
+    fi
+}
+
+extract_wall_sec() {
+    local time_file="$1"
+    if [[ "$RSS_FORMAT" == "darwin" ]]; then
+        # macOS: "N.NN real" line
+        grep "real" "$time_file" | awk '{print $1}' || echo "0"
+    else
+        # Linux: "Elapsed (wall clock) time (h:mm:ss or m:ss): M:SS.SS"
+        local wall
+        wall=$(grep "Elapsed" "$time_file" | awk -F: '{print $(NF-1) ":" $NF}' | tr -d ' ' || echo "0:0")
+        # Convert m:ss.ss to seconds
+        local mins secs
+        mins=$(echo "$wall" | cut -d: -f1)
+        secs=$(echo "$wall" | cut -d: -f2)
+        echo "scale=2; $mins * 60 + $secs" | bc -l
+    fi
+}
+
+# ── Resolve sort binary ──────────────────────────────────────────────────────
+# On macOS, /usr/bin/sort is SIP-protected and ignores DYLD_INSERT_LIBRARIES.
+# Prefer a Homebrew or non-SIP sort if available.
+SORT_BIN="sort"
+if [[ "$(uname)" == "Darwin" ]]; then
+    for candidate in /opt/homebrew/bin/gsort /usr/local/bin/gsort; do
+        if [[ -x "$candidate" ]]; then
+            SORT_BIN="$candidate"
+            break
+        fi
+    done
+    if [[ "$SORT_BIN" == "sort" ]]; then
+        echo "NOTE: Using /usr/bin/sort which is SIP-protected on macOS."
+        echo "      Smash interposition may not work. Install coreutils (brew install coreutils)"
+        echo "      for accurate A/B comparison."
+        echo ""
+    fi
+fi
+
+# ── Wrapper script for DYLD_INSERT ──────────────────────────────────────────
+# On macOS, /usr/bin/time is arm64e and DYLD_INSERT_LIBRARIES propagates to it,
+# causing an architecture mismatch crash. We create a tiny wrapper script that
+# sets DYLD only for the sort child process, so /usr/bin/time itself runs clean.
+SMASH_WRAPPER="${TMPDIR_BENCH}/smash_sort.sh"
+cat > "$SMASH_WRAPPER" << WRAPEOF
+#!/usr/bin/env bash
+exec env ${PRELOAD_VAR}=${SMASH_LIB} "$SORT_BIN" "\$@"
+WRAPEOF
+chmod +x "$SMASH_WRAPPER"
+
+# ── Run baseline sort ───────────────────────────────────────────────────────
+echo "Running sort (baseline, system malloc)..."
+"$TIME_CMD" -l "$SORT_BIN" "$INPUT_FILE" -o "$OUTPUT_FILE" 2> "$TIME_BASELINE" || true
+
+baseline_rss=$(extract_rss_mb "$TIME_BASELINE")
+baseline_wall=$(extract_wall_sec "$TIME_BASELINE")
+
+# Count output lines to verify sort completed
+if [[ -f "$OUTPUT_FILE" ]]; then
+    baseline_lines=$(wc -l < "$OUTPUT_FILE" | tr -d ' ')
+else
+    baseline_lines=0
+fi
+baseline_throughput=$(echo "scale=0; $baseline_lines / ($baseline_wall + 0.001)" | bc -l 2>/dev/null || echo "0")
+
+echo "  Wall time: ${baseline_wall}s, Peak RSS: ${baseline_rss} MB, Lines: ${baseline_lines}"
+rm -f "$OUTPUT_FILE"
+
+# ── Run Smash sort ──────────────────────────────────────────────────────────
+echo "Running sort (Smash)..."
+SMASH_SORT_OK=1
+"$TIME_CMD" -l "$SMASH_WRAPPER" "$INPUT_FILE" -o "$OUTPUT_FILE" 2> "$TIME_SMASH" || SMASH_SORT_OK=0
+
+if [[ "$SMASH_SORT_OK" -eq 1 && -f "$OUTPUT_FILE" ]]; then
+    smash_rss=$(extract_rss_mb "$TIME_SMASH")
+    smash_wall=$(extract_wall_sec "$TIME_SMASH")
+    smash_lines=$(wc -l < "$OUTPUT_FILE" | tr -d ' ')
+    smash_throughput=$(echo "scale=0; $smash_lines / ($smash_wall + 0.001)" | bc -l 2>/dev/null || echo "0")
+    echo "  Wall time: ${smash_wall}s, Peak RSS: ${smash_rss} MB, Lines: ${smash_lines}"
+else
+    echo "  Smash run failed (SIP or crash). Showing baseline-only results."
+    smash_rss="N/A"
+    smash_wall="N/A"
+    smash_lines="N/A"
+    smash_throughput="N/A"
+fi
+rm -f "$OUTPUT_FILE"
+
+# ── Display results ─────────────────────────────────────────────────────────
+
+# Compute deltas
+rss_delta="N/A"
+wall_delta="N/A"
+throughput_delta="N/A"
+
+if [[ "$smash_rss" != "N/A" && "$baseline_rss" != "0" ]]; then
+    rss_delta=$(echo "scale=1; (($smash_rss - $baseline_rss) / $baseline_rss) * 100" | bc -l 2>/dev/null || echo "N/A")
+fi
+if [[ "$smash_wall" != "N/A" && "$baseline_wall" != "0" ]]; then
+    wall_delta=$(echo "scale=1; (($smash_wall - $baseline_wall) / $baseline_wall) * 100" | bc -l 2>/dev/null || echo "N/A")
+fi
+if [[ "$smash_throughput" != "N/A" && "$baseline_throughput" != "0" ]]; then
+    throughput_delta=$(echo "scale=1; (($smash_throughput - $baseline_throughput) / $baseline_throughput) * 100" | bc -l 2>/dev/null || echo "N/A")
+fi
+
+echo ""
+printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+echo "  ------------------------------------------------------------------------"
+
+if [[ "$smash_rss" != "N/A" ]]; then
+    printf "  %-25s %10s%-2s %10s%-2s %9s%%\n" "Peak RSS" "$baseline_rss" "MB" "$smash_rss" "MB" "$rss_delta"
+    printf "  %-25s %10s%-2s %10s%-2s %9s%%\n" "Wall time" "$baseline_wall" "s" "$smash_wall" "s" "$wall_delta"
+    printf "  %-25s %10s%-2s %10s%-2s %9s%%\n" "Throughput (lines/s)" "$baseline_throughput" "" "$smash_throughput" "" "$throughput_delta"
+    printf "  %-25s %10s%-2s %10s%-2s\n" "Input size" "$input_size_mb" "MB" "$input_size_mb" "MB"
+    printf "  %-25s %10s%-2s %10s%-2s\n" "Output lines" "$baseline_lines" "" "$smash_lines" ""
+else
+    printf "  %-25s %10s%-2s %12s %10s\n" "Peak RSS" "$baseline_rss" "MB" "N/A" "N/A"
+    printf "  %-25s %10s%-2s %12s %10s\n" "Wall time" "$baseline_wall" "s" "N/A" "N/A"
+    printf "  %-25s %10s%-2s %12s %10s\n" "Throughput (lines/s)" "$baseline_throughput" "" "N/A" "N/A"
+    printf "  %-25s %10s%-2s %12s\n" "Input size" "$input_size_mb" "MB" "$input_size_mb" "MB"
+    printf "  %-25s %10s%-2s %12s\n" "Output lines" "$baseline_lines" "" "N/A"
+fi
+
+echo ""
+echo "Done."

@@ -1,0 +1,1166 @@
+#!/usr/bin/env python3
+"""Run all paper experiments: ablation (all 5 apps) + compress-only.
+
+Usage:
+    cd build
+    python3 ../bench/run_paper_experiments.py [--quick] [--ablation-only] [--compress-only-only]
+
+Produces paper_results/ with:
+  - ablation_results.json
+  - compress_only_results.json
+  - paper_tables.txt (ready to paste into evaluation.tex)
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import signal
+import socket
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from collections import OrderedDict
+from pathlib import Path
+
+# ── CMake ablation variables ─────────────────────────────────────────────────
+ALL_ABLATION_VARS = [
+    "SMASH_NUM_ARENAS", "SMASH_COLD_TICKS", "SMASH_VERY_COLD_TICKS",
+    "SMASH_DICT_TRAIN_SAMPLES", "SMASH_PREFETCH_WINDOW",
+    "SMASH_COMPRESSOR_WORKERS", "SMASH_COMPRESS_STORE_SHARDS",
+    "SMASH_LARGE_ALLOC_VM_THRESHOLD",
+    "SMASH_ABLATION_NO_ZERO_EAGER", "SMASH_ABLATION_NO_ZERO_DEFERRED",
+    "SMASH_ABLATION_NO_SKIP_STATS", "SMASH_ABLATION_NO_CHUNK_BITMAP",
+    "SMASH_ABLATION_NO_CALLSITE_ARENA",
+]
+
+# ── Ablation configs matching paper table ────────────────────────────────────
+ABLATION_CONFIGS = OrderedDict([
+    ("B1", {"name": "Default", "cmake_flags": {}, "use_smash": True}),
+    ("B0", {"name": "System malloc", "cmake_flags": {}, "use_smash": False}),
+    ("DICT", {"name": "With dicts",
+              "cmake_flags": {"SMASH_DICT_TRAIN_SAMPLES": "16"}, "use_smash": True}),
+    ("T1a", {"name": "No arenas",
+             "cmake_flags": {"SMASH_NUM_ARENAS": "1"}, "use_smash": True}),
+    ("T1c", {"name": "LZ4 only",
+             "cmake_flags": {"SMASH_VERY_COLD_TICKS": "9999"}, "use_smash": True}),
+    ("T2a", {"name": "No zero-deferred",
+             "cmake_flags": {"SMASH_ABLATION_NO_ZERO_DEFERRED": "ON"}, "use_smash": True}),
+    ("T1e", {"name": "No prefetch",
+             "cmake_flags": {"SMASH_PREFETCH_WINDOW": "0"}, "use_smash": True}),
+    ("T1f", {"name": "Single worker",
+             "cmake_flags": {"SMASH_COMPRESSOR_WORKERS": "1"}, "use_smash": True}),
+    ("B2", {"name": "No compression",
+            "cmake_flags": {"SMASH_COLD_TICKS": "9999"}, "use_smash": True}),
+])
+
+APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext"]
+
+IS_DARWIN = platform.system() == "Darwin"
+PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
+LIB_SUFFIX = ".dylib" if IS_DARWIN else ".so"
+
+
+# ── Build helpers ────────────────────────────────────────────────────────────
+
+def rebuild(build_dir, cmake_flags, source_dir):
+    """Reconfigure and rebuild libsmash with given flags."""
+    cmd = ["cmake", str(source_dir), "-DSMASH_BUILD_BENCH=ON"]
+    for var in ALL_ABLATION_VARS:
+        cmd.append(f"-U{var}")
+    for key, val in cmake_flags.items():
+        cmd.append(f"-D{key}={val}")
+
+    r = subprocess.run(cmd, cwd=build_dir, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"    CMAKE FAILED: {r.stderr[-300:]}")
+        return False
+
+    # Build only the targets needed for experiments (avoid broken bench targets)
+    targets = ["smash", "smash_noopt", "smash_compress_only",
+               "bench_sqlite"]
+    r = subprocess.run(["make"] + targets + ["-j"], cwd=build_dir,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"    MAKE FAILED: {r.stderr[-300:]}")
+        return False
+    return True
+
+
+# ── RSS measurement ──────────────────────────────────────────────────────────
+
+def get_rss_mb(pid):
+    """Get RSS of a process in MiB."""
+    try:
+        out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)], text=True)
+        return float(out.strip()) / 1024
+    except Exception:
+        return 0.0
+
+
+def wait_for_port(port, timeout=30):
+    """Wait until a TCP port is accepting connections."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=1)
+            s.close()
+            return True
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.2)
+    return False
+
+
+def wait_for_port_closed(port, timeout=10):
+    """Wait until a TCP port is no longer accepting connections."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=1)
+            s.close()
+            time.sleep(0.2)
+        except (ConnectionRefusedError, OSError):
+            return True
+    return False
+
+
+def wait_for_timewait_drain(port, timeout=60):
+    """Wait until TIME_WAIT sockets on a port are drained."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = subprocess.check_output(
+                ["netstat", "-an", "-p", "tcp"], text=True, timeout=5
+            )
+            tw_count = sum(1 for line in out.splitlines()
+                          if f".{port} " in line and "TIME_WAIT" in line)
+            if tw_count < 100:  # a few stragglers are fine
+                return True
+        except Exception:
+            return True  # can't check → proceed anyway
+        time.sleep(1)
+    return False
+
+
+def kill_redis(port):
+    """Forcefully kill any Redis on the given port and wait for it to die."""
+    subprocess.run(["redis-cli", "-p", str(port), "SHUTDOWN", "NOSAVE"],
+                   capture_output=True, timeout=5)
+    if not wait_for_port_closed(port, timeout=5):
+        # Force kill any process on this port
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-ti", f"tcp:{port}"], text=True, timeout=5
+            ).strip()
+            for pid in out.split():
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+        except subprocess.CalledProcessError:
+            pass
+        wait_for_port_closed(port, timeout=5)
+    # Wait for TIME_WAIT sockets to drain so the next run's clients
+    # don't hit "Can't assign requested address" from ephemeral port exhaustion
+    wait_for_timewait_drain(port)
+
+
+# ── METRIC parsing ───────────────────────────────────────────────────────────
+
+def parse_metrics(text):
+    """Parse METRIC lines from text."""
+    metrics = {}
+    for line in text.splitlines():
+        m = re.match(r"^METRIC (\S+) (\S+)$", line)
+        if m:
+            try:
+                metrics[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+    return metrics
+
+
+# ── In-process benchmark runners ─────────────────────────────────────────────
+
+def run_sqlite(build_dir, smash_lib, quick):
+    """Run bench_sqlite in-process."""
+    exe = build_dir / "bench" / "bench_sqlite"
+    if not exe.exists():
+        return None
+    args = ["--quick"] if quick else []
+    env = os.environ.copy()
+    if smash_lib:
+        env[PRELOAD_VAR] = str(smash_lib)
+        env["SMASH_VERY_COLD_TICKS"] = "5"
+    try:
+        r = subprocess.run([str(exe)] + args, capture_output=True, text=True,
+                           env=env, timeout=300)
+        return parse_metrics(r.stdout)
+    except Exception as e:
+        print(f"    sqlite error: {e}")
+        return None
+
+
+def run_rocksdb(build_dir, smash_lib, quick):
+    """Run bench_rocksdb C++ binary (preferred) or shell script."""
+    # Prefer C++ binary — the shell script requires bash 4+ (declare -A)
+    exe = build_dir / "bench" / "bench_rocksdb"
+    if exe.exists():
+        args = ["--keys", "200000", "--value-size", "256",
+                "--cool", "5", "--serve", "10"] if quick else []
+        env = os.environ.copy()
+        if smash_lib:
+            env[PRELOAD_VAR] = str(smash_lib)
+            env["SMASH_VERY_COLD_TICKS"] = "5"
+        try:
+            r = subprocess.run([str(exe)] + args, capture_output=True, text=True,
+                               env=env, timeout=600)
+            metrics = parse_metrics(r.stdout)
+            if metrics and "rss_reduction_pct" not in metrics:
+                peak = metrics.get("peak_rss_mb", 0)
+                min_rss = metrics.get("min_rss_mb", peak)
+                if peak > 0:
+                    metrics["rss_reduction_pct"] = (1 - min_rss / peak) * 100
+                    metrics["steady_rss_mb"] = metrics.get("serve_rss_mb", min_rss)
+                    metrics["post_cool_rss_mb"] = metrics.get("cool_rss_mb", min_rss)
+            return metrics
+        except Exception as e:
+            print(f"    rocksdb error: {e}")
+            return None
+    # Fallback to shell script
+    script = build_dir / "bench" / "bench_rocksdb.sh"
+    if script.exists():
+        return run_shell_benchmark(script, smash_lib, quick, "rocksdb")
+    return None
+
+
+# ── External-process benchmark runners ───────────────────────────────────────
+
+def run_redis_bench(build_dir, smash_lib, quick):
+    """Run Redis benchmark using redis-benchmark (LLAMA-style config)."""
+    for cmd in ("redis-server", "redis-cli", "redis-benchmark"):
+        if not _check_cmd(cmd):
+            return None
+
+    port = 16399
+    num_ops = 50000 if quick else 100000
+    num_clients = 1000 if quick else 5000
+    value_size = 1000
+    keyspace = 100000
+    cool_sec = 5 if quick else 15
+
+    kill_redis(port)
+
+    env = os.environ.copy()
+    if smash_lib:
+        env[PRELOAD_VAR] = str(smash_lib)
+        env["SMASH_VERY_COLD_TICKS"] = "5"
+
+    proc = subprocess.Popen(
+        ["redis-server", "--port", str(port), "--save", "",
+         "--appendonly", "no", "--daemonize", "no", "--loglevel", "warning",
+         "--hz", "1", "--dynamic-hz", "no"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    try:
+        if not wait_for_port(port, timeout=10):
+            print("    redis: failed to start")
+            return None
+
+        # SET phase via redis-benchmark
+        try:
+            set_result = subprocess.run(
+                ["redis-benchmark", "-p", str(port), "-c", str(num_clients),
+                 "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
+                 "-t", "set", "-q"],
+                capture_output=True, text=True, timeout=600
+            )
+            set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
+        except subprocess.TimeoutExpired:
+            print("    redis SET timed out, returning partial results")
+            set_rps = 0
+
+        # Verify Redis is actually filled
+        try:
+            dbsize = subprocess.check_output(
+                ["redis-cli", "-p", str(port), "DBSIZE"],
+                text=True, timeout=5
+            ).strip()
+        except Exception:
+            dbsize = "?"
+
+        fill_rss = get_rss_mb(proc.pid)
+        if fill_rss < 10:
+            print(f"    redis: fill_rss={fill_rss:.1f}MB (too low, DBSIZE={dbsize})")
+            return None
+
+        # Cool-down: let compression run
+        min_rss = fill_rss
+        for i in range(cool_sec):
+            time.sleep(1)
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                min_rss = min(min_rss, rss)
+
+        cool_rss = get_rss_mb(proc.pid)
+
+        # GET phase via redis-benchmark (skip if SET failed)
+        get_rps = 0
+        if set_rps > 0:
+            try:
+                get_result = subprocess.run(
+                    ["redis-benchmark", "-p", str(port), "-c", str(num_clients),
+                     "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
+                     "-t", "get", "-q"],
+                    capture_output=True, text=True, timeout=600
+                )
+                get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
+            except subprocess.TimeoutExpired:
+                print("    redis GET timed out, returning partial results")
+                get_rps = 0
+
+        reduction = (1 - min_rss / fill_rss) * 100 if fill_rss > 0 else 0
+
+        return {
+            "peak_rss_mb": fill_rss,
+            "steady_rss_mb": cool_rss,
+            "min_rss_mb": min_rss,
+            "rss_reduction_pct": reduction,
+            "set_rps": set_rps,
+            "get_rps": get_rps,
+        }
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        kill_redis(port)
+
+
+def _parse_redis_benchmark_rps(output, cmd_name):
+    """Parse requests/sec from redis-benchmark -q output."""
+    for line in output.splitlines():
+        if cmd_name in line and "requests per second" in line:
+            m = re.search(r'([\d.]+)\s+requests per second', line)
+            if m:
+                return float(m.group(1))
+    return 0.0
+
+
+def run_redis_extended_bench(build_dir, smash_lib, quick):
+    """Run Redis extended benchmark: SET → DELETE 50% → cool → GET."""
+    for cmd in ("redis-server", "redis-cli", "redis-benchmark"):
+        if not _check_cmd(cmd):
+            return None
+
+    port = 16400  # different port from run_redis_bench to avoid conflicts
+    num_ops = 50000 if quick else 100000
+    num_clients = 1000 if quick else 5000
+    value_size = 1000
+    keyspace = 100000
+    cool_sec = 5 if quick else 15
+
+    kill_redis(port)
+
+    env = os.environ.copy()
+    if smash_lib:
+        env[PRELOAD_VAR] = str(smash_lib)
+        env["SMASH_VERY_COLD_TICKS"] = "5"
+
+    proc = subprocess.Popen(
+        ["redis-server", "--port", str(port), "--save", "",
+         "--appendonly", "no", "--daemonize", "no", "--loglevel", "warning",
+         "--hz", "1", "--dynamic-hz", "no"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    try:
+        if not wait_for_port(port, timeout=10):
+            print("    redis_ext: failed to start")
+            return None
+
+        # SET phase via redis-benchmark
+        try:
+            set_result = subprocess.run(
+                ["redis-benchmark", "-p", str(port), "-c", str(num_clients),
+                 "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
+                 "-t", "set", "-q"],
+                capture_output=True, text=True, timeout=600
+            )
+            set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
+        except subprocess.TimeoutExpired:
+            print("    redis_ext SET timed out, returning partial results")
+            set_rps = 0
+        peak_rss = get_rss_mb(proc.pid)
+
+        # Check how many keys we have
+        try:
+            dbsize_out = subprocess.check_output(
+                ["redis-cli", "-p", str(port), "DBSIZE"],
+                text=True, timeout=5
+            ).strip()
+        except Exception:
+            dbsize_out = "?"
+
+        # DELETE ~50% of keys using RANDOMKEY
+        # redis-benchmark -r uses random keys; SCAN works but RANDOMKEY is simpler
+        try:
+            total_keys = int(dbsize_out.split(":")[-1].strip().rstrip("\r"))
+        except (ValueError, IndexError):
+            total_keys = 0
+        target_delete = total_keys // 2
+        deleted = 0
+        if target_delete > 0:
+            # Pipeline DEL commands for speed
+            batch_size = 100
+            for _ in range(0, target_delete, batch_size):
+                n = min(batch_size, target_delete - deleted)
+                # Get random keys and delete them
+                pipe_cmds = ""
+                for _ in range(n):
+                    pipe_cmds += "RANDOMKEY\n"
+                try:
+                    key_result = subprocess.run(
+                        ["redis-cli", "-p", str(port), "--pipe-mode"],
+                        input=pipe_cmds, capture_output=True, text=True, timeout=10
+                    )
+                except Exception:
+                    # Fallback: delete one at a time
+                    pass
+                # Simpler approach: use redis-cli eval
+                try:
+                    del_result = subprocess.run(
+                        ["redis-cli", "-p", str(port), "EVAL",
+                         f"local d=0; for i=1,{n} do local k=redis.call('RANDOMKEY'); "
+                         f"if k then redis.call('DEL',k); d=d+1 end end; return d",
+                         "0"],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    try:
+                        deleted += int(del_result.stdout.strip().split(")")[-1].strip()
+                                      if ")" in del_result.stdout
+                                      else del_result.stdout.strip())
+                    except (ValueError, IndexError):
+                        deleted += n  # assume it worked
+                except Exception:
+                    break
+
+        post_del_rss = get_rss_mb(proc.pid)
+        print(f"    deleted {deleted}/{total_keys} keys", flush=True)
+
+        # Cool-down: let compression run
+        min_rss = post_del_rss
+        for i in range(cool_sec):
+            time.sleep(1)
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                min_rss = min(min_rss, rss)
+
+        cool_rss = get_rss_mb(proc.pid)
+
+        # GET phase via redis-benchmark
+        get_rps = 0
+        if set_rps > 0:
+            try:
+                get_result = subprocess.run(
+                    ["redis-benchmark", "-p", str(port), "-c", str(num_clients),
+                     "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
+                     "-t", "get", "-q"],
+                    capture_output=True, text=True, timeout=600
+                )
+                get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
+            except subprocess.TimeoutExpired:
+                print("    redis-ext GET timed out, returning partial results")
+                get_rps = 0
+
+        reduction = (1 - cool_rss / post_del_rss) * 100 if post_del_rss > 0 else 0
+
+        return {
+            "peak_rss_mb": peak_rss,
+            "post_del_rss_mb": post_del_rss,
+            "steady_rss_mb": cool_rss,
+            "min_rss_mb": min_rss,
+            "rss_reduction_pct": reduction,
+            "set_rps": set_rps,
+            "get_rps": get_rps,
+        }
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        kill_redis(port)
+
+
+def run_memcached_bench(build_dir, smash_lib, quick):
+    """Run Memcached benchmark."""
+    if not _check_cmd("memcached"):
+        return None
+
+    port = 11299
+    num_keys = 100000 if quick else 500000
+    cool_sec = 5 if quick else 10
+    serve_sec = 5 if quick else 10
+
+    env = os.environ.copy()
+    if smash_lib:
+        env[PRELOAD_VAR] = str(smash_lib)
+        env["SMASH_VERY_COLD_TICKS"] = "5"
+
+    # Start memcached
+    proc = subprocess.Popen(
+        ["memcached", "-p", str(port), "-m", "512", "-l", "127.0.0.1"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    try:
+        if not wait_for_port(port, timeout=10):
+            print("    memcached: failed to start")
+            return None
+
+        # Populate with compressible values
+        _populate_memcached(port, num_keys)
+        fill_rss = get_rss_mb(proc.pid)
+
+        # Cool phase
+        time.sleep(cool_sec)
+        cool_rss = get_rss_mb(proc.pid)
+
+        # Serve phase: access hot 5%
+        hot_keys = max(1, num_keys // 20)
+        _access_memcached(port, hot_keys, serve_sec)
+        serve_rss = get_rss_mb(proc.pid)
+
+        reduction = (1 - serve_rss / fill_rss) * 100 if fill_rss > 0 else 0
+
+        return {
+            "peak_rss_mb": fill_rss,
+            "cool_rss_mb": cool_rss,
+            "steady_rss_mb": serve_rss,
+            "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
+            "rss_reduction_pct": reduction,
+        }
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _populate_memcached(port, num_keys):
+    """Populate memcached with SET commands via socket."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=30)
+    s.settimeout(30)
+    try:
+        batch = []
+        for i in range(num_keys):
+            key = f"key:{i:07d}"
+            val = (f"data_entry_{key}_compressible_content_padding_"
+                   f"{'x' * 150}")
+            cmd = f"set {key} 0 0 {len(val)}\r\n{val}\r\n"
+            batch.append(cmd)
+            if len(batch) >= 500:
+                s.sendall("".join(batch).encode())
+                # Drain all responses (one STORED\r\n per SET)
+                expected = len(batch) * len("STORED\r\n")
+                drained = 0
+                while drained < expected:
+                    try:
+                        data = s.recv(65536)
+                        if not data:
+                            break
+                        drained += len(data)
+                    except socket.timeout:
+                        break
+                batch = []
+        if batch:
+            s.sendall("".join(batch).encode())
+            time.sleep(0.5)
+            try:
+                while True:
+                    data = s.recv(65536)
+                    if not data:
+                        break
+            except socket.timeout:
+                pass
+    finally:
+        s.close()
+
+
+def _access_memcached(port, hot_keys, duration_sec):
+    """Access hot keys in memcached for a duration."""
+    deadline = time.time() + duration_sec
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.settimeout(1.0)
+    try:
+        while time.time() < deadline:
+            batch = []
+            for _ in range(100):
+                key = f"key:{hash(time.time()) % hot_keys:07d}"
+                batch.append(f"get {key}\r\n")
+            try:
+                s.sendall("".join(batch).encode())
+                s.recv(65536)
+            except (socket.timeout, BrokenPipeError):
+                break
+            time.sleep(0.01)
+    finally:
+        s.close()
+
+
+def _duckdb_baseline_rss(quick):
+    """Get DuckDB's uncompressed fill RSS (no Smash) — cached."""
+    if not hasattr(_duckdb_baseline_rss, "_cache"):
+        _duckdb_baseline_rss._cache = {}
+    key = "quick" if quick else "full"
+    if key in _duckdb_baseline_rss._cache:
+        return _duckdb_baseline_rss._cache[key]
+
+    sf = 0.1 if quick else 0.5
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = os.path.join(tmpdir, "marker.csv")
+        proc = subprocess.Popen(
+            ["duckdb", ":memory:"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
+                   f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
+            proc.stdin.write(sql.encode())
+            proc.stdin.flush()
+            if not _wait_file(marker, "fill_done", timeout=300):
+                return 0.0
+            rss = get_rss_mb(proc.pid)
+            proc.stdin.close()
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+            rss = 0.0
+    _duckdb_baseline_rss._cache[key] = rss
+    return rss
+
+
+def run_duckdb_bench(build_dir, smash_lib, quick):
+    """Run DuckDB benchmark with TPC-H data."""
+    if not _check_cmd("duckdb"):
+        return None
+
+    sf = 0.1 if quick else 0.5
+    cool_sec = 5 if quick else 10
+    serve_iters = 3 if quick else 10
+
+    env = os.environ.copy()
+    if smash_lib:
+        env[PRELOAD_VAR] = str(smash_lib)
+        env["SMASH_VERY_COLD_TICKS"] = "5"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = os.path.join(tmpdir, "marker.csv")
+
+        # Use subprocess.PIPE for stdin (not FIFO — avoids blocking)
+        proc = subprocess.Popen(
+            ["duckdb", ":memory:"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env
+        )
+
+        try:
+            # Phase 1: Fill
+            sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
+                   f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
+            proc.stdin.write(sql.encode())
+            proc.stdin.flush()
+
+            if not _wait_file(marker, "fill_done", timeout=300):
+                print("    duckdb: fill timed out")
+                return None
+
+            fill_rss = get_rss_mb(proc.pid)
+
+            # Phase 2: Cool
+            time.sleep(cool_sec)
+            cool_rss = get_rss_mb(proc.pid)
+
+            # Phase 3: Serve (narrow queries that touch only a few columns,
+            # leaving the rest cold and compressible)
+            if os.path.exists(marker):
+                os.remove(marker)
+            for _ in range(serve_iters):
+                if proc.poll() is not None:
+                    break
+                sql = ("SELECT l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+                       "FROM lineitem WHERE l_shipdate BETWEEN '1998-11-01' AND '1998-12-01' "
+                       "GROUP BY l_returnflag, l_linestatus;\n")
+                proc.stdin.write(sql.encode())
+                proc.stdin.flush()
+
+            sql = f"COPY (SELECT 'serve_done') TO '{marker}' (HEADER false);\n"
+            proc.stdin.write(sql.encode())
+            proc.stdin.flush()
+            _wait_file(marker, "serve_done", timeout=60)
+
+            serve_rss = get_rss_mb(proc.pid)
+            if serve_rss <= 0:
+                print("    duckdb: process exited during serve phase")
+                return None
+
+            # DuckDB uses mmap (not malloc) for its buffer pool, so Smash
+            # compresses pages during fill — fill_rss is already reduced.
+            # Compare against uncompressed baseline to get true reduction.
+            baseline_rss = _duckdb_baseline_rss(quick)
+            if baseline_rss > 0 and smash_lib:
+                reduction = (1 - serve_rss / baseline_rss) * 100
+            elif fill_rss > 0:
+                reduction = (1 - serve_rss / fill_rss) * 100
+            else:
+                reduction = 0
+
+            # Close stdin to let duckdb exit
+            proc.stdin.close()
+
+            return {
+                "peak_rss_mb": fill_rss,
+                "cool_rss_mb": cool_rss,
+                "steady_rss_mb": serve_rss,
+                "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
+                "rss_reduction_pct": reduction,
+                "baseline_rss_mb": baseline_rss,
+            }
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
+
+def _wait_file(path, content, timeout=60):
+    """Wait for a file to appear with expected content."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    if content in f.read():
+                        return True
+            except Exception:
+                pass
+        time.sleep(0.5)
+    return False
+
+
+def _check_cmd(name):
+    """Check if a command exists in PATH."""
+    try:
+        subprocess.run(["which", name], capture_output=True, check=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+# ── Run shell-script-based benchmark ─────────────────────────────────────────
+
+def run_shell_benchmark(script, smash_lib, quick, name):
+    """Run a shell script benchmark and parse output for smash metrics."""
+    args = ["bash", str(script)]
+    if quick:
+        args.append("--quick")
+
+    # The shell script handles SMASH_LIB internally via BUILD_DIR
+    # Just make sure libsmash.dylib is the right one (rebuilt)
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=600)
+        stdout = r.stdout
+
+        # Parse metrics: look for [smash] ... RSS: X MB lines
+        metrics = {}
+        for line in stdout.splitlines():
+            m = re.match(
+                r"\s*\[smash\]\s+(Fill|Cool|Serve|Cold re-access)\s+done.*RSS:\s+([\d.]+)\s+MB",
+                line)
+            if m:
+                phase = m.group(1).lower().replace(" ", "_").replace("-", "")
+                metrics[f"{phase}_rss_mb"] = float(m.group(2))
+
+        # Also parse METRIC lines
+        for line in stdout.splitlines():
+            m = re.match(r"^METRIC smash_(\S+) ([\d.]+)$", line)
+            if m:
+                metrics[m.group(1)] = float(m.group(2))
+
+        return metrics
+    except Exception as e:
+        print(f"    {name} error: {e}")
+        return None
+
+
+# ── App runner dispatch ──────────────────────────────────────────────────────
+
+def run_app(app, build_dir, smash_lib, quick):
+    """Run a benchmark for a given app, return metrics dict."""
+    if app == "sqlite":
+        return run_sqlite(build_dir, smash_lib, quick)
+    elif app == "rocksdb":
+        return run_rocksdb(build_dir, smash_lib, quick)
+    elif app == "duckdb":
+        return run_duckdb_bench(build_dir, smash_lib, quick)
+    elif app == "memcached":
+        return run_memcached_bench(build_dir, smash_lib, quick)
+    elif app == "redis":
+        return run_redis_bench(build_dir, smash_lib, quick)
+    elif app == "redis_ext":
+        return run_redis_extended_bench(build_dir, smash_lib, quick)
+    return None
+
+
+# ── Ablation experiment ──────────────────────────────────────────────────────
+
+def run_ablation(build_dir, source_dir, apps, quick, output_dir, runs=1):
+    """Run full ablation study across all apps and configs."""
+    results_path = output_dir / "ablation_results.json"
+
+    smash_lib = build_dir / f"libsmash{LIB_SUFFIX}"
+
+    # Load existing results
+    all_results = {}
+    if results_path.exists():
+        all_results = json.loads(results_path.read_text())
+
+    last_flags = None
+    total = len(ABLATION_CONFIGS)
+    t0 = time.time()
+
+    for idx, (cid, cfg) in enumerate(ABLATION_CONFIGS.items(), 1):
+        elapsed = time.time() - t0
+        print(f"\n[{idx}/{total}] {cfg['name']} ({cid})  [{elapsed:.0f}s elapsed]")
+
+        # Rebuild if flags changed
+        flags = cfg["cmake_flags"]
+        if flags != last_flags and cfg["use_smash"]:
+            print(f"  Rebuilding libsmash...")
+            if not rebuild(build_dir, flags, source_dir):
+                print(f"  SKIPPING {cid}: build failed")
+                continue
+            last_flags = flags
+
+        for app in apps:
+            # Check if already done
+            if app in all_results and cid in all_results.get(app, {}):
+                print(f"  {app}: cached")
+                continue
+
+            lib = smash_lib if cfg["use_smash"] else None
+            run_results = []
+
+            max_attempts = runs + 2  # allow a couple retries for transient failures
+            attempt = 0
+            for run_num in range(1, runs + 1):
+                while attempt < max_attempts:
+                    attempt += 1
+                    print(f"  {app} run {run_num}...", end="", flush=True)
+                    metrics = run_app(app, build_dir, lib, quick)
+                    if metrics:
+                        rss = metrics.get("rss_reduction_pct", "N/A")
+                        print(f" rss_reduction={rss}")
+                        run_results.append(metrics)
+                        break
+                    elif app.startswith("redis"):
+                        print(f" RETRY (transient failure)")
+                        time.sleep(2)
+                    else:
+                        print(f" SKIP (not available)")
+                        break
+                else:
+                    print(f"  {app}: too many failures, skipping remaining runs")
+                    break
+
+            if run_results:
+                med = _median_metrics(run_results)
+                if app not in all_results:
+                    all_results[app] = {}
+                all_results[app][cid] = {
+                    "name": cfg["name"],
+                    "runs": run_results,
+                    "median": med,
+                }
+
+        # Save incrementally
+        results_path.write_text(json.dumps(all_results, indent=2))
+
+    elapsed = time.time() - t0
+    print(f"\nAblation complete in {elapsed:.0f}s. Results: {results_path}")
+    return all_results
+
+
+# ── Compress-only experiment ─────────────────────────────────────────────────
+
+def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1):
+    """Run compress-only experiment for all apps."""
+    results_path = output_dir / "compress_only_results.json"
+
+    smash_lib = build_dir / f"libsmash{LIB_SUFFIX}"
+    co_lib = build_dir / f"libsmash_compress_only{LIB_SUFFIX}"
+
+    if not co_lib.exists():
+        print(f"ERROR: {co_lib} not found. Build with -DSMASH_BUILD_BENCH=ON")
+        return {}
+
+    # Ensure default build for full smash
+    rebuild(build_dir, {}, source_dir)
+
+    all_results = {}
+    if results_path.exists():
+        all_results = json.loads(results_path.read_text())
+
+    configs = [
+        ("baseline", None),
+        ("compress_only", co_lib),
+        ("full_smash", smash_lib),
+    ]
+
+    t0 = time.time()
+    for app in apps:
+        print(f"\n{'='*60}")
+        print(f"  Compress-only: {app}")
+        print(f"{'='*60}")
+
+        for config_name, lib in configs:
+            key = f"{app}_{config_name}"
+            if key in all_results:
+                print(f"  {config_name}: cached")
+                continue
+
+            run_results = []
+            max_attempts = runs + 2
+            attempt = 0
+            for run_num in range(1, runs + 1):
+                while attempt < max_attempts:
+                    attempt += 1
+                    print(f"  {config_name} run {run_num}...", end="", flush=True)
+                    metrics = run_app(app, build_dir, lib, quick)
+                    if metrics:
+                        rss = metrics.get("rss_reduction_pct", 0)
+                        steady = metrics.get("steady_rss_mb", 0)
+                        print(f" rss={steady:.1f}MB reduction={rss:.1f}%")
+                        run_results.append(metrics)
+                        break
+                    elif app.startswith("redis"):
+                        print(f" RETRY (transient failure)")
+                        time.sleep(2)
+                    else:
+                        print(f" SKIP")
+                        break
+
+            if run_results:
+                all_results[key] = {
+                    "runs": run_results,
+                    "median": _median_metrics(run_results),
+                }
+
+        results_path.write_text(json.dumps(all_results, indent=2))
+
+    elapsed = time.time() - t0
+    print(f"\nCompress-only complete in {elapsed:.0f}s. Results: {results_path}")
+    return all_results
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _median_metrics(runs):
+    """Compute median of each metric across runs."""
+    if not runs:
+        return {}
+    keys = set()
+    for r in runs:
+        keys.update(r.keys())
+    result = {}
+    for k in keys:
+        vals = [r[k] for r in runs if k in r]
+        if vals:
+            result[k] = statistics.median(vals)
+    return result
+
+
+# ── Paper table generation ───────────────────────────────────────────────────
+
+def generate_ablation_table(results, apps):
+    """Generate LaTeX ablation table from results."""
+    lines = []
+    lines.append("% Auto-generated ablation table")
+    lines.append("\\begin{tabular}{ll" + "r" * len(apps) + "r}")
+    lines.append("\\toprule")
+    headers = " & ".join([f"\\textbf{{{a.capitalize()}}}" for a in apps])
+    lines.append(f"ID & Configuration & {headers} & Avg.\\ $\\Delta$ \\\\")
+    lines.append("\\midrule")
+
+    # Get baseline (B1) values
+    b1 = {}
+    for app in apps:
+        b1[app] = results.get(app, {}).get("B1", {}).get("median", {}).get("rss_reduction_pct")
+
+    for cid, cfg in ABLATION_CONFIGS.items():
+        vals = []
+        deltas = []
+        for app in apps:
+            v = results.get(app, {}).get(cid, {}).get("median", {}).get("rss_reduction_pct")
+            if v is not None and b1.get(app) is not None:
+                delta = v - b1[app]
+                if cid == "B1":
+                    vals.append(f"\\textbf{{{v:.1f}\\%}}")
+                else:
+                    sign = "+" if delta >= 0 else "$-$"
+                    absv = abs(delta)
+                    vals.append(f"{v:.1f}\\% ({sign}{absv:.1f})")
+                    deltas.append(delta)
+            else:
+                vals.append("---")
+
+        avg_delta = f"{statistics.mean(deltas):+.1f}" if deltas else "---"
+        val_str = " & ".join(vals)
+
+        if cid == "B1":
+            lines.append(f"    & \\textbf{{{cfg['name']}}} & {val_str} & --- \\\\")
+        elif cid in ("B0", "B2"):
+            lines.append(f"{cid}  & {cfg['name']} & {val_str} & {avg_delta} \\\\")
+        else:
+            lines.append(f"    & {cfg['name']} & {val_str} & {avg_delta} \\\\")
+
+        if cid == "B0":
+            lines.append("\\midrule")
+
+    lines.append("\\bottomrule")
+    lines.append("\\end{tabular}")
+    return "\n".join(lines)
+
+
+def generate_compress_only_table(results, apps):
+    """Generate LaTeX compress-only table from results."""
+    lines = []
+    lines.append("% Auto-generated compress-only table")
+    lines.append("\\begin{tabular}{llrrr}")
+    lines.append("\\toprule")
+    lines.append("Benchmark & Config & Cool RSS & Reduction & Ops/s \\\\")
+    lines.append("\\midrule")
+
+    for app in apps:
+        baseline = results.get(f"{app}_baseline", {}).get("median", {})
+        co = results.get(f"{app}_compress_only", {}).get("median", {})
+        full = results.get(f"{app}_full_smash", {}).get("median", {})
+
+        base_rss = baseline.get("steady_rss_mb", baseline.get("peak_rss_mb", 0))
+        co_rss = co.get("steady_rss_mb", co.get("min_rss_mb", 0))
+        full_rss = full.get("steady_rss_mb", full.get("min_rss_mb", 0))
+
+        co_red = (1 - co_rss / base_rss) * 100 if base_rss > 0 and co_rss > 0 else 0
+        full_red = (1 - full_rss / base_rss) * 100 if base_rss > 0 and full_rss > 0 else 0
+
+        lines.append(f"\\multirow{{3}}{{*}}{{{app.capitalize()}}}")
+        lines.append(f"  & baseline       & {base_rss:.0f}  & ---    & --- \\\\")
+        lines.append(f"  & compress-only  & {co_rss:.0f}    & {co_red:.1f}\\% & --- \\\\")
+        lines.append(f"  & full \\sys      & \\textbf{{{full_rss:.0f}}}   & "
+                     f"\\textbf{{{full_red:.1f}\\%}} & --- \\\\")
+        lines.append("\\midrule")
+
+    # Remove last midrule
+    if lines[-1] == "\\midrule":
+        lines[-1] = "\\bottomrule"
+
+    lines.append("\\end{tabular}")
+    return "\n".join(lines)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Run all paper experiments")
+    parser.add_argument("--quick", action="store_true", help="Use --quick for faster runs")
+    parser.add_argument("--ablation-only", action="store_true")
+    parser.add_argument("--compress-only-only", action="store_true")
+    parser.add_argument("--build-dir", default=".", help="Build directory (default: .)")
+    parser.add_argument("--runs", type=int, default=1, help="Runs per config (default: 1)")
+    parser.add_argument("--apps", default=None,
+                        help="Comma-separated app list (default: all available)")
+    args = parser.parse_args()
+
+    build_dir = Path(args.build_dir).resolve()
+    source_dir = Path(__file__).resolve().parent.parent
+    output_dir = source_dir / "paper_results"
+    output_dir.mkdir(exist_ok=True)
+
+    # Determine available apps
+    if args.apps:
+        apps = [a.strip() for a in args.apps.split(",")]
+    else:
+        apps = []
+        for app in APPS:
+            if app == "sqlite" and (build_dir / "bench" / "bench_sqlite").exists():
+                apps.append(app)
+            elif app == "rocksdb":
+                if ((build_dir / "bench" / "bench_rocksdb").exists() or
+                        (build_dir / "bench" / "bench_rocksdb.sh").exists()):
+                    apps.append(app)
+            elif app == "duckdb" and _check_cmd("duckdb"):
+                apps.append(app)
+            elif app == "memcached" and _check_cmd("memcached"):
+                apps.append(app)
+            elif app == "redis" and _check_cmd("redis-server"):
+                apps.append(app)
+            elif app == "redis_ext" and _check_cmd("redis-server"):
+                apps.append(app)
+
+    print(f"Apps: {', '.join(apps)}")
+    print(f"Build dir: {build_dir}")
+    print(f"Output: {output_dir}")
+    print(f"Quick: {args.quick}")
+    print()
+
+    ablation_results = {}
+    co_results = {}
+
+    if not args.compress_only_only:
+        print("=" * 70)
+        print("  ABLATION STUDY")
+        print("=" * 70)
+        ablation_results = run_ablation(build_dir, source_dir, apps, args.quick,
+                                        output_dir, runs=args.runs)
+
+    if not args.ablation_only:
+        print("\n" + "=" * 70)
+        print("  COMPRESS-ONLY EXPERIMENT")
+        print("=" * 70)
+        co_results = run_compress_only(build_dir, source_dir, apps, args.quick,
+                                       output_dir, runs=args.runs)
+
+    # Generate tables
+    tables_path = output_dir / "paper_tables.txt"
+    with open(tables_path, "w") as f:
+        if ablation_results:
+            used_apps = [a for a in apps if a in ablation_results]
+            f.write("ABLATION TABLE\n")
+            f.write("=" * 70 + "\n")
+            f.write(generate_ablation_table(ablation_results, used_apps))
+            f.write("\n\n")
+
+        if co_results:
+            f.write("COMPRESS-ONLY TABLE\n")
+            f.write("=" * 70 + "\n")
+            f.write(generate_compress_only_table(co_results, apps))
+            f.write("\n")
+
+    print(f"\nPaper tables: {tables_path}")
+    print("Done!")
+
+
+if __name__ == "__main__":
+    main()

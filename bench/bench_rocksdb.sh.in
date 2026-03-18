@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# bench_rocksdb.sh - RocksDB block cache: system malloc vs Smash
+#
+# Opens a RocksDB database, populates with key-value pairs, then does
+# hot reads (Zipfian over recent keys) while older data goes cold in
+# the block cache. The block cache is allocated via malloc, so Smash
+# can compress cold cache blocks.
+#
+# Requires the C++ bench_rocksdb binary. Built if rocksdb is found.
+#
+# Usage:
+#   bash bench_rocksdb.sh [--quick]
+
+set -euo pipefail
+
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+BENCH_BIN="${BUILD_DIR}/bench/bench_rocksdb"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+NUM_KEYS=500000
+VALUE_SIZE=512
+COOL_DURATION=10
+SERVE_DURATION=20
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_KEYS=200000
+            VALUE_SIZE=256
+            COOL_DURATION=5
+            SERVE_DURATION=10
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+if [[ ! -f "$BENCH_BIN" ]]; then
+    echo "SKIP: bench_rocksdb not built (install rocksdb: brew install rocksdb)"
+    exit 0
+fi
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    exit 1
+fi
+
+TMPDIR_BENCH=$(mktemp -d)
+trap "rm -rf ${TMPDIR_BENCH}" EXIT
+
+get_rss_mb() {
+    local pid="$1"
+    local rss_kb
+    rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ -n "$rss_kb" && "$rss_kb" -gt 0 ]] 2>/dev/null; then
+        echo "scale=1; $rss_kb / 1024" | bc -l
+    else
+        echo "0"
+    fi
+}
+
+run_pass() {
+    local label="$1"
+    local use_smash="$2"
+    local compression="${3:-none}"
+    local db_dir="${TMPDIR_BENCH}/${label}_db"
+
+    echo ""
+    echo "[${label}] Starting RocksDB benchmark (compression=${compression})..."
+
+    local cmd=("$BENCH_BIN" --db "$db_dir" --keys "$NUM_KEYS" --value-size "$VALUE_SIZE" \
+            --cool "$COOL_DURATION" --serve "$SERVE_DURATION" --compression "$compression")
+
+    if [[ "$use_smash" == "yes" ]]; then
+        env "${PRELOAD_VAR}=${SMASH_LIB}" "${cmd[@]}" 2>&1
+    else
+        "${cmd[@]}" 2>&1
+    fi
+
+    rm -rf "$db_dir"
+}
+
+echo ""
+echo "========================================================================"
+echo "  RocksDB Block Cache A/B Comparison"
+echo "========================================================================"
+echo "Keys: ${NUM_KEYS}, Value size: ${VALUE_SIZE}B"
+echo ""
+
+BASELINE_OUT=$(run_pass "baseline" "no" "none")
+SMASH_OUT=$(run_pass "smash" "yes" "none")
+
+# Also run with RocksDB's own compression for comparison
+ROCKSDB_LZ4_OUT=$(run_pass "rocksdb-lz4" "no" "lz4")
+ROCKSDB_ZSTD_OUT=$(run_pass "rocksdb-zstd" "no" "zstd")
+SMASH_LZ4_OUT=$(run_pass "smash+lz4" "yes" "lz4")
+
+# Parse METRIC lines for all configurations
+declare -A OUTPUTS
+OUTPUTS[baseline]="$BASELINE_OUT"
+OUTPUTS[smash]="$SMASH_OUT"
+OUTPUTS[rocksdb-lz4]="$ROCKSDB_LZ4_OUT"
+OUTPUTS[rocksdb-zstd]="$ROCKSDB_ZSTD_OUT"
+OUTPUTS[smash+lz4]="$SMASH_LZ4_OUT"
+
+CONFIGS="baseline smash rocksdb-lz4 rocksdb-zstd smash+lz4"
+
+for cfg in $CONFIGS; do
+    echo "${OUTPUTS[$cfg]}" | grep '^METRIC ' > "${TMPDIR_BENCH}/${cfg}.txt"
+done
+
+metric_val() {
+    local file="$1" name="$2"
+    awk -v m="$name" '$1=="METRIC" && $2==m {print $3}' "$file"
+}
+
+echo ""
+echo ""
+echo "========================================================================"
+echo "  Results Summary"
+echo "========================================================================"
+echo ""
+echo "  Configurations:"
+echo "    baseline    = system malloc, no RocksDB compression"
+echo "    smash       = Smash allocator, no RocksDB compression"
+echo "    rocksdb-lz4 = system malloc, RocksDB LZ4 SST compression"
+echo "    rocksdb-zstd= system malloc, RocksDB zstd SST compression"
+echo "    smash+lz4   = Smash allocator + RocksDB LZ4 SST compression"
+echo ""
+
+printf "  %-25s" "Metric"
+for cfg in $CONFIGS; do
+    printf " %12s" "$cfg"
+done
+echo ""
+echo "  ────────────────────────────────────────────────────────────────────────────────────────────"
+
+for metric in peak_rss_mb cool_rss_mb serve_rss_mb min_rss_mb ops_per_sec cold_sec cold_rss_mb; do
+    case "$metric" in
+        peak_rss_mb)   label="Peak RSS (MB)" ;;
+        cool_rss_mb)   label="Post-cool RSS (MB)" ;;
+        serve_rss_mb)  label="Serve RSS (MB)" ;;
+        min_rss_mb)    label="Min RSS (MB)" ;;
+        ops_per_sec)   label="Ops/sec" ;;
+        cold_sec)      label="Cold access (s)" ;;
+        cold_rss_mb)   label="Cold RSS (MB)" ;;
+    esac
+    printf "  %-25s" "$label"
+    for cfg in $CONFIGS; do
+        val=$(metric_val "${TMPDIR_BENCH}/${cfg}.txt" "$metric")
+        printf " %12s" "${val:-N/A}"
+    done
+    echo ""
+done
+
+# RSS reduction vs baseline
+echo ""
+echo "  RSS reduction vs baseline (serve RSS):"
+baseline_serve=$(metric_val "${TMPDIR_BENCH}/baseline.txt" "serve_rss_mb")
+if [[ -n "$baseline_serve" && "$baseline_serve" != "0" ]]; then
+    for cfg in smash rocksdb-lz4 rocksdb-zstd smash+lz4; do
+        val=$(metric_val "${TMPDIR_BENCH}/${cfg}.txt" "serve_rss_mb")
+        if [[ -n "$val" && "$val" != "N/A" ]]; then
+            delta=$(echo "scale=1; (($val - $baseline_serve) / $baseline_serve) * 100" | bc -l 2>/dev/null || echo "N/A")
+            printf "    %-15s %s%%\n" "$cfg" "$delta"
+        fi
+    done
+fi
+
+echo ""
+echo "Done."

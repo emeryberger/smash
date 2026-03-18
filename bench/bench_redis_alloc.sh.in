@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# bench_redis_alloc.sh - Redis RSS + throughput comparison across allocators
+#
+# Runs Redis with each allocator via DYLD_INSERT_LIBRARIES.
+# Two workloads per allocator:
+#   Standard: SET → cool → GET
+#   Extended: SET → DELETE ~50% → cool → GET
+#
+# Usage:
+#   bash bench_redis_alloc.sh [--quick]
+#
+# Compatible with bash 3.2+ (macOS default).
+
+set -euo pipefail
+
+export SMASH_VERY_COLD_TICKS=5
+
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+NUM_OPS=100000
+NUM_CLIENTS=5000
+VALUE_SIZE=1000
+KEYSPACE=100000
+COOL_DURATION=15
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_OPS=50000
+            NUM_CLIENTS=1000
+            COOL_DURATION=5
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+# ── Check prerequisites ─────────────────────────────────────────────────────
+for cmd in redis-server redis-cli redis-benchmark; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "SKIP: $cmd not found in PATH"
+        exit 0
+    fi
+done
+
+declare -a ALLOCATORS=(
+    "system||"
+    "mimalloc|/opt/homebrew/lib/libmimalloc.dylib|MIMALLOC_PURGE_DELAY=-1"
+    "jemalloc|/opt/homebrew/lib/libjemalloc.dylib|MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"
+    "tcmalloc|/opt/homebrew/lib/libtcmalloc.dylib|TCMALLOC_RELEASE_RATE=0"
+    "hoard|/usr/local/lib/libhoard.dylib|"
+    "mesh|/Users/emery/git/mesh/build/lib/libmesh.dylib|"
+    "diehard|/usr/local/lib/libdiehard.dylib|"
+    "dieharder|/usr/local/lib/libdieharder.dylib|"
+    "smash|${SMASH_LIB}|"
+)
+
+TMPDIR_BENCH=$(mktemp -d)
+STD_RESULT_FILE="${TMPDIR_BENCH}/results_standard.txt"
+EXT_RESULT_FILE="${TMPDIR_BENCH}/results_extended.txt"
+: > "$STD_RESULT_FILE"
+: > "$EXT_RESULT_FILE"
+
+REDIS_PID=""
+
+cleanup() {
+    [[ -n "$REDIS_PID" ]] && kill "$REDIS_PID" 2>/dev/null && wait "$REDIS_PID" 2>/dev/null || true
+    rm -rf "$TMPDIR_BENCH"
+}
+trap cleanup EXIT
+
+get_rss_mb() {
+    local pid="$1"
+    local rss_kb
+    rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ -n "$rss_kb" && "$rss_kb" -gt 0 ]] 2>/dev/null; then
+        echo "scale=1; $rss_kb / 1024" | bc -l
+    else
+        echo "0"
+    fi
+}
+
+extract_rps() {
+    # Extract requests per second from redis-benchmark -q output
+    # Format: "SET: 12345.67 requests per second" or similar
+    local line="$1"
+    echo "$line" | sed -E 's/.*: ([0-9.]+) requests per second.*/\1/' | head -1
+}
+
+delete_half_keys() {
+    local port="$1"
+    echo "  Deleting ~50% of keys via SCAN+DEL..."
+    local cursor=0
+    local deleted=0
+    local toggle=0
+    while true; do
+        local scan_result
+        scan_result=$(redis-cli -p "$port" SCAN "$cursor" COUNT 100 2>/dev/null)
+        cursor=$(echo "$scan_result" | head -1 | tr -d '\r')
+        local keys
+        keys=$(echo "$scan_result" | tail -n +2 | tr -d '\r')
+        if [[ -n "$keys" ]]; then
+            while IFS= read -r key; do
+                if [[ -n "$key" && $((toggle % 2)) -eq 0 ]]; then
+                    redis-cli -p "$port" DEL "$key" &>/dev/null || true
+                    deleted=$((deleted + 1))
+                fi
+                toggle=$((toggle + 1))
+            done <<< "$keys"
+        fi
+        if [[ "$cursor" == "0" ]]; then
+            break
+        fi
+    done
+    echo "    Deleted ${deleted} keys"
+}
+
+PORT=16390
+
+echo ""
+echo "========================================================================"
+echo "  Redis Multi-Allocator Comparison"
+echo "========================================================================"
+echo "Config: ${NUM_OPS} ops, ${NUM_CLIENTS} clients, ${VALUE_SIZE}B values, keyspace ${KEYSPACE}"
+echo "Cool: ${COOL_DURATION}s, SMASH_VERY_COLD_TICKS=${SMASH_VERY_COLD_TICKS}"
+echo ""
+
+for entry in "${ALLOCATORS[@]}"; do
+    IFS='|' read -r alloc_name lib_path env_vars <<< "$entry"
+
+    if [[ -n "$lib_path" && ! -f "$lib_path" ]]; then
+        echo "[${alloc_name}] SKIP: $lib_path not found"
+        echo "${alloc_name} SKIP" >> "$STD_RESULT_FILE"
+        echo "${alloc_name} SKIP" >> "$EXT_RESULT_FILE"
+        continue
+    fi
+
+    # ── Build env ────────────────────────────────────────────────────────────
+    declare -a env_cmd=()
+    if [[ -n "$lib_path" ]]; then
+        env_cmd+=("${PRELOAD_VAR}=${lib_path}")
+    fi
+    if [[ -n "$env_vars" ]]; then
+        IFS=',' read -ra ev_parts <<< "$env_vars"
+        for ev in "${ev_parts[@]}"; do
+            env_cmd+=("$ev")
+        done
+    fi
+
+    # ======================================================================
+    # WORKLOAD 1: Standard (SET → cool → GET)
+    # ======================================================================
+    PORT=$((PORT + 1))
+    echo ""
+    echo "──────────────────────────────────────────────────────────────────────"
+    echo "[${alloc_name}] STANDARD workload — port ${PORT}"
+
+    # Launch Redis
+    if [[ ${#env_cmd[@]} -gt 0 ]]; then
+        env "${env_cmd[@]}" redis-server --port "$PORT" --save "" --appendonly no \
+            --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
+    else
+        redis-server --port "$PORT" --save "" --appendonly no \
+            --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
+    fi
+    REDIS_PID=$!
+    sleep 2
+
+    if ! redis-cli -p "$PORT" PING &>/dev/null; then
+        echo "  [${alloc_name}] FAILED to start"
+        echo "${alloc_name} FAILED" >> "$STD_RESULT_FILE"
+        kill "$REDIS_PID" 2>/dev/null && wait "$REDIS_PID" 2>/dev/null || true
+        REDIS_PID=""
+        echo "${alloc_name} FAILED" >> "$EXT_RESULT_FILE"
+        continue
+    fi
+    echo "  Redis running (pid ${REDIS_PID})"
+
+    # SET phase
+    echo "  SET: ${NUM_OPS} ops, ${NUM_CLIENTS} clients, ${VALUE_SIZE}B values..."
+    set_line=$(redis-benchmark -p "$PORT" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+        -d "$VALUE_SIZE" -r "$KEYSPACE" -t set -q 2>&1 | grep -i SET || echo "SET: 0 requests per second")
+    set_rps=$(extract_rps "$set_line")
+    echo "    $set_line"
+
+    fill_rss=$(get_rss_mb "$REDIS_PID")
+    echo "  Fill RSS: ${fill_rss} MB"
+
+    # Cool
+    echo "  Cooling ${COOL_DURATION}s..."
+    for sec in $(seq 1 $COOL_DURATION); do
+        sleep 1
+        if [[ $((sec % 5)) -eq 0 ]]; then
+            rss=$(get_rss_mb "$REDIS_PID")
+            echo "    t=${sec}s: RSS=${rss} MB"
+        fi
+    done
+    cool_rss=$(get_rss_mb "$REDIS_PID")
+    echo "  Cool RSS: ${cool_rss} MB"
+
+    # GET phase
+    echo "  GET: ${NUM_OPS} ops..."
+    get_line=$(redis-benchmark -p "$PORT" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+        -d "$VALUE_SIZE" -r "$KEYSPACE" -t get -q 2>&1 | grep -i GET || echo "GET: 0 requests per second")
+    get_rps=$(extract_rps "$get_line")
+    echo "    $get_line"
+
+    echo "${alloc_name} ${fill_rss} ${cool_rss} ${set_rps} ${get_rps}" >> "$STD_RESULT_FILE"
+
+    # Stop Redis
+    kill "$REDIS_PID" 2>/dev/null && wait "$REDIS_PID" 2>/dev/null || true
+    REDIS_PID=""
+    sleep 2
+
+    # ======================================================================
+    # WORKLOAD 2: Extended (SET → DELETE ~50% → cool → GET)
+    # ======================================================================
+    PORT=$((PORT + 1))
+    echo ""
+    echo "  [${alloc_name}] EXTENDED workload — port ${PORT}"
+
+    # Launch Redis
+    if [[ ${#env_cmd[@]} -gt 0 ]]; then
+        env "${env_cmd[@]}" redis-server --port "$PORT" --save "" --appendonly no \
+            --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
+    else
+        redis-server --port "$PORT" --save "" --appendonly no \
+            --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
+    fi
+    REDIS_PID=$!
+    sleep 2
+
+    if ! redis-cli -p "$PORT" PING &>/dev/null; then
+        echo "  [${alloc_name}] FAILED to start (extended)"
+        echo "${alloc_name} FAILED" >> "$EXT_RESULT_FILE"
+        kill "$REDIS_PID" 2>/dev/null && wait "$REDIS_PID" 2>/dev/null || true
+        REDIS_PID=""
+        continue
+    fi
+    echo "  Redis running (pid ${REDIS_PID})"
+
+    # SET phase
+    echo "  SET: ${NUM_OPS} ops..."
+    ext_set_line=$(redis-benchmark -p "$PORT" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+        -d "$VALUE_SIZE" -r "$KEYSPACE" -t set -q 2>&1 | grep -i SET || echo "SET: 0 requests per second")
+    ext_set_rps=$(extract_rps "$ext_set_line")
+    echo "    $ext_set_line"
+
+    ext_fill_rss=$(get_rss_mb "$REDIS_PID")
+    echo "  Fill RSS: ${ext_fill_rss} MB"
+
+    # DELETE ~50%
+    delete_half_keys "$PORT"
+
+    # Cool
+    echo "  Cooling ${COOL_DURATION}s..."
+    for sec in $(seq 1 $COOL_DURATION); do
+        sleep 1
+        if [[ $((sec % 5)) -eq 0 ]]; then
+            rss=$(get_rss_mb "$REDIS_PID")
+            echo "    t=${sec}s: RSS=${rss} MB"
+        fi
+    done
+    ext_cool_rss=$(get_rss_mb "$REDIS_PID")
+    echo "  Cool RSS: ${ext_cool_rss} MB"
+
+    # GET phase
+    echo "  GET: ${NUM_OPS} ops..."
+    ext_get_line=$(redis-benchmark -p "$PORT" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+        -d "$VALUE_SIZE" -r "$KEYSPACE" -t get -q 2>&1 | grep -i GET || echo "GET: 0 requests per second")
+    ext_get_rps=$(extract_rps "$ext_get_line")
+    echo "    $ext_get_line"
+
+    echo "${alloc_name} ${ext_fill_rss} ${ext_cool_rss} ${ext_set_rps} ${ext_get_rps}" >> "$EXT_RESULT_FILE"
+
+    # Stop Redis
+    kill "$REDIS_PID" 2>/dev/null && wait "$REDIS_PID" 2>/dev/null || true
+    REDIS_PID=""
+    sleep 2
+done
+
+# ── Display results ──────────────────────────────────────────────────────────
+echo ""
+echo ""
+echo "========================================================================"
+echo "  Standard Workload: SET → cool ${COOL_DURATION}s → GET"
+echo "========================================================================"
+echo ""
+printf "  %-12s %10s %10s %12s %12s\n" "Allocator" "Fill RSS" "Cool RSS" "SET rps" "GET rps"
+echo "  ──────────────────────────────────────────────────────────────────"
+
+while IFS=' ' read -r name fill cool setrps getrps; do
+    if [[ "$fill" == "SKIP" || "$fill" == "FAILED" ]]; then
+        printf "  %-12s %s\n" "$name" "$fill"
+        continue
+    fi
+    printf "  %-12s %8sMB %8sMB %12s %12s\n" "$name" "$fill" "$cool" "$setrps" "$getrps"
+done < "$STD_RESULT_FILE"
+
+# RSS reduction vs system (standard)
+echo ""
+echo "  RSS reduction vs system malloc (cool RSS):"
+system_cool=$(awk '$1=="system" {print $3}' "$STD_RESULT_FILE")
+if [[ -n "$system_cool" && "$system_cool" != "0" ]]; then
+    while IFS=' ' read -r name fill cool setrps getrps; do
+        if [[ "$fill" == "SKIP" || "$fill" == "FAILED" || "$name" == "system" ]]; then continue; fi
+        delta=$(echo "scale=1; (($cool - $system_cool) / $system_cool) * 100" | bc -l 2>/dev/null || echo "N/A")
+        printf "  %-12s %s%%\n" "$name" "$delta"
+    done < "$STD_RESULT_FILE"
+fi
+
+echo ""
+echo ""
+echo "========================================================================"
+echo "  Extended Workload: SET → DELETE ~50% → cool ${COOL_DURATION}s → GET"
+echo "========================================================================"
+echo ""
+printf "  %-12s %10s %10s %12s %12s\n" "Allocator" "Fill RSS" "Cool RSS" "SET rps" "GET rps"
+echo "  ──────────────────────────────────────────────────────────────────"
+
+while IFS=' ' read -r name fill cool setrps getrps; do
+    if [[ "$fill" == "SKIP" || "$fill" == "FAILED" ]]; then
+        printf "  %-12s %s\n" "$name" "$fill"
+        continue
+    fi
+    printf "  %-12s %8sMB %8sMB %12s %12s\n" "$name" "$fill" "$cool" "$setrps" "$getrps"
+done < "$EXT_RESULT_FILE"
+
+# RSS reduction vs system (extended)
+echo ""
+echo "  RSS reduction vs system malloc (cool RSS):"
+system_cool_ext=$(awk '$1=="system" {print $3}' "$EXT_RESULT_FILE")
+if [[ -n "$system_cool_ext" && "$system_cool_ext" != "0" ]]; then
+    while IFS=' ' read -r name fill cool setrps getrps; do
+        if [[ "$fill" == "SKIP" || "$fill" == "FAILED" || "$name" == "system" ]]; then continue; fi
+        delta=$(echo "scale=1; (($cool - $system_cool_ext) / $system_cool_ext) * 100" | bc -l 2>/dev/null || echo "N/A")
+        printf "  %-12s %s%%\n" "$name" "$delta"
+    done < "$EXT_RESULT_FILE"
+fi
+
+echo ""
+echo "Done."

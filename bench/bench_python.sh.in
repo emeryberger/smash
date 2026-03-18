@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# bench_python.sh - Python DataFrame workload: system malloc vs Smash
+#
+# Requires python3 with pandas and numpy. When run with PYTHONMALLOC=malloc,
+# CPython routes all allocations through system malloc, enabling Smash interposition.
+#
+# Usage:
+#   bash bench_python.sh [--quick]
+#
+# Compatible with bash 3.2+ (macOS default).
+
+set -euo pipefail
+
+# ── Paths (substituted by CMake configure_file) ─────────────────────────────
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+# ── Platform detection ───────────────────────────────────────────────────────
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+NUM_ROWS=500000
+COOL_DURATION=10
+SERVE_DURATION=20
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_ROWS=250000
+            COOL_DURATION=5
+            SERVE_DURATION=10
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+# ── Check prerequisites ─────────────────────────────────────────────────────
+if ! command -v python3 &>/dev/null; then
+    echo "SKIP: python3 not found in PATH"
+    exit 0
+fi
+
+if ! python3 -c "import pandas, numpy" &>/dev/null; then
+    echo "SKIP: pandas and/or numpy not installed for python3"
+    exit 0
+fi
+
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON && make -j"
+    exit 1
+fi
+
+# ── Temp files for METRIC capture ───────────────────────────────────────────
+TMPDIR_BENCH=$(mktemp -d)
+BASELINE_FILE="${TMPDIR_BENCH}/baseline.txt"
+SMASH_FILE="${TMPDIR_BENCH}/smash.txt"
+trap "rm -rf ${TMPDIR_BENCH}" EXIT
+
+# ── Python workload script ──────────────────────────────────────────────────
+PYSCRIPT="${TMPDIR_BENCH}/bench_df.py"
+cat > "$PYSCRIPT" << 'PYEOF'
+import sys
+import time
+import resource
+import numpy as np
+import pandas as pd
+
+num_rows = int(sys.argv[1])
+cool_duration = int(sys.argv[2])
+serve_duration = int(sys.argv[3])
+
+def get_rss_mb():
+    """Get current RSS in MB via getrusage (works on macOS and Linux)."""
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    # macOS: ru_maxrss is in bytes; Linux: ru_maxrss is in KB
+    if sys.platform == "darwin":
+        return ru.ru_maxrss / (1024 * 1024)
+    else:
+        return ru.ru_maxrss / 1024
+
+def get_rss_mb_current():
+    """Get current (not peak) RSS. Falls back to peak if /proc unavailable."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # KB to MB
+    except FileNotFoundError:
+        pass
+    # macOS: use task_info via ctypes if available, else fallback to peak
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+
+        class mach_task_basic_info(ctypes.Structure):
+            _fields_ = [
+                ("virtual_size", ctypes.c_uint64),
+                ("resident_size", ctypes.c_uint64),
+                ("resident_size_max", ctypes.c_uint64),
+                ("user_time_seconds", ctypes.c_uint32),
+                ("user_time_microseconds", ctypes.c_uint32),
+                ("system_time_seconds", ctypes.c_uint32),
+                ("system_time_microseconds", ctypes.c_uint32),
+                ("policy", ctypes.c_int32),
+                ("suspend_count", ctypes.c_int32),
+            ]
+
+        MACH_TASK_BASIC_INFO = 20
+        info = mach_task_basic_info()
+        count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+        libc.task_info(libc.mach_task_self(), MACH_TASK_BASIC_INFO,
+                       ctypes.byref(info), ctypes.byref(count))
+        return info.resident_size / (1024 * 1024)
+    except Exception:
+        return get_rss_mb()  # fallback to peak
+
+print("=== Python DataFrame Benchmark ===", file=sys.stderr)
+print(f"Rows: {num_rows}, Cool: {cool_duration}s, Serve: {serve_duration}s\n", file=sys.stderr)
+
+# ── Fill phase ────────────────────────────────────────────────────────────
+print("Generating DataFrame...", file=sys.stderr)
+t0 = time.monotonic()
+
+np.random.seed(42)
+df = pd.DataFrame({
+    "id": np.arange(num_rows),
+    "name": ["user_" + str(i).zfill(7) for i in range(num_rows)],
+    "score_a": np.random.randn(num_rows),
+    "score_b": np.random.randn(num_rows),
+    "score_c": np.random.randn(num_rows),
+    "category": np.random.choice(["alpha", "beta", "gamma", "delta"], num_rows),
+    "value_x": np.random.rand(num_rows) * 1000,
+    "value_y": np.random.rand(num_rows) * 1000,
+    "description": [
+        "entry record field index query data value store cache " * 3
+        + str(i) for i in range(num_rows)
+    ],
+    "notes": [
+        "the data value store cache entry record field index " * 3
+        + str(i * 7 + 13) for i in range(num_rows)
+    ],
+})
+
+fill_sec = time.monotonic() - t0
+peak_rss = get_rss_mb_current()
+
+print(f"Generated {num_rows} rows in {fill_sec:.2f}s", file=sys.stderr)
+print(f"Peak RSS: {peak_rss:.1f} MB\n", file=sys.stderr)
+
+print(f"METRIC fill_time_sec {fill_sec:.2f}")
+print(f"METRIC peak_rss_mb {peak_rss:.1f}")
+
+# ── Phase 1: Cooling ─────────────────────────────────────────────────────
+print(f"Cooling phase: {cool_duration} seconds...", file=sys.stderr)
+
+for sec in range(1, cool_duration + 1):
+    time.sleep(1)
+    rss = get_rss_mb_current()
+    print(f"  t={sec:2d}s: RSS={rss:.1f} MB", file=sys.stderr)
+
+post_cool_rss = get_rss_mb_current()
+cool_reduction = (1.0 - post_cool_rss / peak_rss) * 100.0 if peak_rss > 0 else 0.0
+print(f"Post-cooling RSS: {post_cool_rss:.1f} MB ({cool_reduction:.1f}% reduction)\n",
+      file=sys.stderr)
+
+print(f"METRIC post_cool_rss_mb {post_cool_rss:.1f}")
+print(f"METRIC cool_reduction_pct {cool_reduction:.1f}")
+
+# ── Phase 2: Hot-only serve ──────────────────────────────────────────────
+# Only access score_a, score_b, category columns on recent rows (top 5%)
+hot_start = int(num_rows * 0.95)
+hot_df = df.iloc[hot_start:]
+
+print(f"Serve phase: {serve_duration}s (hot-only, rows {hot_start}..{num_rows-1})...",
+      file=sys.stderr)
+
+total_ops = 0
+min_serve_rss = get_rss_mb_current()
+
+for sec in range(serve_duration):
+    ops = 0
+    sec_start = time.monotonic()
+    while time.monotonic() - sec_start < 1.0:
+        # Mix of aggregation queries on hot subset
+        r = np.random.randint(0, 100)
+        if r < 40:
+            _ = hot_df["score_a"].mean()
+        elif r < 70:
+            _ = hot_df.groupby("category")["value_x"].sum()
+        elif r < 90:
+            _ = hot_df[hot_df["score_b"] > 0]["value_y"].std()
+        else:
+            _ = hot_df.sort_values("score_c").head(100)
+        ops += 1
+    total_ops += ops
+    rss = get_rss_mb_current()
+    if rss < min_serve_rss:
+        min_serve_rss = rss
+    print(f"  t={sec+1:2d}s: RSS={rss:.1f} MB  ops={ops}", file=sys.stderr)
+
+steady_rss = get_rss_mb_current()
+serve_reduction = (1.0 - min_serve_rss / peak_rss) * 100.0 if peak_rss > 0 else 0.0
+ops_per_sec = total_ops / serve_duration
+
+print(f"METRIC steady_rss_mb {steady_rss:.1f}")
+print(f"METRIC min_rss_mb {min_serve_rss:.1f}")
+print(f"METRIC rss_reduction_pct {serve_reduction:.1f}")
+print(f"METRIC ops_per_sec {ops_per_sec:.0f}")
+
+# ── Phase 3: Cold re-access ─────────────────────────────────────────────
+# Access untouched columns (description, notes) on old rows
+print("\nCold re-access: touching description/notes on old rows...", file=sys.stderr)
+cold_df = df.iloc[:hot_start]
+
+t0 = time.monotonic()
+_ = cold_df["description"].str.len().sum()
+_ = cold_df["notes"].str.len().sum()
+cold_sec = time.monotonic() - t0
+
+post_reaccess_rss = get_rss_mb_current()
+print(f"Cold access time: {cold_sec:.3f}s", file=sys.stderr)
+print(f"Post re-access RSS: {post_reaccess_rss:.1f} MB", file=sys.stderr)
+
+print(f"METRIC cold_access_sec {cold_sec:.3f}")
+print(f"METRIC post_reaccess_rss_mb {post_reaccess_rss:.1f}")
+
+print(f"\nResults:", file=sys.stderr)
+print(f"  Fill time: {fill_sec:.2f}s", file=sys.stderr)
+print(f"  Peak RSS: {peak_rss:.1f} MB", file=sys.stderr)
+print(f"  Post-cooling RSS: {post_cool_rss:.1f} MB ({cool_reduction:.1f}% reduction)",
+      file=sys.stderr)
+print(f"  Steady-state RSS: {steady_rss:.1f} MB", file=sys.stderr)
+print(f"  Ops/sec: {ops_per_sec:.0f}", file=sys.stderr)
+print(f"  Cold access: {cold_sec:.3f}s", file=sys.stderr)
+
+sys.stdout.flush()
+PYEOF
+
+# ── Helper functions ────────────────────────────────────────────────────────
+
+# Extract METRIC value from file
+metric_val() {
+    local file="$1" name="$2"
+    awk -v m="$name" '$1=="METRIC" && $2==m {print $3}' "$file"
+}
+
+print_row() {
+    local label="$1" metric="$2" unit="$3"
+    local base smash
+    base=$(metric_val "$BASELINE_FILE" "$metric")
+    smash=$(metric_val "$SMASH_FILE" "$metric")
+    base="${base:-N/A}"
+    smash="${smash:-N/A}"
+
+    if [[ "$base" == "N/A" || "$smash" == "N/A" ]]; then
+        printf "  %-25s %12s %12s %10s\n" "$label" "$base" "$smash" "N/A"
+        return
+    fi
+
+    local delta="N/A"
+    if [[ "$base" != "0" ]]; then
+        delta=$(echo "scale=1; (($smash - $base) / $base) * 100" | bc -l 2>/dev/null || echo "N/A")
+        if [[ "$delta" != "N/A" ]]; then
+            delta="${delta}%"
+        fi
+    fi
+
+    printf "  %-25s %10s%-2s %10s%-2s %10s\n" "$label" "$base" "$unit" "$smash" "$unit" "$delta"
+}
+
+# ── Run benchmarks ──────────────────────────────────────────────────────────
+
+echo ""
+echo "========================================================================"
+echo "  Python DataFrame A/B Comparison"
+echo "========================================================================"
+echo ""
+echo "Rows: ${NUM_ROWS}, Cool: ${COOL_DURATION}s, Serve: ${SERVE_DURATION}s"
+echo ""
+
+# Baseline run (PYTHONMALLOC=malloc so CPython uses system malloc)
+echo "Running baseline (system malloc)..."
+PYTHONMALLOC=malloc python3 "$PYSCRIPT" "$NUM_ROWS" "$COOL_DURATION" "$SERVE_DURATION" \
+    2>/dev/null | grep '^METRIC ' > "$BASELINE_FILE" || true
+
+# Smash run
+echo "Running with Smash..."
+env PYTHONMALLOC=malloc "${PRELOAD_VAR}=${SMASH_LIB}" \
+    python3 "$PYSCRIPT" "$NUM_ROWS" "$COOL_DURATION" "$SERVE_DURATION" \
+    2>/dev/null | grep '^METRIC ' > "$SMASH_FILE" || true
+
+# ── Display results ─────────────────────────────────────────────────────────
+
+echo ""
+printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+echo "  ------------------------------------------------------------------------"
+
+print_row "Fill time"           fill_time_sec        "s"
+print_row "Peak RSS"            peak_rss_mb          "MB"
+print_row "Post-cooling RSS"    post_cool_rss_mb     "MB"
+print_row "Cool reduction"      cool_reduction_pct   "%"
+print_row "Steady-state RSS"    steady_rss_mb        "MB"
+print_row "Min serve RSS"       min_rss_mb           "MB"
+print_row "RSS reduction"       rss_reduction_pct    "%"
+print_row "Ops/sec"             ops_per_sec          ""
+print_row "Cold access time"    cold_access_sec      "s"
+print_row "Post re-access RSS"  post_reaccess_rss_mb "MB"
+
+echo ""
+echo "Done."

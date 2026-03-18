@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# bench_sklearn.sh - scikit-learn ML workload: system malloc vs Smash
+#
+# Trains multiple models on large feature matrices. After training,
+# only the serving model is hot; training data and intermediate models
+# go cold and become compressible. Uses PYTHONMALLOC=malloc so CPython
+# routes allocations through system malloc for Smash interposition.
+#
+# Requires python3 with scikit-learn, numpy. Skips gracefully if absent.
+#
+# Usage:
+#   bash bench_sklearn.sh [--quick]
+
+set -euo pipefail
+
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+NUM_SAMPLES=200000
+NUM_FEATURES=200
+COOL_DURATION=10
+SERVE_DURATION=20
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_SAMPLES=50000
+            NUM_FEATURES=100
+            COOL_DURATION=5
+            SERVE_DURATION=10
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+if ! command -v python3 &>/dev/null; then
+    echo "SKIP: python3 not found"
+    exit 0
+fi
+if ! python3 -c "import sklearn, numpy" &>/dev/null; then
+    echo "SKIP: scikit-learn and/or numpy not installed"
+    exit 0
+fi
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    exit 1
+fi
+
+TMPDIR_BENCH=$(mktemp -d)
+BASELINE_FILE="${TMPDIR_BENCH}/baseline.txt"
+SMASH_FILE="${TMPDIR_BENCH}/smash.txt"
+trap "rm -rf ${TMPDIR_BENCH}" EXIT
+
+PYSCRIPT="${TMPDIR_BENCH}/bench_sklearn.py"
+cat > "$PYSCRIPT" << 'PYEOF'
+import sys, time
+import numpy as np
+
+num_samples = int(sys.argv[1])
+num_features = int(sys.argv[2])
+cool_duration = int(sys.argv[3])
+serve_duration = int(sys.argv[4])
+
+def get_rss_mb():
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        class mach_task_basic_info(ctypes.Structure):
+            _fields_ = [
+                ("virtual_size", ctypes.c_uint64),
+                ("resident_size", ctypes.c_uint64),
+                ("resident_size_max", ctypes.c_uint64),
+                ("user_time_seconds", ctypes.c_uint32),
+                ("user_time_microseconds", ctypes.c_uint32),
+                ("system_time_seconds", ctypes.c_uint32),
+                ("system_time_microseconds", ctypes.c_uint32),
+                ("policy", ctypes.c_int32),
+                ("suspend_count", ctypes.c_int32),
+            ]
+        MACH_TASK_BASIC_INFO = 20
+        info = mach_task_basic_info()
+        count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+        libc.task_info(libc.mach_task_self(), MACH_TASK_BASIC_INFO,
+                       ctypes.byref(info), ctypes.byref(count))
+        return info.resident_size / (1024 * 1024)
+    except Exception:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        return ru.ru_maxrss / (1024 * 1024) if sys.platform == "darwin" else ru.ru_maxrss / 1024
+
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+print(f"=== scikit-learn ML Benchmark ===", file=sys.stderr)
+print(f"Samples: {num_samples}, Features: {num_features}\n", file=sys.stderr)
+
+# ── Fill: Generate data + train multiple models ──
+print("Generating dataset...", file=sys.stderr)
+t0 = time.monotonic()
+X, y = make_classification(n_samples=num_samples, n_features=num_features,
+                           n_informative=num_features // 2, n_redundant=num_features // 4,
+                           random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+gen_sec = time.monotonic() - t0
+print(f"  Dataset: {X.shape}, generated in {gen_sec:.2f}s", file=sys.stderr)
+
+# Train models (keeps all in memory — large forests use lots of heap)
+print("Training Random Forest...", file=sys.stderr)
+rf = RandomForestClassifier(n_estimators=200, max_depth=20, random_state=42, n_jobs=1)
+rf.fit(X_train_scaled, y_train)
+rf_rss = get_rss_mb()
+print(f"  RF done, RSS: {rf_rss:.1f} MB", file=sys.stderr)
+
+print("Training Gradient Boosting...", file=sys.stderr)
+gb = GradientBoostingClassifier(n_estimators=100, max_depth=5, random_state=42)
+gb.fit(X_train_scaled, y_train)
+gb_rss = get_rss_mb()
+print(f"  GB done, RSS: {gb_rss:.1f} MB", file=sys.stderr)
+
+print("Training Logistic Regression...", file=sys.stderr)
+lr = LogisticRegression(max_iter=500, random_state=42)
+lr.fit(X_train_scaled, y_train)
+
+fill_sec = time.monotonic() - t0
+peak_rss = get_rss_mb()
+print(f"All models trained in {fill_sec:.2f}s, RSS: {peak_rss:.1f} MB\n", file=sys.stderr)
+print(f"METRIC fill_time_sec {fill_sec:.2f}")
+print(f"METRIC peak_rss_mb {peak_rss:.1f}")
+
+# ── Cool ──
+print(f"Cooling for {cool_duration}s...", file=sys.stderr)
+for sec in range(1, cool_duration + 1):
+    time.sleep(1)
+    rss = get_rss_mb()
+    if sec % 3 == 0 or sec == 1:
+        print(f"  t={sec}s: RSS={rss:.1f} MB", file=sys.stderr)
+
+cool_rss = get_rss_mb()
+print(f"METRIC cool_rss_mb {cool_rss:.1f}")
+
+# ── Serve: inference with only the RF model (GB, LR, training data go cold) ──
+print(f"\nServe phase: {serve_duration}s (RF inference only)...", file=sys.stderr)
+total_preds = 0
+min_rss = get_rss_mb()
+
+# Only use test data for inference — training data is cold
+for sec in range(serve_duration):
+    preds = 0
+    sec_start = time.monotonic()
+    while time.monotonic() - sec_start < 1.0:
+        batch_idx = np.random.randint(0, len(X_test_scaled), size=100)
+        batch = X_test_scaled[batch_idx]
+        _ = rf.predict_proba(batch)
+        preds += 100
+    total_preds += preds
+    rss = get_rss_mb()
+    if rss < min_rss:
+        min_rss = rss
+    if (sec + 1) % 5 == 0:
+        print(f"  t={sec+1}s: RSS={rss:.1f} MB preds={preds}", file=sys.stderr)
+
+serve_rss = get_rss_mb()
+preds_per_sec = total_preds / serve_duration
+print(f"METRIC serve_rss_mb {serve_rss:.1f}")
+print(f"METRIC min_rss_mb {min_rss:.1f}")
+print(f"METRIC preds_per_sec {preds_per_sec:.0f}")
+
+# ── Cold re-access: use GB and LR models + retrain ──
+print("\nCold re-access: GB/LR inference + re-score training data...", file=sys.stderr)
+t0 = time.monotonic()
+_ = gb.predict(X_test_scaled)
+_ = lr.predict(X_test_scaled)
+# Re-score on full training set (touches cold training data)
+_ = rf.score(X_train_scaled, y_train)
+_ = gb.score(X_train_scaled, y_train)
+cold_sec = time.monotonic() - t0
+cold_rss = get_rss_mb()
+print(f"Cold access: {cold_sec:.3f}s, RSS: {cold_rss:.1f} MB", file=sys.stderr)
+print(f"METRIC cold_sec {cold_sec:.3f}")
+print(f"METRIC cold_rss_mb {cold_rss:.1f}")
+
+sys.stdout.flush()
+PYEOF
+
+metric_val() {
+    local file="$1" name="$2"
+    awk -v m="$name" '$1=="METRIC" && $2==m {print $3}' "$file"
+}
+
+print_row() {
+    local label="$1" metric="$2" unit="$3"
+    local base smash
+    base=$(metric_val "$BASELINE_FILE" "$metric")
+    smash=$(metric_val "$SMASH_FILE" "$metric")
+    base="${base:-N/A}"; smash="${smash:-N/A}"
+    if [[ "$base" == "N/A" || "$smash" == "N/A" || "$base" == "0" ]]; then
+        printf "  %-25s %12s %12s %10s\n" "$label" "$base" "$smash" "N/A"
+        return
+    fi
+    local delta
+    delta=$(echo "scale=1; (($smash - $base) / $base) * 100" | bc -l 2>/dev/null || echo "N/A")
+    printf "  %-25s %10s%-2s %10s%-2s %9s%%\n" "$label" "$base" "$unit" "$smash" "$unit" "$delta"
+}
+
+echo ""
+echo "========================================================================"
+echo "  scikit-learn ML A/B Comparison"
+echo "========================================================================"
+echo "Samples: ${NUM_SAMPLES}, Features: ${NUM_FEATURES}"
+echo ""
+
+echo "Running baseline..."
+PYTHONMALLOC=malloc python3 "$PYSCRIPT" "$NUM_SAMPLES" "$NUM_FEATURES" "$COOL_DURATION" "$SERVE_DURATION" \
+    2>/dev/null | grep '^METRIC ' > "$BASELINE_FILE" || true
+
+echo "Running with Smash..."
+env PYTHONMALLOC=malloc "${PRELOAD_VAR}=${SMASH_LIB}" \
+    python3 "$PYSCRIPT" "$NUM_SAMPLES" "$NUM_FEATURES" "$COOL_DURATION" "$SERVE_DURATION" \
+    2>/dev/null | grep '^METRIC ' > "$SMASH_FILE" || true
+
+echo ""
+printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+echo "  ------------------------------------------------------------------------"
+
+print_row "Fill time"         fill_time_sec  "s"
+print_row "Peak RSS"          peak_rss_mb    "MB"
+print_row "Post-cool RSS"     cool_rss_mb    "MB"
+print_row "Serve RSS"         serve_rss_mb   "MB"
+print_row "Min RSS"           min_rss_mb     "MB"
+print_row "Preds/sec"         preds_per_sec  ""
+print_row "Cold access time"  cold_sec       "s"
+print_row "Cold RSS"          cold_rss_mb    "MB"
+
+echo ""
+echo "Done."

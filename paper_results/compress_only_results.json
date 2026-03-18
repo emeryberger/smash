@@ -1,0 +1,104 @@
+{
+  "sqlite_baseline": {
+    "runs": [
+      {
+        "fill_time_sec": 1.31,
+        "peak_rss_mb": 179.1,
+        "post_cool_rss_mb": 179.1,
+        "cool_reduction_pct": -0.0,
+        "steady_rss_mb": 238.9,
+        "min_rss_mb": 179.1,
+        "rss_reduction_pct": 25.0,
+        "ops_per_sec": 85311.0,
+        "hot_p50_us": 0.73,
+        "hot_p99_us": 60.9,
+        "cold_p50_us": 1.27,
+        "cold_p99_us": 2.17,
+        "post_reaccess_rss_mb": 239.2
+      }
+    ],
+    "median": {
+      "hot_p50_us": 0.73,
+      "cold_p99_us": 2.17,
+      "peak_rss_mb": 179.1,
+      "ops_per_sec": 85311.0,
+      "post_reaccess_rss_mb": 239.2,
+      "rss_reduction_pct": 25.0,
+      "fill_time_sec": 1.31,
+      "cool_reduction_pct": -0.0,
+      "hot_p99_us": 60.9,
+      "steady_rss_mb": 238.9,
+      "post_cool_rss_mb": 179.1,
+      "cold_p50_us": 1.27,
+      "min_rss_mb": 179.1
+    }
+  },
+  "sqlite_compress_only": {
+    "runs": [
+      {
+        "fill_time_sec": 1.32,
+        "peak_rss_mb": 188.0,
+        "post_cool_rss_mb": 188.1,
+        "cool_reduction_pct": -0.0,
+        "steady_rss_mb": 247.9,
+        "min_rss_mb": 188.1,
+        "rss_reduction_pct": 24.1,
+        "ops_per_sec": 84997.0,
+        "hot_p50_us": 0.74,
+        "hot_p99_us": 59.68,
+        "cold_p50_us": 1.31,
+        "cold_p99_us": 2.14,
+        "post_reaccess_rss_mb": 247.9
+      }
+    ],
+    "median": {
+      "hot_p50_us": 0.74,
+      "cold_p99_us": 2.14,
+      "peak_rss_mb": 188.0,
+      "ops_per_sec": 84997.0,
+      "post_reaccess_rss_mb": 247.9,
+      "rss_reduction_pct": 24.1,
+      "fill_time_sec": 1.32,
+      "cool_reduction_pct": -0.0,
+      "hot_p99_us": 59.68,
+      "steady_rss_mb": 247.9,
+      "post_cool_rss_mb": 188.1,
+      "cold_p50_us": 1.31,
+      "min_rss_mb": 188.1
+    }
+  },
+  "sqlite_full_smash": {
+    "runs": [
+      {
+        "fill_time_sec": 1.78,
+        "peak_rss_mb": 254.3,
+        "post_cool_rss_mb": 86.8,
+        "cool_reduction_pct": 65.9,
+        "steady_rss_mb": 131.2,
+        "min_rss_mb": 86.8,
+        "rss_reduction_pct": 65.9,
+        "ops_per_sec": 74336.0,
+        "hot_p50_us": 0.85,
+        "hot_p99_us": 71.72,
+        "cold_p50_us": 12.75,
+        "cold_p99_us": 71.73,
+        "post_reaccess_rss_mb": 217.0
+      }
+    ],
+    "median": {
+      "hot_p50_us": 0.85,
+      "cold_p99_us": 71.73,
+      "peak_rss_mb": 254.3,
+      "ops_per_sec": 74336.0,
+      "post_reaccess_rss_mb": 217.0,
+      "rss_reduction_pct": 65.9,
+      "fill_time_sec": 1.78,
+      "cool_reduction_pct": 65.9,
+      "hot_p99_us": 71.72,
+      "steady_rss_mb": 131.2,
+      "post_cool_rss_mb": 86.8,
+      "cold_p50_us": 12.75,
+      "min_rss_mb": 86.8
+    }
+  }
+}

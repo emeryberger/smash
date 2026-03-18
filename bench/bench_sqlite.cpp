@@ -25,6 +25,7 @@
 #elif defined(__linux__)
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #endif
 
 // ── Compressor trigger ──────────────────────────────────────────────────────
@@ -63,7 +64,7 @@ static size_t getCurrentRSSBytes() {
     int fd = open("/proc/self/statm", O_RDONLY);
     if (fd < 0) return 0;
     char buf[128];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    ssize_t n = syscall(SYS_read, fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0) return 0;
     buf[n] = '\0';

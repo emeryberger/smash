@@ -22,7 +22,9 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #elif defined(__linux__)
-#include <fstream>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
 #endif
 
 // ── Compressor trigger ──────────────────────────────────────────────────────
@@ -62,16 +64,19 @@ static size_t getCurrentRSSBytes() {
     }
     return 0;
 #elif defined(__linux__)
-    std::ifstream status("/proc/self/status");
-    std::string line;
-    while (std::getline(status, line)) {
-        if (line.rfind("VmRSS:", 0) == 0) {
-            size_t kb = 0;
-            sscanf(line.c_str(), "VmRSS: %zu kB", &kb);
-            return kb * 1024;
-        }
-    }
-    return 0;
+    // Use direct syscall to avoid Smash's read() interposition
+    int fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[4096];
+    ssize_t n = syscall(SYS_read, fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    const char* p = strstr(buf, "VmRSS:");
+    if (!p) return 0;
+    size_t kb = 0;
+    sscanf(p, "VmRSS: %zu kB", &kb);
+    return kb * 1024;
 #else
     return 0;
 #endif

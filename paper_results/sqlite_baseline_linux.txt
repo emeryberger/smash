@@ -1,0 +1,54 @@
+=== SQLite In-Memory Benchmark ===
+Rows: 250000, Hot: 12500 (top 5% by id), Cool: 5s, Serve: 10s
+
+  Inserted 100000/250000 rows...
+  Inserted 200000/250000 rows...
+Filled 250000 rows in 1.30s
+Peak RSS after fill: 179.0 MB
+
+Cooling phase: 5 seconds (no access, waiting for compression)...
+  t= 1s: RSS=179.1 MB
+  t= 2s: RSS=179.1 MB
+  t= 3s: RSS=179.1 MB
+  t= 4s: RSS=179.1 MB
+  t= 5s: RSS=179.1 MB
+Post-cooling RSS: 179.1 MB (-0.0% reduction from peak)
+
+Serve phase: 10 seconds (hot-only, ids 237500..249999)...
+  t= 1s: RSS=185.1 MB  ops=85163
+  t= 2s: RSS=191.1 MB  ops=83299
+  t= 3s: RSS=196.7 MB  ops=83362
+  t= 4s: RSS=202.9 MB  ops=85279
+  t= 5s: RSS=208.9 MB  ops=84339
+  t= 6s: RSS=214.8 MB  ops=84232
+  t= 7s: RSS=220.7 MB  ops=84922
+  t= 8s: RSS=226.6 MB  ops=85187
+  t= 9s: RSS=232.6 MB  ops=85311
+  t=10s: RSS=238.8 MB  ops=85568
+
+Cold re-access: querying 12500 old rows (ids 0..124999)...
+Cold query p50/p99: 1.4 / 2.5 us
+Post re-access RSS: 238.8 MB
+
+Results:
+  Fill time: 1.30s
+  Peak RSS: 238.8 MB
+  Post-cooling RSS: 179.1 MB (-0.0% reduction)
+  Steady-state RSS: 238.8 MB
+  Min serve RSS: 179.1 MB (25.0% reduction)
+  Ops/sec: 84666
+  Hot p50/p99: 0.76 / 61.88 us
+  Cold p50/p99: 1.4 / 2.5 us
+METRIC fill_time_sec 1.30
+METRIC peak_rss_mb 179.0
+METRIC post_cool_rss_mb 179.1
+METRIC cool_reduction_pct -0.0
+METRIC steady_rss_mb 238.8
+METRIC min_rss_mb 179.1
+METRIC rss_reduction_pct 25.0
+METRIC ops_per_sec 84666
+METRIC hot_p50_us 0.76
+METRIC hot_p99_us 61.88
+METRIC cold_p50_us 1.35
+METRIC cold_p99_us 2.46
+METRIC post_reaccess_rss_mb 238.8

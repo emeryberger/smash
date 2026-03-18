@@ -242,15 +242,19 @@ Figure~\ref{fig:algo_compare} presents compression ratios and
 Table~\ref{tab:algo_throughput} presents throughput.  \punt{WKdm, the macOS VM compressor, achieves only 1.0--1.1$\times$
 on text data because its 32-bit word-granularity dictionary cannot
 match byte-level patterns.  It performs adequately on binary data
-(6.4$\times$ on SQLite pages).  }LZ4 achieves 4.7--12.3$\times$ compression on key-value workloads at
-$\sim$3\,GB/s compression throughput.
-DuckDB's columnar data is less compressible (2.1$\times$ with LZ4)
-because its internal representation already packs values densely.
-zstd-9 achieves the best
+(6.4$\times$ on SQLite pages).  }LZ4 achieves 4.7--12.3$\times$ compression at
+$\sim$3\,GB/s.  zstd-1 achieves 1.5--2$\times$ higher ratios
+(8.8--20.4$\times$) at $\sim$2$\times$ lower throughput, because its
+entropy coder (FSE) captures byte-frequency skew that LZ4's
+literal-copy format cannot exploit.  zstd-9 achieves the best
 ratios (3.0--20.8$\times$) at lower~throughput.
+DuckDB's columnar data is less compressible (2.1$\times$ with LZ4,
+2.8$\times$ with zstd-1) because its internal representation already
+packs values densely.
 
 \begin{table}[t]
-\caption{\textbf{LZ4 provides the best throughput--ratio trade-off}
+\caption{\textbf{zstd-1 trades throughput for better ratios; zstd-9
+  decompresses as fast as zstd-1}
   (\S\ref{sec:eval:algo}).  Throughput in MB/s on SQLite heap pages.}
 \label{tab:algo_throughput}
 \centering\small
@@ -259,6 +263,7 @@ ratios (3.0--20.8$\times$) at lower~throughput.
 Algorithm & Compression & Decompression \\
 \midrule
 LZ4    & \textbf{2955} & \textbf{4184} \\
+zstd-1 & 1397 & 1797 \\
 zstd-3 & 1252 & 1768 \\
 zstd-9 & 731  & 1823 \\
 \bottomrule
@@ -281,19 +286,22 @@ zstd-9 & 90   & 731  & 1437  & 1823 \\
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/algo_compare.pdf}
-\caption{\textbf{LZ4 and zstd achieve 5--21$\times$ compression on
-  most application heap pages; DuckDB's columnar data is less compressible}
+\caption{\textbf{zstd-1 achieves 1.5--2$\times$ higher ratios than
+  LZ4 at comparable throughput; zstd-9 adds a further 1.0--1.3$\times$}
   (\S\ref{sec:eval:algo}).  Higher is better.}
 \label{fig:algo_compare}
 \end{figure}
 
 \paragraph{Summary}
-Heap pages compress well: LZ4 achieves 4.7--12.3$\times$ compression at
-$\sim$3\,GB/s, and zstd-9 reaches 9--21$\times$ on structured data at
-lower throughput.  These results motivate \sys's ROI-based JIT
+Heap pages compress well: zstd-1 achieves 8.8--20.4$\times$ compression
+at 0.6--1.4\,GB/s, and zstd-9 reaches 9--21$\times$ on structured data at
+lower throughput.  zstd-1's entropy coder gives 1.5--2$\times$ better
+ratios than LZ4 at $\sim$2$\times$ lower throughput; for cold pages
+that remain idle, the better ratio yields higher net~ROI\@.
+These results motivate \sys's ROI-based JIT
 compression: because highly compressible data is also \emph{cheaper}
 to compress (higher throughput), the ROI is doubly favorable---the
-model naturally selects LZ4 for recently cold pages (where fast
+model naturally selects zstd-1 for recently cold pages (where fast
 compression minimizes risk) and zstd-9 for long-idle pages (where the
 better ratio justifies the~cost).
 
@@ -319,8 +327,8 @@ Disabling compression entirely ($-$45.7\,\pp average) confirms that
 compression is the dominant mechanism; without it, \sys reduces to
 a standard allocator with no RSS benefit beyond what the allocator
 design alone provides.  The remaining optimizations---arenas, LZ4-only
-mode, deferred zeroing, prefetch, and parallelism---each contribute
-less than 1.5\,\pp individually.
+mode (disabling zstd-1), deferred zeroing, prefetch, and
+parallelism---each contribute less than 1.5\,\pp individually.
 
 \begin{figure}[t]
 \centering
@@ -438,8 +446,8 @@ unmodified system allocator.  This library interposes
 \texttt{malloc}/\texttt{free} solely to discover which pages
 belong to the heap; all allocation requests are forwarded to
 system malloc unchanged.  It then applies \sys's page monitoring,
-JIT compression (LZ4$\to$zstd tiering), signal-based decompression, and
-prefetching to those pages.  Because allocation is still performed
+JIT compression (zstd-1$\to$zstd-9 tiering), signal-based
+decompression, and prefetching to those pages.  Because allocation is still performed
 by system malloc, pages contain embedded freelists, objects are
 not zeroed, and allocations are not segregated by call site.
 

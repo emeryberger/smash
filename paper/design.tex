@@ -38,8 +38,9 @@ access;
 (\texttt{PROT\_READ}) to detect future writes;
 (4)~\textbf{COMPRESSING}: being compressed by a background worker;
 and
-(5)~\textbf{COMPRESSED}: compressed with LZ4 or zstd (selected by
-ROI; \S\ref{sec:design:adaptive}), physical page decommitted.
+(5)~\textbf{COMPRESSED}: compressed with zstd (level~1 or~9,
+selected by ROI; \S\ref{sec:design:adaptive}), physical page
+decommitted.
 
 \input{fig_arch}
 
@@ -165,25 +166,36 @@ savings, so they are compressed early; poorly-compressing pages
 cold duration---or are skipped entirely.
 
 \paragraph{Algorithm selection}
-\sys maintains throughput profiles for LZ4 and zstd-9.  For each
-candidate page, it computes the ROI for every registered algorithm and
-selects whichever has the highest ROI above a configurable threshold.
-LZ4 compresses at $\sim$1\,GB/s and decompresses at
-$\sim$4--6\,GB/s; zstd-9 achieves 1.5--2$\times$ higher compression
-ratios (Figure~\ref{fig:algo_compare}) at 10$\times$ lower
-compression throughput, but comparable decompression speed
-(1.2--1.8\,GB/s).  Because zstd's higher compression cost requires
-more cold ticks to amortize, LZ4 dominates for recently-cold pages
-and zstd wins only for long-idle pages where the better ratio justifies
-the extra CPU.  This naturally reproduces tiered behavior without
-hard-coded time~thresholds.
+\sys uses zstd at two compression levels as a tiered strategy:
+zstd-1 as the fast tier for recently-cold pages and zstd-9 as the
+deep tier for long-idle~pages.  zstd-1 compresses at
+$\sim$0.6--1.4\,GB/s---about 2$\times$ slower than LZ4---but
+achieves 1.5--2$\times$ higher compression ratios
+(Table~\ref{tab:algo_compare}), because its entropy coder (FSE)
+captures byte-frequency skew that LZ4's literal-copy format cannot
+exploit.  For cold pages that remain idle for seconds or minutes,
+the better ratio (and thus greater RSS savings) more than
+compensates for the additional compression~cost.
+zstd-9 achieves a further 1.0--1.3$\times$ improvement over zstd-1
+(Figure~\ref{fig:algo_compare}) at 10$\times$ lower compression
+throughput, but comparable decompression speed (1.2--1.8\,GB/s).
+\sys maintains throughput profiles for both tiers.  For each
+candidate page, it computes the ROI for each and selects whichever
+has the highest ROI above a configurable threshold.  Because zstd-9's
+higher compression cost requires more cold ticks to amortize, the
+fast tier dominates for recently-cold pages and zstd-9 wins only for
+long-idle pages where the better ratio justifies the extra CPU\@.
+This naturally produces tiered behavior without hard-coded
+time~thresholds.  If the fast tier fails to compress below a
+configurable ratio gate (default 75\%), \sys falls back to zstd-9,
+which often achieves 30--50\% better compression on the same~data.
 
 If a compressed page is accessed, it is decompressed and its cold
 count resets to zero---analogous to a JIT deoptimization.  The page
 will be recompressed only if it goes cold~again.
 
 \paragraph{Auto-calibration}
-At startup, \sys benchmarks LZ4 and zstd-9 on two synthetic pages
+At startup, \sys benchmarks zstd-1 and zstd-9 on two synthetic pages
 (all-zeros and pseudo-random) to measure per-machine throughput,
 taking the median of 10 iterations per algorithm per page
 ($\sim$1\,ms total).  The results populate the throughput profile

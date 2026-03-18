@@ -5,9 +5,9 @@ knowledge invisible to the rest of the system. \sys{} organizes
 allocations by call site so that similar objects share pages At
 compression time, it zeroes freed slots to increase compressiblility,
 and applies \emph{JIT compression}: a return-on-investment model
-selects from fast LZ4 or high-ratio zstd based on the expected CPU
-cost and RSS savings for each page, with signal-based decompression
-on~demand.
+selects between fast zstd-1 and high-ratio zstd-9 based on the
+expected CPU cost and RSS savings for each page, with signal-based
+decompression on~demand.
 
 Across five applications---memcached, RocksDB, DuckDB,
 SQLite, and Redis---\sys reduces resident set size (RSS) by 27--87\% with negligible throughput

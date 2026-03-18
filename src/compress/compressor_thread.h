@@ -362,41 +362,22 @@ class CompressorThread {
     }
 
     // Phase 3: Set up access monitoring for remaining active pages
+    //
+    // Uses per-page mprotect to minimize the TOCTOU race window between
+    // checking a page's pin count and calling mprotect. Batched mprotect
+    // creates a large window where pinned pages are transiently PROT_READ,
+    // causing kernel EFAULT in concurrent syscalls (kevent, read, etc.).
+    // Syscall wrappers also retry on EFAULT as a safety net.
     void phase3Range(size_t start, size_t end) {
-        size_t run_start = 0;
-        size_t last_in_run = 0;
-        bool in_run = false;
-
         forEachLivePage(start, end, [&](size_t i) {
             PageState st = states_->get(i);
             bool pinned = vm::g_page_pins &&
-                vm::g_page_pins[i].load(std::memory_order_relaxed) > 0;
+                vm::g_page_pins[i].load(std::memory_order_acquire) > 0;
             if (st == PageState::ACTIVE && !pinned) {
-                if (!in_run) {
-                    run_start = i;
-                    in_run = true;
-                } else if (i != last_in_run + 1 ||
-                           reinterpret_cast<uintptr_t>(vm_->pageAddress(i)) !=
-                           reinterpret_cast<uintptr_t>(vm_->pageAddress(last_in_run)) + kPageSize) {
-                    // Gap or non-contiguous addresses — flush previous run
-                    vm::protectPages(vm_->pageAddress(run_start),
-                                    (last_in_run - run_start + 1) * kPageSize, true, false);
-                    run_start = i;
-                }
-                last_in_run = i;
                 states_->set(i, PageState::ACTIVE_MONITORING);
-            } else {
-                if (in_run) {
-                    vm::protectPages(vm_->pageAddress(run_start),
-                                    (last_in_run - run_start + 1) * kPageSize, true, false);
-                    in_run = false;
-                }
+                vm::protectPages(vm_->pageAddress(i), kPageSize, true, false);
             }
         });
-        if (in_run) {
-            vm::protectPages(vm_->pageAddress(run_start),
-                            (last_in_run - run_start + 1) * kPageSize, true, false);
-        }
     }
 
     // ── Compress one page using worker's contexts ─────────────────────────

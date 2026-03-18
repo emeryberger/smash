@@ -315,5 +315,381 @@
         "min_rss_mb": 254.8
       }
     }
+  },
+  "duckdb": {
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 203.51953125,
+          "cool_rss_mb": 203.51953125,
+          "steady_rss_mb": 206.375,
+          "min_rss_mb": 203.51953125,
+          "rss_reduction_pct": -1.4030440874455374,
+          "baseline_rss_mb": 173.34765625
+        }
+      ],
+      "median": {
+        "steady_rss_mb": 206.375,
+        "baseline_rss_mb": 173.34765625,
+        "peak_rss_mb": 203.51953125,
+        "min_rss_mb": 203.51953125,
+        "rss_reduction_pct": -1.4030440874455374,
+        "cool_rss_mb": 203.51953125
+      }
+    }
+  },
+  "rocksdb": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "fill_sec": 0.84,
+          "peak_rss_mb": 307.2,
+          "cool_rss_mb": 66.2,
+          "serve_rss_mb": 75.7,
+          "min_rss_mb": 66.2,
+          "ops_per_sec": 472544.0,
+          "hot_p50_us": 1.59,
+          "hot_p99_us": 8.44,
+          "cold_sec": 0.165,
+          "cold_p50_us": 7.67,
+          "cold_p99_us": 14.13,
+          "cold_rss_mb": 77.3,
+          "rss_reduction_pct": 78.45052083333333,
+          "steady_rss_mb": 75.7,
+          "post_cool_rss_mb": 66.2
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 307.2,
+        "cool_rss_mb": 66.2,
+        "hot_p50_us": 1.59,
+        "hot_p99_us": 8.44,
+        "rss_reduction_pct": 78.45052083333333,
+        "cold_sec": 0.165,
+        "steady_rss_mb": 75.7,
+        "fill_sec": 0.84,
+        "min_rss_mb": 66.2,
+        "cold_p99_us": 14.13,
+        "cold_p50_us": 7.67,
+        "cold_rss_mb": 77.3,
+        "serve_rss_mb": 75.7,
+        "ops_per_sec": 472544.0,
+        "post_cool_rss_mb": 66.2
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "fill_sec": 0.95,
+          "peak_rss_mb": 400.3,
+          "cool_rss_mb": 400.3,
+          "serve_rss_mb": 402.9,
+          "min_rss_mb": 400.3,
+          "ops_per_sec": 554812.0,
+          "hot_p50_us": 1.6,
+          "hot_p99_us": 3.02,
+          "cold_sec": 0.037,
+          "cold_p50_us": 1.53,
+          "cold_p99_us": 8.51,
+          "cold_rss_mb": 402.9,
+          "rss_reduction_pct": 0.0,
+          "steady_rss_mb": 402.9,
+          "post_cool_rss_mb": 400.3
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 400.3,
+        "cool_rss_mb": 400.3,
+        "hot_p50_us": 1.6,
+        "hot_p99_us": 3.02,
+        "rss_reduction_pct": 0.0,
+        "cold_sec": 0.037,
+        "steady_rss_mb": 402.9,
+        "fill_sec": 0.95,
+        "min_rss_mb": 400.3,
+        "cold_p99_us": 8.51,
+        "cold_p50_us": 1.53,
+        "cold_rss_mb": 402.9,
+        "serve_rss_mb": 402.9,
+        "ops_per_sec": 554812.0,
+        "post_cool_rss_mb": 400.3
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "fill_sec": 0.78,
+          "peak_rss_mb": 306.8,
+          "cool_rss_mb": 69.0,
+          "serve_rss_mb": 79.0,
+          "min_rss_mb": 69.0,
+          "ops_per_sec": 574406.0,
+          "hot_p50_us": 1.52,
+          "hot_p99_us": 2.9,
+          "cold_sec": 0.173,
+          "cold_p50_us": 7.88,
+          "cold_p99_us": 15.69,
+          "cold_rss_mb": 80.8,
+          "rss_reduction_pct": 77.50977835723599,
+          "steady_rss_mb": 79.0,
+          "post_cool_rss_mb": 69.0
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 306.8,
+        "cool_rss_mb": 69.0,
+        "hot_p50_us": 1.52,
+        "hot_p99_us": 2.9,
+        "rss_reduction_pct": 77.50977835723599,
+        "cold_sec": 0.173,
+        "steady_rss_mb": 79.0,
+        "fill_sec": 0.78,
+        "min_rss_mb": 69.0,
+        "cold_p99_us": 15.69,
+        "cold_p50_us": 7.88,
+        "cold_rss_mb": 80.8,
+        "serve_rss_mb": 79.0,
+        "ops_per_sec": 574406.0,
+        "post_cool_rss_mb": 69.0
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "fill_sec": 0.82,
+          "peak_rss_mb": 307.0,
+          "cool_rss_mb": 66.6,
+          "serve_rss_mb": 76.2,
+          "min_rss_mb": 66.6,
+          "ops_per_sec": 573163.0,
+          "hot_p50_us": 1.51,
+          "hot_p99_us": 3.17,
+          "cold_sec": 0.171,
+          "cold_p50_us": 7.77,
+          "cold_p99_us": 27.46,
+          "cold_rss_mb": 78.0,
+          "rss_reduction_pct": 78.30618892508143,
+          "steady_rss_mb": 76.2,
+          "post_cool_rss_mb": 66.6
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 307.0,
+        "cool_rss_mb": 66.6,
+        "hot_p50_us": 1.51,
+        "hot_p99_us": 3.17,
+        "rss_reduction_pct": 78.30618892508143,
+        "cold_sec": 0.171,
+        "steady_rss_mb": 76.2,
+        "fill_sec": 0.82,
+        "min_rss_mb": 66.6,
+        "cold_p99_us": 27.46,
+        "cold_p50_us": 7.77,
+        "cold_rss_mb": 78.0,
+        "serve_rss_mb": 76.2,
+        "ops_per_sec": 573163.0,
+        "post_cool_rss_mb": 66.6
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "fill_sec": 0.92,
+          "peak_rss_mb": 309.0,
+          "cool_rss_mb": 67.9,
+          "serve_rss_mb": 71.7,
+          "min_rss_mb": 67.9,
+          "ops_per_sec": 118298.0,
+          "hot_p50_us": 7.93,
+          "hot_p99_us": 13.05,
+          "cold_sec": 0.166,
+          "cold_p50_us": 7.82,
+          "cold_p99_us": 12.58,
+          "cold_rss_mb": 72.7,
+          "rss_reduction_pct": 78.02588996763754,
+          "steady_rss_mb": 71.7,
+          "post_cool_rss_mb": 67.9
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 309.0,
+        "cool_rss_mb": 67.9,
+        "hot_p50_us": 7.93,
+        "hot_p99_us": 13.05,
+        "rss_reduction_pct": 78.02588996763754,
+        "cold_sec": 0.166,
+        "steady_rss_mb": 71.7,
+        "fill_sec": 0.92,
+        "min_rss_mb": 67.9,
+        "cold_p99_us": 12.58,
+        "cold_p50_us": 7.82,
+        "cold_rss_mb": 72.7,
+        "serve_rss_mb": 71.7,
+        "ops_per_sec": 118298.0,
+        "post_cool_rss_mb": 67.9
+      }
+    },
+    "T2a": {
+      "name": "No zero-deferred",
+      "runs": [
+        {
+          "fill_sec": 0.76,
+          "peak_rss_mb": 306.7,
+          "cool_rss_mb": 67.5,
+          "serve_rss_mb": 77.4,
+          "min_rss_mb": 67.5,
+          "ops_per_sec": 581283.0,
+          "hot_p50_us": 1.5,
+          "hot_p99_us": 3.01,
+          "cold_sec": 0.171,
+          "cold_p50_us": 7.86,
+          "cold_p99_us": 15.49,
+          "cold_rss_mb": 79.2,
+          "rss_reduction_pct": 77.99152266058037,
+          "steady_rss_mb": 77.4,
+          "post_cool_rss_mb": 67.5
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 306.7,
+        "cool_rss_mb": 67.5,
+        "hot_p50_us": 1.5,
+        "hot_p99_us": 3.01,
+        "rss_reduction_pct": 77.99152266058037,
+        "cold_sec": 0.171,
+        "steady_rss_mb": 77.4,
+        "fill_sec": 0.76,
+        "min_rss_mb": 67.5,
+        "cold_p99_us": 15.49,
+        "cold_p50_us": 7.86,
+        "cold_rss_mb": 79.2,
+        "serve_rss_mb": 77.4,
+        "ops_per_sec": 581283.0,
+        "post_cool_rss_mb": 67.5
+      }
+    },
+    "T1e": {
+      "name": "No prefetch",
+      "runs": [
+        {
+          "fill_sec": 0.82,
+          "peak_rss_mb": 307.1,
+          "cool_rss_mb": 66.4,
+          "serve_rss_mb": 74.4,
+          "min_rss_mb": 66.4,
+          "ops_per_sec": 518903.0,
+          "hot_p50_us": 1.53,
+          "hot_p99_us": 8.44,
+          "cold_sec": 0.164,
+          "cold_p50_us": 7.56,
+          "cold_p99_us": 16.62,
+          "cold_rss_mb": 75.4,
+          "rss_reduction_pct": 78.37837837837837,
+          "steady_rss_mb": 74.4,
+          "post_cool_rss_mb": 66.4
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 307.1,
+        "cool_rss_mb": 66.4,
+        "hot_p50_us": 1.53,
+        "hot_p99_us": 8.44,
+        "rss_reduction_pct": 78.37837837837837,
+        "cold_sec": 0.164,
+        "steady_rss_mb": 74.4,
+        "fill_sec": 0.82,
+        "min_rss_mb": 66.4,
+        "cold_p99_us": 16.62,
+        "cold_p50_us": 7.56,
+        "cold_rss_mb": 75.4,
+        "serve_rss_mb": 74.4,
+        "ops_per_sec": 518903.0,
+        "post_cool_rss_mb": 66.4
+      }
+    },
+    "T1f": {
+      "name": "Single worker",
+      "runs": [
+        {
+          "fill_sec": 0.92,
+          "peak_rss_mb": 309.0,
+          "cool_rss_mb": 67.9,
+          "serve_rss_mb": 70.6,
+          "min_rss_mb": 67.9,
+          "ops_per_sec": 122503.0,
+          "hot_p50_us": 7.79,
+          "hot_p99_us": 12.03,
+          "cold_sec": 0.164,
+          "cold_p50_us": 7.66,
+          "cold_p99_us": 16.83,
+          "cold_rss_mb": 71.9,
+          "rss_reduction_pct": 78.02588996763754,
+          "steady_rss_mb": 70.6,
+          "post_cool_rss_mb": 67.9
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 309.0,
+        "cool_rss_mb": 67.9,
+        "hot_p50_us": 7.79,
+        "hot_p99_us": 12.03,
+        "rss_reduction_pct": 78.02588996763754,
+        "cold_sec": 0.164,
+        "steady_rss_mb": 70.6,
+        "fill_sec": 0.92,
+        "min_rss_mb": 67.9,
+        "cold_p99_us": 16.83,
+        "cold_p50_us": 7.66,
+        "cold_rss_mb": 71.9,
+        "serve_rss_mb": 70.6,
+        "ops_per_sec": 122503.0,
+        "post_cool_rss_mb": 67.9
+      }
+    },
+    "B2": {
+      "name": "No compression",
+      "runs": [
+        {
+          "fill_sec": 0.76,
+          "peak_rss_mb": 306.8,
+          "cool_rss_mb": 306.8,
+          "serve_rss_mb": 309.7,
+          "min_rss_mb": 306.8,
+          "ops_per_sec": 588837.0,
+          "hot_p50_us": 1.49,
+          "hot_p99_us": 3.06,
+          "cold_sec": 0.158,
+          "cold_p50_us": 7.59,
+          "cold_p99_us": 11.63,
+          "cold_rss_mb": 309.8,
+          "rss_reduction_pct": 0.0,
+          "steady_rss_mb": 309.7,
+          "post_cool_rss_mb": 306.8
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 306.8,
+        "cool_rss_mb": 306.8,
+        "hot_p50_us": 1.49,
+        "hot_p99_us": 3.06,
+        "rss_reduction_pct": 0.0,
+        "cold_sec": 0.158,
+        "steady_rss_mb": 309.7,
+        "fill_sec": 0.76,
+        "min_rss_mb": 306.8,
+        "cold_p99_us": 11.63,
+        "cold_p50_us": 7.59,
+        "cold_rss_mb": 309.8,
+        "serve_rss_mb": 309.7,
+        "ops_per_sec": 588837.0,
+        "post_cool_rss_mb": 306.8
+      }
+    }
   }
 }

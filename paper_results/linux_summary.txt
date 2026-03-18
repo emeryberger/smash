@@ -108,3 +108,20 @@ compression pipeline. External metadata + arena routing essential for best resul
 - LZ4 is optimal for cold pages: 30-37% ratio, ~1 GB/s compress, ~4-6 GB/s decompress
 - zstd-9 gives best ratios but 6-10x slower than LZ4
 - Smash's adaptive LZ4->zstd strategy optimal for mixed workloads
+
+## RocksDB Results (added with local installs)
+
+| Metric | Baseline | Smash | Reduction |
+|--------|----------|-------|-----------|
+| Cool RSS | 384 MB | 76 MB | **80.2%** |
+| Ablation default | 0% | 78.5% | +78.5pp |
+
+RocksDB shows the highest benefit from Smash due to large contiguous
+block cache allocations that compress extremely well.
+
+### Ablation on RocksDB
+- Default: 78.5%
+- With dicts: 77.5% (-0.9pp)
+- No arenas: 78.3% (-0.1pp)  
+- LZ4 only: 78.0% (-0.4pp)
+- No compression: 0% (baseline)

@@ -100,5 +100,159 @@
       "cold_p50_us": 12.75,
       "min_rss_mb": 86.8
     }
+  },
+  "duckdb_baseline": {
+    "runs": [
+      {
+        "peak_rss_mb": 173.20703125,
+        "cool_rss_mb": 173.20703125,
+        "steady_rss_mb": 175.64453125,
+        "min_rss_mb": 173.20703125,
+        "rss_reduction_pct": -1.407275433571642,
+        "baseline_rss_mb": 173.34765625
+      }
+    ],
+    "median": {
+      "steady_rss_mb": 175.64453125,
+      "baseline_rss_mb": 173.34765625,
+      "peak_rss_mb": 173.20703125,
+      "min_rss_mb": 173.20703125,
+      "rss_reduction_pct": -1.407275433571642,
+      "cool_rss_mb": 173.20703125
+    }
+  },
+  "duckdb_compress_only": {
+    "runs": [
+      {
+        "peak_rss_mb": 182.125,
+        "cool_rss_mb": 182.125,
+        "steady_rss_mb": 185.16015625,
+        "min_rss_mb": 182.125,
+        "rss_reduction_pct": -6.814340762106497,
+        "baseline_rss_mb": 173.34765625
+      }
+    ],
+    "median": {
+      "steady_rss_mb": 185.16015625,
+      "baseline_rss_mb": 173.34765625,
+      "peak_rss_mb": 182.125,
+      "min_rss_mb": 182.125,
+      "rss_reduction_pct": -6.814340762106497,
+      "cool_rss_mb": 182.125
+    }
+  },
+  "rocksdb_baseline": {
+    "runs": [
+      {
+        "fill_sec": 0.8,
+        "peak_rss_mb": 381.0,
+        "cool_rss_mb": 381.0,
+        "serve_rss_mb": 383.8,
+        "min_rss_mb": 381.0,
+        "ops_per_sec": 584236.0,
+        "hot_p50_us": 1.5,
+        "hot_p99_us": 3.38,
+        "cold_sec": 0.035,
+        "cold_p50_us": 1.44,
+        "cold_p99_us": 8.3,
+        "cold_rss_mb": 383.8,
+        "rss_reduction_pct": 0.0,
+        "steady_rss_mb": 383.8,
+        "post_cool_rss_mb": 381.0
+      }
+    ],
+    "median": {
+      "peak_rss_mb": 381.0,
+      "cool_rss_mb": 381.0,
+      "hot_p50_us": 1.5,
+      "hot_p99_us": 3.38,
+      "rss_reduction_pct": 0.0,
+      "cold_sec": 0.035,
+      "steady_rss_mb": 383.8,
+      "fill_sec": 0.8,
+      "min_rss_mb": 381.0,
+      "cold_p99_us": 8.3,
+      "cold_p50_us": 1.44,
+      "cold_rss_mb": 383.8,
+      "serve_rss_mb": 383.8,
+      "ops_per_sec": 584236.0,
+      "post_cool_rss_mb": 381.0
+    }
+  },
+  "rocksdb_compress_only": {
+    "runs": [
+      {
+        "fill_sec": 0.9,
+        "peak_rss_mb": 443.8,
+        "cool_rss_mb": 443.8,
+        "serve_rss_mb": 446.4,
+        "min_rss_mb": 443.8,
+        "ops_per_sec": 569816.0,
+        "hot_p50_us": 1.57,
+        "hot_p99_us": 2.6,
+        "cold_sec": 0.038,
+        "cold_p50_us": 1.53,
+        "cold_p99_us": 7.99,
+        "cold_rss_mb": 446.7,
+        "rss_reduction_pct": 0.0,
+        "steady_rss_mb": 446.4,
+        "post_cool_rss_mb": 443.8
+      }
+    ],
+    "median": {
+      "peak_rss_mb": 443.8,
+      "cool_rss_mb": 443.8,
+      "hot_p50_us": 1.57,
+      "hot_p99_us": 2.6,
+      "rss_reduction_pct": 0.0,
+      "cold_sec": 0.038,
+      "steady_rss_mb": 446.4,
+      "fill_sec": 0.9,
+      "min_rss_mb": 443.8,
+      "cold_p99_us": 7.99,
+      "cold_p50_us": 1.53,
+      "cold_rss_mb": 446.7,
+      "serve_rss_mb": 446.4,
+      "ops_per_sec": 569816.0,
+      "post_cool_rss_mb": 443.8
+    }
+  },
+  "rocksdb_full_smash": {
+    "runs": [
+      {
+        "fill_sec": 0.77,
+        "peak_rss_mb": 306.7,
+        "cool_rss_mb": 66.0,
+        "serve_rss_mb": 75.9,
+        "min_rss_mb": 66.0,
+        "ops_per_sec": 570763.0,
+        "hot_p50_us": 1.5,
+        "hot_p99_us": 3.32,
+        "cold_sec": 0.169,
+        "cold_p50_us": 7.82,
+        "cold_p99_us": 16.12,
+        "cold_rss_mb": 77.7,
+        "rss_reduction_pct": 78.4805999347897,
+        "steady_rss_mb": 75.9,
+        "post_cool_rss_mb": 66.0
+      }
+    ],
+    "median": {
+      "peak_rss_mb": 306.7,
+      "cool_rss_mb": 66.0,
+      "hot_p50_us": 1.5,
+      "hot_p99_us": 3.32,
+      "rss_reduction_pct": 78.4805999347897,
+      "cold_sec": 0.169,
+      "steady_rss_mb": 75.9,
+      "fill_sec": 0.77,
+      "min_rss_mb": 66.0,
+      "cold_p99_us": 16.12,
+      "cold_p50_us": 7.82,
+      "cold_rss_mb": 77.7,
+      "serve_rss_mb": 75.9,
+      "ops_per_sec": 570763.0,
+      "post_cool_rss_mb": 66.0
+    }
   }
 }

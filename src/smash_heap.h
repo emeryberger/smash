@@ -41,18 +41,23 @@ class SmashHeap {
 
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
-    static uint8_t callsiteArena() {
+    static uint8_t callsiteArena(uint8_t sc) {
 #ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
         return 0;
 #else
-        // XOR return addresses from two stack depths for arena routing.
-        // xxmalloc tail-calls SmashHeap::malloc, so:
-        //   depth 0 = app's malloc() callsite (or app wrapper)
-        //   depth 1 = caller of that function
-        // XORing both ensures different routing even through a common
-        // application-level malloc wrapper.
-        uintptr_t h = reinterpret_cast<uintptr_t>(__builtin_return_address(0))
-                    ^ reinterpret_cast<uintptr_t>(__builtin_return_address(1));
+        // LLAMA-style stack hash [Maas et al., ASPLOS 2020]:
+        // hash(return_address, stack_height, object_size).
+        //
+        // Return address (depth 0) identifies the immediate call site.
+        // Stack height (via __builtin_frame_address(0), safe at depth 0)
+        // distinguishes calls through different wrapper chains that share
+        // the same immediate call site.  Size class adds object-type
+        // context.  This replaces the prior __builtin_return_address(1)
+        // approach, which required frame-pointer walking and triggered
+        // -Wframe-address warnings.
+        uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        uintptr_t sh = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+        uintptr_t h = ra ^ (sh >> 4) ^ static_cast<uintptr_t>(sc);
         h ^= h >> 16;
         return static_cast<uint8_t>(h & (kNumArenas - 1));
 #endif
@@ -148,7 +153,7 @@ public:
             ThreadCache* tc = getOrCreateThreadCache();
             void* ptr = tc->allocate(sc);
             if (ptr) return ptr;
-            return tc->refill(sc, &slab(callsiteArena(), sc));
+            return tc->refill(sc, &slab(callsiteArena(sc), sc));
         }
         return large_alloc_.allocate(size, kMinAlignment);
     }

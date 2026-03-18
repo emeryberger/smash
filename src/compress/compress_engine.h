@@ -281,8 +281,10 @@ public:
         return (sc < kNumClasses && dicts_[sc].trained) ? dicts_[sc].cdict : nullptr;
     }
 
-    // Direct access to zstd context (for experiments that need level control)
+    // Direct access to contexts (for calibration and experiments)
+    void* getLz4State() const { return lz4_state_; }
     ZSTD_CCtx* getZstdCCtx() const { return zstd_cctx_; }
+    ZSTD_DCtx* getZstdDCtx() const { return zstd_dctx_; }
 
     // Maximum compressed output size for a given input and algorithm.
     static size_t maxCompressedSize(size_t src_size, CompressAlgo algo = CompressAlgo::LZ4) {

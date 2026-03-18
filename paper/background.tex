@@ -11,8 +11,9 @@ keeping them resident and swapping to disk.
 WKdm~\cite{wilson1999case,apple2013compressed}, a 32-bit
 word-granularity dictionary compressor designed for 4\,KiB
 pointer-heavy pages.  \punt{On 16\,KiB ARM64 pages with text or
-serialized data, WKdm achieves poor compression: 98.9\% on JSON
-and 93.7\% on key-value records (Table~\ref{tab:algo_compare}).}
+serialized data, WKdm achieves poor compression: only 1.01$\times$ on
+JSON and 1.07$\times$ on key-value records
+(Table~\ref{tab:algo_compare}).}
 
 \paragraph{Linux zswap.}  zswap intercepts pages destined for swap
 and compresses them into a memory

@@ -44,6 +44,9 @@ inline constexpr size_t kPageMapL2Size = 1ULL << kPageMapL2Bits;
 inline constexpr int kPageMapL1Bits = kAddressBits - kPageShift - kPageMapL2Bits;
 inline constexpr size_t kPageMapL1Size = 1ULL << kPageMapL1Bits;
 
+// ── ROI model defaults (overridable via SMASH_ROI_THRESHOLD env var) ─────────
+inline constexpr int kRoiThresholdDefault = 1024;
+
 // ── Compression (Phase 3+) ───────────────────────────────────────────────────
 inline constexpr int kCompressIntervalMs = 1000;
 #ifndef SMASH_COLD_TICKS
@@ -69,8 +72,17 @@ inline constexpr int kPrefetchWindow = 2;         // pages each direction on fau
 #else
 inline constexpr int kPrefetchWindow = SMASH_PREFETCH_WINDOW;
 #endif
+inline constexpr int kZstdFastLevel = 1;            // fast tier (replaces LZ4)
 inline constexpr int kZstdNormalLevel = 3;
 inline constexpr int kZstdDeepLevel = 9;
+
+// When true, use LZ4 as the fast compression tier (original behavior).
+// When false (default), use zstd-1 as the fast tier for better ratios.
+#ifdef SMASH_USE_LZ4
+inline constexpr bool kUseLz4FastTier = true;
+#else
+inline constexpr bool kUseLz4FastTier = false;
+#endif
 inline constexpr int kDictLevel = 3;            // CDict built at level 3 (430KB vs 686KB at level 9)
 inline constexpr size_t kDictCapacity = 16 * 1024; // 16KB dict (down from 32KB)
 inline constexpr int kMaxDictClasses = 8;        // cap total dict memory overhead

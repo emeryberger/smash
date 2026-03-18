@@ -4,15 +4,16 @@ transparently compresses cold heap pages by exploiting domain
 knowledge invisible to the rest of the system. \sys{} organizes
 allocations by call site so that similar objects share pages At
 compression time, it zeroes freed slots to increase compressiblility,
-and applies \emph{JIT compression}: fast LZ4 for recently cold pages,
-zstd (slower, but higher compression ratios) for long-lived cold data, with
-signal-based decompression on~demand.
+and applies \emph{JIT compression}: a return-on-investment model
+selects between fast zstd-1 and high-ratio zstd-9 based on the
+expected CPU cost and RSS savings for each page, with signal-based
+decompression on~demand.
 
 Across five applications---memcached, RocksDB, DuckDB,
-SQLite, and Redis---\sys reduces resident set size (RSS) by 17--80\% with negligible throughput
+SQLite, and Redis---\sys reduces resident set size (RSS) by 27--87\% with negligible throughput
 impact. We show that \sys{}'s compression
 pipeline and allocator design are synergistic: its pipeline achieves
-32--61\% RSS reduction even atop an unmodified system allocator,
-while its allocator design further reduces RSS by
-10--25\% on large-object workloads.
+20--61\% RSS reduction even atop an unmodified system allocator,
+while its allocator-level page tracking is critical for workloads
+like Redis where external VM scanning cannot detect cold~pages.
 \end{abstract}

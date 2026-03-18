@@ -1,114 +1,114 @@
 \begin{figure*}[t!]
 \centering
 \begin{tikzpicture}[
-  slot/.style={draw, minimum width=0.52cm, minimum height=0.52cm,
-               font=\tiny, inner sep=0pt, line width=0.3pt},
+  slot/.style={draw, minimum width=0.78cm, minimum height=0.78cm,
+               font=\scriptsize, inner sep=0pt, line width=0.3pt},
   freed/.style={slot, pattern=north east lines, pattern color=black!40},
-  meta/.style={slot, fill=green!20, font=\tiny\bfseries},
+  meta/.style={slot, fill=green!20, font=\scriptsize\bfseries},
   zeroed/.style={slot, fill=white},
-  lbl/.style={font=\scriptsize\sffamily},
-  heading/.style={font=\footnotesize\sffamily\bfseries},
+  lbl/.style={font=\small\sffamily},
+  heading/.style={font=\normalsize\sffamily\bfseries},
   brace/.style={decorate, decoration={brace, amplitude=4pt, raise=2pt}},
 ]
 
 % ============ LEFT: Conventional allocator ============
-\node[heading] at (0, 2.2) {Conventional Allocator};
+\node[heading] at (0, 2.5) {Conventional Allocator};
 
 % Page box
-\node[draw, thick, rounded corners=2pt, minimum width=5.4cm,
-      minimum height=2.8cm, fill=gray!3] (convbox) at (0, 0) {};
+\node[draw, thick, rounded corners=2pt, minimum width=7.2cm,
+      minimum height=3.6cm, fill=gray!3] (convbox) at (0, 0) {};
 \node[lbl, anchor=north west] at (convbox.north west)
   {\strut Slab page (size class 64\,B)};
 
 % Row 1: mixed live objects from different call sites
-\node[slot, fill=red!25]    at (-2.1, 0.55) {\textsf{A}};
-\node[slot, fill=blue!20]   at (-1.55, 0.55) {\textsf{B}};
-\node[meta]                 at (-1.0, 0.55) {\textsf{fl}};
-\node[slot, fill=yellow!30] at (-0.45, 0.55) {\textsf{C}};
-\node[slot, fill=red!25]    at (0.1, 0.55) {\textsf{A}};
-\node[freed]                at (0.65, 0.55) {};
-\node[slot, fill=blue!20]   at (1.2, 0.55) {\textsf{B}};
-\node[slot, fill=yellow!30] at (1.75, 0.55) {\textsf{C}};
+\node[slot, fill=red!25]    at (-2.8, 0.85) {\textsf{A}};
+\node[slot, fill=blue!20]   at (-2.0, 0.85) {\textsf{B}};
+\node[meta]                 at (-1.2, 0.85) {\textsf{fl}};
+\node[slot, fill=yellow!30] at (-0.4, 0.85) {\textsf{C}};
+\node[slot, fill=red!25]    at (0.4, 0.85) {\textsf{A}};
+\node[freed]                at (1.2, 0.85) {};
+\node[slot, fill=blue!20]   at (2.0, 0.85) {\textsf{B}};
+\node[slot, fill=yellow!30] at (2.8, 0.85) {\textsf{C}};
 
 % Row 2
-\node[meta]                 at (-2.1, 0.0) {\textsf{fl}};
-\node[slot, fill=yellow!30] at (-1.55, 0.0) {\textsf{C}};
-\node[slot, fill=red!25]    at (-1.0, 0.0) {\textsf{A}};
-\node[slot, fill=blue!20]   at (-0.45, 0.0) {\textsf{B}};
-\node[freed]                at (0.1, 0.0) {};
-\node[slot, fill=red!25]    at (0.65, 0.0) {\textsf{A}};
-\node[slot, fill=yellow!30] at (1.2, 0.0) {\textsf{C}};
-\node[meta]                 at (1.75, 0.0) {\textsf{fl}};
+\node[meta]                 at (-2.8, 0.0) {\textsf{fl}};
+\node[slot, fill=yellow!30] at (-2.0, 0.0) {\textsf{C}};
+\node[slot, fill=red!25]    at (-1.2, 0.0) {\textsf{A}};
+\node[slot, fill=blue!20]   at (-0.4, 0.0) {\textsf{B}};
+\node[freed]                at (0.4, 0.0) {};
+\node[slot, fill=red!25]    at (1.2, 0.0) {\textsf{A}};
+\node[slot, fill=yellow!30] at (2.0, 0.0) {\textsf{C}};
+\node[meta]                 at (2.8, 0.0) {\textsf{fl}};
 
 % Row 3
-\node[slot, fill=blue!20]   at (-2.1, -0.55) {\textsf{B}};
-\node[meta]                 at (-1.55, -0.55) {\textsf{fl}};
-\node[slot, fill=yellow!30] at (-1.0, -0.55) {\textsf{C}};
-\node[slot, fill=red!25]    at (-0.45, -0.55) {\textsf{A}};
-\node[slot, fill=blue!20]   at (0.1, -0.55) {\textsf{B}};
-\node[slot, fill=yellow!30] at (1.2, -0.55) {\textsf{C}};
-\node[slot, fill=red!25]    at (0.65, -0.55) {\textsf{A}};
-\node[freed]                at (1.75, -0.55) {};
+\node[slot, fill=blue!20]   at (-2.8, -0.85) {\textsf{B}};
+\node[meta]                 at (-2.0, -0.85) {\textsf{fl}};
+\node[slot, fill=yellow!30] at (-1.2, -0.85) {\textsf{C}};
+\node[slot, fill=red!25]    at (-0.4, -0.85) {\textsf{A}};
+\node[slot, fill=blue!20]   at (0.4, -0.85) {\textsf{B}};
+\node[slot, fill=yellow!30] at (2.0, -0.85) {\textsf{C}};
+\node[slot, fill=red!25]    at (1.2, -0.85) {\textsf{A}};
+\node[freed]                at (2.8, -0.85) {};
 
 % Annotations
-\node[lbl, text=black!60, anchor=north, align=center] at (0, -1.7) {
+\node[lbl, text=black!60, anchor=north, align=center] at (0, -2.3) {
   Objects from different call sites (A, B, C) intermixed\\
   Free-list pointers (\,\raisebox{-0.5ex}{\tikz
-    \node[draw, fill=green!20, minimum width=0.3cm, minimum height=0.3cm,
-          inner sep=0pt, line width=0.3pt, font=\tiny\bfseries]
-          {\textsf{fl}};}\,) written on malloc/free $\to$ pages stay ``warm''};
+    \node[draw, fill=green!20, minimum width=0.45cm, minimum height=0.45cm,
+          inner sep=0pt, line width=0.3pt, font=\scriptsize\bfseries]
+          {\textsf{fl}};}\,) written on malloc/free\\$\to$ pages stay ``warm''};
 
 % ============ RIGHT: Smash ============
-\node[heading] at (7.5, 2.2) {\sys};
+\node[heading] at (8.5, 2.5) {\sys};
 
 % Page box
-\node[draw, thick, rounded corners=2pt, minimum width=5.4cm,
-      minimum height=2.8cm, fill=gray!3] (smashbox) at (7.5, 0) {};
+\node[draw, thick, rounded corners=2pt, minimum width=7.2cm,
+      minimum height=3.6cm, fill=gray!3] (smashbox) at (8.5, 0) {};
 \node[lbl, anchor=north west] at (smashbox.north west)
   {\strut Slab page (arena 2, size class 64\,B)};
 
 % Row 1: all same call site, freed slots zeroed
-\node[slot, fill=red!25]  at (5.4, 0.55) {\textsf{A}};
-\node[slot, fill=red!25]  at (5.95, 0.55) {\textsf{A}};
-\node[zeroed]             at (6.5, 0.55) {\color{black!30}0};
-\node[slot, fill=red!25]  at (7.05, 0.55) {\textsf{A}};
-\node[slot, fill=red!25]  at (7.6, 0.55) {\textsf{A}};
-\node[zeroed]             at (8.15, 0.55) {\color{black!30}0};
-\node[slot, fill=red!25]  at (8.7, 0.55) {\textsf{A}};
-\node[slot, fill=red!25]  at (9.25, 0.55) {\textsf{A}};
+\node[slot, fill=red!25]  at (5.7, 0.85) {\textsf{A}};
+\node[slot, fill=red!25]  at (6.5, 0.85) {\textsf{A}};
+\node[zeroed]             at (7.3, 0.85) {\color{black!30}0};
+\node[slot, fill=red!25]  at (8.1, 0.85) {\textsf{A}};
+\node[slot, fill=red!25]  at (8.9, 0.85) {\textsf{A}};
+\node[zeroed]             at (9.7, 0.85) {\color{black!30}0};
+\node[slot, fill=red!25]  at (10.5, 0.85) {\textsf{A}};
+\node[slot, fill=red!25]  at (11.3, 0.85) {\textsf{A}};
 
 % Row 2
-\node[zeroed]             at (5.4, 0.0) {\color{black!30}0};
-\node[slot, fill=red!25]  at (5.95, 0.0) {\textsf{A}};
+\node[zeroed]             at (5.7, 0.0) {\color{black!30}0};
 \node[slot, fill=red!25]  at (6.5, 0.0) {\textsf{A}};
-\node[slot, fill=red!25]  at (7.05, 0.0) {\textsf{A}};
-\node[zeroed]             at (7.6, 0.0) {\color{black!30}0};
-\node[slot, fill=red!25]  at (8.15, 0.0) {\textsf{A}};
-\node[slot, fill=red!25]  at (8.7, 0.0) {\textsf{A}};
-\node[zeroed]             at (9.25, 0.0) {\color{black!30}0};
+\node[slot, fill=red!25]  at (7.3, 0.0) {\textsf{A}};
+\node[slot, fill=red!25]  at (8.1, 0.0) {\textsf{A}};
+\node[zeroed]             at (8.9, 0.0) {\color{black!30}0};
+\node[slot, fill=red!25]  at (9.7, 0.0) {\textsf{A}};
+\node[slot, fill=red!25]  at (10.5, 0.0) {\textsf{A}};
+\node[zeroed]             at (11.3, 0.0) {\color{black!30}0};
 
 % Row 3
-\node[slot, fill=red!25]  at (5.4, -0.55) {\textsf{A}};
-\node[slot, fill=red!25]  at (5.95, -0.55) {\textsf{A}};
-\node[slot, fill=red!25]  at (6.5, -0.55) {\textsf{A}};
-\node[zeroed]             at (7.05, -0.55) {\color{black!30}0};
-\node[slot, fill=red!25]  at (7.6, -0.55) {\textsf{A}};
-\node[slot, fill=red!25]  at (8.15, -0.55) {\textsf{A}};
-\node[zeroed]             at (8.7, -0.55) {\color{black!30}0};
-\node[slot, fill=red!25]  at (9.25, -0.55) {\textsf{A}};
+\node[slot, fill=red!25]  at (5.7, -0.85) {\textsf{A}};
+\node[slot, fill=red!25]  at (6.5, -0.85) {\textsf{A}};
+\node[slot, fill=red!25]  at (7.3, -0.85) {\textsf{A}};
+\node[zeroed]             at (8.1, -0.85) {\color{black!30}0};
+\node[slot, fill=red!25]  at (8.9, -0.85) {\textsf{A}};
+\node[slot, fill=red!25]  at (9.7, -0.85) {\textsf{A}};
+\node[zeroed]             at (10.5, -0.85) {\color{black!30}0};
+\node[slot, fill=red!25]  at (11.3, -0.85) {\textsf{A}};
 
 % Annotations
-\node[lbl, text=black!60, anchor=north, align=center] at (7.5, -1.7) {
+\node[lbl, text=black!60, anchor=north, align=center] at (8.5, -2.3) {
   Same call site per arena $\to$ homogeneous structure\\
   Out-of-band bitmaps $\to$ no metadata writes on data pages};
 
 % ============ Compression result arrows ============
-\draw[-{Stealth[length=5pt]}, thick, black!50]
-  (0, -2.55) -- ++(0, -0.5)
-  node[below, font=\scriptsize, text=black!60] {LZ4: poor ratio};
-\draw[-{Stealth[length=5pt]}, thick, black!50]
-  (7.5, -2.55) -- ++(0, -0.5)
-  node[below, font=\scriptsize, text=black!60] {LZ4: 40--65\% reduction};
+\draw[-{Stealth[length=7pt]}, thick, black!50]
+  (0, -3.45) -- ++(0, -0.6)
+  node[below, font=\small, text=black!60] {Low compression ratios};
+\draw[-{Stealth[length=7pt]}, thick, black!50]
+  (8.5, -3.45) -- ++(0, -0.6)
+  node[below, font=\small, text=black!60] {High compression ratios};
 
 \end{tikzpicture}
 \caption{\textbf{Conventional allocator vs.\ \sys: page-level data layout}

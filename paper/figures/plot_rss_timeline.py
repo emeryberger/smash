@@ -86,9 +86,13 @@ SYNTH_DATA = {
                   'mesh':     (241, 241, 241),
                   'smash':    (240, 175, 180)},
     'redis':     {'title': 'Redis',
-                  'baseline': (55, 55, 55),
-                  'mesh':     (59, 59, 59),
-                  'smash':    (57, 47, 48)},
+                  'baseline': (122, 122, 122),
+                  'mesh':     (109, 96, 96),
+                  'smash':    (133, 44, 111)},
+    'redis_ext': {'title': 'Redis (extended)',
+                  'baseline': (120, 121, 121),
+                  'mesh':     (109, 74, 83),
+                  'smash':    (133, 43, 110)},
 }
 
 def _plot_bench(ax, key):
@@ -113,28 +117,18 @@ def make_combined_from_synthetic(output_dir):
     benchmarks = list(SYNTH_DATA.keys())
     ncols = 3
     nrows = (len(benchmarks) + ncols - 1) // ncols
-    bottom_count = len(benchmarks) - ncols * (nrows - 1)
 
-    fig = plt.figure(figsize=(3.4 * ncols, 2.4 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.4 * ncols, 2.4 * nrows))
+    axes = axes.flatten()
 
-    # Top row: use gridspec spanning full width
-    import matplotlib.gridspec as gridspec
-    gs = gridspec.GridSpec(nrows, 2 * ncols, figure=fig,
-                           hspace=0.45, wspace=0.4)
+    for i, key in enumerate(benchmarks):
+        _plot_bench(axes[i], key)
 
-    # Top row: 3 equally-spaced subplots
-    for i in range(ncols):
-        ax = fig.add_subplot(gs[0, 2 * i : 2 * i + 2])
-        _plot_bench(ax, benchmarks[i])
+    # Hide any unused axes
+    for j in range(len(benchmarks), len(axes)):
+        axes[j].set_visible(False)
 
-    # Bottom row: center by offsetting into the 6-column grid
-    # 2 plots in 6 cols -> each plot is 2 cols wide, offset by 1 col
-    offset = ncols - bottom_count  # = 1 col offset on each side
-    for i in range(bottom_count):
-        col = offset + 2 * i
-        ax = fig.add_subplot(gs[1, col : col + 2])
-        _plot_bench(ax, benchmarks[ncols + i])
-
+    fig.tight_layout()
     out_path = os.path.join(output_dir, 'rss_combined.pdf')
     fig.savefig(out_path)
     plt.close(fig)
@@ -148,6 +142,7 @@ def make_timeline_figures(baseline_dir, smash_dir, output_dir):
         ('duckdb', 'DuckDB'),
         ('memcached', 'Memcached'),
         ('redis', 'Redis'),
+        ('redis_ext', 'Redis (extended)'),
     ]
 
     for filename, title in benchmarks:

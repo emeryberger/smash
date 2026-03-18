@@ -15,6 +15,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ── Threads ───────────────────────────────────────────────────────────────────
+find_package(Threads REQUIRED)
+
 # ── macOS: build fat arm64+arm64e so interposition works with all binaries ───
 # System binaries (ls, cat, etc.) are arm64e (pointer authentication).
 # DYLD_INSERT_LIBRARIES requires the dylib to match the process architecture.
@@ -105,7 +108,7 @@ target_include_directories(smash PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_libraries(smash PRIVATE alloc8::interpose lz4_static libzstd_static)
+target_link_libraries(smash PRIVATE alloc8::interpose lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash PROPERTIES
   OUTPUT_NAME "smash"
@@ -152,7 +155,7 @@ target_include_directories(smash_noopt PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_libraries(smash_noopt PRIVATE alloc8::interpose lz4_static libzstd_static)
+target_link_libraries(smash_noopt PRIVATE alloc8::interpose lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash_noopt PROPERTIES
   OUTPUT_NAME "smash_noopt"
@@ -184,7 +187,7 @@ target_include_directories(smash_compress_only PRIVATE
 )
 
 # Only needs alloc8 headers (for platform.h), NOT the interpose machinery
-target_link_libraries(smash_compress_only PRIVATE alloc8::headers lz4_static libzstd_static)
+target_link_libraries(smash_compress_only PRIVATE alloc8::headers lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash_compress_only PROPERTIES
   OUTPUT_NAME "smash_compress_only"

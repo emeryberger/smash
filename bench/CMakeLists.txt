@@ -1,5 +1,7 @@
 # smash/bench/CMakeLists.txt - Standalone benchmark executables
 
+find_package(Threads REQUIRED)
+
 set(SMASH_BENCH_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
   ${CMAKE_CURRENT_SOURCE_DIR}/../src
@@ -37,6 +39,7 @@ function(smash_add_standalone_bench name source)
   # Override compile options to exclude -fno-builtin-malloc etc.
   _get_filtered_dir_compile_options(clean_opts)
   set_target_properties(${name} PROPERTIES COMPILE_OPTIONS "${clean_opts}")
+  target_link_libraries(${name} PRIVATE Threads::Threads)
 endfunction()
 
 # ── cJSON library (for bench_json) ──────────────────────────────────────────

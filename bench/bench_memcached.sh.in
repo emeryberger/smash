@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# bench_memcached.sh - Memcached A/B comparison: system malloc vs Smash
+#
+# Memcached's slab allocator calls malloc() for ~1MB slab pages, so
+# DYLD_INSERT intercepts them. Cold slabs (items not accessed) get
+# compressed by Smash.
+#
+# Requires memcached in PATH. Skips gracefully if absent.
+#
+# Usage:
+#   bash bench_memcached.sh [--quick]
+#
+# Compatible with bash 3.2+ (macOS default).
+
+set -euo pipefail
+
+# ── Paths (substituted by CMake configure_file) ─────────────────────────────
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+# ── Platform detection ───────────────────────────────────────────────────────
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+    NC_FLAGS="-w 1"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+    NC_FLAGS="-q 1"
+fi
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+NUM_KEYS=1000000
+COOL_DURATION=10
+SERVE_DURATION=20
+BATCH_SIZE=5000
+TPCH_SF=1.0
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_KEYS=500000
+            COOL_DURATION=5
+            SERVE_DURATION=10
+            TPCH_SF=0.5
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+NUM_BATCHES=$((NUM_KEYS / BATCH_SIZE))
+HOT_KEYS=$((NUM_KEYS / 20))           # top 5%
+COLD_KEYS=$((NUM_KEYS / 10))
+
+# ── Check prerequisites ─────────────────────────────────────────────────────
+if ! command -v memcached &>/dev/null; then
+    echo "SKIP: memcached not found in PATH (brew install memcached)"
+    exit 0
+fi
+
+if ! command -v nc &>/dev/null; then
+    echo "SKIP: nc (netcat) not found in PATH"
+    exit 0
+fi
+
+if ! command -v duckdb &>/dev/null; then
+    echo "SKIP: duckdb not found in PATH (brew install duckdb) — needed for TPC-H data generation"
+    exit 0
+fi
+
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON && make -j"
+    exit 1
+fi
+
+# ── Ports ────────────────────────────────────────────────────────────────────
+BASELINE_PORT=11311
+SMASH_PORT=11312
+
+# ── Temp directory ───────────────────────────────────────────────────────────
+TMPDIR_BENCH=$(mktemp -d)
+METRIC_FILE="${TMPDIR_BENCH}/metrics.txt"
+: > "$METRIC_FILE"
+
+# ── Cleanup trap ─────────────────────────────────────────────────────────────
+MC_PID=""
+MONITOR_PID=""
+
+cleanup() {
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$MC_PID" ]]; then
+        kill "$MC_PID" 2>/dev/null || true
+        wait "$MC_PID" 2>/dev/null || true
+    fi
+    rm -rf "$TMPDIR_BENCH"
+}
+trap cleanup EXIT
+
+# ── Helper: get RSS via ps (in KB → MB) ─────────────────────────────────────
+get_rss_mb() {
+    local pid="$1"
+    local rss_kb
+    rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ -n "$rss_kb" && "$rss_kb" -gt 0 ]] 2>/dev/null; then
+        echo "scale=1; $rss_kb / 1024" | bc -l
+    else
+        echo "0"
+    fi
+}
+
+# ── Helper: send commands to memcached via nc ────────────────────────────────
+# Appends "quit\r\n" to cleanly close the connection.
+mc_send() {
+    local port="$1"
+    # Read commands from stdin, append quit, send via nc
+    { cat; printf "quit\r\n"; } | nc $NC_FLAGS localhost "$port" >/dev/null 2>&1 || true
+}
+
+# ── Helper: generate TPC-H JSON corpus ──────────────────────────────────────
+generate_corpus() {
+    local corpus_file="$1"
+    echo "  Generating TPC-H JSON corpus (sf=${TPCH_SF})..."
+    duckdb -c "
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf=${TPCH_SF});
+COPY (
+    SELECT o_orderkey as id, c_name as customer, c_address as addr,
+           c_phone as phone, c_mktsegment as segment,
+           o_orderstatus as status, o_totalprice as total,
+           o_orderdate as date, o_orderpriority as priority,
+           o_comment as order_note, c_comment as customer_note
+    FROM orders JOIN customer ON o_custkey = c_custkey
+    ORDER BY o_orderkey
+) TO '${corpus_file}' (FORMAT JSON, ARRAY false);
+"
+    local nlines
+    nlines=$(wc -l < "$corpus_file" | tr -d ' ')
+    echo "  Corpus: ${nlines} JSON records"
+}
+
+# ── Helper: populate memcached ───────────────────────────────────────────────
+populate_memcached() {
+    local port="$1"
+    local num_keys="$2"
+    local corpus_file="$3"
+
+    echo "  Populating ${num_keys} keys on port ${port}..."
+
+    # Generate all SET commands in one streaming pass (no full corpus load)
+    local commands_file="${TMPDIR_BENCH}/set_commands.txt"
+    head -n "$num_keys" "$corpus_file" | awk '
+    {
+        key = sprintf("key:%07d", NR - 1);
+        val = $0;
+        printf "set %s 0 0 %d\r\n%s\r\n", key, length(val), val;
+    }' > "$commands_file"
+
+    # Split into batch-sized chunks and send (each SET = 2 lines)
+    local lines_per_batch=$((BATCH_SIZE * 2))
+    mkdir -p "${TMPDIR_BENCH}/batches"
+    split -l "$lines_per_batch" "$commands_file" "${TMPDIR_BENCH}/batches/b_"
+
+    local batch=0
+    for chunk in "${TMPDIR_BENCH}"/batches/b_*; do
+        mc_send "$port" < "$chunk"
+        batch=$((batch + 1))
+        if [[ $((batch % 50)) -eq 0 ]]; then
+            echo "    ${batch}/${NUM_BATCHES} batches..."
+        fi
+    done
+
+    rm -rf "${TMPDIR_BENCH}/batches" "$commands_file"
+    echo "  Done populating."
+}
+
+# ── Helper: serve hot GETs ───────────────────────────────────────────────────
+serve_hot_gets() {
+    local port="$1"
+    local duration="$2"
+    local hot_range="$3"
+    local metric_label="$4"
+
+    local end_time=$(($(date +%s) + duration))
+    local hot_start=$((NUM_KEYS - hot_range))
+    local total_gets=0
+
+    while [[ $(date +%s) -lt $end_time ]]; do
+        awk -v hs="$hot_start" -v hr="$hot_range" '
+        BEGIN {
+            srand();
+            for (i = 0; i < 500; i++) {
+                idx = hs + int(rand() * hr);
+                printf "get key:%07d\r\n", idx;
+            }
+        }' | mc_send "$port"
+        total_gets=$((total_gets + 500))
+    done
+
+    if [[ $duration -gt 0 ]]; then
+        local ops_sec=$((total_gets / duration))
+        emit_metric "${metric_label}_serve_ops" "$ops_sec"
+    fi
+}
+
+# ── Helper: access cold keys ────────────────────────────────────────────────
+access_cold_keys() {
+    local port="$1"
+    local cold_start="$2"
+    local cold_count="$3"
+
+    echo "  Accessing ${cold_count} cold keys starting at ${cold_start}..."
+
+    local batch_size=5000
+    local i=0
+    while [[ $i -lt $cold_count ]]; do
+        local batch_end=$((i + batch_size))
+        if [[ $batch_end -gt $cold_count ]]; then
+            batch_end=$cold_count
+        fi
+
+        awk -v s="$((cold_start + i))" -v e="$((cold_start + batch_end))" '
+        BEGIN {
+            for (j = s; j < e; j++) {
+                printf "get key:%07d\r\n", j;
+            }
+        }' | mc_send "$port"
+
+        i=$batch_end
+    done
+
+    echo "  Done accessing cold keys."
+}
+
+# ── Helper: emit a metric ───────────────────────────────────────────────────
+emit_metric() {
+    echo "METRIC $1 $2" >> "$METRIC_FILE"
+}
+
+# ── Helper: look up a metric ────────────────────────────────────────────────
+metric_val() {
+    local name="$1"
+    awk -v m="$name" '$1=="METRIC" && $2==m {print $3}' "$METRIC_FILE"
+}
+
+# ── Helper: print comparison row ────────────────────────────────────────────
+print_row() {
+    local label="$1" base_metric="$2" smash_metric="$3"
+    local base smash
+    base=$(metric_val "$base_metric")
+    smash=$(metric_val "$smash_metric")
+    base="${base:-N/A}"
+    smash="${smash:-N/A}"
+
+    if [[ "$base" == "N/A" || "$smash" == "N/A" || "$base" == "0" ]]; then
+        printf "  %-25s %10s MB %10s MB %10s\n" "$label" "$base" "$smash" "N/A"
+        return
+    fi
+
+    local delta
+    delta=$(echo "scale=1; (($smash - $base) / $base) * 100" | bc -l 2>/dev/null || echo "N/A")
+    printf "  %-25s %10s MB %10s MB %9s%%\n" "$label" "$base" "$smash" "$delta"
+}
+
+# ── Run one full pass ────────────────────────────────────────────────────────
+# Returns 0 on success, 1 if memcached failed to start (e.g. Smash incompatibility)
+run_memcached_pass() {
+    local label="$1"
+    local port="$2"
+    local use_smash="$3"
+
+    echo ""
+    echo "[${label}] Starting memcached on port ${port}..."
+
+    # Disable LRU crawler/maintainer — these background threads continuously
+    # walk slab pages even when idle, preventing cold pages from compressing.
+    local mc_opts="-p $port -m 512 -t 1 -o no_lru_crawler,no_lru_maintainer"
+
+    if [[ "$use_smash" == "yes" ]]; then
+        env "${PRELOAD_VAR}=${SMASH_LIB}" memcached $mc_opts &>/dev/null &
+    else
+        memcached $mc_opts &>/dev/null &
+    fi
+    MC_PID=$!
+    sleep 3
+
+    # Verify it started and responds to protocol commands
+    local verify=""
+    local attempt=0
+    while [[ $attempt -lt 5 ]]; do
+        if ! kill -0 "$MC_PID" 2>/dev/null; then
+            echo "  memcached exited prematurely"
+            MC_PID=""
+            return 1
+        fi
+        verify=$(printf "version\r\nquit\r\n" | nc $NC_FLAGS localhost "$port" 2>/dev/null | head -1 || true)
+        if [[ -n "$verify" ]]; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    if [[ -z "$verify" ]]; then
+        echo "  memcached not responding on port ${port}"
+        kill "$MC_PID" 2>/dev/null || true
+        wait "$MC_PID" 2>/dev/null || true
+        MC_PID=""
+        return 1
+    fi
+    echo "  memcached running (pid ${MC_PID})"
+
+    # Phase 1: Fill with TPC-H JSON records
+    echo "[${label}] Phase 1: Fill ${NUM_KEYS} keys..."
+    local corpus_file="${TMPDIR_BENCH}/${label}_corpus.jsonl"
+    if [[ ! -f "${TMPDIR_BENCH}/tpch_corpus.jsonl" ]]; then
+        generate_corpus "${TMPDIR_BENCH}/tpch_corpus.jsonl"
+    fi
+    corpus_file="${TMPDIR_BENCH}/tpch_corpus.jsonl"
+    local fill_start
+    fill_start=$(date +%s)
+    populate_memcached "$port" "$NUM_KEYS" "$corpus_file"
+    local fill_end
+    fill_end=$(date +%s)
+    local fill_sec=$((fill_end - fill_start))
+    if [[ $fill_sec -lt 1 ]]; then fill_sec=1; fi
+    local fill_ops=$((NUM_KEYS / fill_sec))
+    emit_metric "${label}_fill_sec" "$fill_sec"
+    emit_metric "${label}_fill_ops" "$fill_ops"
+    echo "  Fill: ${fill_sec}s (${fill_ops} SET/s)"
+
+    local fill_rss
+    fill_rss=$(get_rss_mb "$MC_PID")
+    emit_metric "${label}_fill_rss_mb" "$fill_rss"
+    echo "  Fill RSS: ${fill_rss} MB"
+
+    # Start RSS background monitor
+    local rss_log="${TMPDIR_BENCH}/${label}_rss.log"
+    : > "$rss_log"
+    (
+        while kill -0 "$MC_PID" 2>/dev/null; do
+            get_rss_mb "$MC_PID" >> "$rss_log"
+            sleep 1
+        done
+    ) &
+    MONITOR_PID=$!
+
+    # Phase 2: Cool
+    echo "[${label}] Phase 2: Cool for ${COOL_DURATION}s..."
+    sleep "$COOL_DURATION"
+
+    local cool_rss
+    cool_rss=$(get_rss_mb "$MC_PID")
+    emit_metric "${label}_cool_rss_mb" "$cool_rss"
+    echo "  Post-cool RSS: ${cool_rss} MB"
+
+    # Phase 3: Serve hot 5%
+    echo "[${label}] Phase 3: Serve hot ${HOT_KEYS} keys for ${SERVE_DURATION}s..."
+    serve_hot_gets "$port" "$SERVE_DURATION" "$HOT_KEYS" "$label"
+
+    local serve_ops
+    serve_ops=$(metric_val "${label}_serve_ops")
+    echo "  Serve: ${serve_ops:-?} GET/s"
+
+    local serve_rss
+    serve_rss=$(get_rss_mb "$MC_PID")
+    emit_metric "${label}_serve_rss_mb" "$serve_rss"
+    echo "  Serve RSS: ${serve_rss} MB"
+
+    # Phase 4: Cold re-access
+    echo "[${label}] Phase 4: Access ${COLD_KEYS} cold keys..."
+    local cold_start_t
+    cold_start_t=$(date +%s)
+    access_cold_keys "$port" 0 "$COLD_KEYS"
+    local cold_end_t
+    cold_end_t=$(date +%s)
+    local cold_sec=$((cold_end_t - cold_start_t))
+    if [[ $cold_sec -lt 1 ]]; then cold_sec=1; fi
+    local cold_ops=$((COLD_KEYS / cold_sec))
+    emit_metric "${label}_cold_sec" "$cold_sec"
+    emit_metric "${label}_cold_ops" "$cold_ops"
+    echo "  Cold re-access: ${cold_sec}s (${cold_ops} GET/s)"
+
+    local cold_rss
+    cold_rss=$(get_rss_mb "$MC_PID")
+    emit_metric "${label}_cold_rss_mb" "$cold_rss"
+    echo "  Cold re-access RSS: ${cold_rss} MB"
+
+    # Stop monitor
+    kill "$MONITOR_PID" 2>/dev/null || true
+    wait "$MONITOR_PID" 2>/dev/null || true
+    MONITOR_PID=""
+
+    # Extract peak/min/steady from RSS log
+    if [[ -s "$rss_log" ]]; then
+        awk -v lbl="$label" '
+        BEGIN { peak=0; min=999999; last=0; }
+        {
+            v = $1 + 0;
+            if (v > peak) peak = v;
+            if (v > 0 && v < min) min = v;
+            last = v;
+        }
+        END {
+            printf "METRIC %s_peak_rss_mb %s\n", lbl, peak;
+            printf "METRIC %s_min_rss_mb %s\n", lbl, (min == 999999 ? 0 : min);
+            printf "METRIC %s_steady_rss_mb %s\n", lbl, last;
+        }' "$rss_log" >> "$METRIC_FILE"
+    fi
+
+    # Stop memcached
+    kill "$MC_PID" 2>/dev/null || true
+    wait "$MC_PID" 2>/dev/null || true
+    MC_PID=""
+    sleep 1
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "========================================================================"
+echo "  Memcached A/B Comparison"
+echo "========================================================================"
+echo ""
+echo "Keys: ${NUM_KEYS}, TPC-H sf=${TPCH_SF}, Cool: ${COOL_DURATION}s, Serve: ${SERVE_DURATION}s"
+echo ""
+
+# Run baseline
+run_memcached_pass "baseline" "$BASELINE_PORT" "no"
+
+# Run Smash
+SMASH_OK=1
+run_memcached_pass "smash" "$SMASH_PORT" "yes" || SMASH_OK=0
+
+# ── Display results ──────────────────────────────────────────────────────────
+
+if [[ "$SMASH_OK" -eq 0 ]]; then
+    echo ""
+    echo "NOTE: Memcached crashes under Smash due to kevent(2) incompatibility."
+    echo "      Smash uses mprotect-based page compression with SIGSEGV fault handling."
+    echo "      macOS kevent(2) accesses event buffers from kernel space, bypassing"
+    echo "      userspace signal delivery — causing EFAULT on protected pages."
+    echo "      Showing baseline-only results."
+    echo ""
+    echo "  ------------------------------------------------------------------------"
+    printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+    echo "  ------------------------------------------------------------------------"
+
+    for metric in fill_rss_mb peak_rss_mb cool_rss_mb serve_rss_mb min_rss_mb steady_rss_mb cold_rss_mb; do
+        base=$(metric_val "baseline_${metric}")
+        base="${base:-N/A}"
+        label=$(echo "$metric" | sed 's/_mb$//' | sed 's/_/ /g')
+        printf "  %-25s %10s MB %10s MB %10s\n" "$label" "$base" "N/A" "N/A"
+    done
+else
+    echo ""
+    echo "  ------------------------------------------------------------------------"
+    printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+    echo "  ------------------------------------------------------------------------"
+
+    print_row "Fill RSS"           "baseline_fill_rss_mb"    "smash_fill_rss_mb"
+    print_row "Peak RSS"           "baseline_peak_rss_mb"    "smash_peak_rss_mb"
+    print_row "Post-cool RSS"      "baseline_cool_rss_mb"    "smash_cool_rss_mb"
+    print_row "Serve RSS"          "baseline_serve_rss_mb"   "smash_serve_rss_mb"
+    print_row "Min RSS"            "baseline_min_rss_mb"     "smash_min_rss_mb"
+    print_row "Steady RSS"         "baseline_steady_rss_mb"  "smash_steady_rss_mb"
+    print_row "Cold re-access RSS" "baseline_cold_rss_mb"    "smash_cold_rss_mb"
+fi
+
+echo ""
+echo "Done."

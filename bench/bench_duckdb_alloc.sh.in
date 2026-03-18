@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# bench_duckdb_alloc.sh - DuckDB RSS comparison across allocators
+#
+# Runs DuckDB with each allocator via DYLD_INSERT_LIBRARIES,
+# generates TPC-H data, cools, serves queries, measures RSS.
+#
+# Usage:
+#   bash bench_duckdb_alloc.sh [--quick]
+
+set -euo pipefail
+
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+TPCH_SF=0.5
+COOL_DURATION=10
+SERVE_ITERATIONS=10
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            TPCH_SF=0.1
+            COOL_DURATION=5
+            SERVE_ITERATIONS=5
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+# ── Check prerequisites ─────────────────────────────────────────────────────
+if ! command -v duckdb &>/dev/null; then
+    echo "SKIP: duckdb not found in PATH (brew install duckdb)"
+    exit 0
+fi
+
+# ── Allocators ───────────────────────────────────────────────────────────────
+declare -a ALLOCATORS=(
+    "system::"
+    "mimalloc:/opt/homebrew/lib/libmimalloc.dylib:MIMALLOC_PURGE_DELAY=-1"
+    "tcmalloc:/opt/homebrew/lib/libtcmalloc.dylib:TCMALLOC_RELEASE_RATE=0"
+    "hoard:/usr/local/lib/libhoard.dylib:"
+    "mesh:/usr/local/lib/libmesh.dylib:"
+    "diehard:/usr/local/lib/libdiehard.dylib:"
+    "dieharder:/usr/local/lib/libdieharder.dylib:"
+    "smash:${SMASH_LIB}:"
+)
+# Note: jemalloc DYLD interposition hangs with DuckDB on macOS — skipped
+
+# ── Temp directory ───────────────────────────────────────────────────────────
+TMPDIR_BENCH=$(mktemp -d)
+RESULT_FILE="${TMPDIR_BENCH}/results.txt"
+: > "$RESULT_FILE"
+
+DUCK_PID=""
+
+cleanup() {
+    exec 3>&- 2>/dev/null || true
+    [[ -n "$DUCK_PID" ]] && kill "$DUCK_PID" 2>/dev/null && wait "$DUCK_PID" 2>/dev/null || true
+    rm -rf "$TMPDIR_BENCH"
+}
+trap cleanup EXIT
+
+get_rss_mb() {
+    local pid="$1"
+    local rss_kb
+    rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ -n "$rss_kb" && "$rss_kb" -gt 0 ]] 2>/dev/null; then
+        echo "scale=1; $rss_kb / 1024" | bc -l
+    else
+        echo "0"
+    fi
+}
+
+wait_for_marker() {
+    local marker_file="$1"
+    local expected="$2"
+    local timeout_sec="${3:-120}"
+    local elapsed=0
+    while [[ $elapsed -lt $timeout_sec ]]; do
+        if [[ -f "$marker_file" ]]; then
+            local content
+            content=$(cat "$marker_file" 2>/dev/null || true)
+            if [[ "$content" == *"$expected"* ]]; then return 0; fi
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    echo "WARNING: Timed out waiting for marker '$expected'"
+    return 1
+}
+
+echo ""
+echo "========================================================================"
+echo "  DuckDB Multi-Allocator Comparison"
+echo "========================================================================"
+echo "TPC-H sf=${TPCH_SF}, Cool: ${COOL_DURATION}s, Iterations: ${SERVE_ITERATIONS}"
+echo ""
+
+for entry in "${ALLOCATORS[@]}"; do
+    IFS=':' read -r alloc_name lib_path env_vars <<< "$entry"
+
+    if [[ -n "$lib_path" && ! -f "$lib_path" ]]; then
+        echo "[${alloc_name}] SKIP: $lib_path not found"
+        echo "${alloc_name} SKIP" >> "$RESULT_FILE"
+        continue
+    fi
+
+    echo ""
+    echo "──────────────────────────────────────────────────────────────────────"
+    echo "[${alloc_name}] Starting DuckDB..."
+
+    fifo="${TMPDIR_BENCH}/${alloc_name}_fifo"
+    marker="${TMPDIR_BENCH}/${alloc_name}_marker"
+    rss_log="${TMPDIR_BENCH}/${alloc_name}_rss.log"
+    mkfifo "$fifo"
+    rm -f "$marker"
+    : > "$rss_log"
+
+    # Build env
+    declare -a env_cmd=()
+    if [[ -n "$lib_path" ]]; then
+        env_cmd+=("${PRELOAD_VAR}=${lib_path}")
+    fi
+    if [[ -n "$env_vars" ]]; then
+        IFS=',' read -ra ev_parts <<< "$env_vars"
+        for ev in "${ev_parts[@]}"; do
+            env_cmd+=("$ev")
+        done
+    fi
+
+    # Launch DuckDB
+    if [[ ${#env_cmd[@]} -gt 0 ]]; then
+        env "${env_cmd[@]}" duckdb :memory: < "$fifo" >/dev/null 2>&1 &
+    else
+        duckdb :memory: < "$fifo" >/dev/null 2>&1 &
+    fi
+    DUCK_PID=$!
+    exec 3> "$fifo"
+
+    # RSS monitor
+    (
+        exec 3>&- 2>/dev/null || true
+        while kill -0 "$DUCK_PID" 2>/dev/null; do
+            get_rss_mb "$DUCK_PID" >> "$rss_log"
+            sleep 1
+        done
+    ) &
+    monitor_pid=$!
+
+    # Phase 1: Fill (TPC-H)
+    echo "  [${alloc_name}] Generating TPC-H data..."
+    rm -f "$marker"
+    cat >&3 << SQLEOF
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf=${TPCH_SF});
+COPY (SELECT 'fill_done') TO '${marker}' (HEADER false);
+SQLEOF
+
+    if ! wait_for_marker "$marker" "fill_done" 120; then
+        echo "  [${alloc_name}] TIMEOUT during fill"
+        exec 3>&- 2>/dev/null || true
+        kill "$DUCK_PID" 2>/dev/null && wait "$DUCK_PID" 2>/dev/null || true
+        DUCK_PID=""
+        kill "$monitor_pid" 2>/dev/null && wait "$monitor_pid" 2>/dev/null || true
+        echo "${alloc_name} FAILED" >> "$RESULT_FILE"
+        rm -f "$fifo" "$marker"
+        sleep 1
+        continue
+    fi
+    fill_rss=$(get_rss_mb "$DUCK_PID")
+    echo "  [${alloc_name}] Fill RSS: ${fill_rss} MB"
+
+    # Phase 2: Cool
+    echo "  [${alloc_name}] Cooling for ${COOL_DURATION}s..."
+    sleep "$COOL_DURATION"
+    cool_rss=$(get_rss_mb "$DUCK_PID")
+    echo "  [${alloc_name}] Post-cool RSS: ${cool_rss} MB"
+
+    # Phase 3: Serve (narrow queries)
+    serve_rss="$cool_rss"
+    if kill -0 "$DUCK_PID" 2>/dev/null; then
+        echo "  [${alloc_name}] Serving ${SERVE_ITERATIONS} query rounds..."
+        rm -f "$marker"
+        trap '' PIPE
+
+        iter=0
+        write_ok=1
+        while [[ $iter -lt $SERVE_ITERATIONS && $write_ok -eq 1 ]]; do
+            if ! kill -0 "$DUCK_PID" 2>/dev/null; then write_ok=0; break; fi
+            cat >&3 << 'SQLEOF' || write_ok=0
+SELECT l_returnflag, l_linestatus, count(*), sum(l_quantity),
+       sum(l_extendedprice), sum(l_extendedprice * (1 - l_discount))
+FROM lineitem WHERE l_shipdate BETWEEN '1998-11-01' AND '1998-12-01'
+GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;
+SELECT o_orderpriority, count(*) FROM orders
+WHERE o_orderdate >= '1998-07-01' GROUP BY o_orderpriority;
+SELECT c_name, sum(o_totalprice) FROM customer
+JOIN orders ON c_custkey = o_custkey WHERE o_orderdate >= '1998-01-01'
+GROUP BY c_name ORDER BY 2 DESC LIMIT 100;
+SQLEOF
+            iter=$((iter + 1))
+        done
+
+        if [[ $write_ok -eq 1 ]] && kill -0 "$DUCK_PID" 2>/dev/null; then
+            cat >&3 << SQLEOF || true
+COPY (SELECT 'serve_done') TO '${marker}' (HEADER false);
+SQLEOF
+            wait_for_marker "$marker" "serve_done" 30 || true
+            serve_rss=$(get_rss_mb "$DUCK_PID")
+        fi
+        trap - PIPE
+        echo "  [${alloc_name}] Serve RSS: ${serve_rss} MB"
+    fi
+
+    # Phase 4: Cold re-access (full-scan queries)
+    cold_rss="$serve_rss"
+    if kill -0 "$DUCK_PID" 2>/dev/null; then
+        echo "  [${alloc_name}] Cold re-access (full-scan queries)..."
+        rm -f "$marker"
+        trap '' PIPE
+        cat >&3 << 'SQLEOF' || true
+SELECT l_returnflag, l_linestatus, sum(l_quantity), sum(l_extendedprice),
+       sum(l_extendedprice * (1-l_discount)),
+       sum(l_extendedprice * (1-l_discount) * (1+l_tax)),
+       avg(l_quantity), avg(l_extendedprice), avg(l_discount), count(*)
+FROM lineitem WHERE l_shipdate <= '1998-12-01'
+GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;
+SELECT n_name, sum(l_extendedprice * (1 - l_discount)) as revenue
+FROM customer, orders, lineitem, supplier, nation, region
+WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey AND l_suppkey = s_suppkey
+  AND c_nationkey = s_nationkey AND s_nationkey = n_nationkey
+  AND n_regionkey = r_regionkey AND r_name = 'ASIA'
+  AND o_orderdate >= '1994-01-01' AND o_orderdate < '1995-01-01'
+GROUP BY n_name ORDER BY revenue DESC;
+SQLEOF
+        cat >&3 << SQLEOF || true
+COPY (SELECT 'cold_done') TO '${marker}' (HEADER false);
+SQLEOF
+        trap - PIPE
+
+        if kill -0 "$DUCK_PID" 2>/dev/null; then
+            wait_for_marker "$marker" "cold_done" 60 || true
+            cold_rss=$(get_rss_mb "$DUCK_PID")
+        fi
+        echo "  [${alloc_name}] Cold RSS: ${cold_rss} MB"
+    fi
+
+    # Finish
+    exec 3>&- 2>/dev/null || true
+    wait "$DUCK_PID" 2>/dev/null || true
+    DUCK_PID=""
+    kill "$monitor_pid" 2>/dev/null && wait "$monitor_pid" 2>/dev/null || true
+
+    # Extract peak/min from RSS log
+    peak_rss="$fill_rss"
+    min_rss="$fill_rss"
+    if [[ -s "$rss_log" ]]; then
+        read peak_rss min_rss <<< $(awk '
+        BEGIN { peak=0; min=999999; }
+        {
+            v = $1 + 0;
+            if (v > peak) peak = v;
+            if (v > 0 && v < min) min = v;
+        }
+        END { print peak, (min == 999999 ? 0 : min); }' "$rss_log")
+    fi
+
+    echo "${alloc_name} ${fill_rss} ${peak_rss} ${cool_rss} ${serve_rss} ${min_rss} ${cold_rss}" >> "$RESULT_FILE"
+    rm -f "$fifo" "$marker"
+    sleep 2
+done
+
+# ── Display results ──────────────────────────────────────────────────────────
+echo ""
+echo ""
+echo "========================================================================"
+echo "  Results Summary"
+echo "========================================================================"
+echo ""
+printf "  %-12s %8s %8s %8s %8s %8s %8s\n" \
+    "Allocator" "Fill" "Peak" "Cool" "Serve" "Min" "Cold"
+echo "  ──────────────────────────────────────────────────────────────────────"
+
+while IFS=' ' read -r name fill peak cool serve min cold; do
+    if [[ "$fill" == "SKIP" || "$fill" == "FAILED" ]]; then
+        printf "  %-12s %s\n" "$name" "$fill"
+        continue
+    fi
+    printf "  %-12s %7sMB %7sMB %7sMB %7sMB %7sMB %7sMB\n" \
+        "$name" "$fill" "$peak" "$cool" "$serve" "$min" "$cold"
+done < "$RESULT_FILE"
+
+# Show RSS reduction vs system
+echo ""
+echo "  RSS reduction vs system malloc (serve phase):"
+system_serve=$(awk '$1=="system" {print $5}' "$RESULT_FILE")
+if [[ -n "$system_serve" && "$system_serve" != "0" ]]; then
+    while IFS=' ' read -r name fill peak cool serve min cold; do
+        if [[ "$fill" == "SKIP" || "$fill" == "FAILED" || "$name" == "system" ]]; then continue; fi
+        delta=$(echo "scale=1; (($serve - $system_serve) / $system_serve) * 100" | bc -l 2>/dev/null || echo "N/A")
+        printf "  %-12s %s%%\n" "$name" "$delta"
+    done < "$RESULT_FILE"
+fi
+
+echo ""
+echo "Done."

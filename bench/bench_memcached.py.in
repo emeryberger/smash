@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""bench_memcached.py - Memcached A/B comparison: system malloc vs Smash
+
+Memcached's slab allocator calls malloc() for ~1MB slab pages, so
+DYLD_INSERT intercepts them. Cold slabs (items not accessed) get
+compressed by Smash.
+
+Requires: memcached and duckdb CLI in PATH.
+
+Usage:
+    python3 bench_memcached.py [--quick]
+"""
+
+import argparse
+import os
+import platform
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import random
+
+# ── Paths (substituted by CMake configure_file) ─────────────────────────
+BUILD_DIR = "@CMAKE_BINARY_DIR@"
+
+# ── Platform detection ───────────────────────────────────────────────────
+IS_DARWIN = platform.system() == "Darwin"
+PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
+SMASH_LIB = os.path.join(BUILD_DIR, "libsmash.dylib" if IS_DARWIN else "libsmash.so")
+
+
+def check_prereqs():
+    for tool, pkg in [("memcached", "memcached"), ("duckdb", "duckdb")]:
+        if not shutil.which(tool):
+            print(f"SKIP: {tool} not found in PATH (brew install {pkg})")
+            sys.exit(0)
+    if not os.path.isfile(SMASH_LIB):
+        print(f"ERROR: libsmash not found at {SMASH_LIB}")
+        print("Build with: cmake .. -DSMASH_BUILD_BENCH=ON && make -j")
+        sys.exit(1)
+
+
+def get_rss_mb(pid):
+    """Get RSS of a process in MB via ps."""
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(pid)], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        return int(out) / 1024.0 if out else 0.0
+    except (subprocess.CalledProcessError, ValueError):
+        return 0.0
+
+
+def mc_send(port, data):
+    """Send raw memcached protocol data and discard the response."""
+    try:
+        with socket.create_connection(("localhost", port), timeout=5) as sock:
+            if isinstance(data, str):
+                data = data.encode()
+            sock.sendall(data + b"quit\r\n")
+            # Drain response
+            sock.settimeout(2)
+            try:
+                while sock.recv(65536):
+                    pass
+            except (socket.timeout, ConnectionError):
+                pass
+    except (ConnectionError, OSError):
+        pass
+
+
+def mc_version(port):
+    """Check if memcached responds on the given port."""
+    try:
+        with socket.create_connection(("localhost", port), timeout=2) as sock:
+            sock.sendall(b"version\r\nquit\r\n")
+            sock.settimeout(2)
+            return sock.recv(256).decode(errors="replace")
+    except (ConnectionError, OSError, socket.timeout):
+        return ""
+
+
+# ── Corpus generation ────────────────────────────────────────────────────
+
+def generate_corpus(corpus_path, tpch_sf):
+    print(f"  Generating TPC-H JSON corpus (sf={tpch_sf})...")
+    subprocess.run(
+        ["duckdb", "-c", f"""
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf={tpch_sf});
+COPY (
+    SELECT o_orderkey as id, c_name as customer, c_address as addr,
+           c_phone as phone, c_mktsegment as segment,
+           o_orderstatus as status, o_totalprice as total,
+           o_orderdate as date, o_orderpriority as priority,
+           o_comment as order_note, c_comment as customer_note
+    FROM orders JOIN customer ON o_custkey = c_custkey
+    ORDER BY o_orderkey
+) TO '{corpus_path}' (FORMAT JSON, ARRAY false);
+"""],
+        check=True, capture_output=True,
+    )
+    nlines = sum(1 for _ in open(corpus_path))
+    print(f"  Corpus: {nlines} JSON records")
+
+
+# ── Benchmark phases ─────────────────────────────────────────────────────
+
+def populate(port, num_keys, corpus_path, batch_size):
+    """SET num_keys keys from the JSON corpus.  Returns (elapsed_sec, ops_per_sec)."""
+    print(f"  Populating {num_keys} keys on port {port}...")
+    t0 = time.time()
+    batch = []
+    sent = 0
+    with open(corpus_path) as f:
+        for i, line in enumerate(f):
+            if i >= num_keys:
+                break
+            val = line.rstrip("\n")
+            batch.append(f"set key:{i:07d} 0 0 {len(val)}\r\n{val}\r\n")
+            if len(batch) >= batch_size:
+                mc_send(port, "".join(batch))
+                sent += len(batch)
+                batch = []
+                if (sent // batch_size) % 50 == 0:
+                    print(f"    {sent // batch_size}/{num_keys // batch_size} batches...")
+    if batch:
+        mc_send(port, "".join(batch))
+        sent += len(batch)
+    elapsed = max(time.time() - t0, 0.001)
+    ops = int(sent / elapsed)
+    print(f"  Done populating: {elapsed:.1f}s ({ops:,} SET/s)")
+    return elapsed, ops
+
+
+def serve_hot_gets(port, duration, num_keys, hot_keys, batch=500):
+    """Send random GETs to the hot subset for `duration` seconds.
+    Paces at ~1 batch/sec to simulate realistic serving and give the
+    compressor time to re-compress cold pages between bursts.
+    Returns (total_gets, ops_per_sec)."""
+    hot_start = num_keys - hot_keys
+    total = 0
+    t0 = time.time()
+    deadline = t0 + duration
+    while time.time() < deadline:
+        batch_start = time.time()
+        cmds = []
+        for _ in range(batch):
+            idx = random.randint(hot_start, num_keys - 1)
+            cmds.append(f"get key:{idx:07d}\r\n")
+        mc_send(port, "".join(cmds))
+        total += batch
+        # Pace ~1 batch/sec
+        elapsed_batch = time.time() - batch_start
+        if elapsed_batch < 1.0:
+            time.sleep(1.0 - elapsed_batch)
+    elapsed = max(time.time() - t0, 0.001)
+    ops = int(total / elapsed)
+    return total, ops
+
+
+def access_cold_keys(port, cold_start, cold_count, batch_size=5000):
+    """GET a sequential range of cold keys.  Returns (elapsed_sec, ops_per_sec)."""
+    print(f"  Accessing {cold_count} cold keys starting at {cold_start}...")
+    t0 = time.time()
+    i = 0
+    while i < cold_count:
+        end = min(i + batch_size, cold_count)
+        cmds = [f"get key:{cold_start + j:07d}\r\n" for j in range(i, end)]
+        mc_send(port, "".join(cmds))
+        i = end
+    elapsed = max(time.time() - t0, 0.001)
+    ops = int(cold_count / elapsed)
+    print(f"  Done: {elapsed:.1f}s ({ops:,} GET/s)")
+    return elapsed, ops
+
+
+# ── RSS background monitor ───────────────────────────────────────────────
+
+class RssMonitor:
+    def __init__(self, pid):
+        self.pid = pid
+        self.samples = []  # list of (time_sec, rss_mb)
+        self._stop = False
+        self._t0 = time.time()
+        import threading
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._t0 = time.time()
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        self._thread.join(timeout=3)
+
+    def record_now(self):
+        """Record an RSS sample at the current time."""
+        rss = get_rss_mb(self.pid)
+        if rss > 0:
+            self.samples.append((time.time() - self._t0, rss))
+
+    def _run(self):
+        while not self._stop:
+            self.record_now()
+            time.sleep(1)
+
+    @property
+    def peak(self):
+        return max(r for _, r in self.samples) if self.samples else 0.0
+
+    @property
+    def minimum(self):
+        return min(r for _, r in self.samples) if self.samples else 0.0
+
+    @property
+    def final(self):
+        return self.samples[-1][1] if self.samples else 0.0
+
+    def dump_csv(self, path):
+        """Write RSS timeline to CSV."""
+        with open(path, 'w') as f:
+            f.write("time_sec,rss_mb\n")
+            for t, r in self.samples:
+                f.write(f"{t:.2f},{r:.1f}\n")
+
+
+# ── Run one full pass ────────────────────────────────────────────────────
+
+def run_pass(label, port, use_smash, cfg, corpus_path):
+    """Returns dict of metrics, or None if memcached failed to start."""
+    metrics = {}
+    print(f"\n[{label}] Starting memcached on port {port}...")
+
+    mc_opts = [
+        "memcached", "-p", str(port), "-m", "512", "-t", "1",
+        "-o", "no_lru_crawler,no_lru_maintainer",
+    ]
+    env = dict(os.environ)
+    if use_smash:
+        env[PRELOAD_VAR] = SMASH_LIB
+
+    proc = subprocess.Popen(mc_opts, env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    time.sleep(3)
+
+    # Verify memcached is running
+    if proc.poll() is not None:
+        print("  memcached exited prematurely")
+        return None
+    ok = False
+    for _ in range(5):
+        if mc_version(port):
+            ok = True
+            break
+        time.sleep(1)
+    if not ok:
+        print(f"  memcached not responding on port {port}")
+        proc.kill()
+        proc.wait()
+        return None
+    print(f"  memcached running (pid {proc.pid})")
+
+    # Start RSS monitor (covers all phases including fill)
+    mon = RssMonitor(proc.pid)
+    mon.start()
+
+    # Phase 1: Fill
+    print(f"[{label}] Phase 1: Fill {cfg.num_keys} keys...")
+    fill_sec, fill_ops = populate(port, cfg.num_keys, corpus_path, cfg.batch_size)
+    fill_rss = get_rss_mb(proc.pid)
+    metrics["fill_sec"] = fill_sec
+    metrics["fill_ops"] = fill_ops
+    metrics["fill_rss"] = fill_rss
+    print(f"  Fill RSS: {fill_rss:.1f} MB")
+
+    # Phase 2: Cool
+    print(f"[{label}] Phase 2: Cool for {cfg.cool}s...")
+    time.sleep(cfg.cool)
+    cool_rss = get_rss_mb(proc.pid)
+    metrics["cool_rss"] = cool_rss
+    print(f"  Post-cool RSS: {cool_rss:.1f} MB")
+
+    # Phase 3: Serve hot 5%
+    hot_keys = cfg.num_keys // 20
+    print(f"[{label}] Phase 3: Serve hot {hot_keys} keys for {cfg.serve}s...")
+    serve_total, serve_ops = serve_hot_gets(port, cfg.serve, cfg.num_keys, hot_keys)
+    serve_rss = get_rss_mb(proc.pid)
+    metrics["serve_ops"] = serve_ops
+    metrics["serve_rss"] = serve_rss
+    print(f"  Serve: {serve_total:,} GETs, {serve_ops:,} GET/s")
+    print(f"  Serve RSS: {serve_rss:.1f} MB")
+
+    # Phase 4: Cold re-access
+    cold_keys = cfg.num_keys // 10
+    print(f"[{label}] Phase 4: Access {cold_keys} cold keys...")
+    cold_sec, cold_ops = access_cold_keys(port, 0, cold_keys)
+    cold_rss = get_rss_mb(proc.pid)
+    metrics["cold_sec"] = cold_sec
+    metrics["cold_ops"] = cold_ops
+    metrics["cold_rss"] = cold_rss
+    print(f"  Cold re-access RSS: {cold_rss:.1f} MB")
+
+    # Stop
+    mon.stop()
+    metrics["peak_rss"] = mon.peak
+    metrics["min_rss"] = mon.minimum
+
+    # Dump RSS timeline
+    metrics["_rss_monitor"] = mon
+
+    proc.kill()
+    proc.wait()
+    time.sleep(1)
+    return metrics
+
+
+# ── Results table ────────────────────────────────────────────────────────
+
+def print_row(label, base_val, smash_val, unit):
+    if base_val is None or smash_val is None:
+        b = "N/A" if base_val is None else f"{base_val:,.1f}" if isinstance(base_val, float) else f"{base_val:,}"
+        s = "N/A" if smash_val is None else f"{smash_val:,.1f}" if isinstance(smash_val, float) else f"{smash_val:,}"
+        print(f"  {label:<25s} {b:>10s} {unit:<5s} {s:>10s} {unit:<5s} {'N/A':>10s}")
+        return
+    if isinstance(base_val, float):
+        b, s = f"{base_val:.1f}", f"{smash_val:.1f}"
+    else:
+        b, s = f"{base_val:,}", f"{smash_val:,}"
+    if base_val != 0:
+        delta = (smash_val - base_val) / base_val * 100
+        d = f"{delta:+.1f}%"
+    else:
+        d = "N/A"
+    print(f"  {label:<25s} {b:>10s} {unit:<5s} {s:>10s} {unit:<5s} {d:>10s}")
+
+
+def print_results(base, smash):
+    print()
+    print("  " + "-" * 72)
+    print(f"  {'Metric':<25s} {'Baseline':>15s} {'Smash':>15s} {'Delta':>10s}")
+    print("  " + "-" * 72)
+
+    rows = [
+        ("Fill RSS",        "fill_rss",  "MB"),
+        ("Fill throughput",  "fill_ops",  "SET/s"),
+        ("Peak RSS",        "peak_rss",  "MB"),
+        ("Post-cool RSS",   "cool_rss",  "MB"),
+        ("Serve RSS",       "serve_rss", "MB"),
+        ("Serve throughput", "serve_ops", "GET/s"),
+        ("Min RSS",         "min_rss",   "MB"),
+        ("Cold re-access RSS", "cold_rss", "MB"),
+        ("Cold throughput",  "cold_ops",  "GET/s"),
+    ]
+    for label, key, unit in rows:
+        bv = base.get(key) if base else None
+        sv = smash.get(key) if smash else None
+        print_row(label, bv, sv, unit)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Memcached A/B: system malloc vs Smash")
+    parser.add_argument("--quick", action="store_true", help="Smaller dataset, shorter durations")
+    args = parser.parse_args()
+
+    class Cfg:
+        pass
+    cfg = Cfg()
+    if args.quick:
+        cfg.num_keys = 500_000
+        cfg.cool = 5
+        cfg.serve = 10
+        cfg.tpch_sf = 0.5
+    else:
+        cfg.num_keys = 1_000_000
+        cfg.cool = 10
+        cfg.serve = 20
+        cfg.tpch_sf = 1.0
+    cfg.batch_size = 5000
+
+    check_prereqs()
+
+    print()
+    print("=" * 72)
+    print("  Memcached A/B Comparison")
+    print("=" * 72)
+    print()
+    print(f"Keys: {cfg.num_keys:,}, TPC-H sf={cfg.tpch_sf}, Cool: {cfg.cool}s, Serve: {cfg.serve}s")
+
+    # Generate corpus once
+    tmpdir = tempfile.mkdtemp()
+    corpus_path = os.path.join(tmpdir, "tpch_corpus.jsonl")
+    try:
+        generate_corpus(corpus_path, cfg.tpch_sf)
+
+        base_metrics = run_pass("baseline", 11311, False, cfg, corpus_path)
+        smash_metrics = run_pass("smash", 11312, True, cfg, corpus_path)
+
+        if smash_metrics is None:
+            print()
+            print("NOTE: Memcached+Smash failed to start.")
+            print("      Showing baseline-only results.")
+
+        print_results(base_metrics, smash_metrics)
+
+        # Dump RSS timelines
+        rss_base_dir = os.environ.get("SMASH_RSS_BASELINE_DIR")
+        rss_smash_dir = os.environ.get("SMASH_RSS_SMASH_DIR")
+        if rss_base_dir and base_metrics and "_rss_monitor" in base_metrics:
+            os.makedirs(rss_base_dir, exist_ok=True)
+            base_metrics["_rss_monitor"].dump_csv(
+                os.path.join(rss_base_dir, "memcached_rss.csv"))
+            print(f"  Wrote {rss_base_dir}/memcached_rss.csv")
+        if rss_smash_dir and smash_metrics and "_rss_monitor" in smash_metrics:
+            os.makedirs(rss_smash_dir, exist_ok=True)
+            smash_metrics["_rss_monitor"].dump_csv(
+                os.path.join(rss_smash_dir, "memcached_rss.csv"))
+            print(f"  Wrote {rss_smash_dir}/memcached_rss.csv")
+
+        print()
+        print("Done.")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

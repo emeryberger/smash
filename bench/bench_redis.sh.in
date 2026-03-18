@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# bench_redis.sh - Redis A/B comparison: system malloc vs Smash
+#
+# Two workloads:
+#   1. Standard:  SET → cool → GET
+#   2. Extended:  SET → DELETE 50% → cool → GET
+#
+# Uses redis-benchmark (LLAMA-style config: 5K connections, 100K ops, 1000B values).
+# Requires redis-server, redis-cli, and redis-benchmark in PATH.
+#
+# Usage:
+#   bash bench_redis.sh [--quick]
+#
+# Compatible with bash 3.2+ (macOS default).
+
+set -euo pipefail
+
+# ── Paths (substituted by CMake configure_file) ─────────────────────────────
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+# ── Platform detection ───────────────────────────────────────────────────────
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+NUM_OPS=100000
+NUM_CLIENTS=5000
+VALUE_SIZE=1000
+KEYSPACE=100000
+COOL_DURATION=15
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_OPS=50000
+            NUM_CLIENTS=1000
+            COOL_DURATION=8
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+# ── Check prerequisites ─────────────────────────────────────────────────────
+for cmd in redis-server redis-cli redis-benchmark; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "SKIP: $cmd not found in PATH"
+        exit 0
+    fi
+done
+
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON && make -j"
+    exit 1
+fi
+
+# ── Smash tuning ─────────────────────────────────────────────────────────────
+# Lower VERY_COLD_TICKS so the ROI model can consider zstd during the 15s cool.
+export SMASH_VERY_COLD_TICKS=5
+
+# ── Ports ────────────────────────────────────────────────────────────────────
+BASELINE_PORT=16379
+SMASH_PORT=16380
+
+# ── Cleanup trap ─────────────────────────────────────────────────────────────
+cleanup() {
+    redis-cli -p "$BASELINE_PORT" shutdown nosave 2>/dev/null || true
+    redis-cli -p "$SMASH_PORT" shutdown nosave 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ── Helper: get Redis RSS (in MB) ───────────────────────────────────────────
+get_redis_rss_mb() {
+    local port="$1"
+    local rss_bytes
+    rss_bytes=$(redis-cli -p "$port" INFO memory 2>/dev/null \
+        | grep "used_memory_rss:" \
+        | cut -d: -f2 \
+        | tr -d '\r')
+    if [[ -n "$rss_bytes" ]]; then
+        echo "scale=1; $rss_bytes / 1048576" | bc -l
+    else
+        echo "0"
+    fi
+}
+
+# ── Helper: delete ~50% of keys using SCAN + DEL ────────────────────────────
+delete_half_keys() {
+    local port="$1"
+    local cursor=0
+    local deleted=0
+    local toggle=0
+
+    while true; do
+        local result
+        result=$(redis-cli -p "$port" SCAN "$cursor" COUNT 100 2>/dev/null)
+        # SCAN returns: cursor\nkey1\nkey2\n...
+        local new_cursor
+        new_cursor=$(echo "$result" | head -1)
+        local keys
+        keys=$(echo "$result" | tail -n +2)
+
+        while IFS= read -r key; do
+            if [[ -z "$key" ]]; then
+                continue
+            fi
+            # Delete every other key
+            if [[ $((toggle % 2)) -eq 0 ]]; then
+                redis-cli -p "$port" DEL "$key" &>/dev/null
+                deleted=$((deleted + 1))
+            fi
+            toggle=$((toggle + 1))
+        done <<< "$keys"
+
+        cursor="$new_cursor"
+        if [[ "$cursor" == "0" ]]; then
+            break
+        fi
+    done
+
+    echo "$deleted"
+}
+
+# ── Run standard workload: SET → cool → GET ─────────────────────────────────
+run_config() {
+    local label="$1"
+    local port="$2"
+    local env_prefix="$3"  # empty for baseline, "VAR=VAL" for smash
+
+    echo ""
+    echo "[${label}] Starting Redis on port ${port}..."
+    # --hz 1 --dynamic-hz no: minimize background memory touching during cool-down
+    if [[ -n "$env_prefix" ]]; then
+        env ${env_prefix} redis-server --port "$port" --save "" --appendonly no \
+            --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
+    else
+        redis-server --port "$port" --save "" --appendonly no \
+            --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
+    fi
+    sleep 2
+
+    if ! redis-cli -p "$port" PING &>/dev/null; then
+        echo "ERROR: Failed to start ${label} Redis"
+        return 1
+    fi
+
+    # SET phase: populate with redis-benchmark
+    echo "[${label}] SET phase: ${NUM_OPS} ops, ${NUM_CLIENTS} clients, ${VALUE_SIZE}B values..."
+    local set_result
+    set_result=$(redis-benchmark -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+        -d "$VALUE_SIZE" -r "$KEYSPACE" -t set -q 2>&1 | grep SET)
+    echo "  $set_result"
+
+    local fill_rss
+    fill_rss=$(get_redis_rss_mb "$port")
+    echo "  Fill RSS: ${fill_rss} MB"
+
+    # Cool-down: let compression run
+    echo "[${label}] Cooling for ${COOL_DURATION}s..."
+    local min_rss="$fill_rss"
+    local sec=1
+    while [[ $sec -le $COOL_DURATION ]]; do
+        sleep 1
+        local rss
+        rss=$(get_redis_rss_mb "$port")
+        if [[ $(echo "$rss < $min_rss" | bc -l) -eq 1 ]]; then
+            min_rss=$rss
+        fi
+        if [[ $((sec % 5)) -eq 0 ]] || [[ $sec -eq 1 ]]; then
+            echo "    t=${sec}s: RSS=${rss} MB" >&2
+        fi
+        sec=$((sec + 1))
+    done
+    local cool_rss
+    cool_rss=$(get_redis_rss_mb "$port")
+    echo "  Cool RSS: ${cool_rss} MB (min: ${min_rss} MB)"
+
+    # GET phase: measure throughput on cold data
+    echo "[${label}] GET phase: ${NUM_OPS} ops, ${NUM_CLIENTS} clients..."
+    local get_result
+    get_result=$(redis-benchmark -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+        -d "$VALUE_SIZE" -r "$KEYSPACE" -t get -q 2>&1 | grep GET)
+    echo "  $get_result"
+
+    local get_rss
+    get_rss=$(get_redis_rss_mb "$port")
+    echo "  Post-GET RSS: ${get_rss} MB"
+
+    # Output metrics
+    echo "METRIC ${label}_fill_rss_mb ${fill_rss}"
+    echo "METRIC ${label}_cool_rss_mb ${cool_rss}"
+    echo "METRIC ${label}_min_rss_mb ${min_rss}"
+    echo "METRIC ${label}_get_rss_mb ${get_rss}"
+    echo "METRIC ${label}_set_throughput ${set_result}"
+    echo "METRIC ${label}_get_throughput ${get_result}"
+
+    # Shutdown
+    redis-cli -p "$port" shutdown nosave 2>/dev/null || true
+    sleep 1
+}
+
+# ── Run extended workload: SET → DELETE 50% → cool → GET ────────────────────
+run_extended_config() {
+    local label="$1"
+    local port="$2"
+    local env_prefix="$3"  # empty for baseline, "VAR=VAL" for smash
+
+    echo ""
+    echo "[${label}] Starting Redis on port ${port}..."
+    if [[ -n "$env_prefix" ]]; then
+        env ${env_prefix} redis-server --port "$port" --save "" --appendonly no \
+            --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
+    else
+        redis-server --port "$port" --save "" --appendonly no \
+            --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
+    fi
+    sleep 2
+
+    if ! redis-cli -p "$port" PING &>/dev/null; then
+        echo "ERROR: Failed to start ${label} Redis"
+        return 1
+    fi
+
+    # SET phase: populate with redis-benchmark
+    echo "[${label}] SET phase: ${NUM_OPS} ops, ${NUM_CLIENTS} clients, ${VALUE_SIZE}B values..."
+    local set_result
+    set_result=$(redis-benchmark -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+        -d "$VALUE_SIZE" -r "$KEYSPACE" -t set -q 2>&1 | grep SET)
+    echo "  $set_result"
+
+    local fill_rss
+    fill_rss=$(get_redis_rss_mb "$port")
+    echo "  Fill RSS: ${fill_rss} MB"
+
+    # DELETE phase: remove ~50% of keys
+    echo "[${label}] DELETE phase: removing ~50% of keys..."
+    local num_deleted
+    num_deleted=$(delete_half_keys "$port")
+    echo "  Deleted ${num_deleted} keys"
+
+    local post_del_rss
+    post_del_rss=$(get_redis_rss_mb "$port")
+    echo "  Post-DELETE RSS: ${post_del_rss} MB"
+
+    # Cool-down: let compression run
+    echo "[${label}] Cooling for ${COOL_DURATION}s..."
+    local min_rss="$post_del_rss"
+    local sec=1
+    while [[ $sec -le $COOL_DURATION ]]; do
+        sleep 1
+        local rss
+        rss=$(get_redis_rss_mb "$port")
+        if [[ $(echo "$rss < $min_rss" | bc -l) -eq 1 ]]; then
+            min_rss=$rss
+        fi
+        if [[ $((sec % 5)) -eq 0 ]] || [[ $sec -eq 1 ]]; then
+            echo "    t=${sec}s: RSS=${rss} MB" >&2
+        fi
+        sec=$((sec + 1))
+    done
+    local cool_rss
+    cool_rss=$(get_redis_rss_mb "$port")
+    echo "  Cool RSS: ${cool_rss} MB (min: ${min_rss} MB)"
+
+    # GET phase: measure throughput on cold data (will miss ~50% of keys)
+    echo "[${label}] GET phase: ${NUM_OPS} ops, ${NUM_CLIENTS} clients..."
+    local get_result
+    get_result=$(redis-benchmark -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+        -d "$VALUE_SIZE" -r "$KEYSPACE" -t get -q 2>&1 | grep GET)
+    echo "  $get_result"
+
+    local get_rss
+    get_rss=$(get_redis_rss_mb "$port")
+    echo "  Post-GET RSS: ${get_rss} MB"
+
+    # Output metrics
+    echo "METRIC ${label}_fill_rss_mb ${fill_rss}"
+    echo "METRIC ${label}_post_del_rss_mb ${post_del_rss}"
+    echo "METRIC ${label}_cool_rss_mb ${cool_rss}"
+    echo "METRIC ${label}_min_rss_mb ${min_rss}"
+    echo "METRIC ${label}_get_rss_mb ${get_rss}"
+    echo "METRIC ${label}_set_throughput ${set_result}"
+    echo "METRIC ${label}_get_throughput ${get_result}"
+
+    # Shutdown
+    redis-cli -p "$port" shutdown nosave 2>/dev/null || true
+    sleep 1
+}
+
+# ── Display summary table ───────────────────────────────────────────────────
+display_summary() {
+    local workload_name="$1"
+    local tmpfile="$2"
+    local metrics="$3"  # space-separated list of metric suffixes
+
+    echo ""
+    echo "  --- ${workload_name} ---"
+    echo "  ------------------------------------------------------------------------"
+    printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+    echo "  ------------------------------------------------------------------------"
+
+    for metric in $metrics; do
+        local base smash
+        base=$(awk -v m="Baseline_${metric}" '$1=="METRIC" && $2==m {print $3}' "$tmpfile")
+        smash=$(awk -v m="Smash_${metric}" '$1=="METRIC" && $2==m {print $3}' "$tmpfile")
+        base="${base:-N/A}"
+        smash="${smash:-N/A}"
+
+        local label
+        label=$(echo "$metric" | sed 's/_mb$//' | sed 's/_/ /g')
+
+        if [[ "$base" != "N/A" && "$smash" != "N/A" && "$base" != "0" ]]; then
+            local delta
+            delta=$(echo "scale=1; (($smash - $base) / $base) * 100" | bc -l 2>/dev/null || echo "N/A")
+            printf "  %-25s %10s MB %10s MB %9s%%\n" "$label" "$base" "$smash" "$delta"
+        else
+            printf "  %-25s %10s MB %10s MB %10s\n" "$label" "$base" "$smash" "N/A"
+        fi
+    done
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "========================================================================"
+echo "  Redis A/B Comparison (redis-benchmark)"
+echo "========================================================================"
+echo ""
+echo "Config: ${NUM_OPS} ops, ${NUM_CLIENTS} clients, ${VALUE_SIZE}B values, keyspace ${KEYSPACE}"
+echo "Cool duration: ${COOL_DURATION}s, SMASH_VERY_COLD_TICKS=${SMASH_VERY_COLD_TICKS}"
+echo ""
+
+# ── Workload 1: Standard (SET → cool → GET) ─────────────────────────────────
+echo ""
+echo "========================================================================"
+echo "  Workload 1: Standard (SET -> cool -> GET)"
+echo "========================================================================"
+
+STD_BASELINE_OUTPUT=$(run_config "Baseline" "$BASELINE_PORT" "")
+STD_SMASH_OUTPUT=$(run_config "Smash" "$SMASH_PORT" "${PRELOAD_VAR}=${SMASH_LIB}")
+
+STD_TMPFILE=$(mktemp)
+echo "$STD_BASELINE_OUTPUT" > "$STD_TMPFILE"
+echo "$STD_SMASH_OUTPUT" >> "$STD_TMPFILE"
+
+# ── Workload 2: Extended (SET → DELETE 50% → cool → GET) ────────────────────
+echo ""
+echo "========================================================================"
+echo "  Workload 2: Extended (SET -> DELETE 50% -> cool -> GET)"
+echo "========================================================================"
+
+EXT_BASELINE_OUTPUT=$(run_extended_config "Baseline" "$BASELINE_PORT" "")
+EXT_SMASH_OUTPUT=$(run_extended_config "Smash" "$SMASH_PORT" "${PRELOAD_VAR}=${SMASH_LIB}")
+
+EXT_TMPFILE=$(mktemp)
+echo "$EXT_BASELINE_OUTPUT" > "$EXT_TMPFILE"
+echo "$EXT_SMASH_OUTPUT" >> "$EXT_TMPFILE"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+echo ""
+echo "========================================================================"
+echo "  Summary"
+echo "========================================================================"
+
+display_summary "Standard (SET -> cool -> GET)" "$STD_TMPFILE" \
+    "fill_rss_mb cool_rss_mb min_rss_mb"
+
+display_summary "Extended (SET -> DELETE 50% -> cool -> GET)" "$EXT_TMPFILE" \
+    "fill_rss_mb post_del_rss_mb cool_rss_mb min_rss_mb"
+
+rm -f "$STD_TMPFILE" "$EXT_TMPFILE"
+echo ""
+echo "Done."

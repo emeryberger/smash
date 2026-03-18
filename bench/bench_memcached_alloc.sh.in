@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# bench_memcached_alloc.sh - Memcached RSS comparison across allocators
+#
+# Runs memcached with each allocator via DYLD_INSERT_LIBRARIES,
+# populates with TPC-H JSON records, cools, serves hot keys, measures RSS.
+#
+# Usage:
+#   bash bench_memcached_alloc.sh [--quick]
+
+set -euo pipefail
+
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+    NC_FLAGS="-w 1"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+    NC_FLAGS="-q 1"
+fi
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+NUM_KEYS=500000
+COOL_DURATION=8
+SERVE_DURATION=15
+BATCH_SIZE=5000
+TPCH_SF=0.5
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_KEYS=200000
+            COOL_DURATION=5
+            SERVE_DURATION=8
+            TPCH_SF=0.3
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+NUM_BATCHES=$((NUM_KEYS / BATCH_SIZE))
+HOT_KEYS=$((NUM_KEYS / 20))
+COLD_KEYS=$((NUM_KEYS / 10))
+
+# ── Check prerequisites ─────────────────────────────────────────────────────
+if ! command -v memcached &>/dev/null; then
+    echo "SKIP: memcached not found in PATH (brew install memcached)"
+    exit 0
+fi
+if ! command -v nc &>/dev/null; then
+    echo "SKIP: nc (netcat) not found in PATH"
+    exit 0
+fi
+if ! command -v duckdb &>/dev/null; then
+    echo "SKIP: duckdb not found in PATH (needed for TPC-H data generation)"
+    exit 0
+fi
+
+# ── Allocators ───────────────────────────────────────────────────────────────
+# name:dylib_path:env_vars
+# Empty dylib_path = system malloc
+declare -a ALLOCATORS=(
+    "system::"
+    "mimalloc:/opt/homebrew/lib/libmimalloc.dylib:MIMALLOC_PURGE_DELAY=-1"
+    "jemalloc:/opt/homebrew/lib/libjemalloc.dylib:MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"
+    "tcmalloc:/opt/homebrew/lib/libtcmalloc.dylib:TCMALLOC_RELEASE_RATE=0"
+    "hoard:/usr/local/lib/libhoard.dylib:"
+    "mesh:/usr/local/lib/libmesh.dylib:"
+    "diehard:/usr/local/lib/libdiehard.dylib:"
+    "dieharder:/usr/local/lib/libdieharder.dylib:"
+    "smash:${SMASH_LIB}:"
+)
+
+# ── Temp directory ───────────────────────────────────────────────────────────
+TMPDIR_BENCH=$(mktemp -d)
+RESULT_FILE="${TMPDIR_BENCH}/results.txt"
+: > "$RESULT_FILE"
+
+MC_PID=""
+MONITOR_PID=""
+
+cleanup() {
+    [[ -n "$MONITOR_PID" ]] && kill "$MONITOR_PID" 2>/dev/null && wait "$MONITOR_PID" 2>/dev/null || true
+    [[ -n "$MC_PID" ]] && kill "$MC_PID" 2>/dev/null && wait "$MC_PID" 2>/dev/null || true
+    rm -rf "$TMPDIR_BENCH"
+}
+trap cleanup EXIT
+
+get_rss_mb() {
+    local pid="$1"
+    local rss_kb
+    rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ -n "$rss_kb" && "$rss_kb" -gt 0 ]] 2>/dev/null; then
+        echo "scale=1; $rss_kb / 1024" | bc -l
+    else
+        echo "0"
+    fi
+}
+
+mc_send() {
+    local port="$1"
+    { cat; printf "quit\r\n"; } | nc $NC_FLAGS localhost "$port" >/dev/null 2>&1 || true
+}
+
+generate_corpus() {
+    local corpus_file="$1"
+    echo "  Generating TPC-H JSON corpus (sf=${TPCH_SF})..."
+    duckdb -c "
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf=${TPCH_SF});
+COPY (
+    SELECT o_orderkey as id, c_name as customer, c_address as addr,
+           c_phone as phone, c_mktsegment as segment,
+           o_orderstatus as status, o_totalprice as total,
+           o_orderdate as date, o_orderpriority as priority,
+           o_comment as order_note, c_comment as customer_note
+    FROM orders JOIN customer ON o_custkey = c_custkey
+    ORDER BY o_orderkey
+) TO '${corpus_file}' (FORMAT JSON, ARRAY false);
+"
+    local nlines
+    nlines=$(wc -l < "$corpus_file" | tr -d ' ')
+    echo "  Corpus: ${nlines} JSON records"
+}
+
+populate_memcached() {
+    local port="$1"
+    local num_keys="$2"
+    local corpus_file="$3"
+
+    echo "  Populating ${num_keys} keys..."
+    local commands_file="${TMPDIR_BENCH}/set_commands.txt"
+    head -n "$num_keys" "$corpus_file" | awk '
+    {
+        key = sprintf("key:%07d", NR - 1);
+        val = $0;
+        printf "set %s 0 0 %d\r\n%s\r\n", key, length(val), val;
+    }' > "$commands_file"
+
+    local lines_per_batch=$((BATCH_SIZE * 2))
+    mkdir -p "${TMPDIR_BENCH}/batches"
+    split -l "$lines_per_batch" "$commands_file" "${TMPDIR_BENCH}/batches/b_"
+
+    local batch=0
+    for chunk in "${TMPDIR_BENCH}"/batches/b_*; do
+        mc_send "$port" < "$chunk"
+        batch=$((batch + 1))
+        if [[ $((batch % 50)) -eq 0 ]]; then
+            echo "    ${batch}/${NUM_BATCHES} batches..."
+        fi
+    done
+    rm -rf "${TMPDIR_BENCH}/batches" "$commands_file"
+}
+
+serve_hot_gets() {
+    local port="$1"
+    local duration="$2"
+    local hot_range="$3"
+
+    local end_time=$(($(date +%s) + duration))
+    local hot_start=$((NUM_KEYS - hot_range))
+    local total_gets=0
+
+    while [[ $(date +%s) -lt $end_time ]]; do
+        awk -v hs="$hot_start" -v hr="$hot_range" '
+        BEGIN {
+            srand();
+            for (i = 0; i < 500; i++) {
+                idx = hs + int(rand() * hr);
+                printf "get key:%07d\r\n", idx;
+            }
+        }' | mc_send "$port"
+        total_gets=$((total_gets + 500))
+    done
+    echo "$total_gets"
+}
+
+# ── Generate corpus once ─────────────────────────────────────────────────────
+CORPUS_FILE="${TMPDIR_BENCH}/tpch_corpus.jsonl"
+generate_corpus "$CORPUS_FILE"
+
+PORT=11320
+
+echo ""
+echo "========================================================================"
+echo "  Memcached Multi-Allocator Comparison"
+echo "========================================================================"
+echo "Keys: ${NUM_KEYS}, TPC-H sf=${TPCH_SF}, Cool: ${COOL_DURATION}s, Serve: ${SERVE_DURATION}s"
+echo ""
+
+# ── Run each allocator ───────────────────────────────────────────────────────
+for entry in "${ALLOCATORS[@]}"; do
+    IFS=':' read -r alloc_name lib_path env_vars <<< "$entry"
+
+    # Skip if library doesn't exist
+    if [[ -n "$lib_path" && ! -f "$lib_path" ]]; then
+        echo "[${alloc_name}] SKIP: $lib_path not found"
+        echo "${alloc_name} SKIP" >> "$RESULT_FILE"
+        continue
+    fi
+
+    PORT=$((PORT + 1))
+    echo ""
+    echo "──────────────────────────────────────────────────────────────────────"
+    echo "[${alloc_name}] Starting memcached on port ${PORT}..."
+
+    mc_opts="-p $PORT -m 512 -t 1 -o no_lru_crawler,no_lru_maintainer"
+
+    # Build env
+    declare -a env_cmd=()
+    if [[ -n "$lib_path" ]]; then
+        env_cmd+=("${PRELOAD_VAR}=${lib_path}")
+    fi
+    if [[ -n "$env_vars" ]]; then
+        # Split on comma
+        IFS=',' read -ra ev_parts <<< "$env_vars"
+        for ev in "${ev_parts[@]}"; do
+            env_cmd+=("$ev")
+        done
+    fi
+
+    # Launch
+    if [[ ${#env_cmd[@]} -gt 0 ]]; then
+        env "${env_cmd[@]}" memcached $mc_opts &>/dev/null &
+    else
+        memcached $mc_opts &>/dev/null &
+    fi
+    MC_PID=$!
+    sleep 3
+
+    # Verify
+    verify=""
+    attempt=0
+    while [[ $attempt -lt 5 ]]; do
+        if ! kill -0 "$MC_PID" 2>/dev/null; then
+            echo "  [${alloc_name}] memcached exited prematurely"
+            MC_PID=""
+            break
+        fi
+        verify=$(printf "version\r\nquit\r\n" | nc $NC_FLAGS localhost "$PORT" 2>/dev/null | head -1 || true)
+        if [[ -n "$verify" ]]; then break; fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+
+    if [[ -z "$verify" ]]; then
+        echo "  [${alloc_name}] FAILED to start"
+        echo "${alloc_name} FAILED" >> "$RESULT_FILE"
+        [[ -n "$MC_PID" ]] && kill "$MC_PID" 2>/dev/null && wait "$MC_PID" 2>/dev/null || true
+        MC_PID=""
+        continue
+    fi
+
+    echo "  [${alloc_name}] memcached running (pid ${MC_PID})"
+
+    # Phase 1: Fill
+    fill_start=$(date +%s)
+    populate_memcached "$PORT" "$NUM_KEYS" "$CORPUS_FILE"
+    fill_end=$(date +%s)
+    fill_sec=$((fill_end - fill_start))
+    [[ $fill_sec -lt 1 ]] && fill_sec=1
+
+    fill_rss=$(get_rss_mb "$MC_PID")
+    echo "  [${alloc_name}] Fill: ${fill_sec}s, RSS: ${fill_rss} MB"
+
+    # Start RSS monitor
+    rss_log="${TMPDIR_BENCH}/${alloc_name}_rss.log"
+    : > "$rss_log"
+    (
+        while kill -0 "$MC_PID" 2>/dev/null; do
+            get_rss_mb "$MC_PID" >> "$rss_log"
+            sleep 1
+        done
+    ) &
+    MONITOR_PID=$!
+
+    # Phase 2: Cool
+    echo "  [${alloc_name}] Cooling for ${COOL_DURATION}s..."
+    sleep "$COOL_DURATION"
+    cool_rss=$(get_rss_mb "$MC_PID")
+    echo "  [${alloc_name}] Post-cool RSS: ${cool_rss} MB"
+
+    # Phase 3: Serve hot 5%
+    echo "  [${alloc_name}] Serving hot keys for ${SERVE_DURATION}s..."
+    total_gets=$(serve_hot_gets "$PORT" "$SERVE_DURATION" "$HOT_KEYS")
+    serve_rss=$(get_rss_mb "$MC_PID")
+    ops_sec=$((total_gets / SERVE_DURATION))
+    echo "  [${alloc_name}] Serve: ${ops_sec} GET/s, RSS: ${serve_rss} MB"
+
+    # Phase 4: Cold re-access
+    echo "  [${alloc_name}] Accessing ${COLD_KEYS} cold keys..."
+    cold_start_t=$(date +%s)
+    local_batch_size=5000
+    i=0
+    while [[ $i -lt $COLD_KEYS ]]; do
+        batch_end=$((i + local_batch_size))
+        [[ $batch_end -gt $COLD_KEYS ]] && batch_end=$COLD_KEYS
+        awk -v s="$i" -v e="$batch_end" '
+        BEGIN {
+            for (j = s; j < e; j++) {
+                printf "get key:%07d\r\n", j;
+            }
+        }' | mc_send "$PORT"
+        i=$batch_end
+    done
+    cold_end_t=$(date +%s)
+    cold_sec=$((cold_end_t - cold_start_t))
+    [[ $cold_sec -lt 1 ]] && cold_sec=1
+    cold_ops=$((COLD_KEYS / cold_sec))
+    cold_rss=$(get_rss_mb "$MC_PID")
+    echo "  [${alloc_name}] Cold re-access: ${cold_sec}s (${cold_ops} GET/s), RSS: ${cold_rss} MB"
+
+    # Stop monitor
+    kill "$MONITOR_PID" 2>/dev/null && wait "$MONITOR_PID" 2>/dev/null || true
+    MONITOR_PID=""
+
+    # Extract peak/min from RSS log
+    peak_rss="$fill_rss"
+    min_rss="$fill_rss"
+    if [[ -s "$rss_log" ]]; then
+        read peak_rss min_rss <<< $(awk '
+        BEGIN { peak=0; min=999999; }
+        {
+            v = $1 + 0;
+            if (v > peak) peak = v;
+            if (v > 0 && v < min) min = v;
+        }
+        END { print peak, (min == 999999 ? 0 : min); }' "$rss_log")
+    fi
+
+    # Record results
+    echo "${alloc_name} ${fill_rss} ${peak_rss} ${cool_rss} ${serve_rss} ${min_rss} ${cold_rss} ${ops_sec} ${cold_ops}" >> "$RESULT_FILE"
+
+    # Stop memcached
+    kill "$MC_PID" 2>/dev/null && wait "$MC_PID" 2>/dev/null || true
+    MC_PID=""
+    sleep 2
+done
+
+# ── Display results ──────────────────────────────────────────────────────────
+echo ""
+echo ""
+echo "========================================================================"
+echo "  Results Summary"
+echo "========================================================================"
+echo ""
+printf "  %-12s %8s %8s %8s %8s %8s %8s %8s %8s\n" \
+    "Allocator" "Fill" "Peak" "Cool" "Serve" "Min" "Cold" "GET/s" "ColdGET"
+echo "  ──────────────────────────────────────────────────────────────────────────────────"
+
+while IFS=' ' read -r name fill peak cool serve min cold ops cold_ops; do
+    if [[ "$fill" == "SKIP" || "$fill" == "FAILED" ]]; then
+        printf "  %-12s %s\n" "$name" "$fill"
+        continue
+    fi
+    printf "  %-12s %7sMB %7sMB %7sMB %7sMB %7sMB %7sMB %8s %8s\n" \
+        "$name" "$fill" "$peak" "$cool" "$serve" "$min" "$cold" "$ops" "$cold_ops"
+done < "$RESULT_FILE"
+
+# Show RSS reduction relative to system baseline
+echo ""
+echo "  RSS reduction vs system malloc (serve phase):"
+system_serve=$(awk '$1=="system" {print $5}' "$RESULT_FILE")
+if [[ -n "$system_serve" && "$system_serve" != "0" ]]; then
+    while IFS=' ' read -r name fill peak cool serve min cold ops cold_ops; do
+        if [[ "$fill" == "SKIP" || "$fill" == "FAILED" || "$name" == "system" ]]; then continue; fi
+        delta=$(echo "scale=1; (($serve - $system_serve) / $system_serve) * 100" | bc -l 2>/dev/null || echo "N/A")
+        printf "  %-12s %s%%\n" "$name" "$delta"
+    done < "$RESULT_FILE"
+fi
+
+echo ""
+echo "Done."

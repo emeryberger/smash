@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# bench_runner.sh - A/B comparison: system malloc vs Smash
+# Runs C++ benchmarks with and without DYLD_INSERT_LIBRARIES/LD_PRELOAD.
+# Optional flags run shell-script benchmarks (Python, sort, Redis).
+#
+# Usage:
+#   bash bench_runner.sh [--quick] [--redis] [--python] [--sort] [--memcached] [--duckdb] [--all]
+#
+# Compatible with bash 3.2+ (macOS default).
+
+set -euo pipefail
+
+# ── Paths (substituted by CMake configure_file) ─────────────────────────────
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+BENCH_DIR="${BUILD_DIR}/bench"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+# ── Platform detection ───────────────────────────────────────────────────────
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+QUICK_FLAG=""
+RUN_REDIS=0
+RUN_PYTHON=0
+RUN_SORT=0
+RUN_MEMCACHED=0
+RUN_DUCKDB=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick) QUICK_FLAG="--quick" ;;
+        --redis) RUN_REDIS=1 ;;
+        --python) RUN_PYTHON=1 ;;
+        --sort) RUN_SORT=1 ;;
+        --memcached) RUN_MEMCACHED=1 ;;
+        --duckdb) RUN_DUCKDB=1 ;;
+        --all) RUN_REDIS=1; RUN_PYTHON=1; RUN_SORT=1; RUN_MEMCACHED=1; RUN_DUCKDB=1 ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+# ── Verify prerequisites ────────────────────────────────────────────────────
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON && make -j"
+    exit 1
+fi
+
+# ── Temp files for METRIC capture (bash 3.2 compatible — no assoc arrays) ──
+TMPDIR_BENCH=$(mktemp -d)
+BASELINE_FILE="${TMPDIR_BENCH}/baseline.txt"
+SMASH_FILE="${TMPDIR_BENCH}/smash.txt"
+trap "rm -rf ${TMPDIR_BENCH}" EXIT
+
+# ── Helper functions ─────────────────────────────────────────────────────────
+
+# Run a benchmark, save METRIC lines to a file
+# Usage: run_bench <output_file> <executable> [args...]
+run_bench() {
+    local outfile="$1"; shift
+    local exe="$1"; shift
+    "$exe" "$@" 2>/dev/null | grep '^METRIC ' > "$outfile" || true
+}
+
+run_bench_smash() {
+    local outfile="$1"; shift
+    local exe="$1"; shift
+    env "${PRELOAD_VAR}=${SMASH_LIB}" "$exe" "$@" 2>/dev/null | grep '^METRIC ' > "$outfile" || true
+}
+
+# Look up a metric value from a file
+# Usage: metric_val <file> <metric_name>
+metric_val() {
+    local file="$1" name="$2"
+    awk -v m="$name" '$1=="METRIC" && $2==m {print $3}' "$file"
+}
+
+# Print a comparison row
+# Usage: print_row <label> <metric_name> <unit>
+print_row() {
+    local label="$1" metric="$2" unit="$3"
+    local base smash
+    base=$(metric_val "$BASELINE_FILE" "$metric")
+    smash=$(metric_val "$SMASH_FILE" "$metric")
+    base="${base:-N/A}"
+    smash="${smash:-N/A}"
+
+    if [[ "$base" == "N/A" || "$smash" == "N/A" ]]; then
+        printf "  %-25s %12s %12s %10s\n" "$label" "$base" "$smash" "N/A"
+        return
+    fi
+
+    local delta="N/A"
+    if [[ "$base" != "0" ]]; then
+        delta=$(echo "scale=1; (($smash - $base) / $base) * 100" | bc -l 2>/dev/null || echo "N/A")
+        if [[ "$delta" != "N/A" ]]; then
+            delta="${delta}%"
+        fi
+    fi
+
+    printf "  %-25s %10s%-2s %10s%-2s %10s\n" "$label" "$base" "$unit" "$smash" "$unit" "$delta"
+}
+
+# Print comparison table header
+print_header() {
+    local bench_name="$1"
+    echo ""
+    echo "========================================================================"
+    echo "  $bench_name"
+    echo "========================================================================"
+    printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+    echo "  ------------------------------------------------------------------------"
+}
+
+# ── Run benchmarks ───────────────────────────────────────────────────────────
+
+echo "Smash A/B Benchmark Runner"
+echo "libsmash: ${SMASH_LIB}"
+if [[ -n "$QUICK_FLAG" ]]; then
+    echo "Mode: --quick (reduced duration)"
+fi
+echo ""
+
+# ── bench_json ───────────────────────────────────────────────────────────────
+BENCH_JSON="${BENCH_DIR}/bench_json"
+if [[ -f "$BENCH_JSON" ]]; then
+    echo "Running bench_json (baseline)..."
+    run_bench "$BASELINE_FILE" "$BENCH_JSON" $QUICK_FLAG
+
+    echo "Running bench_json (smash)..."
+    run_bench_smash "$SMASH_FILE" "$BENCH_JSON" $QUICK_FLAG
+
+    print_header "JSON Processing (bench_json)"
+    print_row "JSON size"            json_size_mb           "MB"
+    print_row "Parse throughput"     parse_throughput_mbs   "MB/s"
+    print_row "Peak RSS"             peak_rss_mb            "MB"
+    print_row "Post-cooling RSS"     post_cool_rss_mb       "MB"
+    print_row "Cool reduction"       cool_reduction_pct     "%"
+    print_row "Steady-state RSS"     steady_rss_mb          "MB"
+    print_row "Min serve RSS"        min_rss_mb             "MB"
+    print_row "RSS reduction"        rss_reduction_pct      "%"
+    print_row "Accesses/sec"         accesses_per_sec       ""
+    print_row "Cold access p50"      cold_p50_us            "us"
+    print_row "Cold access p99"      cold_p99_us            "us"
+    print_row "Post re-access RSS"   post_reaccess_rss_mb   "MB"
+    echo ""
+else
+    echo "SKIP: bench_json not found at ${BENCH_JSON}"
+fi
+
+# ── bench_kv_store ───────────────────────────────────────────────────────────
+BENCH_KV="${BENCH_DIR}/bench_kv_store"
+if [[ -f "$BENCH_KV" ]]; then
+    echo "Running bench_kv_store (baseline)..."
+    run_bench "$BASELINE_FILE" "$BENCH_KV" $QUICK_FLAG
+
+    echo "Running bench_kv_store (smash)..."
+    run_bench_smash "$SMASH_FILE" "$BENCH_KV" $QUICK_FLAG
+
+    print_header "KV Store (bench_kv_store)"
+    print_row "Fill time"            fill_time_sec          "s"
+    print_row "Peak RSS"             peak_rss_mb            "MB"
+    print_row "Post-cooling RSS"     post_cool_rss_mb       "MB"
+    print_row "Cool reduction"       cool_reduction_pct     "%"
+    print_row "Steady-state RSS"     steady_rss_mb          "MB"
+    print_row "Min serve RSS"        min_rss_mb             "MB"
+    print_row "RSS reduction"        rss_reduction_pct      "%"
+    print_row "Ops/sec"              ops_per_sec            ""
+    print_row "Hot latency p50"      hot_p50_us             "us"
+    print_row "Hot latency p99"      hot_p99_us             "us"
+    print_row "Cold access p50"      cold_p50_us            "us"
+    print_row "Cold access p99"      cold_p99_us            "us"
+    print_row "Post re-access RSS"   post_reaccess_rss_mb   "MB"
+    echo ""
+else
+    echo "SKIP: bench_kv_store not found at ${BENCH_KV}"
+fi
+
+# ── bench_sqlite ─────────────────────────────────────────────────────────────
+BENCH_SQLITE="${BENCH_DIR}/bench_sqlite"
+if [[ -f "$BENCH_SQLITE" ]]; then
+    echo "Running bench_sqlite (baseline)..."
+    run_bench "$BASELINE_FILE" "$BENCH_SQLITE" $QUICK_FLAG
+
+    echo "Running bench_sqlite (smash)..."
+    run_bench_smash "$SMASH_FILE" "$BENCH_SQLITE" $QUICK_FLAG
+
+    print_header "SQLite In-Memory (bench_sqlite)"
+    print_row "Fill time"            fill_time_sec          "s"
+    print_row "Peak RSS"             peak_rss_mb            "MB"
+    print_row "Post-cooling RSS"     post_cool_rss_mb       "MB"
+    print_row "Cool reduction"       cool_reduction_pct     "%"
+    print_row "Steady-state RSS"     steady_rss_mb          "MB"
+    print_row "Min serve RSS"        min_rss_mb             "MB"
+    print_row "RSS reduction"        rss_reduction_pct      "%"
+    print_row "Ops/sec"              ops_per_sec            ""
+    print_row "Hot latency p50"      hot_p50_us             "us"
+    print_row "Hot latency p99"      hot_p99_us             "us"
+    print_row "Cold query p50"       cold_p50_us            "us"
+    print_row "Cold query p99"       cold_p99_us            "us"
+    print_row "Post re-access RSS"   post_reaccess_rss_mb   "MB"
+    echo ""
+else
+    echo "SKIP: bench_sqlite not found at ${BENCH_SQLITE}"
+fi
+
+# ── bench_redis (optional) ───────────────────────────────────────────────────
+if [[ "$RUN_REDIS" -eq 1 ]]; then
+    REDIS_SCRIPT="${BENCH_DIR}/bench_redis.sh"
+    if [[ -f "$REDIS_SCRIPT" ]]; then
+        echo "Running Redis benchmark..."
+        bash "$REDIS_SCRIPT" $QUICK_FLAG
+    else
+        echo "SKIP: bench_redis.sh not found at ${REDIS_SCRIPT}"
+    fi
+fi
+
+# ── bench_python (optional) ─────────────────────────────────────────────────
+if [[ "$RUN_PYTHON" -eq 1 ]]; then
+    PYTHON_SCRIPT="${BENCH_DIR}/bench_python.sh"
+    if [[ -f "$PYTHON_SCRIPT" ]]; then
+        echo "Running Python DataFrame benchmark..."
+        bash "$PYTHON_SCRIPT" $QUICK_FLAG
+    else
+        echo "SKIP: bench_python.sh not found at ${PYTHON_SCRIPT}"
+    fi
+fi
+
+# ── bench_sort (optional) ───────────────────────────────────────────────────
+if [[ "$RUN_SORT" -eq 1 ]]; then
+    SORT_SCRIPT="${BENCH_DIR}/bench_sort.sh"
+    if [[ -f "$SORT_SCRIPT" ]]; then
+        echo "Running GNU sort benchmark..."
+        bash "$SORT_SCRIPT" $QUICK_FLAG
+    else
+        echo "SKIP: bench_sort.sh not found at ${SORT_SCRIPT}"
+    fi
+fi
+
+# ── bench_memcached (optional) ─────────────────────────────────────────────
+if [[ "$RUN_MEMCACHED" -eq 1 ]]; then
+    MEMCACHED_SCRIPT="${BENCH_DIR}/bench_memcached.sh"
+    if [[ -f "$MEMCACHED_SCRIPT" ]]; then
+        echo "Running Memcached benchmark..."
+        bash "$MEMCACHED_SCRIPT" $QUICK_FLAG
+    else
+        echo "SKIP: bench_memcached.sh not found at ${MEMCACHED_SCRIPT}"
+    fi
+fi
+
+# ── bench_duckdb (optional) ────────────────────────────────────────────────
+if [[ "$RUN_DUCKDB" -eq 1 ]]; then
+    DUCKDB_SCRIPT="${BENCH_DIR}/bench_duckdb.sh"
+    if [[ -f "$DUCKDB_SCRIPT" ]]; then
+        echo "Running DuckDB OLAP benchmark..."
+        bash "$DUCKDB_SCRIPT" $QUICK_FLAG
+    else
+        echo "SKIP: bench_duckdb.sh not found at ${DUCKDB_SCRIPT}"
+    fi
+fi
+
+echo ""
+echo "Done."

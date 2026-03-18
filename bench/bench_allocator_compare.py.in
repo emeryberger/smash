@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Allocator substrate compression comparison runner.
+
+Compares page compressibility across allocator substrates (system malloc,
+mimalloc, jemalloc, tcmalloc, DieHard, DieHarder, Smash) while keeping
+compression logic constant.
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import statistics
+import subprocess
+import sys
+import time
+from collections import OrderedDict
+from pathlib import Path
+
+BUILD_DIR = Path("@CMAKE_BINARY_DIR@")
+BENCH_DIR = BUILD_DIR / "bench"
+SMASH_LIB = BUILD_DIR / ("libsmash.dylib" if platform.system() == "Darwin" else "libsmash.so")
+
+INTERPOSE_KEY = "DYLD_INSERT_LIBRARIES" if platform.system() == "Darwin" else "LD_PRELOAD"
+
+ALLOCATORS = OrderedDict([
+    # --- Base allocators (no zeroing) ---
+    ("system", {
+        "exe": "bench_alloc_system",
+        "env": {},
+        "desc": "System malloc (libmalloc/glibc)",
+    }),
+    ("mimalloc", {
+        "exe": "bench_alloc_mimalloc",
+        "env": {"MIMALLOC_PURGE_DELAY": "-1"},
+        "desc": "mimalloc v2.1 (embedded freelists)",
+    }),
+    ("jemalloc", {
+        "exe": "bench_alloc_jemalloc",
+        "env": {"MALLOC_CONF": "dirty_decay_ms:-1,muzzy_decay_ms:-1"},
+        "desc": "jemalloc (embedded freelists)",
+        "optional": True,
+    }),
+    ("tcmalloc", {
+        "exe": "bench_alloc_tcmalloc",
+        "env": {"TCMALLOC_RELEASE_RATE": "0"},
+        "desc": "tcmalloc (embedded freelists)",
+        "optional": True,
+    }),
+    ("hoard", {
+        "exe": "bench_alloc_hoard",
+        "env": {},
+        "desc": "Hoard (superblock-based)",
+        "optional": True,
+    }),
+    ("mesh", {
+        "exe": "bench_alloc_mesh",
+        "env": {},
+        "desc": "Mesh (external metadata, VM remapping)",
+        "optional": True,
+    }),
+    ("diehard", {
+        "exe": "bench_alloc_diehard",
+        "env": {},
+        "desc": "DieHard (external metadata, no zeroing)",
+        "optional": True,
+    }),
+    ("dieharder", {
+        "exe": "bench_alloc_dieharder",
+        "env": {},
+        "desc": "DieHarder (external metadata + security zeroing)",
+        "optional": True,
+    }),
+    # --- Zeroing variants (benchmark zeros before free) ---
+    ("system+zero", {
+        "exe": "bench_alloc_system_zero",
+        "env": {},
+        "desc": "System malloc + zero-on-free",
+    }),
+    ("mimalloc+zero", {
+        "exe": "bench_alloc_mimalloc_zero",
+        "env": {"MIMALLOC_PURGE_DELAY": "-1"},
+        "desc": "mimalloc + zero-on-free",
+    }),
+    ("jemalloc+zero", {
+        "exe": "bench_alloc_jemalloc_zero",
+        "env": {"MALLOC_CONF": "dirty_decay_ms:-1,muzzy_decay_ms:-1"},
+        "desc": "jemalloc + zero-on-free",
+        "optional": True,
+    }),
+    ("tcmalloc+zero", {
+        "exe": "bench_alloc_tcmalloc_zero",
+        "env": {"TCMALLOC_RELEASE_RATE": "0"},
+        "desc": "tcmalloc + zero-on-free",
+        "optional": True,
+    }),
+    ("hoard+zero", {
+        "exe": "bench_alloc_hoard_zero",
+        "env": {},
+        "desc": "Hoard + zero-on-free",
+        "optional": True,
+    }),
+    ("mesh+zero", {
+        "exe": "bench_alloc_mesh_zero",
+        "env": {},
+        "desc": "Mesh + zero-on-free",
+        "optional": True,
+    }),
+    ("diehard+zero", {
+        "exe": "bench_alloc_diehard_zero",
+        "env": {},
+        "desc": "DieHard + zero-on-free (= external metadata + zeroing)",
+        "optional": True,
+    }),
+    # --- Smash (has built-in zero-on-free + arenas) ---
+    ("smash", {
+        "exe": "bench_alloc_system",
+        "env": {INTERPOSE_KEY: str(SMASH_LIB)},
+        "desc": "Smash (external metadata + zeroing + arenas)",
+    }),
+])
+
+DATA_TYPES = ["json", "kv", "struct", "mixed"]
+OBJ_SIZES = [64, 128, 256, 512]
+
+
+def parse_metrics(stdout):
+    metrics = {}
+    for line in stdout.splitlines():
+        m = re.match(r"^METRIC (\S+) (\S+)$", line)
+        if m:
+            try:
+                metrics[m.group(1)] = float(m.group(2))
+            except ValueError:
+                metrics[m.group(1)] = m.group(2)
+    return metrics
+
+
+def run_one(exe, allocator_name, data_type, obj_size, obj_count, free_pct, extra_env):
+    env = os.environ.copy()
+    env.update(extra_env)
+
+    cmd = [
+        str(exe),
+        f"--data={data_type}",
+        f"--size={obj_size}",
+        f"--count={obj_count}",
+        f"--free-pct={free_pct}",
+    ]
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+        if r.returncode != 0:
+            print(f"    FAILED (rc={r.returncode}): {r.stderr[:200]}")
+            return None
+        return parse_metrics(r.stdout)
+    except subprocess.TimeoutExpired:
+        print(f"    TIMEOUT")
+        return None
+    except Exception as e:
+        print(f"    ERROR: {e}")
+        return None
+
+
+def median_metrics(runs):
+    if not runs:
+        return {}
+    all_keys = set()
+    for r in runs:
+        all_keys.update(r.keys())
+    result = {}
+    for k in all_keys:
+        vals = [r[k] for r in runs if k in r and isinstance(r[k], (int, float))]
+        if vals:
+            result[k] = statistics.median(vals)
+    return result
+
+
+def print_summary_table(all_results):
+    """Print a summary table across all allocators and data types."""
+    print(f"\n{'=' * 90}")
+    print(f"  ALLOCATOR COMPRESSION COMPARISON SUMMARY")
+    print(f"{'=' * 90}")
+
+    for algo_name, ratio_key in [("LZ4", "avg_ratio_lz4"), ("zstd-9", "avg_ratio_zstd")]:
+        print(f"\n  {algo_name} Average Compression Ratio (lower = better):")
+        print(f"  {'Allocator':<14}", end="")
+        for dt in DATA_TYPES:
+            print(f"  {dt:>8}", end="")
+        print(f"  {'Average':>8}")
+        print(f"  {'-'*14}", end="")
+        for _ in DATA_TYPES:
+            print(f"  {'--------':>8}", end="")
+        print(f"  {'--------':>8}")
+
+        for alloc_name in ALLOCATORS:
+            vals_across_dt = []
+            print(f"  {alloc_name:<14}", end="")
+            for dt in DATA_TYPES:
+                key = f"{alloc_name}_{dt}"
+                if key in all_results and all_results[key].get("median"):
+                    v = all_results[key]["median"].get(ratio_key)
+                    if v is not None:
+                        print(f"  {v:>7.1%}", end="")
+                        vals_across_dt.append(v)
+                    else:
+                        print(f"  {'N/A':>8}", end="")
+                else:
+                    print(f"  {'---':>8}", end="")
+            if vals_across_dt:
+                avg = sum(vals_across_dt) / len(vals_across_dt)
+                print(f"  {avg:>7.1%}", end="")
+            else:
+                print(f"  {'---':>8}", end="")
+            print()
+
+
+def write_report(output_dir, all_results):
+    """Write markdown report."""
+    lines = ["# Allocator Substrate Compression Comparison\n"]
+    lines.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    for algo_name, ratio_key in [("LZ4", "avg_ratio_lz4"), ("zstd-9", "avg_ratio_zstd")]:
+        lines.append(f"\n## {algo_name} Compression Ratios\n")
+        cols = ["Allocator"] + DATA_TYPES + ["Average"]
+        lines.append("| " + " | ".join(cols) + " |")
+        lines.append("|" + "|".join(["---"] * len(cols)) + "|")
+
+        for alloc_name, alloc_cfg in ALLOCATORS.items():
+            row = [alloc_name]
+            vals = []
+            for dt in DATA_TYPES:
+                key = f"{alloc_name}_{dt}"
+                if key in all_results and all_results[key].get("median"):
+                    v = all_results[key]["median"].get(ratio_key)
+                    if v is not None:
+                        row.append(f"{v:.1%}")
+                        vals.append(v)
+                    else:
+                        row.append("N/A")
+                else:
+                    row.append("---")
+            if vals:
+                row.append(f"{sum(vals)/len(vals):.1%}")
+            else:
+                row.append("---")
+            lines.append("| " + " | ".join(row) + " |")
+
+    report_path = output_dir / "allocator_compare_report.md"
+    report_path.write_text("\n".join(lines) + "\n")
+    print(f"\nReport written to {report_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Allocator compression comparison runner")
+    parser.add_argument("--allocators", default=None,
+                        help="Comma-separated allocator names (default: all available)")
+    parser.add_argument("--data-types", default="json,kv,struct,mixed",
+                        help="Comma-separated data types")
+    parser.add_argument("--sizes", default="64,128,256,512",
+                        help="Comma-separated object sizes")
+    parser.add_argument("--count", type=int, default=100000,
+                        help="Number of objects (default: 100000)")
+    parser.add_argument("--free-pct", type=int, default=50,
+                        help="Percentage of objects to free (default: 50)")
+    parser.add_argument("--runs", type=int, default=3,
+                        help="Runs per configuration (default: 3)")
+    parser.add_argument("--output", default="allocator_compare_results",
+                        help="Output directory")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip configurations already in results file")
+    parser.add_argument("--size", type=int, default=None,
+                        help="Run a single object size only")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results_path = output_dir / "allocator_compare_results.json"
+
+    data_types = [d.strip() for d in args.data_types.split(",")]
+    obj_sizes = [int(s) for s in args.sizes.split(",")]
+    if args.size is not None:
+        obj_sizes = [args.size]
+
+    # Determine available allocators
+    alloc_names = list(ALLOCATORS.keys())
+    if args.allocators:
+        alloc_names = [a.strip() for a in args.allocators.split(",")]
+
+    available = []
+    for name in alloc_names:
+        if name not in ALLOCATORS:
+            print(f"Unknown allocator: {name}")
+            continue
+        cfg = ALLOCATORS[name]
+        exe = BENCH_DIR / cfg["exe"]
+        if name == "smash":
+            exe = BENCH_DIR / ALLOCATORS["system"]["exe"]
+            if not SMASH_LIB.exists():
+                print(f"  {name}: skipped (libsmash not found at {SMASH_LIB})")
+                continue
+        if not exe.exists():
+            if cfg.get("optional"):
+                print(f"  {name}: skipped (not built)")
+                continue
+            else:
+                print(f"  {name}: WARNING - executable not found at {exe}")
+                continue
+        available.append(name)
+
+    print(f"Allocators: {', '.join(available)}")
+    print(f"Data types: {', '.join(data_types)}")
+    print(f"Object sizes: {obj_sizes}")
+    print(f"Objects per run: {args.count}, free%: {args.free_pct}")
+    print()
+
+    # Load existing results
+    all_results = {}
+    if args.resume and results_path.exists():
+        all_results = json.loads(results_path.read_text())
+        print(f"Loaded {len(all_results)} existing results")
+
+    t0 = time.time()
+    total = len(available) * len(data_types) * len(obj_sizes)
+    done = 0
+
+    for alloc_name in available:
+        cfg = ALLOCATORS[alloc_name]
+        if alloc_name == "smash":
+            exe = BENCH_DIR / ALLOCATORS["system"]["exe"]
+        else:
+            exe = BENCH_DIR / cfg["exe"]
+
+        for dt in data_types:
+            for obj_size in obj_sizes:
+                done += 1
+                result_key = f"{alloc_name}_{dt}_{obj_size}"
+
+                if args.resume and result_key in all_results:
+                    print(f"[{done}/{total}] {alloc_name} / {dt} / {obj_size}B — skipped (resume)")
+                    continue
+
+                print(f"[{done}/{total}] {alloc_name} / {dt} / {obj_size}B", end="")
+                runs = []
+                for run_num in range(1, args.runs + 1):
+                    metrics = run_one(exe, alloc_name, dt, obj_size,
+                                      args.count, args.free_pct, cfg["env"])
+                    if metrics:
+                        runs.append(metrics)
+                        lz4_r = metrics.get("avg_ratio_lz4", "?")
+                        zstd_r = metrics.get("avg_ratio_zstd", "?")
+                        print(f"  [lz4={lz4_r:.3f} zstd={zstd_r:.3f}]" if isinstance(lz4_r, float) else "", end="")
+
+                if runs:
+                    med = median_metrics(runs)
+                    all_results[result_key] = {"runs": runs, "median": med}
+                print()
+
+                # Save incrementally
+                results_path.write_text(json.dumps(all_results, indent=2))
+
+    # Also compute per-allocator+data_type aggregates (avg across sizes)
+    for alloc_name in available:
+        for dt in data_types:
+            agg_key = f"{alloc_name}_{dt}"
+            size_results = []
+            for obj_size in obj_sizes:
+                rk = f"{alloc_name}_{dt}_{obj_size}"
+                if rk in all_results and "median" in all_results[rk]:
+                    size_results.append(all_results[rk]["median"])
+            if size_results:
+                agg = {}
+                for k in size_results[0]:
+                    vals = [r[k] for r in size_results if k in r and isinstance(r.get(k), (int, float))]
+                    if vals:
+                        agg[k] = sum(vals) / len(vals)
+                all_results[agg_key] = {"median": agg, "aggregated_from": len(size_results)}
+
+    results_path.write_text(json.dumps(all_results, indent=2))
+
+    print_summary_table(all_results)
+    write_report(output_dir, all_results)
+
+    elapsed = time.time() - t0
+    print(f"\nDone in {elapsed:.0f}s. Results: {results_path}")
+
+
+if __name__ == "__main__":
+    main()

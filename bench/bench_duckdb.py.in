@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""bench_duckdb.py - DuckDB OLAP A/B comparison: system malloc vs Smash
+
+DuckDB on macOS uses system malloc (jemalloc extension is Linux-only).
+Analytical queries touch a fraction of columnar data -- untouched column
+chunks go cold and get compressed by Smash.
+
+Feeds SQL to a long-running `duckdb :memory:` process via stdin, using
+COPY TO for phase synchronization.  Parent monitors RSS between phases.
+
+Requires: duckdb CLI in PATH.
+
+Usage:
+    python3 bench_duckdb.py [--quick]
+"""
+
+import argparse
+import os
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+# ── Paths (substituted by CMake configure_file) ─────────────────────────
+BUILD_DIR = "@CMAKE_BINARY_DIR@"
+
+IS_DARWIN = platform.system() == "Darwin"
+PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
+SMASH_LIB = os.path.join(BUILD_DIR, "libsmash.dylib" if IS_DARWIN else "libsmash.so")
+
+# ── SQL templates ────────────────────────────────────────────────────────
+
+SQL_FILL = """\
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf={sf});
+"""
+
+# Narrow date-range queries -- touch a small subset of columnar data
+SQL_HOT = """\
+SELECT l_returnflag, l_linestatus, count(*), sum(l_quantity),
+       sum(l_extendedprice), sum(l_extendedprice * (1 - l_discount))
+FROM lineitem WHERE l_shipdate BETWEEN '1998-11-01' AND '1998-12-01'
+GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;
+SELECT o_orderpriority, count(*) FROM orders
+WHERE o_orderdate >= '1998-07-01' GROUP BY o_orderpriority;
+SELECT c_name, sum(o_totalprice) FROM customer
+JOIN orders ON c_custkey = o_custkey WHERE o_orderdate >= '1998-01-01'
+GROUP BY c_name ORDER BY 2 DESC LIMIT 100;
+"""
+
+# Full-scan TPC-H queries -- touch all columnar data
+SQL_COLD = """\
+SELECT l_returnflag, l_linestatus, sum(l_quantity), sum(l_extendedprice),
+       sum(l_extendedprice * (1-l_discount)),
+       sum(l_extendedprice * (1-l_discount) * (1+l_tax)),
+       avg(l_quantity), avg(l_extendedprice), avg(l_discount), count(*)
+FROM lineitem WHERE l_shipdate <= '1998-12-01'
+GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;
+SELECT n_name, sum(l_extendedprice * (1 - l_discount)) as revenue
+FROM customer, orders, lineitem, supplier, nation, region
+WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey AND l_suppkey = s_suppkey
+  AND c_nationkey = s_nationkey AND s_nationkey = n_nationkey
+  AND n_regionkey = r_regionkey AND r_name = 'ASIA'
+  AND o_orderdate >= '1994-01-01' AND o_orderdate < '1995-01-01'
+GROUP BY n_name ORDER BY revenue DESC;
+SELECT c_custkey, c_name, sum(l_extendedprice * (1-l_discount)) as revenue,
+       c_acctbal, n_name, c_address, c_phone, c_comment
+FROM customer, orders, lineitem, nation
+WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey
+  AND o_orderdate >= '1993-10-01' AND o_orderdate < '1994-01-01'
+  AND l_returnflag = 'R' AND c_nationkey = n_nationkey
+GROUP BY c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment
+ORDER BY revenue DESC LIMIT 20;
+"""
+
+
+def check_prereqs():
+    if not shutil.which("duckdb"):
+        print("SKIP: duckdb not found in PATH (brew install duckdb)")
+        sys.exit(0)
+    if not os.path.isfile(SMASH_LIB):
+        print(f"ERROR: libsmash not found at {SMASH_LIB}")
+        print("Build with: cmake .. -DSMASH_BUILD_BENCH=ON && make -j")
+        sys.exit(1)
+
+
+def get_rss_mb(pid):
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(pid)], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        return int(out) / 1024.0 if out else 0.0
+    except (subprocess.CalledProcessError, ValueError):
+        return 0.0
+
+
+class RssMonitor:
+    def __init__(self, pid):
+        self.pid = pid
+        self.samples = []
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        self._thread.join(timeout=3)
+
+    def _run(self):
+        while not self._stop:
+            rss = get_rss_mb(self.pid)
+            if rss > 0:
+                self.samples.append(rss)
+            time.sleep(1)
+
+    @property
+    def peak(self):
+        return max(self.samples) if self.samples else 0.0
+
+    @property
+    def minimum(self):
+        s = [v for v in self.samples if v > 0]
+        return min(s) if s else 0.0
+
+    @property
+    def final(self):
+        return self.samples[-1] if self.samples else 0.0
+
+
+def wait_for_marker(path, expected, timeout=120):
+    """Poll for a marker file containing `expected`.  Returns True on success."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            content = open(path).read()
+            if expected in content:
+                return True
+        except FileNotFoundError:
+            pass
+        time.sleep(0.5)
+    print(f"WARNING: Timed out waiting for marker '{expected}'")
+    return False
+
+
+def send_sql(proc, sql):
+    """Write SQL to the duckdb process stdin.  Returns False if pipe broke."""
+    try:
+        proc.stdin.write(sql.encode())
+        proc.stdin.flush()
+        return True
+    except (BrokenPipeError, OSError):
+        return False
+
+
+def is_alive(proc):
+    return proc.poll() is None
+
+
+# ── Run one DuckDB pass ─────────────────────────────────────────────────
+
+def run_pass(label, use_smash, cfg, tmpdir):
+    metrics = {}
+    marker = os.path.join(tmpdir, f"{label}_marker")
+
+    print(f"\n[{label}] Starting DuckDB (TPC-H sf={cfg.sf})...")
+
+    env = dict(os.environ)
+    if use_smash:
+        env[PRELOAD_VAR] = SMASH_LIB
+
+    t_start = time.time()
+    proc = subprocess.Popen(
+        ["duckdb", ":memory:"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=env,
+    )
+
+    mon = RssMonitor(proc.pid)
+    mon.start()
+
+    # ── Phase 1: Fill ────────────────────────────────────────────────────
+    print(f"[{label}] Phase 1: Generate TPC-H data (sf={cfg.sf})...")
+    try:
+        os.unlink(marker)
+    except FileNotFoundError:
+        pass
+
+    t_fill = time.time()
+    if not send_sql(proc, SQL_FILL.format(sf=cfg.sf)):
+        print(f"  [{label}] DuckDB exited during fill")
+        mon.stop()
+        return metrics
+    send_sql(proc, f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
+    wait_for_marker(marker, "fill_done", timeout=120)
+    fill_sec = time.time() - t_fill
+
+    fill_rss = get_rss_mb(proc.pid)
+    metrics["fill_rss"] = fill_rss
+    metrics["fill_sec"] = round(fill_sec, 1)
+    print(f"  [{label}] Fill done — {fill_sec:.1f}s, RSS: {fill_rss:.1f} MB")
+
+    # ── Phase 2: Cool ────────────────────────────────────────────────────
+    print(f"[{label}] Phase 2: Cool for {cfg.cool}s...")
+    time.sleep(cfg.cool)
+    cool_rss = get_rss_mb(proc.pid)
+    metrics["cool_rss"] = cool_rss
+    print(f"  [{label}] Cool done — RSS: {cool_rss:.1f} MB")
+
+    # ── Phase 3: Hot serve ───────────────────────────────────────────────
+    if is_alive(proc):
+        print(f"[{label}] Phase 3: Serve ({cfg.iterations} iterations, narrow queries)...")
+        try:
+            os.unlink(marker)
+        except FileNotFoundError:
+            pass
+
+        t_serve = time.time()
+        ok = True
+        for _ in range(cfg.iterations):
+            if not is_alive(proc):
+                ok = False
+                break
+            if not send_sql(proc, SQL_HOT):
+                ok = False
+                break
+
+        if ok and is_alive(proc):
+            send_sql(proc, f"COPY (SELECT 'serve_done') TO '{marker}' (HEADER false);\n")
+            wait_for_marker(marker, "serve_done", timeout=60)
+            serve_sec = time.time() - t_serve
+            serve_rss = get_rss_mb(proc.pid)
+            metrics["serve_rss"] = serve_rss
+            metrics["serve_sec"] = round(serve_sec, 1)
+            # 3 queries per iteration
+            metrics["serve_qps"] = round(cfg.iterations * 3 / max(serve_sec, 0.001), 1)
+            print(f"  [{label}] Serve done — {serve_sec:.1f}s ({metrics['serve_qps']} q/s), RSS: {serve_rss:.1f} MB")
+        else:
+            print(f"  [{label}] DuckDB exited during serve phase")
+
+    # ── Phase 4: Cold re-access ──────────────────────────────────────────
+    if is_alive(proc):
+        print(f"[{label}] Phase 4: Cold re-access (full-scan + multi-table joins)...")
+        try:
+            os.unlink(marker)
+        except FileNotFoundError:
+            pass
+
+        t_cold = time.time()
+        send_sql(proc, SQL_COLD)
+        send_sql(proc, f"COPY (SELECT 'cold_done') TO '{marker}' (HEADER false);\n")
+
+        if is_alive(proc):
+            wait_for_marker(marker, "cold_done", timeout=120)
+            cold_sec = time.time() - t_cold
+            cold_rss = get_rss_mb(proc.pid)
+            metrics["cold_rss"] = cold_rss
+            metrics["cold_sec"] = round(cold_sec, 1)
+            # 3 cold queries
+            metrics["cold_qps"] = round(3 / max(cold_sec, 0.001), 1)
+            print(f"  [{label}] Cold re-access done — {cold_sec:.1f}s ({metrics['cold_qps']} q/s), RSS: {cold_rss:.1f} MB")
+        else:
+            print(f"  [{label}] DuckDB exited during cold re-access phase")
+
+    # ── Finish ───────────────────────────────────────────────────────────
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    proc.wait()
+    mon.stop()
+
+    total_sec = time.time() - t_start
+    metrics["total_sec"] = round(total_sec, 1)
+    metrics["peak_rss"] = mon.peak
+    metrics["min_rss"] = mon.minimum
+    metrics["final_rss"] = mon.final
+    print(f"  [{label}] Total time: {total_sec:.1f}s")
+
+    return metrics
+
+
+# ── Results table ────────────────────────────────────────────────────────
+
+def print_row(label, base_val, smash_val, unit):
+    def fmt(v):
+        if v is None:
+            return "N/A"
+        if isinstance(v, float):
+            return f"{v:.1f}"
+        return str(v)
+
+    b, s = fmt(base_val), fmt(smash_val)
+    if base_val is not None and smash_val is not None and base_val != 0:
+        delta = (smash_val - base_val) / base_val * 100
+        d = f"{delta:+.1f}%"
+    else:
+        d = "N/A"
+    print(f"  {label:<25s} {b:>10s} {unit:<4s} {s:>10s} {unit:<4s} {d:>10s}")
+
+
+def print_results(base, smash):
+    print()
+    print("  " + "-" * 72)
+    print(f"  {'Metric':<25s} {'Baseline':>14s} {'Smash':>14s} {'Delta':>10s}")
+    print("  " + "-" * 72)
+
+    rows = [
+        ("Fill RSS",        "fill_rss",   "MB"),
+        ("Fill time",       "fill_sec",   "s"),
+        ("Post-cool RSS",   "cool_rss",   "MB"),
+        ("Serve RSS",       "serve_rss",  "MB"),
+        ("Serve time",      "serve_sec",  "s"),
+        ("Serve throughput", "serve_qps", "q/s"),
+        ("Cold re-access RSS", "cold_rss", "MB"),
+        ("Cold time",       "cold_sec",   "s"),
+        ("Cold throughput",  "cold_qps",  "q/s"),
+        ("Peak RSS",        "peak_rss",   "MB"),
+        ("Final RSS",       "final_rss",  "MB"),
+        ("Total time",      "total_sec",  "s"),
+    ]
+    for label, key, unit in rows:
+        bv = base.get(key)
+        sv = smash.get(key)
+        print_row(label, bv, sv, unit)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="DuckDB OLAP A/B: system malloc vs Smash")
+    parser.add_argument("--quick", action="store_true")
+    args = parser.parse_args()
+
+    class Cfg:
+        pass
+    cfg = Cfg()
+    if args.quick:
+        cfg.sf = 0.1
+        cfg.cool = 5
+        cfg.iterations = 5
+    else:
+        cfg.sf = 0.5
+        cfg.cool = 10
+        cfg.iterations = 10
+
+    check_prereqs()
+
+    print()
+    print("=" * 72)
+    print("  DuckDB OLAP A/B Comparison")
+    print("=" * 72)
+    print()
+    print(f"TPC-H sf={cfg.sf}, Cool: {cfg.cool}s, Iterations: {cfg.iterations}")
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        base = run_pass("baseline", False, cfg, tmpdir)
+        smash = run_pass("smash", True, cfg, tmpdir)
+        print_results(base, smash)
+        print()
+        print("Done.")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# bench_networkx.sh - NetworkX graph processing: system malloc vs Smash
+#
+# Builds a large graph, computes centrality on a subgraph (hot),
+# letting the rest go cold. Uses PYTHONMALLOC=malloc for Smash interposition.
+#
+# Requires python3 with networkx and numpy. Skips gracefully if absent.
+#
+# Usage:
+#   bash bench_networkx.sh [--quick]
+
+set -euo pipefail
+
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+else
+    PRELOAD_VAR="LD_PRELOAD"
+    SMASH_LIB="${BUILD_DIR}/libsmash.so"
+fi
+
+NUM_NODES=200000
+AVG_DEGREE=8
+COOL_DURATION=10
+SERVE_DURATION=20
+
+for arg in "$@"; do
+    case "$arg" in
+        --quick)
+            NUM_NODES=50000
+            AVG_DEGREE=6
+            COOL_DURATION=5
+            SERVE_DURATION=10
+            ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
+if ! command -v python3 &>/dev/null; then
+    echo "SKIP: python3 not found"
+    exit 0
+fi
+if ! python3 -c "import networkx, numpy" &>/dev/null; then
+    echo "SKIP: networkx and/or numpy not installed"
+    exit 0
+fi
+if [[ ! -f "${SMASH_LIB}" ]]; then
+    echo "ERROR: libsmash not found at ${SMASH_LIB}"
+    exit 1
+fi
+
+TMPDIR_BENCH=$(mktemp -d)
+BASELINE_FILE="${TMPDIR_BENCH}/baseline.txt"
+SMASH_FILE="${TMPDIR_BENCH}/smash.txt"
+trap "rm -rf ${TMPDIR_BENCH}" EXIT
+
+PYSCRIPT="${TMPDIR_BENCH}/bench_graph.py"
+cat > "$PYSCRIPT" << 'PYEOF'
+import sys, time, random
+import numpy as np
+import networkx as nx
+
+num_nodes = int(sys.argv[1])
+avg_degree = int(sys.argv[2])
+cool_duration = int(sys.argv[3])
+serve_duration = int(sys.argv[4])
+
+def get_rss_mb():
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        class mach_task_basic_info(ctypes.Structure):
+            _fields_ = [
+                ("virtual_size", ctypes.c_uint64),
+                ("resident_size", ctypes.c_uint64),
+                ("resident_size_max", ctypes.c_uint64),
+                ("user_time_seconds", ctypes.c_uint32),
+                ("user_time_microseconds", ctypes.c_uint32),
+                ("system_time_seconds", ctypes.c_uint32),
+                ("system_time_microseconds", ctypes.c_uint32),
+                ("policy", ctypes.c_int32),
+                ("suspend_count", ctypes.c_int32),
+            ]
+        MACH_TASK_BASIC_INFO = 20
+        info = mach_task_basic_info()
+        count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+        libc.task_info(libc.mach_task_self(), MACH_TASK_BASIC_INFO,
+                       ctypes.byref(info), ctypes.byref(count))
+        return info.resident_size / (1024 * 1024)
+    except Exception:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        return ru.ru_maxrss / (1024 * 1024) if sys.platform == "darwin" else ru.ru_maxrss / 1024
+
+print(f"=== NetworkX Graph Benchmark ===", file=sys.stderr)
+print(f"Nodes: {num_nodes}, Avg degree: {avg_degree}\n", file=sys.stderr)
+
+# ── Fill: Build large graph with node attributes ──
+print("Building graph...", file=sys.stderr)
+t0 = time.monotonic()
+
+num_edges = num_nodes * avg_degree // 2
+G = nx.gnm_random_graph(num_nodes, num_edges, seed=42)
+
+# Add node attributes (makes graph objects large, creates compressible data)
+for n in G.nodes():
+    G.nodes[n]["label"] = f"node_{n:08d}"
+    G.nodes[n]["group"] = n % 100
+    G.nodes[n]["weight"] = random.random() * 100
+    G.nodes[n]["data"] = f"attribute data for node {n} padding text entry"
+    G.nodes[n]["features"] = [random.random() for _ in range(10)]
+
+# Add edge attributes
+for u, v in G.edges():
+    G.edges[u, v]["weight"] = random.random()
+    G.edges[u, v]["type"] = random.choice(["follow", "friend", "colleague", "other"])
+
+fill_sec = time.monotonic() - t0
+peak_rss = get_rss_mb()
+print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges", file=sys.stderr)
+print(f"Built in {fill_sec:.2f}s, RSS: {peak_rss:.1f} MB\n", file=sys.stderr)
+print(f"METRIC fill_time_sec {fill_sec:.2f}")
+print(f"METRIC peak_rss_mb {peak_rss:.1f}")
+
+# ── Cool ──
+print(f"Cooling for {cool_duration}s...", file=sys.stderr)
+for sec in range(1, cool_duration + 1):
+    time.sleep(1)
+    rss = get_rss_mb()
+    if sec % 3 == 0 or sec == 1:
+        print(f"  t={sec}s: RSS={rss:.1f} MB", file=sys.stderr)
+
+cool_rss = get_rss_mb()
+print(f"METRIC cool_rss_mb {cool_rss:.1f}")
+
+# ── Serve: queries on small subgraph (hot region) ──
+# Create a hot subgraph: ego graph of a high-degree node
+degrees = sorted(G.degree(), key=lambda x: x[1], reverse=True)
+hub = degrees[0][0]
+hot_nodes = set(nx.ego_graph(G, hub, radius=2).nodes())
+hot_subgraph = G.subgraph(hot_nodes)
+
+print(f"\nServe: queries on hot subgraph ({len(hot_nodes)} nodes) for {serve_duration}s...",
+      file=sys.stderr)
+total_ops = 0
+min_rss = get_rss_mb()
+
+for sec in range(serve_duration):
+    ops = 0
+    sec_start = time.monotonic()
+    while time.monotonic() - sec_start < 1.0:
+        r = random.randint(0, 99)
+        if r < 30:
+            # BFS from random hot node
+            src = random.choice(list(hot_nodes))
+            _ = dict(nx.bfs_edges(hot_subgraph, src))
+        elif r < 55:
+            # Shortest paths in hot subgraph
+            src = random.choice(list(hot_nodes))
+            _ = nx.single_source_shortest_path_length(hot_subgraph, src, cutoff=3)
+        elif r < 75:
+            # Degree centrality on hot subgraph
+            _ = nx.degree_centrality(hot_subgraph)
+        elif r < 90:
+            # Clustering coefficient
+            src = random.choice(list(hot_nodes))
+            _ = nx.clustering(hot_subgraph, src)
+        else:
+            # Connected components check
+            _ = nx.is_connected(hot_subgraph)
+        ops += 1
+    total_ops += ops
+    rss = get_rss_mb()
+    if rss < min_rss:
+        min_rss = rss
+    if (sec + 1) % 5 == 0:
+        print(f"  t={sec+1}s: RSS={rss:.1f} MB ops={ops}", file=sys.stderr)
+
+serve_rss = get_rss_mb()
+ops_per_sec = total_ops / serve_duration
+print(f"METRIC serve_rss_mb {serve_rss:.1f}")
+print(f"METRIC min_rss_mb {min_rss:.1f}")
+print(f"METRIC ops_per_sec {ops_per_sec:.0f}")
+
+# ── Cold re-access: pagerank + betweenness on full graph ──
+print("\nCold re-access: PageRank on full graph...", file=sys.stderr)
+t0 = time.monotonic()
+pr = nx.pagerank(G, max_iter=50, tol=1e-4)
+# Access node attributes across the whole graph
+total_weight = sum(G.nodes[n]["weight"] for n in G.nodes())
+cold_sec = time.monotonic() - t0
+cold_rss = get_rss_mb()
+print(f"Cold access: {cold_sec:.3f}s, RSS: {cold_rss:.1f} MB", file=sys.stderr)
+print(f"METRIC cold_sec {cold_sec:.3f}")
+print(f"METRIC cold_rss_mb {cold_rss:.1f}")
+
+sys.stdout.flush()
+PYEOF
+
+metric_val() {
+    local file="$1" name="$2"
+    awk -v m="$name" '$1=="METRIC" && $2==m {print $3}' "$file"
+}
+
+print_row() {
+    local label="$1" metric="$2" unit="$3"
+    local base smash
+    base=$(metric_val "$BASELINE_FILE" "$metric")
+    smash=$(metric_val "$SMASH_FILE" "$metric")
+    base="${base:-N/A}"; smash="${smash:-N/A}"
+    if [[ "$base" == "N/A" || "$smash" == "N/A" || "$base" == "0" ]]; then
+        printf "  %-25s %12s %12s %10s\n" "$label" "$base" "$smash" "N/A"
+        return
+    fi
+    local delta
+    delta=$(echo "scale=1; (($smash - $base) / $base) * 100" | bc -l 2>/dev/null || echo "N/A")
+    printf "  %-25s %10s%-2s %10s%-2s %9s%%\n" "$label" "$base" "$unit" "$smash" "$unit" "$delta"
+}
+
+echo ""
+echo "========================================================================"
+echo "  NetworkX Graph Processing A/B Comparison"
+echo "========================================================================"
+echo "Nodes: ${NUM_NODES}, Avg degree: ${AVG_DEGREE}"
+echo ""
+
+echo "Running baseline..."
+PYTHONMALLOC=malloc python3 "$PYSCRIPT" "$NUM_NODES" "$AVG_DEGREE" "$COOL_DURATION" "$SERVE_DURATION" \
+    2>/dev/null | grep '^METRIC ' > "$BASELINE_FILE" || true
+
+echo "Running with Smash..."
+env PYTHONMALLOC=malloc "${PRELOAD_VAR}=${SMASH_LIB}" \
+    python3 "$PYSCRIPT" "$NUM_NODES" "$AVG_DEGREE" "$COOL_DURATION" "$SERVE_DURATION" \
+    2>/dev/null | grep '^METRIC ' > "$SMASH_FILE" || true
+
+echo ""
+printf "  %-25s %12s %12s %10s\n" "Metric" "Baseline" "Smash" "Delta"
+echo "  ------------------------------------------------------------------------"
+
+print_row "Fill time"         fill_time_sec  "s"
+print_row "Peak RSS"          peak_rss_mb    "MB"
+print_row "Post-cool RSS"     cool_rss_mb    "MB"
+print_row "Serve RSS"         serve_rss_mb   "MB"
+print_row "Min RSS"           min_rss_mb     "MB"
+print_row "Ops/sec"           ops_per_sec    ""
+print_row "Cold access time"  cold_sec       "s"
+print_row "Cold RSS"          cold_rss_mb    "MB"
+
+echo ""
+echo "Done."

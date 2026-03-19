@@ -15,7 +15,16 @@ set -euo pipefail
 
 BUILD_DIR="@CMAKE_BINARY_DIR@"
 SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
-BENCH_BIN="${BUILD_DIR}/bench/bench_rocksdb"
+
+# Prefer built-from-source rocksdb benchmark, fall back to system-linked one
+if [[ -x "${BUILD_DIR}/bench/bench_rocksdb_builtin" ]]; then
+    BENCH_BIN="${BUILD_DIR}/bench/bench_rocksdb_builtin"
+    echo "Using built-from-source RocksDB benchmark"
+elif [[ -x "${BUILD_DIR}/bench/bench_rocksdb" ]]; then
+    BENCH_BIN="${BUILD_DIR}/bench/bench_rocksdb"
+else
+    BENCH_BIN=""
+fi
 
 if [[ "$(uname)" == "Darwin" ]]; then
     PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
@@ -41,8 +50,10 @@ for arg in "$@"; do
     esac
 done
 
-if [[ ! -f "$BENCH_BIN" ]]; then
-    echo "SKIP: bench_rocksdb not built (install rocksdb: brew install rocksdb)"
+if [[ -z "$BENCH_BIN" || ! -f "$BENCH_BIN" ]]; then
+    echo "SKIP: bench_rocksdb not built"
+    echo "Either install rocksdb (brew install rocksdb) or build with:"
+    echo "  cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON && make bench_deps"
     exit 0
 fi
 if [[ ! -f "${SMASH_LIB}" ]]; then

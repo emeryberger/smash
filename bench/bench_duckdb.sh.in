@@ -9,7 +9,7 @@
 # with COPY TO for phase synchronization. Parent shell monitors RSS
 # between phases.
 #
-# Requires duckdb CLI in PATH. Skips gracefully if absent.
+# Requires duckdb CLI in PATH or built by cmake. Skips gracefully if absent.
 #
 # Usage:
 #   bash bench_duckdb.sh [--quick]
@@ -21,6 +21,15 @@ set -euo pipefail
 # ── Paths (substituted by CMake configure_file) ─────────────────────────────
 BUILD_DIR="@CMAKE_BINARY_DIR@"
 SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+# DuckDB path - prefer built version
+BENCH_DEPS_DIR="${BUILD_DIR}/bench/deps"
+if [[ -x "${BENCH_DEPS_DIR}/bin/duckdb" ]]; then
+    DUCKDB="${BENCH_DEPS_DIR}/bin/duckdb"
+    echo "Using built DuckDB: ${DUCKDB}"
+else
+    DUCKDB="duckdb"
+fi
 
 # ── Platform detection ───────────────────────────────────────────────────────
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -47,8 +56,9 @@ for arg in "$@"; do
 done
 
 # ── Check prerequisites ─────────────────────────────────────────────────────
-if ! command -v duckdb &>/dev/null; then
-    echo "SKIP: duckdb not found in PATH (brew install duckdb)"
+if ! command -v "$DUCKDB" &>/dev/null; then
+    echo "SKIP: duckdb not found"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON && make bench_deps"
     exit 0
 fi
 
@@ -163,10 +173,10 @@ run_duckdb_pass() {
 
     # Launch DuckDB reading from FIFO
     if [[ "$use_smash" == "yes" ]]; then
-        env "${PRELOAD_VAR}=${SMASH_LIB}" duckdb :memory: < "$fifo" \
+        env "${PRELOAD_VAR}=${SMASH_LIB}" $DUCKDB :memory: < "$fifo" \
             >/dev/null 2>&1 &
     else
-        duckdb :memory: < "$fifo" >/dev/null 2>&1 &
+        $DUCKDB :memory: < "$fifo" >/dev/null 2>&1 &
     fi
     DUCK_PID=$!
 

@@ -5,7 +5,7 @@
 # DYLD_INSERT intercepts them. Cold slabs (items not accessed) get
 # compressed by Smash.
 #
-# Requires memcached in PATH. Skips gracefully if absent.
+# Requires memcached in PATH or built by cmake. Skips gracefully if absent.
 #
 # Usage:
 #   bash bench_memcached.sh [--quick]
@@ -17,6 +17,21 @@ set -euo pipefail
 # ── Paths (substituted by CMake configure_file) ─────────────────────────────
 BUILD_DIR="@CMAKE_BINARY_DIR@"
 SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+# Memcached and DuckDB paths - prefer built versions
+BENCH_DEPS_DIR="${BUILD_DIR}/bench/deps"
+if [[ -x "${BENCH_DEPS_DIR}/bin/memcached" ]]; then
+    MEMCACHED="${BENCH_DEPS_DIR}/bin/memcached"
+    echo "Using built memcached: ${MEMCACHED}"
+else
+    MEMCACHED="memcached"
+fi
+if [[ -x "${BENCH_DEPS_DIR}/bin/duckdb" ]]; then
+    DUCKDB="${BENCH_DEPS_DIR}/bin/duckdb"
+    echo "Using built DuckDB: ${DUCKDB}"
+else
+    DUCKDB="duckdb"
+fi
 
 # ── Platform detection ───────────────────────────────────────────────────────
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -52,8 +67,9 @@ HOT_KEYS=$((NUM_KEYS / 20))           # top 5%
 COLD_KEYS=$((NUM_KEYS / 10))
 
 # ── Check prerequisites ─────────────────────────────────────────────────────
-if ! command -v memcached &>/dev/null; then
-    echo "SKIP: memcached not found in PATH (brew install memcached)"
+if ! command -v "$MEMCACHED" &>/dev/null; then
+    echo "SKIP: memcached not found"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON && make bench_deps"
     exit 0
 fi
 
@@ -62,8 +78,9 @@ if ! command -v nc &>/dev/null; then
     exit 0
 fi
 
-if ! command -v duckdb &>/dev/null; then
-    echo "SKIP: duckdb not found in PATH (brew install duckdb) — needed for TPC-H data generation"
+if ! command -v "$DUCKDB" &>/dev/null; then
+    echo "SKIP: duckdb not found"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON && make bench_deps"
     exit 0
 fi
 
@@ -123,7 +140,7 @@ mc_send() {
 generate_corpus() {
     local corpus_file="$1"
     echo "  Generating TPC-H JSON corpus (sf=${TPCH_SF})..."
-    duckdb -c "
+    $DUCKDB -c "
 INSTALL tpch;
 LOAD tpch;
 CALL dbgen(sf=${TPCH_SF});
@@ -280,9 +297,9 @@ run_memcached_pass() {
     local mc_opts="-p $port -m 512 -t 1 -o no_lru_crawler,no_lru_maintainer"
 
     if [[ "$use_smash" == "yes" ]]; then
-        env "${PRELOAD_VAR}=${SMASH_LIB}" memcached $mc_opts &>/dev/null &
+        env "${PRELOAD_VAR}=${SMASH_LIB}" $MEMCACHED $mc_opts &>/dev/null &
     else
-        memcached $mc_opts &>/dev/null &
+        $MEMCACHED $mc_opts &>/dev/null &
     fi
     MC_PID=$!
     sleep 3

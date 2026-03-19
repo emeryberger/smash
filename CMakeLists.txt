@@ -172,10 +172,12 @@ if(APPLE)
   set_target_properties(smash_noopt PROPERTIES SUFFIX ".dylib")
 endif()
 
-# ── libsmash_compress_only: system malloc + Smash compression ────────────────
-# Interposes malloc/free but forwards to system allocator. Tracks pages and
-# runs the compression pipeline on system-allocated memory. Measures Smash
-# compression effectiveness without Smash's allocation design.
+# ── libsmash_compress_only: DEPRECATED - use libsmash with SMASH_MODE=compress_only
+# Kept for backwards compatibility. The main libsmash library now supports
+# compress-only mode at runtime: SMASH_MODE=compress_only LD_PRELOAD=libsmash.so
+#
+# This separate library can still be useful when you want a smaller binary
+# that doesn't include the full Smash allocator code.
 add_library(smash_compress_only SHARED
   src/compress_only/co_interpose_mac.cpp
   src/compress_only/co_interpose_linux.cpp

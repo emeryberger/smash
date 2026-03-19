@@ -31,7 +31,7 @@ add_executable(test_integration
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
 )
 target_include_directories(test_integration PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
-target_link_libraries(test_integration PRIVATE alloc8::headers lz4_static libzstd_static)
+target_link_libraries(test_integration PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
 if(APPLE)
   target_compile_options(test_integration PRIVATE -ftls-model=initial-exec)
 endif()
@@ -70,7 +70,7 @@ add_executable(test_contention
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
 )
 target_include_directories(test_contention PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
-target_link_libraries(test_contention PRIVATE alloc8::headers lz4_static libzstd_static)
+target_link_libraries(test_contention PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
 if(APPLE)
   target_compile_options(test_contention PRIVATE -ftls-model=initial-exec)
 endif()

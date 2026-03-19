@@ -84,9 +84,14 @@ This ensures we only operate on pages we actually manage.
 
 ## Compress-Only Mode
 
-For applications that use mmap for large allocations (like DuckDB), use `libsmash_compress_only.so`:
+For applications that use mmap for large allocations (like DuckDB) or have their own
+allocator (like Redis with jemalloc), use compress-only mode:
 
 ```bash
+# Unified library with runtime mode selection (recommended)
+SMASH_MODE=compress_only LD_PRELOAD=./libsmash.so duckdb ...
+
+# Or use the dedicated compress-only library (smaller binary)
 LD_PRELOAD=./libsmash_compress_only.so duckdb ...
 ```
 
@@ -99,6 +104,14 @@ This mode:
 Key difference from full Smash: compress-only works with ANY allocator since it tracks
 pages after allocation, not during. It's ideal for applications where you can't replace
 the allocator but still want compression benefits.
+
+### Unified Library (New)
+
+The main `libsmash.so` now supports both modes at runtime:
+- **Full mode** (default): `LD_PRELOAD=./libsmash.so myapp`
+- **Compress-only mode**: `SMASH_MODE=compress_only LD_PRELOAD=./libsmash.so myapp`
+
+This simplifies deployment - you only need one library file.
 
 ## Test Matrix
 

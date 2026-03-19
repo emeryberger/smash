@@ -82,6 +82,24 @@ ssize_t recv(int fd, void* buf, size_t count) {
 
 This ensures we only operate on pages we actually manage.
 
+## Compress-Only Mode
+
+For applications that use mmap for large allocations (like DuckDB), use `libsmash_compress_only.so`:
+
+```bash
+LD_PRELOAD=./libsmash_compress_only.so duckdb ...
+```
+
+This mode:
+- Interposes on malloc/mmap but forwards to the system allocator
+- Tracks pages allocated through malloc/mmap
+- Compresses cold pages using the same LZ4/zstd pipeline
+- Achieves ~80% RSS reduction on compressible data
+
+Key difference from full Smash: compress-only works with ANY allocator since it tracks
+pages after allocation, not during. It's ideal for applications where you can't replace
+the allocator but still want compression benefits.
+
 ## Test Matrix
 
 | App | System Malloc | Smash (no compress) | Smash (full) |
@@ -93,7 +111,7 @@ This ensures we only operate on pages we actually manage.
 | DuckDB | ✓ | ✓ | ✓ 0%** |
 
 *Redis low reduction due to built-in jemalloc
-**DuckDB uses mmap for buffer pool, not malloc - Smash cannot compress mmap'd memory
+**DuckDB uses mmap for buffer pool - use compress-only mode (libsmash_compress_only.so) instead
 
 ## Priority
 

@@ -4,338 +4,70 @@
       "name": "Default",
       "runs": [
         {
-          "fill_time_sec": 1.74,
-          "peak_rss_mb": 254.4,
-          "post_cool_rss_mb": 86.9,
-          "cool_reduction_pct": 65.9,
-          "steady_rss_mb": 131.5,
-          "min_rss_mb": 86.9,
-          "rss_reduction_pct": 65.9,
-          "ops_per_sec": 76323.0,
-          "hot_p50_us": 0.82,
-          "hot_p99_us": 67.6,
-          "cold_p50_us": 12.29,
-          "cold_p99_us": 77.3,
-          "post_reaccess_rss_mb": 219.4
-        }
-      ],
-      "median": {
-        "hot_p50_us": 0.82,
-        "cold_p99_us": 77.3,
-        "peak_rss_mb": 254.4,
-        "ops_per_sec": 76323.0,
-        "post_reaccess_rss_mb": 219.4,
-        "rss_reduction_pct": 65.9,
-        "fill_time_sec": 1.74,
-        "cool_reduction_pct": 65.9,
-        "hot_p99_us": 67.6,
-        "steady_rss_mb": 131.5,
-        "post_cool_rss_mb": 86.9,
-        "cold_p50_us": 12.29,
-        "min_rss_mb": 86.9
-      }
-    },
-    "B0": {
-      "name": "System malloc",
-      "runs": [
-        {
-          "fill_time_sec": 1.31,
-          "peak_rss_mb": 179.1,
-          "post_cool_rss_mb": 179.2,
-          "cool_reduction_pct": -0.0,
-          "steady_rss_mb": 238.7,
-          "min_rss_mb": 179.2,
-          "rss_reduction_pct": 24.9,
-          "ops_per_sec": 84703.0,
-          "hot_p50_us": 0.76,
-          "hot_p99_us": 61.22,
-          "cold_p50_us": 1.22,
-          "cold_p99_us": 1.96,
-          "post_reaccess_rss_mb": 238.7
-        }
-      ],
-      "median": {
-        "hot_p50_us": 0.76,
-        "cold_p99_us": 1.96,
-        "peak_rss_mb": 179.1,
-        "ops_per_sec": 84703.0,
-        "post_reaccess_rss_mb": 238.7,
-        "rss_reduction_pct": 24.9,
-        "fill_time_sec": 1.31,
-        "cool_reduction_pct": -0.0,
-        "hot_p99_us": 61.22,
-        "steady_rss_mb": 238.7,
-        "post_cool_rss_mb": 179.2,
-        "cold_p50_us": 1.22,
-        "min_rss_mb": 179.2
-      }
-    },
-    "DICT": {
-      "name": "With dicts",
-      "runs": [
-        {
-          "fill_time_sec": 1.76,
-          "peak_rss_mb": 254.4,
-          "post_cool_rss_mb": 88.2,
-          "cool_reduction_pct": 65.3,
-          "steady_rss_mb": 131.0,
-          "min_rss_mb": 88.2,
-          "rss_reduction_pct": 65.3,
-          "ops_per_sec": 77486.0,
-          "hot_p50_us": 0.81,
-          "hot_p99_us": 66.55,
-          "cold_p50_us": 12.36,
-          "cold_p99_us": 64.2,
-          "post_reaccess_rss_mb": 218.9
-        }
-      ],
-      "median": {
-        "hot_p50_us": 0.81,
-        "cold_p99_us": 64.2,
-        "peak_rss_mb": 254.4,
-        "ops_per_sec": 77486.0,
-        "post_reaccess_rss_mb": 218.9,
-        "rss_reduction_pct": 65.3,
-        "fill_time_sec": 1.76,
-        "cool_reduction_pct": 65.3,
-        "hot_p99_us": 66.55,
-        "steady_rss_mb": 131.0,
-        "post_cool_rss_mb": 88.2,
-        "cold_p50_us": 12.36,
-        "min_rss_mb": 88.2
-      }
-    },
-    "T1a": {
-      "name": "No arenas",
-      "runs": [
-        {
-          "fill_time_sec": 1.71,
-          "peak_rss_mb": 254.4,
-          "post_cool_rss_mb": 86.6,
-          "cool_reduction_pct": 65.9,
-          "steady_rss_mb": 130.1,
-          "min_rss_mb": 86.6,
-          "rss_reduction_pct": 65.9,
-          "ops_per_sec": 75664.0,
-          "hot_p50_us": 0.85,
-          "hot_p99_us": 68.92,
-          "cold_p50_us": 13.02,
-          "cold_p99_us": 90.43,
-          "post_reaccess_rss_mb": 218.5
-        }
-      ],
-      "median": {
-        "hot_p50_us": 0.85,
-        "cold_p99_us": 90.43,
-        "peak_rss_mb": 254.4,
-        "ops_per_sec": 75664.0,
-        "post_reaccess_rss_mb": 218.5,
-        "rss_reduction_pct": 65.9,
-        "fill_time_sec": 1.71,
-        "cool_reduction_pct": 65.9,
-        "hot_p99_us": 68.92,
-        "steady_rss_mb": 130.1,
-        "post_cool_rss_mb": 86.6,
-        "cold_p50_us": 13.02,
-        "min_rss_mb": 86.6
-      }
-    },
-    "T1c": {
-      "name": "LZ4 only",
-      "runs": [
-        {
-          "fill_time_sec": 1.74,
-          "peak_rss_mb": 254.4,
-          "post_cool_rss_mb": 86.7,
-          "cool_reduction_pct": 65.9,
-          "steady_rss_mb": 131.6,
-          "min_rss_mb": 86.7,
-          "rss_reduction_pct": 65.9,
-          "ops_per_sec": 77123.0,
-          "hot_p50_us": 0.81,
-          "hot_p99_us": 66.02,
-          "cold_p50_us": 12.09,
-          "cold_p99_us": 75.28,
-          "post_reaccess_rss_mb": 219.2
-        }
-      ],
-      "median": {
-        "hot_p50_us": 0.81,
-        "cold_p99_us": 75.28,
-        "peak_rss_mb": 254.4,
-        "ops_per_sec": 77123.0,
-        "post_reaccess_rss_mb": 219.2,
-        "rss_reduction_pct": 65.9,
-        "fill_time_sec": 1.74,
-        "cool_reduction_pct": 65.9,
-        "hot_p99_us": 66.02,
-        "steady_rss_mb": 131.6,
-        "post_cool_rss_mb": 86.7,
-        "cold_p50_us": 12.09,
-        "min_rss_mb": 86.7
-      }
-    },
-    "T2a": {
-      "name": "No zero-deferred",
-      "runs": [
-        {
-          "fill_time_sec": 1.75,
-          "peak_rss_mb": 254.4,
-          "post_cool_rss_mb": 86.9,
-          "cool_reduction_pct": 65.9,
-          "steady_rss_mb": 132.0,
-          "min_rss_mb": 86.9,
-          "rss_reduction_pct": 65.9,
-          "ops_per_sec": 77575.0,
-          "hot_p50_us": 0.82,
-          "hot_p99_us": 67.93,
-          "cold_p50_us": 12.42,
-          "cold_p99_us": 69.0,
-          "post_reaccess_rss_mb": 219.8
-        }
-      ],
-      "median": {
-        "hot_p50_us": 0.82,
-        "cold_p99_us": 69.0,
-        "peak_rss_mb": 254.4,
-        "ops_per_sec": 77575.0,
-        "post_reaccess_rss_mb": 219.8,
-        "rss_reduction_pct": 65.9,
-        "fill_time_sec": 1.75,
-        "cool_reduction_pct": 65.9,
-        "hot_p99_us": 67.93,
-        "steady_rss_mb": 132.0,
-        "post_cool_rss_mb": 86.9,
-        "cold_p50_us": 12.42,
-        "min_rss_mb": 86.9
-      }
-    },
-    "T1e": {
-      "name": "No prefetch",
-      "runs": [
-        {
-          "fill_time_sec": 1.76,
-          "peak_rss_mb": 254.4,
-          "post_cool_rss_mb": 86.5,
-          "cool_reduction_pct": 66.0,
-          "steady_rss_mb": 131.1,
-          "min_rss_mb": 86.5,
-          "rss_reduction_pct": 66.0,
-          "ops_per_sec": 76407.0,
-          "hot_p50_us": 0.83,
-          "hot_p99_us": 70.77,
-          "cold_p50_us": 25.45,
-          "cold_p99_us": 47.94,
-          "post_reaccess_rss_mb": 194.0
-        }
-      ],
-      "median": {
-        "hot_p50_us": 0.83,
-        "cold_p99_us": 47.94,
-        "peak_rss_mb": 254.4,
-        "ops_per_sec": 76407.0,
-        "post_reaccess_rss_mb": 194.0,
-        "rss_reduction_pct": 66.0,
-        "fill_time_sec": 1.76,
-        "cool_reduction_pct": 66.0,
-        "hot_p99_us": 70.77,
-        "steady_rss_mb": 131.1,
-        "post_cool_rss_mb": 86.5,
-        "cold_p50_us": 25.45,
-        "min_rss_mb": 86.5
-      }
-    },
-    "T1f": {
-      "name": "Single worker",
-      "runs": [
-        {
-          "fill_time_sec": 1.68,
+          "fill_time_sec": 1.73,
           "peak_rss_mb": 254.3,
-          "post_cool_rss_mb": 86.4,
+          "post_cool_rss_mb": 86.6,
           "cool_reduction_pct": 66.0,
-          "steady_rss_mb": 128.2,
-          "min_rss_mb": 86.4,
+          "steady_rss_mb": 132.2,
+          "min_rss_mb": 86.6,
           "rss_reduction_pct": 66.0,
-          "ops_per_sec": 76747.0,
-          "hot_p50_us": 0.83,
-          "hot_p99_us": 69.64,
-          "cold_p50_us": 13.25,
-          "cold_p99_us": 84.55,
-          "post_reaccess_rss_mb": 216.5
+          "ops_per_sec": 77348.0,
+          "hot_p50_us": 0.8,
+          "hot_p99_us": 65.87,
+          "cold_p50_us": 12.24,
+          "cold_p99_us": 73.3,
+          "post_reaccess_rss_mb": 218.2
         }
       ],
       "median": {
-        "hot_p50_us": 0.83,
-        "cold_p99_us": 84.55,
         "peak_rss_mb": 254.3,
-        "ops_per_sec": 76747.0,
-        "post_reaccess_rss_mb": 216.5,
         "rss_reduction_pct": 66.0,
-        "fill_time_sec": 1.68,
+        "post_reaccess_rss_mb": 218.2,
+        "hot_p50_us": 0.8,
+        "hot_p99_us": 65.87,
+        "steady_rss_mb": 132.2,
+        "post_cool_rss_mb": 86.6,
+        "fill_time_sec": 1.73,
+        "cold_p50_us": 12.24,
         "cool_reduction_pct": 66.0,
-        "hot_p99_us": 69.64,
-        "steady_rss_mb": 128.2,
-        "post_cool_rss_mb": 86.4,
-        "cold_p50_us": 13.25,
-        "min_rss_mb": 86.4
+        "ops_per_sec": 77348.0,
+        "min_rss_mb": 86.6,
+        "cold_p99_us": 73.3
       }
     },
-    "B2": {
-      "name": "No compression",
-      "runs": [
-        {
-          "fill_time_sec": 1.75,
-          "peak_rss_mb": 254.4,
-          "post_cool_rss_mb": 254.8,
-          "cool_reduction_pct": -0.2,
-          "steady_rss_mb": 322.1,
-          "min_rss_mb": 254.8,
-          "rss_reduction_pct": 20.9,
-          "ops_per_sec": 76883.0,
-          "hot_p50_us": 0.83,
-          "hot_p99_us": 65.92,
-          "cold_p50_us": 8.73,
-          "cold_p99_us": 51.97,
-          "post_reaccess_rss_mb": 322.4
-        }
-      ],
-      "median": {
-        "hot_p50_us": 0.83,
-        "cold_p99_us": 51.97,
-        "peak_rss_mb": 254.4,
-        "ops_per_sec": 76883.0,
-        "post_reaccess_rss_mb": 322.4,
-        "rss_reduction_pct": 20.9,
-        "fill_time_sec": 1.75,
-        "cool_reduction_pct": -0.2,
-        "hot_p99_us": 65.92,
-        "steady_rss_mb": 322.1,
-        "post_cool_rss_mb": 254.8,
-        "cold_p50_us": 8.73,
-        "min_rss_mb": 254.8
-      }
-    }
-  },
-  "duckdb": {
     "B0": {
       "name": "System malloc",
       "runs": [
         {
-          "peak_rss_mb": 203.51953125,
-          "cool_rss_mb": 203.51953125,
-          "steady_rss_mb": 206.375,
-          "min_rss_mb": 203.51953125,
-          "rss_reduction_pct": -1.4030440874455374,
-          "baseline_rss_mb": 173.34765625
+          "fill_time_sec": 1.32,
+          "peak_rss_mb": 179.1,
+          "post_cool_rss_mb": 179.1,
+          "cool_reduction_pct": -0.0,
+          "steady_rss_mb": 238.9,
+          "min_rss_mb": 179.1,
+          "rss_reduction_pct": 25.0,
+          "ops_per_sec": 85244.0,
+          "hot_p50_us": 0.73,
+          "hot_p99_us": 58.55,
+          "cold_p50_us": 1.21,
+          "cold_p99_us": 1.97,
+          "post_reaccess_rss_mb": 239.2
         }
       ],
       "median": {
-        "steady_rss_mb": 206.375,
-        "baseline_rss_mb": 173.34765625,
-        "peak_rss_mb": 203.51953125,
-        "min_rss_mb": 203.51953125,
-        "rss_reduction_pct": -1.4030440874455374,
-        "cool_rss_mb": 203.51953125
+        "peak_rss_mb": 179.1,
+        "rss_reduction_pct": 25.0,
+        "post_reaccess_rss_mb": 239.2,
+        "hot_p50_us": 0.73,
+        "hot_p99_us": 58.55,
+        "steady_rss_mb": 238.9,
+        "post_cool_rss_mb": 179.1,
+        "fill_time_sec": 1.32,
+        "cold_p50_us": 1.21,
+        "cool_reduction_pct": -0.0,
+        "ops_per_sec": 85244.0,
+        "min_rss_mb": 179.1,
+        "cold_p99_us": 1.97
       }
     }
   },
@@ -344,351 +76,233 @@
       "name": "Default",
       "runs": [
         {
-          "fill_sec": 0.84,
-          "peak_rss_mb": 307.2,
-          "cool_rss_mb": 66.2,
-          "serve_rss_mb": 75.7,
-          "min_rss_mb": 66.2,
-          "ops_per_sec": 472544.0,
-          "hot_p50_us": 1.59,
-          "hot_p99_us": 8.44,
-          "cold_sec": 0.165,
-          "cold_p50_us": 7.67,
-          "cold_p99_us": 14.13,
-          "cold_rss_mb": 77.3,
-          "rss_reduction_pct": 78.45052083333333,
-          "steady_rss_mb": 75.7,
-          "post_cool_rss_mb": 66.2
+          "fill_sec": 1.01,
+          "peak_rss_mb": 71.9,
+          "cool_rss_mb": 54.9,
+          "serve_rss_mb": 56.3,
+          "min_rss_mb": 54.9,
+          "ops_per_sec": 120414.0,
+          "hot_p50_us": 7.98,
+          "hot_p99_us": 11.86,
+          "cold_sec": 0.029,
+          "cold_p50_us": 0.65,
+          "cold_p99_us": 27.3,
+          "cold_rss_mb": 61.9,
+          "rss_reduction_pct": 23.643949930458973,
+          "steady_rss_mb": 56.3,
+          "post_cool_rss_mb": 54.9
         }
       ],
       "median": {
-        "peak_rss_mb": 307.2,
-        "cool_rss_mb": 66.2,
-        "hot_p50_us": 1.59,
-        "hot_p99_us": 8.44,
-        "rss_reduction_pct": 78.45052083333333,
-        "cold_sec": 0.165,
-        "steady_rss_mb": 75.7,
-        "fill_sec": 0.84,
-        "min_rss_mb": 66.2,
-        "cold_p99_us": 14.13,
-        "cold_p50_us": 7.67,
-        "cold_rss_mb": 77.3,
-        "serve_rss_mb": 75.7,
-        "ops_per_sec": 472544.0,
-        "post_cool_rss_mb": 66.2
+        "peak_rss_mb": 71.9,
+        "rss_reduction_pct": 23.643949930458973,
+        "hot_p50_us": 7.98,
+        "cool_rss_mb": 54.9,
+        "cold_sec": 0.029,
+        "hot_p99_us": 11.86,
+        "steady_rss_mb": 56.3,
+        "post_cool_rss_mb": 54.9,
+        "serve_rss_mb": 56.3,
+        "cold_p50_us": 0.65,
+        "ops_per_sec": 120414.0,
+        "cold_rss_mb": 61.9,
+        "min_rss_mb": 54.9,
+        "cold_p99_us": 27.3,
+        "fill_sec": 1.01
       }
     },
     "B0": {
       "name": "System malloc",
       "runs": [
         {
-          "fill_sec": 0.95,
-          "peak_rss_mb": 400.3,
-          "cool_rss_mb": 400.3,
-          "serve_rss_mb": 402.9,
-          "min_rss_mb": 400.3,
-          "ops_per_sec": 554812.0,
-          "hot_p50_us": 1.6,
-          "hot_p99_us": 3.02,
-          "cold_sec": 0.037,
-          "cold_p50_us": 1.53,
-          "cold_p99_us": 8.51,
-          "cold_rss_mb": 402.9,
-          "rss_reduction_pct": 0.0,
-          "steady_rss_mb": 402.9,
-          "post_cool_rss_mb": 400.3
-        }
-      ],
-      "median": {
-        "peak_rss_mb": 400.3,
-        "cool_rss_mb": 400.3,
-        "hot_p50_us": 1.6,
-        "hot_p99_us": 3.02,
-        "rss_reduction_pct": 0.0,
-        "cold_sec": 0.037,
-        "steady_rss_mb": 402.9,
-        "fill_sec": 0.95,
-        "min_rss_mb": 400.3,
-        "cold_p99_us": 8.51,
-        "cold_p50_us": 1.53,
-        "cold_rss_mb": 402.9,
-        "serve_rss_mb": 402.9,
-        "ops_per_sec": 554812.0,
-        "post_cool_rss_mb": 400.3
-      }
-    },
-    "DICT": {
-      "name": "With dicts",
-      "runs": [
-        {
-          "fill_sec": 0.78,
-          "peak_rss_mb": 306.8,
-          "cool_rss_mb": 69.0,
-          "serve_rss_mb": 79.0,
-          "min_rss_mb": 69.0,
-          "ops_per_sec": 574406.0,
-          "hot_p50_us": 1.52,
-          "hot_p99_us": 2.9,
-          "cold_sec": 0.173,
-          "cold_p50_us": 7.88,
-          "cold_p99_us": 15.69,
-          "cold_rss_mb": 80.8,
-          "rss_reduction_pct": 77.50977835723599,
-          "steady_rss_mb": 79.0,
-          "post_cool_rss_mb": 69.0
-        }
-      ],
-      "median": {
-        "peak_rss_mb": 306.8,
-        "cool_rss_mb": 69.0,
-        "hot_p50_us": 1.52,
-        "hot_p99_us": 2.9,
-        "rss_reduction_pct": 77.50977835723599,
-        "cold_sec": 0.173,
-        "steady_rss_mb": 79.0,
-        "fill_sec": 0.78,
-        "min_rss_mb": 69.0,
-        "cold_p99_us": 15.69,
-        "cold_p50_us": 7.88,
-        "cold_rss_mb": 80.8,
-        "serve_rss_mb": 79.0,
-        "ops_per_sec": 574406.0,
-        "post_cool_rss_mb": 69.0
-      }
-    },
-    "T1a": {
-      "name": "No arenas",
-      "runs": [
-        {
-          "fill_sec": 0.82,
-          "peak_rss_mb": 307.0,
-          "cool_rss_mb": 66.6,
-          "serve_rss_mb": 76.2,
-          "min_rss_mb": 66.6,
-          "ops_per_sec": 573163.0,
-          "hot_p50_us": 1.51,
-          "hot_p99_us": 3.17,
-          "cold_sec": 0.171,
-          "cold_p50_us": 7.77,
-          "cold_p99_us": 27.46,
-          "cold_rss_mb": 78.0,
-          "rss_reduction_pct": 78.30618892508143,
-          "steady_rss_mb": 76.2,
-          "post_cool_rss_mb": 66.6
-        }
-      ],
-      "median": {
-        "peak_rss_mb": 307.0,
-        "cool_rss_mb": 66.6,
-        "hot_p50_us": 1.51,
-        "hot_p99_us": 3.17,
-        "rss_reduction_pct": 78.30618892508143,
-        "cold_sec": 0.171,
-        "steady_rss_mb": 76.2,
-        "fill_sec": 0.82,
-        "min_rss_mb": 66.6,
-        "cold_p99_us": 27.46,
-        "cold_p50_us": 7.77,
-        "cold_rss_mb": 78.0,
-        "serve_rss_mb": 76.2,
-        "ops_per_sec": 573163.0,
-        "post_cool_rss_mb": 66.6
-      }
-    },
-    "T1c": {
-      "name": "LZ4 only",
-      "runs": [
-        {
-          "fill_sec": 0.92,
-          "peak_rss_mb": 309.0,
-          "cool_rss_mb": 67.9,
-          "serve_rss_mb": 71.7,
-          "min_rss_mb": 67.9,
-          "ops_per_sec": 118298.0,
-          "hot_p50_us": 7.93,
-          "hot_p99_us": 13.05,
-          "cold_sec": 0.166,
-          "cold_p50_us": 7.82,
-          "cold_p99_us": 12.58,
-          "cold_rss_mb": 72.7,
-          "rss_reduction_pct": 78.02588996763754,
-          "steady_rss_mb": 71.7,
-          "post_cool_rss_mb": 67.9
-        }
-      ],
-      "median": {
-        "peak_rss_mb": 309.0,
-        "cool_rss_mb": 67.9,
-        "hot_p50_us": 7.93,
-        "hot_p99_us": 13.05,
-        "rss_reduction_pct": 78.02588996763754,
-        "cold_sec": 0.166,
-        "steady_rss_mb": 71.7,
-        "fill_sec": 0.92,
-        "min_rss_mb": 67.9,
-        "cold_p99_us": 12.58,
-        "cold_p50_us": 7.82,
-        "cold_rss_mb": 72.7,
-        "serve_rss_mb": 71.7,
-        "ops_per_sec": 118298.0,
-        "post_cool_rss_mb": 67.9
-      }
-    },
-    "T2a": {
-      "name": "No zero-deferred",
-      "runs": [
-        {
-          "fill_sec": 0.76,
-          "peak_rss_mb": 306.7,
-          "cool_rss_mb": 67.5,
-          "serve_rss_mb": 77.4,
-          "min_rss_mb": 67.5,
-          "ops_per_sec": 581283.0,
+          "fill_sec": 2.15,
+          "peak_rss_mb": 295.1,
+          "cool_rss_mb": 295.1,
+          "serve_rss_mb": 297.9,
+          "min_rss_mb": 295.1,
+          "ops_per_sec": 591698.0,
           "hot_p50_us": 1.5,
-          "hot_p99_us": 3.01,
-          "cold_sec": 0.171,
-          "cold_p50_us": 7.86,
-          "cold_p99_us": 15.49,
-          "cold_rss_mb": 79.2,
-          "rss_reduction_pct": 77.99152266058037,
-          "steady_rss_mb": 77.4,
-          "post_cool_rss_mb": 67.5
-        }
-      ],
-      "median": {
-        "peak_rss_mb": 306.7,
-        "cool_rss_mb": 67.5,
-        "hot_p50_us": 1.5,
-        "hot_p99_us": 3.01,
-        "rss_reduction_pct": 77.99152266058037,
-        "cold_sec": 0.171,
-        "steady_rss_mb": 77.4,
-        "fill_sec": 0.76,
-        "min_rss_mb": 67.5,
-        "cold_p99_us": 15.49,
-        "cold_p50_us": 7.86,
-        "cold_rss_mb": 79.2,
-        "serve_rss_mb": 77.4,
-        "ops_per_sec": 581283.0,
-        "post_cool_rss_mb": 67.5
-      }
-    },
-    "T1e": {
-      "name": "No prefetch",
-      "runs": [
-        {
-          "fill_sec": 0.82,
-          "peak_rss_mb": 307.1,
-          "cool_rss_mb": 66.4,
-          "serve_rss_mb": 74.4,
-          "min_rss_mb": 66.4,
-          "ops_per_sec": 518903.0,
-          "hot_p50_us": 1.53,
-          "hot_p99_us": 8.44,
-          "cold_sec": 0.164,
-          "cold_p50_us": 7.56,
-          "cold_p99_us": 16.62,
-          "cold_rss_mb": 75.4,
-          "rss_reduction_pct": 78.37837837837837,
-          "steady_rss_mb": 74.4,
-          "post_cool_rss_mb": 66.4
-        }
-      ],
-      "median": {
-        "peak_rss_mb": 307.1,
-        "cool_rss_mb": 66.4,
-        "hot_p50_us": 1.53,
-        "hot_p99_us": 8.44,
-        "rss_reduction_pct": 78.37837837837837,
-        "cold_sec": 0.164,
-        "steady_rss_mb": 74.4,
-        "fill_sec": 0.82,
-        "min_rss_mb": 66.4,
-        "cold_p99_us": 16.62,
-        "cold_p50_us": 7.56,
-        "cold_rss_mb": 75.4,
-        "serve_rss_mb": 74.4,
-        "ops_per_sec": 518903.0,
-        "post_cool_rss_mb": 66.4
-      }
-    },
-    "T1f": {
-      "name": "Single worker",
-      "runs": [
-        {
-          "fill_sec": 0.92,
-          "peak_rss_mb": 309.0,
-          "cool_rss_mb": 67.9,
-          "serve_rss_mb": 70.6,
-          "min_rss_mb": 67.9,
-          "ops_per_sec": 122503.0,
-          "hot_p50_us": 7.79,
-          "hot_p99_us": 12.03,
-          "cold_sec": 0.164,
-          "cold_p50_us": 7.66,
-          "cold_p99_us": 16.83,
-          "cold_rss_mb": 71.9,
-          "rss_reduction_pct": 78.02588996763754,
-          "steady_rss_mb": 70.6,
-          "post_cool_rss_mb": 67.9
-        }
-      ],
-      "median": {
-        "peak_rss_mb": 309.0,
-        "cool_rss_mb": 67.9,
-        "hot_p50_us": 7.79,
-        "hot_p99_us": 12.03,
-        "rss_reduction_pct": 78.02588996763754,
-        "cold_sec": 0.164,
-        "steady_rss_mb": 70.6,
-        "fill_sec": 0.92,
-        "min_rss_mb": 67.9,
-        "cold_p99_us": 16.83,
-        "cold_p50_us": 7.66,
-        "cold_rss_mb": 71.9,
-        "serve_rss_mb": 70.6,
-        "ops_per_sec": 122503.0,
-        "post_cool_rss_mb": 67.9
-      }
-    },
-    "B2": {
-      "name": "No compression",
-      "runs": [
-        {
-          "fill_sec": 0.76,
-          "peak_rss_mb": 306.8,
-          "cool_rss_mb": 306.8,
-          "serve_rss_mb": 309.7,
-          "min_rss_mb": 306.8,
-          "ops_per_sec": 588837.0,
-          "hot_p50_us": 1.49,
-          "hot_p99_us": 3.06,
-          "cold_sec": 0.158,
-          "cold_p50_us": 7.59,
-          "cold_p99_us": 11.63,
-          "cold_rss_mb": 309.8,
+          "hot_p99_us": 2.58,
+          "cold_sec": 0.035,
+          "cold_p50_us": 1.44,
+          "cold_p99_us": 8.92,
+          "cold_rss_mb": 297.9,
           "rss_reduction_pct": 0.0,
-          "steady_rss_mb": 309.7,
-          "post_cool_rss_mb": 306.8
+          "steady_rss_mb": 297.9,
+          "post_cool_rss_mb": 295.1
         }
       ],
       "median": {
-        "peak_rss_mb": 306.8,
-        "cool_rss_mb": 306.8,
-        "hot_p50_us": 1.49,
-        "hot_p99_us": 3.06,
+        "peak_rss_mb": 295.1,
         "rss_reduction_pct": 0.0,
-        "cold_sec": 0.158,
-        "steady_rss_mb": 309.7,
-        "fill_sec": 0.76,
-        "min_rss_mb": 306.8,
-        "cold_p99_us": 11.63,
-        "cold_p50_us": 7.59,
-        "cold_rss_mb": 309.8,
-        "serve_rss_mb": 309.7,
-        "ops_per_sec": 588837.0,
-        "post_cool_rss_mb": 306.8
+        "hot_p50_us": 1.5,
+        "cool_rss_mb": 295.1,
+        "cold_sec": 0.035,
+        "hot_p99_us": 2.58,
+        "steady_rss_mb": 297.9,
+        "post_cool_rss_mb": 295.1,
+        "serve_rss_mb": 297.9,
+        "cold_p50_us": 1.44,
+        "ops_per_sec": 591698.0,
+        "cold_rss_mb": 297.9,
+        "min_rss_mb": 295.1,
+        "cold_p99_us": 8.92,
+        "fill_sec": 2.15
+      }
+    }
+  },
+  "memcached": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 64.671875,
+          "cool_rss_mb": 38.125,
+          "steady_rss_mb": 0.0,
+          "min_rss_mb": 0.0,
+          "rss_reduction_pct": 100.0
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 64.671875,
+        "rss_reduction_pct": 100.0,
+        "cool_rss_mb": 38.125,
+        "steady_rss_mb": 0.0,
+        "min_rss_mb": 0.0
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 32.21484375,
+          "cool_rss_mb": 32.72265625,
+          "steady_rss_mb": 32.72265625,
+          "min_rss_mb": 32.21484375,
+          "rss_reduction_pct": -1.5763307869528287
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 32.21484375,
+        "rss_reduction_pct": -1.5763307869528287,
+        "cool_rss_mb": 32.72265625,
+        "steady_rss_mb": 32.72265625,
+        "min_rss_mb": 32.21484375
+      }
+    }
+  },
+  "redis": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 86.5859375,
+          "steady_rss_mb": 48.19921875,
+          "min_rss_mb": 47.9375,
+          "rss_reduction_pct": 44.63592890011729,
+          "set_rps": 58004.64,
+          "get_rps": 51759.83
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.5859375,
+        "rss_reduction_pct": 44.63592890011729,
+        "steady_rss_mb": 48.19921875,
+        "set_rps": 58004.64,
+        "get_rps": 51759.83,
+        "min_rss_mb": 47.9375
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 55.3828125,
+          "steady_rss_mb": 55.3671875,
+          "min_rss_mb": 55.3671875,
+          "rss_reduction_pct": 0.028212723938492168,
+          "set_rps": 58411.21,
+          "get_rps": 56116.72
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 55.3828125,
+        "rss_reduction_pct": 0.028212723938492168,
+        "steady_rss_mb": 55.3671875,
+        "set_rps": 58411.21,
+        "get_rps": 56116.72,
+        "min_rss_mb": 55.3671875
+      }
+    }
+  },
+  "redis_ext": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 86.51171875,
+          "post_del_rss_mb": 86.4921875,
+          "steady_rss_mb": 47.625,
+          "min_rss_mb": 47.58984375,
+          "rss_reduction_pct": 44.93722337638877,
+          "set_rps": 57803.47,
+          "get_rps": 51921.08
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.51171875,
+        "rss_reduction_pct": 44.93722337638877,
+        "steady_rss_mb": 47.625,
+        "set_rps": 57803.47,
+        "post_del_rss_mb": 86.4921875,
+        "get_rps": 51921.08,
+        "min_rss_mb": 47.58984375
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 55.44921875,
+          "post_del_rss_mb": 55.359375,
+          "steady_rss_mb": 55.359375,
+          "min_rss_mb": 55.359375,
+          "rss_reduction_pct": 0.0,
+          "set_rps": 54347.82,
+          "get_rps": 58139.54
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 55.44921875,
+        "rss_reduction_pct": 0.0,
+        "steady_rss_mb": 55.359375,
+        "set_rps": 54347.82,
+        "post_del_rss_mb": 55.359375,
+        "get_rps": 58139.54,
+        "min_rss_mb": 55.359375
+      }
+    }
+  },
+  "duckdb": {
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 333.8046875,
+          "cool_rss_mb": 333.71484375,
+          "steady_rss_mb": 336.4453125,
+          "min_rss_mb": 333.71484375,
+          "rss_reduction_pct": -0.7910688791630482,
+          "baseline_rss_mb": 334.67578125
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 333.8046875,
+        "rss_reduction_pct": -0.7910688791630482,
+        "cool_rss_mb": 333.71484375,
+        "baseline_rss_mb": 334.67578125,
+        "steady_rss_mb": 336.4453125,
+        "min_rss_mb": 333.71484375
       }
     }
   }

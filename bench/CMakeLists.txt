@@ -436,12 +436,41 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/bin/redis-benchmark
   )
 
+  # ── libevent (required by memcached) ────────────────────────────────────────
+  find_path(LIBEVENT_INCLUDE event.h HINTS /usr/include /usr/local/include ${BENCH_DEPS_DIR}/include)
+  find_library(LIBEVENT_LIB event HINTS /usr/lib /usr/lib64 /usr/local/lib ${BENCH_DEPS_DIR}/lib)
+  if(NOT LIBEVENT_INCLUDE OR NOT LIBEVENT_LIB)
+    # Build libevent from source
+    ExternalProject_Add(libevent_build
+      GIT_REPOSITORY https://github.com/libevent/libevent.git
+      GIT_TAG release-2.1.12-stable
+      GIT_SHALLOW TRUE
+      PREFIX ${BENCH_DEPS_DIR}/libevent
+      CMAKE_ARGS
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+        -DEVENT__DISABLE_TESTS=ON
+        -DEVENT__DISABLE_SAMPLES=ON
+        -DEVENT__DISABLE_BENCHMARK=ON
+      BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j4
+      INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+      BUILD_BYPRODUCTS
+        ${BENCH_DEPS_DIR}/lib/libevent.a
+        ${BENCH_DEPS_DIR}/include/event.h
+    )
+    set(LIBEVENT_INCLUDE ${BENCH_DEPS_DIR}/include)
+    set(LIBEVENT_LIB ${BENCH_DEPS_DIR}/lib)
+    set(LIBEVENT_BUILT TRUE)
+    message(STATUS "Will build libevent from source")
+  else()
+    set(LIBEVENT_BUILT FALSE)
+    message(STATUS "libevent found: ${LIBEVENT_LIB}")
+  endif()
+
   # ── Memcached (built with system malloc) ───────────────────────────────────
   # Memcached uses its own slab allocator on top of malloc, so system malloc works
-  # Requires: autoconf, libevent-devel
   find_program(AUTORECONF autoreconf)
-  find_path(LIBEVENT_INCLUDE event.h HINTS /usr/include /usr/local/include)
-  if(AUTORECONF AND LIBEVENT_INCLUDE)
+  if(AUTORECONF)
     ExternalProject_Add(memcached_build
       GIT_REPOSITORY https://github.com/memcached/memcached.git
       GIT_TAG 1.6.34
@@ -450,17 +479,21 @@ if(SMASH_BUILD_BENCH_DEPS)
       CONFIGURE_COMMAND
         cd <SOURCE_DIR> && ./autogen.sh &&
         <SOURCE_DIR>/configure --prefix=${BENCH_DEPS_DIR}
+          --with-libevent=${BENCH_DEPS_DIR}
+          CFLAGS=-I${LIBEVENT_INCLUDE}
+          LDFLAGS=-L${LIBEVENT_LIB}
       BUILD_IN_SOURCE TRUE
       BUILD_COMMAND make -j4
       INSTALL_COMMAND
         ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/memcached ${BENCH_DEPS_DIR}/bin/memcached
       BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/memcached
     )
+    if(LIBEVENT_BUILT)
+      add_dependencies(memcached_build libevent_build)
+    endif()
     message(STATUS "Will build memcached from source")
-  elseif(NOT AUTORECONF)
-    message(STATUS "autoreconf not found - skipping memcached build (install autoconf)")
   else()
-    message(STATUS "libevent-devel not found - skipping memcached build (install libevent-devel)")
+    message(STATUS "autoreconf not found - skipping memcached build (install autoconf)")
   endif()
 
   # ── DuckDB (CLI with system malloc) ────────────────────────────────────────
@@ -516,12 +549,16 @@ if(SMASH_BUILD_BENCH_DEPS)
   # Create a convenience target
   add_custom_target(bench_deps)
   add_dependencies(bench_deps redis_build duckdb_build rocksdb_build)
+  if(TARGET libevent_build)
+    add_dependencies(bench_deps libevent_build)
+  endif()
   if(TARGET memcached_build)
     add_dependencies(bench_deps memcached_build)
   endif()
 
   message(STATUS "External benchmark dependencies will be built in: ${BENCH_DEPS_DIR}")
   message(STATUS "  Redis (libc malloc): ${BENCH_DEPS_DIR}/bin/redis-server-libc")
+  message(STATUS "  Memcached: ${BENCH_DEPS_DIR}/bin/memcached")
   message(STATUS "  DuckDB: ${BENCH_DEPS_DIR}/bin/duckdb")
   message(STATUS "  RocksDB: ${BENCH_DEPS_DIR}/lib/librocksdb.a")
 

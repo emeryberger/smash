@@ -420,7 +420,7 @@ if(SMASH_BUILD_BENCH_DEPS)
   # ── Redis (built with libc malloc instead of jemalloc) ─────────────────────
   ExternalProject_Add(redis_build
     GIT_REPOSITORY https://github.com/redis/redis.git
-    GIT_TAG 7.2.4
+    GIT_TAG 8.0.2
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/redis
     CONFIGURE_COMMAND ""
@@ -444,7 +444,7 @@ if(SMASH_BUILD_BENCH_DEPS)
   if(AUTORECONF AND LIBEVENT_INCLUDE)
     ExternalProject_Add(memcached_build
       GIT_REPOSITORY https://github.com/memcached/memcached.git
-      GIT_TAG 1.6.23
+      GIT_TAG 1.6.34
       GIT_SHALLOW TRUE
       PREFIX ${BENCH_DEPS_DIR}/memcached
       CONFIGURE_COMMAND
@@ -466,7 +466,7 @@ if(SMASH_BUILD_BENCH_DEPS)
   # ── DuckDB (CLI with system malloc) ────────────────────────────────────────
   ExternalProject_Add(duckdb_build
     GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-    GIT_TAG v1.0.0
+    GIT_TAG v1.2.0
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/duckdb
     CMAKE_ARGS
@@ -485,7 +485,7 @@ if(SMASH_BUILD_BENCH_DEPS)
   # ── RocksDB (static library for benchmarks) ────────────────────────────────
   ExternalProject_Add(rocksdb_build
     GIT_REPOSITORY https://github.com/facebook/rocksdb.git
-    GIT_TAG v9.0.0
+    GIT_TAG v9.8.4
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/rocksdb
     CMAKE_ARGS

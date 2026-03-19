@@ -31,6 +31,10 @@ page size; Linux's \texttt{madvise} immediately releases
 physical pages (versus macOS's lazy free), so RSS drops appear
 more promptly after data goes~cold.
 
+Benchmark applications: Redis~8.0.2 (built with libc malloc),
+memcached~1.6.34, DuckDB~1.2.0, RocksDB~9.8.4, SQLite~3.51.0.
+Compression libraries: LZ4~1.9.4, zstd~1.5.6.
+
 \subsection{Application Benchmarks (RQ1)}
 \label{sec:eval:apps}
 
@@ -208,7 +212,7 @@ Mesh                     & 194  & $-$1\% & 1.94 \\
 
 The root cause is that the fragmentation Mesh exploited no longer
 occurs.  The original experiment used Redis~4.0.2 with
-jemalloc~3.6.0; we use Redis~8.6.1 with jemalloc~5.3.0.  Modern
+jemalloc~3.6.0; we use Redis~8.0.2 with jemalloc~5.3.0.  Modern
 jemalloc handles size-class transitions (240\,B $\to$ 492\,B) with
 far less fragmentation, and Redis itself has improved its internal
 memory management over five major versions.  The result is that LRU

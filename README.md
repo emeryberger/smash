@@ -61,10 +61,10 @@ make bench_deps   # Builds Redis, memcached, DuckDB, RocksDB from source
 ```
 
 **Note**: Building DuckDB from source takes significant time (10-20 minutes). The `bench_deps` target builds:
-- Redis with `MALLOC=libc` (instead of jemalloc)
-- memcached (uses system malloc by default)
-- DuckDB CLI
-- RocksDB static library
+- Redis 8.0.2 with `MALLOC=libc` (instead of jemalloc)
+- memcached 1.6.34 (requires libevent-devel)
+- DuckDB 1.2.0 CLI
+- RocksDB 9.8.4 static library
 
 ## Usage
 

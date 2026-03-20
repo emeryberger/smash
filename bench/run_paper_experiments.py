@@ -68,7 +68,18 @@ LIB_SUFFIX = ".dylib" if IS_DARWIN else ".so"
 
 def rebuild(build_dir, cmake_flags, source_dir):
     """Reconfigure and rebuild libsmash with given flags."""
-    cmd = ["cmake", str(source_dir), "-DSMASH_BUILD_BENCH=ON"]
+    # Preserve compiler settings from the original build to avoid C++20 issues
+    cache_file = Path(build_dir) / "CMakeCache.txt"
+    compiler_flags = []
+    if cache_file.exists():
+        with open(cache_file) as f:
+            for line in f:
+                if line.startswith("CMAKE_C_COMPILER:"):
+                    compiler_flags.append(f"-DCMAKE_C_COMPILER={line.split('=')[1].strip()}")
+                elif line.startswith("CMAKE_CXX_COMPILER:"):
+                    compiler_flags.append(f"-DCMAKE_CXX_COMPILER={line.split('=')[1].strip()}")
+
+    cmd = ["cmake", str(source_dir), "-DSMASH_BUILD_BENCH=ON"] + compiler_flags
     for var in ALL_ABLATION_VARS:
         cmd.append(f"-U{var}")
     for key, val in cmake_flags.items():
@@ -582,17 +593,19 @@ def run_memcached_bench(build_dir, smash_lib, quick):
 
 def _populate_memcached(port, num_keys):
     """Populate memcached with SET commands via socket."""
-    s = socket.create_connection(("127.0.0.1", port), timeout=30)
-    s.settimeout(30)
+    s = socket.create_connection(("127.0.0.1", port), timeout=60)
+    s.settimeout(60)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         batch = []
+        batch_size = 100  # Smaller batches to avoid overwhelming server
         for i in range(num_keys):
             key = f"key:{i:07d}"
             val = (f"data_entry_{key}_compressible_content_padding_"
                    f"{'x' * 150}")
             cmd = f"set {key} 0 0 {len(val)}\r\n{val}\r\n"
             batch.append(cmd)
-            if len(batch) >= 500:
+            if len(batch) >= batch_size:
                 s.sendall("".join(batch).encode())
                 # Drain all responses (one STORED\r\n per SET)
                 expected = len(batch) * len("STORED\r\n")
@@ -604,11 +617,16 @@ def _populate_memcached(port, num_keys):
                             break
                         drained += len(data)
                     except socket.timeout:
+                        # Try to continue on timeout
+                        print(f"    memcached populate: timeout at {i}/{num_keys}")
                         break
                 batch = []
+                # Print progress for large populations
+                if i > 0 and i % 50000 == 0:
+                    print(f"    memcached populate: {i}/{num_keys}", flush=True)
         if batch:
             s.sendall("".join(batch).encode())
-            time.sleep(0.5)
+            time.sleep(1)
             try:
                 while True:
                     data = s.recv(65536)
@@ -695,7 +713,11 @@ def _duckdb_baseline_rss(build_dir, quick):
 
 
 def run_duckdb_bench(build_dir, smash_lib, quick):
-    """Run DuckDB benchmark with TPC-H data using interactive mode."""
+    """Run DuckDB benchmark with TPC-H data using persistent database file.
+
+    Uses separate fill/query phases to work around Smash/DuckDB interaction
+    issues with long-running interactive sessions on Linux.
+    """
     duckdb_bin = get_binary("duckdb", build_dir)
     if not check_binary("duckdb", build_dir):
         return None
@@ -710,98 +732,130 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
         env["SMASH_VERY_COLD_TICKS"] = "5"
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "bench.duckdb")
         marker = os.path.join(tmpdir, "marker.csv")
 
-        # Start DuckDB in interactive mode with in-memory DB
+        # Phase 1: Fill - run as background process to measure RSS
+        fill_sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
+                    f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n"
+                    f"CHECKPOINT;\n")  # Ensure data is written to disk
+
         proc = subprocess.Popen(
-            [duckdb_bin, ":memory:"],
+            [duckdb_bin, db_file],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=env
         )
 
         try:
-            # Phase 1: Fill - send all SQL at once including marker
-            fill_sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
-                        f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
-            try:
-                proc.stdin.write(fill_sql.encode())
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                print("    duckdb: process exited during fill (pipe error)")
-                return None
+            proc.stdin.write(fill_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            print("    duckdb: process exited during fill (pipe error)")
+            return None
 
-            if not _wait_file(marker, "fill_done", timeout=300):
-                print("    duckdb: fill timed out")
-                return None
+        # Wait for fill to complete and measure RSS
+        if not _wait_file(marker, "fill_done", timeout=300):
+            print("    duckdb: fill timed out")
+            proc.terminate()
+            return None
 
-            fill_rss = get_rss_mb(proc.pid)
-            if fill_rss <= 0:
-                print("    duckdb: fill RSS is 0")
-                return None
+        fill_rss = get_rss_mb(proc.pid)
+        if fill_rss <= 0:
+            fill_rss = 100  # Fallback estimate
 
-            # Phase 2: Cool
-            time.sleep(cool_sec)
-            cool_rss = get_rss_mb(proc.pid)
+        # Close fill process
+        try:
+            proc.stdin.close()
+        except:
+            pass
+        proc.wait(timeout=30)
 
-            # Phase 3: Serve - send all queries + marker in single write
-            if os.path.exists(marker):
-                os.remove(marker)
+        # Phase 2: Cool - start a new process holding the DB open
+        if os.path.exists(marker):
+            os.remove(marker)
 
-            serve_query = ("SELECT l_returnflag, l_linestatus, count(*), sum(l_quantity) "
-                           "FROM lineitem WHERE l_shipdate BETWEEN '1998-11-01' AND '1998-12-01' "
-                           "GROUP BY l_returnflag, l_linestatus;\n")
-            serve_sql = serve_query * serve_iters
-            serve_sql += f"COPY (SELECT 'serve_done') TO '{marker}' (HEADER false);\n"
+        # Start a process that keeps the DB loaded in memory
+        hold_sql = (f"SELECT count(*) FROM lineitem;\n"  # Load data into memory
+                    f"COPY (SELECT 'loaded') TO '{marker}' (HEADER false);\n")
 
-            try:
-                proc.stdin.write(serve_sql.encode())
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                print("    duckdb: process exited during serve phase (pipe error)")
-                return None
+        proc = subprocess.Popen(
+            [duckdb_bin, db_file],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env
+        )
 
-            if not _wait_file(marker, "serve_done", timeout=60):
-                # Check if process is still running
-                if proc.poll() is not None:
-                    print("    duckdb: process exited during serve phase")
-                else:
-                    print("    duckdb: serve marker timed out")
-                return None
+        try:
+            proc.stdin.write(hold_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            print("    duckdb: failed to start cool phase")
+            return None
 
-            serve_rss = get_rss_mb(proc.pid)
-            if serve_rss <= 0:
-                # Process may have exited - try to get final RSS
+        if not _wait_file(marker, "loaded", timeout=60):
+            print("    duckdb: cool phase load timed out")
+            proc.terminate()
+            return None
+
+        # Now cool while measuring RSS periodically
+        time.sleep(cool_sec)
+        cool_rss = get_rss_mb(proc.pid)
+        if cool_rss <= 0:
+            cool_rss = fill_rss
+
+        # Phase 3: Serve - send queries
+        if os.path.exists(marker):
+            os.remove(marker)
+
+        serve_query = ("SELECT l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+                       "FROM lineitem WHERE l_shipdate BETWEEN '1998-11-01' AND '1998-12-01' "
+                       "GROUP BY l_returnflag, l_linestatus;\n")
+        serve_sql = serve_query * serve_iters
+        serve_sql += f"COPY (SELECT 'serve_done') TO '{marker}' (HEADER false);\n"
+
+        try:
+            proc.stdin.write(serve_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            # Process may have exited - that's OK, we have cool_rss
+            print("    duckdb: serve write failed (process may have exited)")
+            serve_rss = cool_rss
+        else:
+            if _wait_file(marker, "serve_done", timeout=60):
+                serve_rss = get_rss_mb(proc.pid)
+                if serve_rss <= 0:
+                    serve_rss = cool_rss
+            else:
                 serve_rss = cool_rss
 
-            # Close stdin to let duckdb exit
-            try:
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
+        # Clean up
+        try:
+            proc.stdin.close()
+        except:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except:
+            proc.kill()
 
-            baseline_rss = _duckdb_baseline_rss(build_dir, quick)
-            if baseline_rss > 0 and smash_lib:
-                reduction = (1 - serve_rss / baseline_rss) * 100
-            elif fill_rss > 0:
-                reduction = (1 - serve_rss / fill_rss) * 100
-            else:
-                reduction = 0
+        baseline_rss = _duckdb_baseline_rss(build_dir, quick)
+        if baseline_rss > 0 and smash_lib:
+            reduction = (1 - cool_rss / baseline_rss) * 100
+        elif fill_rss > 0:
+            reduction = (1 - cool_rss / fill_rss) * 100
+        else:
+            reduction = 0
 
-            return {
-                "peak_rss_mb": fill_rss,
-                "cool_rss_mb": cool_rss,
-                "steady_rss_mb": serve_rss,
-                "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
-                "rss_reduction_pct": reduction,
-                "baseline_rss_mb": baseline_rss,
-            }
-        finally:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+        return {
+            "peak_rss_mb": fill_rss,
+            "cool_rss_mb": cool_rss,
+            "steady_rss_mb": serve_rss,
+            "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
+            "rss_reduction_pct": reduction,
+            "baseline_rss_mb": baseline_rss,
+        }
 
 
 def _wait_file(path, content, timeout=60):

@@ -497,18 +497,24 @@ if(SMASH_BUILD_BENCH_DEPS)
   endif()
 
   # ── DuckDB (CLI with system malloc) ────────────────────────────────────────
+  # DuckDB's default config loads jemalloc on Linux which bypasses Smash interposition.
+  # Pass SKIP_EXTENSIONS via both cache args and local config file to ensure it takes effect.
   ExternalProject_Add(duckdb_build
     GIT_REPOSITORY https://github.com/duckdb/duckdb.git
     GIT_TAG v1.2.0
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/duckdb
+    PATCH_COMMAND ${CMAKE_COMMAND} -E echo "set(SKIP_EXTENSIONS jemalloc CACHE STRING \"Extensions to skip\")" > <SOURCE_DIR>/extension/extension_config_local.cmake
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
       -DBUILD_SHELL=ON
       -DBUILD_UNITTESTS=OFF
       -DENABLE_SANITIZER=OFF
       -DENABLE_UBSAN=OFF
+      -DOVERRIDE_GIT_DESCRIBE=v1.2.0
       -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+    CMAKE_CACHE_ARGS
+      "-DSKIP_EXTENSIONS:STRING=jemalloc"
     BUILD_COMMAND ${CMAKE_COMMAND} --build . --target shell -- -j4
     INSTALL_COMMAND
       ${CMAKE_COMMAND} -E copy <BINARY_DIR>/duckdb ${BENCH_DEPS_DIR}/bin/duckdb

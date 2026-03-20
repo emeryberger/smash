@@ -1,0 +1,98 @@
+# Smash version script for Linux
+# Extends alloc8's version script with syscall wrapper symbols
+
+GLIBC_2.2.5 {
+  global:
+    # Core allocation functions (from alloc8)
+    malloc;
+    free;
+    calloc;
+    realloc;
+    memalign;
+    posix_memalign;
+    aligned_alloc;
+    free_sized;
+    free_aligned_sized;
+    malloc_usable_size;
+    strdup;
+    strndup;
+    valloc;
+    pvalloc;
+    reallocarray;
+    cfree;
+    mallopt;
+    malloc_trim;
+    malloc_stats;
+    mallinfo;
+    __libc_malloc;
+    __libc_free;
+    __libc_calloc;
+    __libc_realloc;
+    __libc_memalign;
+
+    # C++ operators
+    _Znwm;
+    _Znam;
+    _ZdlPv;
+    _ZdaPv;
+    _ZnwmRKSt9nothrow_t;
+    _ZnamRKSt9nothrow_t;
+    _ZdlPvRKSt9nothrow_t;
+    _ZdaPvRKSt9nothrow_t;
+    _ZdlPvm;
+    _ZdaPvm;
+    _ZnwmSt11align_val_t;
+    _ZnamSt11align_val_t;
+    _ZdlPvSt11align_val_t;
+    _ZdaPvSt11align_val_t;
+    _ZdlPvmSt11align_val_t;
+    _ZdaPvmSt11align_val_t;
+
+    # xxmalloc interface
+    xxmalloc;
+    xxfree;
+    xxfree_sized;
+    xxfree_aligned_sized;
+    xxrealloc;
+    xxcalloc;
+    xxmemalign;
+    xxmalloc_usable_size;
+    xxmalloc_lock;
+    xxmalloc_unlock;
+
+    # Thread lifecycle hooks
+    pthread_create;
+    pthread_exit;
+    xxthread_init;
+    xxthread_cleanup;
+    xxthread_created_flag;
+
+    # Smash syscall wrappers for kernel buffer access
+    read;
+    write;
+    pread;
+    pwrite;
+    readv;
+    writev;
+    recv;
+    send;
+    recvfrom;
+    sendto;
+    recvmsg;
+    sendmsg;
+    epoll_wait;
+    epoll_pwait;
+
+  local:
+    *;
+};
+
+# libevent requests epoll_wait@GLIBC_2.3.2
+# Aliases epoll_wait_232/epoll_pwait_232 provide these versioned symbols
+GLIBC_2.3.2 {
+  global:
+    epoll_wait;
+    epoll_pwait;
+    epoll_wait_232;
+    epoll_pwait_232;
+} GLIBC_2.2.5;

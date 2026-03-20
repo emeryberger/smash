@@ -289,6 +289,45 @@ extern "C" int smash_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     return ret;
 }
 
+// ── epoll_wait ───────────────────────────────────────────────────────────────
+
+#include <sys/epoll.h>
+
+using epoll_wait_fn = int(*)(int, struct epoll_event*, int, int);
+
+extern "C" int smash_epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout);
+SMASH_INTERPOSE(smash_epoll_wait, epoll_wait);
+extern "C" int smash_epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
+    auto* vm = smash::g_smash_vm_region;
+    size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
+    if (vm && events && maxevents > 0) {
+        smash::vm::pinPages(events, size, vm);
+        smash::vm::warmPages(events, size, vm);
+    }
+    int ret = reinterpret_cast<epoll_wait_fn>(smash_interpose_smash_epoll_wait.original)(epfd, events, maxevents, timeout);
+    if (vm && events && maxevents > 0)
+        smash::vm::unpinPages(events, size, vm);
+    return ret;
+}
+
+// Also handle epoll_pwait which some programs use
+using epoll_pwait_fn = int(*)(int, struct epoll_event*, int, int, const sigset_t*);
+
+extern "C" int smash_epoll_pwait(int epfd, struct epoll_event* events, int maxevents, int timeout, const sigset_t* sigmask);
+SMASH_INTERPOSE(smash_epoll_pwait, epoll_pwait);
+extern "C" int smash_epoll_pwait(int epfd, struct epoll_event* events, int maxevents, int timeout, const sigset_t* sigmask) {
+    auto* vm = smash::g_smash_vm_region;
+    size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
+    if (vm && events && maxevents > 0) {
+        smash::vm::pinPages(events, size, vm);
+        smash::vm::warmPages(events, size, vm);
+    }
+    int ret = reinterpret_cast<epoll_pwait_fn>(smash_interpose_smash_epoll_pwait.original)(epfd, events, maxevents, timeout, sigmask);
+    if (vm && events && maxevents > 0)
+        smash::vm::unpinPages(events, size, vm);
+    return ret;
+}
+
 // ── read / write ────────────────────────────────────────────────────────────
 
 using read_fn = ssize_t(*)(int, void*, size_t);

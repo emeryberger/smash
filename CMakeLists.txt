@@ -45,6 +45,12 @@ endif()
 # ── Pull in alloc8 ────────────────────────────────────────────────────────────
 # Look for alloc8 as a sibling directory, or allow override via ALLOC8_DIR
 set(ALLOC8_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../alloc8" CACHE PATH "Path to alloc8 source")
+
+# On Linux, use Smash's version script (extends alloc8's with syscall wrappers)
+# Must be set BEFORE add_subdirectory(alloc8) so alloc8 uses this path
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(ALLOC8_VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map" CACHE INTERNAL "Version script" FORCE)
+endif()
 if(NOT EXISTS "${ALLOC8_DIR}/CMakeLists.txt")
   message(FATAL_ERROR "alloc8 not found at ${ALLOC8_DIR}. Set ALLOC8_DIR to the alloc8 source directory.")
 endif()
@@ -103,12 +109,31 @@ add_library(smash SHARED
   ${_SMASH_COMMON_SOURCES}
 )
 
+# Linux syscall wrappers need default visibility for LD_PRELOAD interposition.
+# The global -fvisibility=hidden flag hides them otherwise.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set_source_files_properties(src/linux_syscall_wrappers.cpp PROPERTIES
+    COMPILE_FLAGS "-fvisibility=default -fno-lto"
+  )
+endif()
+
 target_include_directories(smash PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_libraries(smash PRIVATE alloc8::interpose lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
+# On Linux, link against alloc8 components manually instead of alloc8::interpose
+# to avoid the INTERFACE version script and use Smash's instead (includes syscall wrappers)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(smash PRIVATE alloc8::headers pthread dl)
+  target_link_options(smash PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map"
+    "-Bsymbolic"
+  )
+else()
+  target_link_libraries(smash PRIVATE alloc8::interpose)
+endif()
+target_link_libraries(smash PRIVATE lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash PROPERTIES
   OUTPUT_NAME "smash"

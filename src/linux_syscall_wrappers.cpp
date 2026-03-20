@@ -73,10 +73,12 @@ static inline void warmIovecLinux(const struct iovec* iov, int iovcnt, smash::Vm
     }
 }
 
-#pragma GCC visibility push(default)
+// Use explicit visibility attribute - pragma doesn't work with -fvisibility=hidden
+#define SMASH_VISIBLE __attribute__((visibility("default")))
+
 extern "C" {
 
-ssize_t read(int fd, void* buf, size_t count) {
+SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, read);
     if (!real_read) return syscall(SYS_read, fd, buf, count);
@@ -88,7 +90,7 @@ ssize_t read(int fd, void* buf, size_t count) {
     return ret;
 }
 
-ssize_t write(int fd, const void* buf, size_t count) {
+SMASH_VISIBLE ssize_t write(int fd, const void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, const void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, write);
     if (!real_write) return syscall(SYS_write, fd, buf, count);
@@ -100,7 +102,7 @@ ssize_t write(int fd, const void* buf, size_t count) {
     return ret;
 }
 
-ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
+SMASH_VISIBLE ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
     using fn_t = ssize_t(*)(int, void*, size_t, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pread);
     if (!real_pread) return syscall(SYS_pread64, fd, buf, count, offset);
@@ -112,7 +114,7 @@ ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
     return ret;
 }
 
-ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
+SMASH_VISIBLE ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
     using fn_t = ssize_t(*)(int, const void*, size_t, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pwrite);
     if (!real_pwrite) return syscall(SYS_pwrite64, fd, buf, count, offset);
@@ -124,7 +126,7 @@ ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
     return ret;
 }
 
-ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
+SMASH_VISIBLE ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, readv);
     if (!real_readv) return syscall(SYS_readv, fd, iov, iovcnt);
@@ -136,7 +138,7 @@ ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
     return ret;
 }
 
-ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
+SMASH_VISIBLE ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, writev);
     if (!real_writev) return syscall(SYS_writev, fd, iov, iovcnt);
@@ -148,7 +150,7 @@ ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
     return ret;
 }
 
-ssize_t recv(int s, void* buf, size_t len, int flags) {
+SMASH_VISIBLE ssize_t recv(int s, void* buf, size_t len, int flags) {
     using fn_t = ssize_t(*)(int, void*, size_t, int);
     SMASH_LAZY_RESOLVE(fn_t, recv);
     if (!real_recv) return syscall(SYS_recvfrom, s, buf, len, flags, nullptr, nullptr);
@@ -160,7 +162,7 @@ ssize_t recv(int s, void* buf, size_t len, int flags) {
     return ret;
 }
 
-ssize_t send(int s, const void* buf, size_t len, int flags) {
+SMASH_VISIBLE ssize_t send(int s, const void* buf, size_t len, int flags) {
     using fn_t = ssize_t(*)(int, const void*, size_t, int);
     SMASH_LAZY_RESOLVE(fn_t, send);
     if (!real_send) return syscall(SYS_sendto, s, buf, len, flags, nullptr, 0);
@@ -172,7 +174,7 @@ ssize_t send(int s, const void* buf, size_t len, int flags) {
     return ret;
 }
 
-ssize_t recvfrom(int s, void* buf, size_t len, int flags,
+SMASH_VISIBLE ssize_t recvfrom(int s, void* buf, size_t len, int flags,
                  struct sockaddr* from, socklen_t* fromlen) {
     using fn_t = ssize_t(*)(int, void*, size_t, int, struct sockaddr*, socklen_t*);
     SMASH_LAZY_RESOLVE(fn_t, recvfrom);
@@ -185,7 +187,7 @@ ssize_t recvfrom(int s, void* buf, size_t len, int flags,
     return ret;
 }
 
-ssize_t sendto(int s, const void* buf, size_t len, int flags,
+SMASH_VISIBLE ssize_t sendto(int s, const void* buf, size_t len, int flags,
                const struct sockaddr* to, socklen_t tolen) {
     using fn_t = ssize_t(*)(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
     SMASH_LAZY_RESOLVE(fn_t, sendto);
@@ -198,7 +200,7 @@ ssize_t sendto(int s, const void* buf, size_t len, int flags,
     return ret;
 }
 
-ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
+SMASH_VISIBLE ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
     using fn_t = ssize_t(*)(int, struct msghdr*, int);
     SMASH_LAZY_RESOLVE(fn_t, recvmsg);
     if (!real_recvmsg) return syscall(SYS_recvmsg, s, msg, flags);
@@ -214,7 +216,7 @@ ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
     return ret;
 }
 
-ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
+SMASH_VISIBLE ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
     using fn_t = ssize_t(*)(int, const struct msghdr*, int);
     SMASH_LAZY_RESOLVE(fn_t, sendmsg);
     if (!real_sendmsg) return syscall(SYS_sendmsg, s, msg, flags);
@@ -232,15 +234,54 @@ ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
 
 // Note: poll() is NOT intercepted because:
 // 1. pollfd arrays are typically small and stack-allocated
-// 2. Intercepting poll/epoll causes issues with libevent-based apps
+// 2. The kernel returns EFAULT if it can't access the buffer
 
-// Note: epoll_wait/epoll_pwait are NOT intercepted because:
-// 1. Event buffers are typically small and stack-allocated or in libevent's mmap'd memory
-// 2. They are not allocated through malloc, so not Smash-managed
-// 3. Intercepting them causes issues with libevent-based apps (memcached, redis)
-// The kernel will return EFAULT if it can't access the buffer, which is handled by the app.
+// epoll_wait/epoll_pwait - libevent allocates event buffers via malloc,
+// so they ARE Smash-managed and need warming before kernel access.
+// NOTE: Some apps (libevent) may mmap their own buffers, so we warm
+// unconditionally if events is non-null to avoid EFAULT from kernel.
+SMASH_VISIBLE int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
+    using fn_t = int(*)(int, struct epoll_event*, int, int);
+    SMASH_LAZY_RESOLVE(fn_t, epoll_wait);
+    if (!real_epoll_wait) return syscall(SYS_epoll_wait, epfd, events, maxevents, timeout);
+    auto* vm = smash::g_smash_vm_region;
+    size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
+    bool in_heap = bufferInHeap(events, size, vm);
+    if (in_heap) { smash::vm::warmPages(events, size, vm); smash::vm::pinPages(events, size, vm); }
+    int ret = real_epoll_wait(epfd, events, maxevents, timeout);
+    if (in_heap) smash::vm::unpinPages(events, size, vm);
+    return ret;
+}
+
+SMASH_VISIBLE int epoll_pwait(int epfd, struct epoll_event* events, int maxevents, int timeout, const sigset_t* sigmask) {
+    using fn_t = int(*)(int, struct epoll_event*, int, int, const sigset_t*);
+    SMASH_LAZY_RESOLVE(fn_t, epoll_pwait);
+    if (!real_epoll_pwait) return syscall(SYS_epoll_pwait, epfd, events, maxevents, timeout, sigmask);
+    auto* vm = smash::g_smash_vm_region;
+    size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
+    bool in_heap = bufferInHeap(events, size, vm);
+    if (in_heap) { smash::vm::warmPages(events, size, vm); smash::vm::pinPages(events, size, vm); }
+    int ret = real_epoll_pwait(epfd, events, maxevents, timeout, sigmask);
+    if (in_heap) smash::vm::unpinPages(events, size, vm);
+    return ret;
+}
+
+// Versioned symbol aliases for epoll_wait/epoll_pwait
+// libevent requests epoll_wait@GLIBC_2.3.2, glibc uses 2.2.5 internally
+// We export both versions pointing to the same implementation
+SMASH_VISIBLE int epoll_wait_232(int epfd, struct epoll_event* events, int maxevents, int timeout) {
+    // Forward to the main implementation
+    return epoll_wait(epfd, events, maxevents, timeout);
+}
+
+SMASH_VISIBLE int epoll_pwait_232(int epfd, struct epoll_event* events, int maxevents, int timeout, const sigset_t* sigmask) {
+    return epoll_pwait(epfd, events, maxevents, timeout, sigmask);
+}
 
 } // extern "C"
-#pragma GCC visibility pop
+
+// Create version aliases: epoll_wait_232 -> epoll_wait@GLIBC_2.3.2
+__asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
+__asm__(".symver epoll_pwait_232,epoll_pwait@GLIBC_2.3.2");
 
 #endif // __linux__

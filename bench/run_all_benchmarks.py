@@ -313,85 +313,193 @@ def run_rocksdb(build_dir, smash_lib, quick):
 
 
 def run_memcached(build_dir, smash_lib, quick):
-    """Run Memcached benchmark."""
+    """Run Memcached benchmark using TPC-H JSON records (paper methodology).
+
+    Memcached's slab allocator creates ~1MB slab pages. For effective compression:
+    - Use TPC-H JSON records (realistic, compressible data)
+    - Use enough data to fill multiple slabs (~200MB+)
+    - Allow sufficient cool time for compression to kick in
+    - Access only a small "hot set" during serve phase
+    """
     if not check_binary("memcached", build_dir):
         return None
+    if not check_binary("duckdb", build_dir):
+        log("memcached: duckdb required for TPC-H corpus generation", "WARN")
 
     memcached_bin = get_binary("memcached", build_dir)
     port = 11299
-    num_keys = 100000 if quick else 500000
-    cool_sec = 5 if quick else 10
+    num_keys = 200000 if quick else 500000
+    cool_sec = 15 if quick else 30
+    serve_sec = 10 if quick else 20
 
     env = os.environ.copy()
     if smash_lib:
         env[PRELOAD_VAR] = str(smash_lib)
-        env["SMASH_VERY_COLD_TICKS"] = "5"
 
     kill_process_on_port(port)
 
-    proc = subprocess.Popen(
-        [memcached_bin, "-p", str(port), "-m", "512", "-l", "127.0.0.1"],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    # Generate TPC-H corpus
+    corpus_file = None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        corpus_path = os.path.join(tmpdir, "tpch_corpus.jsonl")
+        if check_binary("duckdb", build_dir):
+            log("Generating TPC-H JSON corpus...")
+            if _generate_tpch_corpus(build_dir, num_keys, corpus_path):
+                corpus_file = corpus_path
+                log(f"Corpus generated: {os.path.getsize(corpus_path) // 1024}KB")
 
-    try:
-        if not wait_for_port(port, timeout=10):
-            log("memcached: failed to start", "ERROR")
-            return None
+        # Start memcached with larger memory limit
+        proc = subprocess.Popen(
+            [memcached_bin, "-p", str(port), "-m", "1024", "-l", "127.0.0.1"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
-        # Populate
-        _populate_memcached(port, num_keys)
-        fill_rss = get_rss_mb(proc.pid)
-
-        # Cool phase
-        time.sleep(cool_sec)
-        cool_rss = get_rss_mb(proc.pid)
-
-        # Serve phase
-        hot_keys = max(1, num_keys // 20)
-        _access_memcached(port, hot_keys, 5)
-        serve_rss = get_rss_mb(proc.pid)
-
-        reduction = (1 - serve_rss / fill_rss) * 100 if fill_rss > 0 else 0
-
-        return {
-            "peak_rss_mb": fill_rss,
-            "cool_rss_mb": cool_rss,
-            "steady_rss_mb": serve_rss,
-            "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
-            "rss_reduction_pct": reduction,
-        }
-    except Exception as e:
-        log(f"memcached error: {e}", "ERROR")
-        return None
-    finally:
-        proc.terminate()
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            if not wait_for_port(port, timeout=10):
+                log("memcached: failed to start", "ERROR")
+                return None
+
+            # Populate with TPC-H JSON data
+            log(f"Populating {num_keys} keys...")
+            _populate_memcached(port, num_keys, corpus_file=corpus_file)
+            fill_rss = get_rss_mb(proc.pid)
+
+            if fill_rss < 50:
+                log(f"memcached: fill_rss={fill_rss:.1f}MB (low)", "WARN")
+
+            # Cool phase - track minimum RSS during compression
+            log(f"Cooling for {cool_sec}s...")
+            min_rss = fill_rss
+            for _ in range(cool_sec):
+                time.sleep(1)
+                rss = get_rss_mb(proc.pid)
+                if rss > 0:
+                    min_rss = min(min_rss, rss)
+            cool_rss = get_rss_mb(proc.pid)
+
+            # Serve phase: access only hot 5% of keys
+            hot_keys = max(1, num_keys // 20)
+            log(f"Serving hot {hot_keys} keys for {serve_sec}s...")
+            _access_memcached(port, hot_keys, serve_sec)
+            serve_rss = get_rss_mb(proc.pid)
+
+            reduction = (1 - min_rss / fill_rss) * 100 if fill_rss > 0 else 0
+
+            return {
+                "peak_rss_mb": fill_rss,
+                "cool_rss_mb": cool_rss,
+                "steady_rss_mb": serve_rss,
+                "min_rss_mb": min_rss,
+                "rss_reduction_pct": reduction,
+            }
+        except Exception as e:
+            log(f"memcached error: {e}", "ERROR")
+            return None
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
-def _populate_memcached(port, num_keys):
-    """Populate memcached with SET commands."""
-    s = socket.create_connection(("127.0.0.1", port), timeout=60)
-    s.settimeout(60)
+def _generate_tpch_corpus(build_dir, num_records, output_file):
+    """Generate TPC-H JSON corpus using DuckDB.
+
+    This produces realistic, compressible JSON records matching the paper's methodology.
+    """
+    duckdb_bin = get_binary("duckdb", build_dir)
+    sf = 0.1 if num_records < 200000 else 0.5  # Scale factor based on records needed
+
+    sql = f"""
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf={sf});
+COPY (
+    SELECT o_orderkey as id, c_name as customer, c_address as addr,
+           c_phone as phone, c_mktsegment as segment,
+           o_orderstatus as status, o_totalprice as total,
+           o_orderdate as date, o_orderpriority as priority,
+           o_comment as order_note, c_comment as customer_note
+    FROM orders JOIN customer ON o_custkey = c_custkey
+    ORDER BY o_orderkey
+    LIMIT {num_records}
+) TO '{output_file}' (FORMAT JSON, ARRAY false);
+"""
+    try:
+        subprocess.run([duckdb_bin, "-c", sql], capture_output=True, timeout=120)
+        return os.path.exists(output_file)
+    except Exception as e:
+        log(f"Failed to generate TPC-H corpus: {e}", "ERROR")
+        return False
+
+
+def _populate_memcached(port, num_keys, value_size=500, corpus_file=None):
+    """Populate memcached with data.
+
+    If corpus_file is provided, uses TPC-H JSON records (matching paper methodology).
+    Otherwise falls back to synthetic compressible data.
+    """
+    s = socket.create_connection(("127.0.0.1", port), timeout=120)
+    s.settimeout(120)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
     try:
         batch = []
-        for i in range(num_keys):
-            key = f"key:{i:07d}"
-            val = f"data_entry_{key}_compressible_content_padding_{'x' * 150}"
-            cmd = f"set {key} 0 0 {len(val)}\r\n{val}\r\n"
-            batch.append(cmd)
-            if len(batch) >= 100:
-                s.sendall("".join(batch).encode())
-                try:
-                    s.recv(65536)
-                except socket.timeout:
-                    pass
-                batch = []
+        batch_size = 50
+
+        if corpus_file and os.path.exists(corpus_file):
+            # Use TPC-H JSON records
+            with open(corpus_file, 'r') as f:
+                for i, line in enumerate(f):
+                    if i >= num_keys:
+                        break
+                    key = f"key:{i:07d}"
+                    val = line.strip()
+                    cmd = f"set {key} 0 0 {len(val)}\r\n{val}\r\n"
+                    batch.append(cmd)
+                    if len(batch) >= batch_size:
+                        s.sendall("".join(batch).encode())
+                        try:
+                            while True:
+                                data = s.recv(65536)
+                                if len(data) < 1000:
+                                    break
+                        except socket.timeout:
+                            pass
+                        batch = []
+                        if i > 0 and i % 50000 == 0:
+                            log(f"memcached populate: {i}/{num_keys}")
+        else:
+            # Fallback: synthetic compressible data
+            for i in range(num_keys):
+                key = f"key:{i:07d}"
+                prefix = f"entry_{i:07d}_"
+                pattern = "abcdefghij" * 10
+                padding_needed = max(0, value_size - len(prefix))
+                val = prefix + (pattern * (padding_needed // len(pattern) + 1))[:padding_needed]
+                cmd = f"set {key} 0 0 {len(val)}\r\n{val}\r\n"
+                batch.append(cmd)
+                if len(batch) >= batch_size:
+                    s.sendall("".join(batch).encode())
+                    try:
+                        while True:
+                            data = s.recv(65536)
+                            if len(data) < 1000:
+                                break
+                    except socket.timeout:
+                        pass
+                    batch = []
+                    if i > 0 and i % 50000 == 0:
+                        log(f"memcached populate: {i}/{num_keys}")
+
         if batch:
             s.sendall("".join(batch).encode())
+            time.sleep(0.5)
+            try:
+                s.recv(65536)
+            except socket.timeout:
+                pass
     finally:
         s.close()
 

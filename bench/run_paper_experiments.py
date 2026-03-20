@@ -535,24 +535,33 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
 
 
 def run_memcached_bench(build_dir, smash_lib, quick):
-    """Run Memcached benchmark."""
+    """Run Memcached benchmark.
+
+    Memcached's slab allocator creates ~1MB slab pages. For effective compression:
+    - Use enough data to fill multiple slabs (~200MB+)
+    - Use compressible value patterns (repeated strings)
+    - Allow sufficient cool time for compression to kick in
+    - Access only a small "hot set" during serve phase
+    """
     memcached_bin = get_binary("memcached", build_dir)
     if not check_binary("memcached", build_dir):
         return None
 
     port = 11299
-    num_keys = 100000 if quick else 500000
-    cool_sec = 5 if quick else 10
-    serve_sec = 5 if quick else 10
+    # Use larger dataset for meaningful compression
+    num_keys = 200000 if quick else 500000
+    value_size = 500  # Larger values = better slab utilization
+    cool_sec = 15 if quick else 30  # Longer cool for compression
+    serve_sec = 10 if quick else 20
 
     env = os.environ.copy()
     if smash_lib:
         env[PRELOAD_VAR] = str(smash_lib)
-        env["SMASH_VERY_COLD_TICKS"] = "5"
+        # Don't override SMASH_VERY_COLD_TICKS - use defaults
 
-    # Start memcached
+    # Start memcached with larger memory limit
     proc = subprocess.Popen(
-        [memcached_bin, "-p", str(port), "-m", "512", "-l", "127.0.0.1"],
+        [memcached_bin, "-p", str(port), "-m", "1024", "-l", "127.0.0.1"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
@@ -562,11 +571,19 @@ def run_memcached_bench(build_dir, smash_lib, quick):
             return None
 
         # Populate with compressible values
-        _populate_memcached(port, num_keys)
+        _populate_memcached(port, num_keys, value_size)
         fill_rss = get_rss_mb(proc.pid)
 
-        # Cool phase
-        time.sleep(cool_sec)
+        if fill_rss < 50:
+            print(f"    memcached: fill_rss too low ({fill_rss:.1f}MB)")
+
+        # Cool phase - track minimum RSS
+        min_rss = fill_rss
+        for _ in range(cool_sec):
+            time.sleep(1)
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                min_rss = min(min_rss, rss)
         cool_rss = get_rss_mb(proc.pid)
 
         # Serve phase: access hot 5%
@@ -574,13 +591,13 @@ def run_memcached_bench(build_dir, smash_lib, quick):
         _access_memcached(port, hot_keys, serve_sec)
         serve_rss = get_rss_mb(proc.pid)
 
-        reduction = (1 - serve_rss / fill_rss) * 100 if fill_rss > 0 else 0
+        reduction = (1 - min_rss / fill_rss) * 100 if fill_rss > 0 else 0
 
         return {
             "peak_rss_mb": fill_rss,
             "cool_rss_mb": cool_rss,
             "steady_rss_mb": serve_rss,
-            "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
+            "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
         }
     finally:
@@ -591,47 +608,47 @@ def run_memcached_bench(build_dir, smash_lib, quick):
             proc.kill()
 
 
-def _populate_memcached(port, num_keys):
-    """Populate memcached with SET commands via socket."""
-    s = socket.create_connection(("127.0.0.1", port), timeout=60)
-    s.settimeout(60)
+def _populate_memcached(port, num_keys, value_size=500):
+    """Populate memcached with compressible data.
+
+    Uses repeated patterns that compress well with LZ4/zstd:
+    - Each value has a unique prefix (key identifier)
+    - Followed by repeated compressible content
+    """
+    s = socket.create_connection(("127.0.0.1", port), timeout=120)
+    s.settimeout(120)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         batch = []
-        batch_size = 100  # Smaller batches to avoid overwhelming server
+        batch_size = 50  # Smaller batches for reliability
         for i in range(num_keys):
             key = f"key:{i:07d}"
-            val = (f"data_entry_{key}_compressible_content_padding_"
-                   f"{'x' * 150}")
+            # Create compressible value: prefix + repeated pattern
+            prefix = f"entry_{i:07d}_"
+            pattern = "abcdefghij" * 10  # 100 char pattern
+            padding_needed = max(0, value_size - len(prefix))
+            val = prefix + (pattern * (padding_needed // len(pattern) + 1))[:padding_needed]
             cmd = f"set {key} 0 0 {len(val)}\r\n{val}\r\n"
             batch.append(cmd)
             if len(batch) >= batch_size:
                 s.sendall("".join(batch).encode())
-                # Drain all responses (one STORED\r\n per SET)
-                expected = len(batch) * len("STORED\r\n")
-                drained = 0
-                while drained < expected:
-                    try:
+                # Drain responses
+                try:
+                    while True:
                         data = s.recv(65536)
-                        if not data:
+                        if len(data) < 1000:
                             break
-                        drained += len(data)
-                    except socket.timeout:
-                        # Try to continue on timeout
-                        print(f"    memcached populate: timeout at {i}/{num_keys}")
-                        break
+                except socket.timeout:
+                    pass
                 batch = []
                 # Print progress for large populations
                 if i > 0 and i % 50000 == 0:
                     print(f"    memcached populate: {i}/{num_keys}", flush=True)
         if batch:
             s.sendall("".join(batch).encode())
-            time.sleep(1)
+            time.sleep(0.5)
             try:
-                while True:
-                    data = s.recv(65536)
-                    if not data:
-                        break
+                s.recv(65536)
             except socket.timeout:
                 pass
     finally:

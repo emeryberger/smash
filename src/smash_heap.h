@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <dlfcn.h>
 
 namespace smash {
 
@@ -33,6 +34,32 @@ inline ThreadCache*& currentThreadCache() {
     static thread_local ThreadCache* cache = nullptr;
     return cache;
 }
+
+// ── System malloc/free pointers for compress-only mode ──────────────────────
+// Resolved early before any malloc interposition is active.
+using MallocFn = void*(*)(size_t);
+using FreeFn = void(*)(void*);
+using CallocFn = void*(*)(size_t, size_t);
+using ReallocFn = void*(*)(void*, size_t);
+using MemalignFn = int(*)(void**, size_t, size_t);
+
+struct SystemAllocFns {
+    MallocFn malloc = nullptr;
+    FreeFn free = nullptr;
+    CallocFn calloc = nullptr;
+    ReallocFn realloc = nullptr;
+    MemalignFn posix_memalign = nullptr;
+
+    void resolve() {
+        malloc = reinterpret_cast<MallocFn>(dlsym(RTLD_NEXT, "malloc"));
+        free = reinterpret_cast<FreeFn>(dlsym(RTLD_NEXT, "free"));
+        calloc = reinterpret_cast<CallocFn>(dlsym(RTLD_NEXT, "calloc"));
+        realloc = reinterpret_cast<ReallocFn>(dlsym(RTLD_NEXT, "realloc"));
+        posix_memalign = reinterpret_cast<MemalignFn>(dlsym(RTLD_NEXT, "posix_memalign"));
+    }
+};
+
+extern SystemAllocFns g_system_alloc;
 
 class SmashHeap {
     Slab slabs_[kNumArenas * kNumClasses];  // flat 2D: arena * kNumClasses + sc
@@ -74,6 +101,7 @@ class SmashHeap {
 
     bool compression_inited_ = false;
     std::atomic<bool> compression_started_{false};
+    std::atomic<int> warmup_count_{0};
 
     // Fault callback: decompress on access to compressed/monitored pages
     static bool faultCallback(uintptr_t fault_addr, void* ctx) {
@@ -95,9 +123,35 @@ class SmashHeap {
         compressor_.start();
     }
 
+    // Track allocation in compress-only mode
+    void trackAllocation(void* ptr, size_t size) {
+        if (!ptr || size == 0 || !compression_inited_) return;
+        uintptr_t start_page = reinterpret_cast<uintptr_t>(ptr) & ~(kPageSize - 1);
+        uintptr_t end_page = (reinterpret_cast<uintptr_t>(ptr) + size - 1) & ~(kPageSize - 1);
+
+        for (uintptr_t p = start_page; p <= end_page; p += kPageSize) {
+            size_t idx = vm_region_.trackPage(p);
+            if (idx > 0) {
+                PageState st = page_states_.get(idx);
+                if (st == PageState::EMPTY)
+                    page_states_.set(idx, PageState::ACTIVE);
+            }
+        }
+
+        // Start compression after warmup
+        if (!compression_started_.load(std::memory_order_relaxed)) {
+            if (warmup_count_.fetch_add(1, std::memory_order_relaxed) >= 5000)
+                startCompression();
+        }
+    }
+
 public:
     SmashHeap() {
-        page_map_.init();
+        bool compress_only = isCompressOnlyMode();
+
+        if (!compress_only) {
+            page_map_.init();
+        }
 
         // Try to init VmRegion for compression support
         bool vm_ok = vm_region_.init(kVmRegionSize);
@@ -109,20 +163,22 @@ public:
             compress_engine_.init();
             compressor_.init(&vm_region_, &page_states_, &page_locks_,
                              &compress_store_, &compress_engine_,
-                             &page_map_, &fault_handler_);
+                             compress_only ? nullptr : &page_map_, &fault_handler_);
 
-            for (int a = 0; a < kNumArenas; ++a)
-                for (int i = 0; i < kNumClasses; ++i)
-                    slabs_[a * kNumClasses + i].init(
-                        static_cast<uint8_t>(i), &page_map_,
-                        &vm_region_, &page_states_,
-                        releaseHook, this,
-                        static_cast<uint8_t>(a));
+            if (!compress_only) {
+                for (int a = 0; a < kNumArenas; ++a)
+                    for (int i = 0; i < kNumClasses; ++i)
+                        slabs_[a * kNumClasses + i].init(
+                            static_cast<uint8_t>(i), &page_map_,
+                            &vm_region_, &page_states_,
+                            releaseHook, this,
+                            static_cast<uint8_t>(a));
+            }
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
             vm::g_page_pins = bootstrapArray<std::atomic<uint8_t>>(
                 vm_region_.totalPages());
-        } else {
+        } else if (!compress_only) {
             // Fallback: Phase 1 mode (no compression)
             for (int a = 0; a < kNumArenas; ++a)
                 for (int i = 0; i < kNumClasses; ++i)
@@ -132,11 +188,13 @@ public:
                         static_cast<uint8_t>(a));
         }
 
-        if (compression_inited_) {
-            large_alloc_.init(&page_map_, &vm_region_, &page_states_,
-                              releaseHook, this);
-        } else {
-            large_alloc_.init(&page_map_);
+        if (!compress_only) {
+            if (compression_inited_) {
+                large_alloc_.init(&page_map_, &vm_region_, &page_states_,
+                                  releaseHook, this);
+            } else {
+                large_alloc_.init(&page_map_);
+            }
         }
     }
 
@@ -147,6 +205,14 @@ public:
     }
 
     void* malloc(size_t size) {
+        if (isCompressOnlyMode()) {
+            // During early init, g_system_alloc may not be resolved yet
+            if (!g_system_alloc.malloc) return nullptr;
+            void* ptr = g_system_alloc.malloc(size);
+            trackAllocation(ptr, size);
+            return ptr;
+        }
+
         if (size == 0) size = 1;
         uint8_t sc = sizeToClass(size);
         if (sc < kNumClasses) {
@@ -161,6 +227,12 @@ public:
     void free(void* ptr) {
         if (!ptr) return;
         if (BootstrapAlloc::instance().owns(ptr)) return;
+
+        if (isCompressOnlyMode()) {
+            if (g_system_alloc.free) g_system_alloc.free(ptr);
+            return;
+        }
+
         Span* span = page_map_.get(reinterpret_cast<uintptr_t>(ptr));
         if (!span) return;
         if (span->is_large) { large_alloc_.deallocate(span); return; }
@@ -170,14 +242,62 @@ public:
     }
 
     void* memalign(size_t alignment, size_t size) {
+        if (isCompressOnlyMode()) {
+            if (!g_system_alloc.posix_memalign) return nullptr;
+            void* ptr = nullptr;
+            if (g_system_alloc.posix_memalign(&ptr, alignment, size) == 0) {
+                trackAllocation(ptr, size);
+                return ptr;
+            }
+            return nullptr;
+        }
+
         if (size == 0) size = 1;
         if (alignment <= kMinAlignment) return this->malloc(size);
         return large_alloc_.allocate(size, alignment);
     }
 
+    void* calloc(size_t count, size_t size) {
+        if (isCompressOnlyMode()) {
+            if (!g_system_alloc.calloc) return nullptr;
+            void* ptr = g_system_alloc.calloc(count, size);
+            trackAllocation(ptr, count * size);
+            return ptr;
+        }
+        // In full mode, alloc8 handles calloc -> malloc + memset
+        size_t total = count * size;
+        void* ptr = this->malloc(total);
+        if (ptr) __builtin_memset(ptr, 0, total);
+        return ptr;
+    }
+
+    void* realloc(void* old_ptr, size_t size) {
+        if (isCompressOnlyMode()) {
+            if (!g_system_alloc.realloc) return nullptr;
+            void* ptr = g_system_alloc.realloc(old_ptr, size);
+            trackAllocation(ptr, size);
+            return ptr;
+        }
+        // In full mode, alloc8 handles realloc
+        if (!old_ptr) return this->malloc(size);
+        if (size == 0) { this->free(old_ptr); return nullptr; }
+        size_t old_size = getSize(old_ptr);
+        void* new_ptr = this->malloc(size);
+        if (new_ptr) {
+            __builtin_memcpy(new_ptr, old_ptr, old_size < size ? old_size : size);
+            this->free(old_ptr);
+        }
+        return new_ptr;
+    }
+
     size_t getSize(void* ptr) {
         if (!ptr) return 0;
         if (BootstrapAlloc::instance().owns(ptr)) return 0;
+
+        if (isCompressOnlyMode()) {
+            return 0;  // Can't determine size for system allocations
+        }
+
         Span* span = page_map_.get(reinterpret_cast<uintptr_t>(ptr));
         if (!span) return 0;
         if (span->is_large) return span->large_size;
@@ -185,15 +305,19 @@ public:
     }
 
     void lock() {
+        if (isCompressOnlyMode()) return;
         for (int i = 0; i < kNumArenas * kNumClasses; ++i) slabs_[i].lockSlab();
         large_alloc_.lockAlloc();
     }
     void unlock() {
+        if (isCompressOnlyMode()) return;
         large_alloc_.unlockAlloc();
         for (int i = kNumArenas * kNumClasses - 1; i >= 0; --i) slabs_[i].unlockSlab();
     }
     void threadInit() {
-        getOrCreateThreadCache();
+        if (!isCompressOnlyMode()) {
+            getOrCreateThreadCache();
+        }
         // Start compression after the second thread init call on macOS.
         // The first call is the main thread during early DYLD_INSERT init
         // (before _objc_init). Subsequent calls happen after init is safe.
@@ -210,6 +334,7 @@ public:
         }
     }
     void threadCleanup() {
+        if (isCompressOnlyMode()) return;
         ThreadCache*& tc = currentThreadCache();
         if (tc) { tc->drainAll(slabs_, &page_map_); returnThreadCache(tc); tc = nullptr; }
     }

@@ -67,8 +67,13 @@ inline void startCompression() {
     if (!g_compression_started.compare_exchange_strong(expected, true))
         return;
     g_fault_handler.start(faultCallback, nullptr);
+#ifndef __linux__
+    // On macOS, scan VM regions to find heap pages
     scanVmRegions();
     g_compressor.setPreTickCallback(scanVmRegions);
+#endif
+    // On Linux, don't scan VM regions - it finds glibc internal pages
+    // that crash when mprotected. Only track pages from malloc/mmap interposition.
     g_compressor.start();
 }
 

@@ -46,206 +46,242 @@ static std::atomic<bool> g_resolving_syscalls{false};
         } \
     }
 
-// Helper: warm iovec array buffers
+// Check if ANY part of a buffer range is in Smash-managed memory.
+// Only return true if the buffer actually needs warming.
+static inline bool bufferInHeap(const void* buf, size_t len, smash::VmRegion* vm) {
+    if (!vm || !buf || !len) return false;
+    auto base = reinterpret_cast<uintptr_t>(buf);
+    // Check first and last page of buffer
+    return vm->contains(base) || vm->contains(base + len - 1);
+}
+
+// Helper: check if any iovec buffer is in Smash-managed memory
+static inline bool iovecInHeap(const struct iovec* iov, int iovcnt, smash::VmRegion* vm) {
+    if (!vm || !iov || iovcnt <= 0) return false;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (bufferInHeap(iov[i].iov_base, iov[i].iov_len, vm))
+            return true;
+    }
+    return false;
+}
+
+// Helper: warm iovec array buffers (only those in heap)
 static inline void warmIovecLinux(const struct iovec* iov, int iovcnt, smash::VmRegion* vm) {
     for (int i = 0; i < iovcnt; ++i) {
-        if (iov[i].iov_base && iov[i].iov_len)
+        if (iov[i].iov_base && iov[i].iov_len && bufferInHeap(iov[i].iov_base, iov[i].iov_len, vm))
             smash::vm::warmPages(iov[i].iov_base, iov[i].iov_len, vm);
     }
 }
 
-#pragma GCC visibility push(default)
+// Use explicit visibility attribute - pragma doesn't work with -fvisibility=hidden
+#define SMASH_VISIBLE __attribute__((visibility("default")))
+
 extern "C" {
 
-ssize_t read(int fd, void* buf, size_t count) {
+SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, read);
     if (!real_read) return syscall(SYS_read, fd, buf, count);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    bool in_heap = bufferInHeap(buf, count, vm);
+    if (in_heap) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
     ssize_t ret = real_read(fd, buf, count);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
+    if (in_heap) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
-ssize_t write(int fd, const void* buf, size_t count) {
+SMASH_VISIBLE ssize_t write(int fd, const void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, const void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, write);
     if (!real_write) return syscall(SYS_write, fd, buf, count);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    bool in_heap = bufferInHeap(buf, count, vm);
+    if (in_heap) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
     ssize_t ret = real_write(fd, buf, count);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
+    if (in_heap) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
-ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
+SMASH_VISIBLE ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
     using fn_t = ssize_t(*)(int, void*, size_t, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pread);
     if (!real_pread) return syscall(SYS_pread64, fd, buf, count, offset);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    bool in_heap = bufferInHeap(buf, count, vm);
+    if (in_heap) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
     ssize_t ret = real_pread(fd, buf, count, offset);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
+    if (in_heap) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
-ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
+SMASH_VISIBLE ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
     using fn_t = ssize_t(*)(int, const void*, size_t, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pwrite);
     if (!real_pwrite) return syscall(SYS_pwrite64, fd, buf, count, offset);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    bool in_heap = bufferInHeap(buf, count, vm);
+    if (in_heap) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
     ssize_t ret = real_pwrite(fd, buf, count, offset);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
+    if (in_heap) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
-ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
+SMASH_VISIBLE ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, readv);
     if (!real_readv) return syscall(SYS_readv, fd, iov, iovcnt);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) { warmIovecLinux(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
+    bool in_heap = iovecInHeap(iov, iovcnt, vm);
+    if (in_heap) { warmIovecLinux(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
     ssize_t ret = real_readv(fd, iov, iovcnt);
-    if (vm && iov && iovcnt > 0) smash::vm::unpinIovec(iov, iovcnt, vm);
+    if (in_heap) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
 
-ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
+SMASH_VISIBLE ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, writev);
     if (!real_writev) return syscall(SYS_writev, fd, iov, iovcnt);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) { warmIovecLinux(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
+    bool in_heap = iovecInHeap(iov, iovcnt, vm);
+    if (in_heap) { warmIovecLinux(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
     ssize_t ret = real_writev(fd, iov, iovcnt);
-    if (vm && iov && iovcnt > 0) smash::vm::unpinIovec(iov, iovcnt, vm);
+    if (in_heap) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
 
-ssize_t recv(int s, void* buf, size_t len, int flags) {
+SMASH_VISIBLE ssize_t recv(int s, void* buf, size_t len, int flags) {
     using fn_t = ssize_t(*)(int, void*, size_t, int);
     SMASH_LAZY_RESOLVE(fn_t, recv);
     if (!real_recv) return syscall(SYS_recvfrom, s, buf, len, flags, nullptr, nullptr);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
+    bool in_heap = bufferInHeap(buf, len, vm);
+    if (in_heap) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
     ssize_t ret = real_recv(s, buf, len, flags);
-    if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
+    if (in_heap) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
 
-ssize_t send(int s, const void* buf, size_t len, int flags) {
+SMASH_VISIBLE ssize_t send(int s, const void* buf, size_t len, int flags) {
     using fn_t = ssize_t(*)(int, const void*, size_t, int);
     SMASH_LAZY_RESOLVE(fn_t, send);
     if (!real_send) return syscall(SYS_sendto, s, buf, len, flags, nullptr, 0);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
+    bool in_heap = bufferInHeap(buf, len, vm);
+    if (in_heap) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
     ssize_t ret = real_send(s, buf, len, flags);
-    if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
+    if (in_heap) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
 
-ssize_t recvfrom(int s, void* buf, size_t len, int flags,
+SMASH_VISIBLE ssize_t recvfrom(int s, void* buf, size_t len, int flags,
                  struct sockaddr* from, socklen_t* fromlen) {
     using fn_t = ssize_t(*)(int, void*, size_t, int, struct sockaddr*, socklen_t*);
     SMASH_LAZY_RESOLVE(fn_t, recvfrom);
     if (!real_recvfrom) return syscall(SYS_recvfrom, s, buf, len, flags, from, fromlen);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
+    bool in_heap = bufferInHeap(buf, len, vm);
+    if (in_heap) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
     ssize_t ret = real_recvfrom(s, buf, len, flags, from, fromlen);
-    if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
+    if (in_heap) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
 
-ssize_t sendto(int s, const void* buf, size_t len, int flags,
+SMASH_VISIBLE ssize_t sendto(int s, const void* buf, size_t len, int flags,
                const struct sockaddr* to, socklen_t tolen) {
     using fn_t = ssize_t(*)(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
     SMASH_LAZY_RESOLVE(fn_t, sendto);
     if (!real_sendto) return syscall(SYS_sendto, s, buf, len, flags, to, tolen);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
+    bool in_heap = bufferInHeap(buf, len, vm);
+    if (in_heap) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
     ssize_t ret = real_sendto(s, buf, len, flags, to, tolen);
-    if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
+    if (in_heap) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
 
-ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
+SMASH_VISIBLE ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
     using fn_t = ssize_t(*)(int, struct msghdr*, int);
     SMASH_LAZY_RESOLVE(fn_t, recvmsg);
     if (!real_recvmsg) return syscall(SYS_recvmsg, s, msg, flags);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0) {
+    bool in_heap = msg && iovecInHeap(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
+    if (in_heap) {
         warmIovecLinux(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         smash::vm::pinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     }
     ssize_t ret = real_recvmsg(s, msg, flags);
-    if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
+    if (in_heap)
         smash::vm::unpinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     return ret;
 }
 
-ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
+SMASH_VISIBLE ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
     using fn_t = ssize_t(*)(int, const struct msghdr*, int);
     SMASH_LAZY_RESOLVE(fn_t, sendmsg);
     if (!real_sendmsg) return syscall(SYS_sendmsg, s, msg, flags);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0) {
+    bool in_heap = msg && iovecInHeap(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
+    if (in_heap) {
         warmIovecLinux(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         smash::vm::pinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     }
     ssize_t ret = real_sendmsg(s, msg, flags);
-    if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
+    if (in_heap)
         smash::vm::unpinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     return ret;
 }
 
-int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
-    using fn_t = int(*)(struct pollfd*, nfds_t, int);
-    SMASH_LAZY_RESOLVE(fn_t, poll);
-    if (!real_poll) {
-        // Convert poll(ms) to ppoll(timespec) — aarch64 has no SYS_poll
-        struct timespec ts, *pts = nullptr;
-        if (timeout >= 0) { ts.tv_sec = timeout / 1000; ts.tv_nsec = (timeout % 1000) * 1000000L; pts = &ts; }
-        return syscall(SYS_ppoll, fds, nfds, pts, nullptr, 0);
-    }
+// Note: poll() is NOT intercepted because:
+// 1. pollfd arrays are typically small and stack-allocated
+// 2. The kernel returns EFAULT if it can't access the buffer
+
+// epoll_wait/epoll_pwait - libevent allocates event buffers via malloc,
+// so they ARE Smash-managed and need warming before kernel access.
+// NOTE: Some apps (libevent) may mmap their own buffers, so we warm
+// unconditionally if events is non-null to avoid EFAULT from kernel.
+SMASH_VISIBLE int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
+    using fn_t = int(*)(int, struct epoll_event*, int, int);
+    SMASH_LAZY_RESOLVE(fn_t, epoll_wait);
+    if (!real_epoll_wait) return syscall(SYS_epoll_wait, epfd, events, maxevents, timeout);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && fds && nfds > 0) {
-        smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
-        smash::vm::pinPages(fds, nfds * sizeof(struct pollfd), vm);
-    }
-    int ret = real_poll(fds, nfds, timeout);
-    if (vm && fds && nfds > 0)
-        smash::vm::unpinPages(fds, nfds * sizeof(struct pollfd), vm);
+    size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
+    bool in_heap = bufferInHeap(events, size, vm);
+    if (in_heap) { smash::vm::warmPages(events, size, vm); smash::vm::pinPages(events, size, vm); }
+    int ret = real_epoll_wait(epfd, events, maxevents, timeout);
+    if (in_heap) smash::vm::unpinPages(events, size, vm);
     return ret;
 }
 
-int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
+SMASH_VISIBLE int epoll_pwait(int epfd, struct epoll_event* events, int maxevents, int timeout, const sigset_t* sigmask) {
+    using fn_t = int(*)(int, struct epoll_event*, int, int, const sigset_t*);
+    SMASH_LAZY_RESOLVE(fn_t, epoll_pwait);
+    if (!real_epoll_pwait) return syscall(SYS_epoll_pwait, epfd, events, maxevents, timeout, sigmask);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && events && maxevents > 0) {
-        smash::vm::warmPages(events, maxevents * sizeof(struct epoll_event), vm);
-        smash::vm::pinPages(events, maxevents * sizeof(struct epoll_event), vm);
-    }
-    int ret = syscall(SYS_epoll_pwait, epfd, events, maxevents, timeout, nullptr, 0);
-    if (vm && events && maxevents > 0)
-        smash::vm::unpinPages(events, maxevents * sizeof(struct epoll_event), vm);
+    size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
+    bool in_heap = bufferInHeap(events, size, vm);
+    if (in_heap) { smash::vm::warmPages(events, size, vm); smash::vm::pinPages(events, size, vm); }
+    int ret = real_epoll_pwait(epfd, events, maxevents, timeout, sigmask);
+    if (in_heap) smash::vm::unpinPages(events, size, vm);
     return ret;
 }
 
-int epoll_pwait(int epfd, struct epoll_event* events, int maxevents, int timeout,
-                const sigset_t* sigmask) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && events && maxevents > 0) {
-        smash::vm::warmPages(events, maxevents * sizeof(struct epoll_event), vm);
-        smash::vm::pinPages(events, maxevents * sizeof(struct epoll_event), vm);
-    }
-    int ret = syscall(SYS_epoll_pwait, epfd, events, maxevents, timeout, sigmask,
-                      sigmask ? sizeof(sigset_t) : 0);
-    if (vm && events && maxevents > 0)
-        smash::vm::unpinPages(events, maxevents * sizeof(struct epoll_event), vm);
-    return ret;
+// Versioned symbol aliases for epoll_wait/epoll_pwait
+// libevent requests epoll_wait@GLIBC_2.3.2, glibc uses 2.2.5 internally
+// We export both versions pointing to the same implementation
+SMASH_VISIBLE int epoll_wait_232(int epfd, struct epoll_event* events, int maxevents, int timeout) {
+    // Forward to the main implementation
+    return epoll_wait(epfd, events, maxevents, timeout);
+}
+
+SMASH_VISIBLE int epoll_pwait_232(int epfd, struct epoll_event* events, int maxevents, int timeout, const sigset_t* sigmask) {
+    return epoll_pwait(epfd, events, maxevents, timeout, sigmask);
 }
 
 } // extern "C"
-#pragma GCC visibility pop
+
+// Create version aliases: epoll_wait_232 -> epoll_wait@GLIBC_2.3.2
+__asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
+__asm__(".symver epoll_pwait_232,epoll_pwait@GLIBC_2.3.2");
 
 #endif // __linux__

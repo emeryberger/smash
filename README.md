@@ -50,6 +50,22 @@ cmake .. -DSMASH_BUILD_BENCH=ON
 make -j$(nproc)
 ```
 
+### Build with benchmark dependencies (Redis, memcached, DuckDB, RocksDB)
+
+For full A/B benchmarking, build the external dependencies from source. This ensures they use system malloc (libc) instead of their default allocators (jemalloc), which is required for Smash to effectively compress their memory.
+
+```bash
+cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON
+make -j$(nproc)
+make bench_deps   # Builds Redis, memcached, DuckDB, RocksDB from source
+```
+
+**Note**: Building DuckDB from source takes significant time (10-20 minutes). The `bench_deps` target builds:
+- Redis 8.0.2 with `MALLOC=libc` (instead of jemalloc)
+- memcached 1.6.34 (requires libevent-devel)
+- DuckDB 1.2.0 CLI
+- RocksDB 9.8.4 static library
+
 ## Usage
 
 ### macOS
@@ -63,6 +79,20 @@ DYLD_INSERT_LIBRARIES=./build/libsmash.dylib DYLD_FORCE_FLAT_NAMESPACE=1 ./your_
 ```bash
 LD_PRELOAD=./build/libsmash.so ./your_application
 ```
+
+### Compress-Only Mode
+
+For applications that use custom allocators (jemalloc, tcmalloc, etc.), Smash can run in compress-only mode where it only monitors and compresses pages without replacing malloc:
+
+```bash
+# macOS
+SMASH_MODE=compress_only DYLD_INSERT_LIBRARIES=./build/libsmash.dylib ./your_application
+
+# Linux
+SMASH_MODE=compress_only LD_PRELOAD=./build/libsmash.so ./your_application
+```
+
+This mode tracks all heap pages via `/proc/self/maps` (Linux) or `vm_region` (macOS) and compresses cold regions regardless of which allocator manages them.
 
 ### Optional API
 
@@ -104,6 +134,8 @@ ctest --output-on-failure
 
 ## Benchmarks
 
+### Micro-benchmarks
+
 ```bash
 cd build
 
@@ -118,6 +150,45 @@ cd build
 
 # RSS reduction over time
 ./bench/bench_rss
+
+# Algorithm comparison: WKdm vs LZ4 vs zstd
+./bench/bench_algo_compare
+```
+
+### Application Benchmarks
+
+These scripts run A/B comparisons (baseline vs Smash) on real applications:
+
+```bash
+cd build
+
+# Redis (SET → cool → GET workload)
+bash bench/bench_redis.sh [--quick]
+
+# Memcached (fill → cool → serve → cold re-access)
+bash bench/bench_memcached.sh [--quick]
+
+# DuckDB (TPC-H OLAP queries)
+bash bench/bench_duckdb.sh [--quick]
+
+# RocksDB (block cache with hot/cold access)
+bash bench/bench_rocksdb.sh [--quick]
+```
+
+### Paper Experiments
+
+For reproducible research results:
+
+```bash
+cd build
+
+# Run all experiments (full — for paper-quality results)
+python3 ../bench/run_paper_experiments.py --runs 3
+
+# Quick smoke test
+python3 ../bench/run_paper_experiments.py --quick --runs 1
+
+# Results written to paper_results/
 ```
 
 ## Architecture

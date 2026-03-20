@@ -64,13 +64,13 @@ Smash's mprotect-based monitoring (PROT_READ) and compression (PROT_NONE) can co
 
 ### Solutions implemented in `smash_heap.cpp`
 
-1. **Syscall interposition**: Interpose `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `recv`, `send`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `poll`, `kevent` — warm and pin buffer pages before calling real syscall via `.original` field
-2. **Buffered I/O interposition**: Interpose `fread`, `fgets`, `fgetc`, `getc`, `fwrite`, `fflush` — warm and pin both user buffer AND the FILE's internal buffer (`stream->_bf._base`)
+1. **Syscall interposition**: Interpose `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `recv`, `send`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `poll`, `kevent` (macOS), `epoll_wait`, `epoll_pwait` (Linux) — warm and pin buffer pages before calling real syscall
+2. **Buffered I/O interposition** (macOS): Interpose `fread`, `fgets`, `fgetc`, `getc`, `fwrite`, `fflush` — warm and pin both user buffer AND the FILE's internal buffer (`stream->_bf._base`)
 3. **stdio buffer pinning** (`compressor_thread.h`): `pinStdioBuffers()` permanently pins stdin/stdout/stderr FILE struct + buffer pages at first compressor tick. This covers the intra-libSystem blind spot for standard streams.
 
-### Pattern for calling original functions
+### Platform-specific interposition patterns
 
-Do NOT use `dlsym(RTLD_NEXT)` — on macOS it returns the wrapper itself. Instead read the `.original` field from the interpose struct:
+**macOS**: Do NOT use `dlsym(RTLD_NEXT)` — it returns the wrapper itself. Instead read the `.original` field from the interpose struct:
 ```cpp
 extern "C" ssize_t smash_read(int fd, void* buf, size_t count);
 SMASH_INTERPOSE(smash_read, read);
@@ -80,6 +80,13 @@ extern "C" ssize_t smash_read(int fd, void* buf, size_t count) {
     // ... unpin ...
     return ret;
 }
+```
+
+**Linux**: Use `dlsym(RTLD_NEXT)` with lazy resolution in `linux_syscall_wrappers.cpp`. For versioned glibc symbols (e.g., `epoll_wait@GLIBC_2.3.2` used by libevent), create aliased wrapper functions with `.symver` directives and export both versions in `smash_version_script.map`:
+```cpp
+// Wrapper for GLIBC_2.3.2 version
+SMASH_VISIBLE int epoll_wait_232(...) { return epoll_wait(...); }
+__asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 ```
 
 ### Page pinning (`syscall_compat.h`)

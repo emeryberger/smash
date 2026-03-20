@@ -1,0 +1,58 @@
+ABLATION TABLE
+======================================================================
+% Auto-generated ablation table
+\begin{tabular}{llrrrrrrr}
+\toprule
+ID & Configuration & \textbf{Sqlite} & \textbf{Rocksdb} & \textbf{Duckdb} & \textbf{Memcached} & \textbf{Redis} & \textbf{Redis_ext} & Avg.\ $\Delta$ \\
+\midrule
+    & \textbf{Default} & \textbf{66.0\%} & \textbf{23.6\%} & --- & \textbf{100.0\%} & \textbf{44.6\%} & \textbf{44.9\%} & --- \\
+B0  & System malloc & 25.0\% ($-$41.0) & 0.0\% ($-$23.6) & --- & -1.6\% ($-$101.6) & 0.0\% ($-$44.6) & 0.0\% ($-$44.9) & -51.2 \\
+\midrule
+    & With dicts & --- & --- & --- & --- & --- & --- & --- \\
+    & No arenas & --- & --- & --- & --- & --- & --- & --- \\
+    & LZ4 only & --- & --- & --- & --- & --- & --- & --- \\
+    & No zero-deferred & --- & --- & --- & --- & --- & --- & --- \\
+    & No prefetch & --- & --- & --- & --- & --- & --- & --- \\
+    & Single worker & --- & --- & --- & --- & --- & --- & --- \\
+B2  & No compression & --- & --- & --- & --- & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+
+COMPRESS-ONLY TABLE
+======================================================================
+% Auto-generated compress-only table
+\begin{tabular}{llrrr}
+\toprule
+Benchmark & Config & Cool RSS & Reduction & Ops/s \\
+\midrule
+\multirow{3}{*}{Sqlite}
+  & baseline       & 238  & ---    & --- \\
+  & compress-only  & 261    & -9.6\% & --- \\
+  & full \sys      & \textbf{132}   & \textbf{44.6\%} & --- \\
+\midrule
+\multirow{3}{*}{Rocksdb}
+  & baseline       & 325  & ---    & --- \\
+  & compress-only  & 0    & 0.0\% & --- \\
+  & full \sys      & \textbf{77}   & \textbf{76.2\%} & --- \\
+\midrule
+\multirow{3}{*}{Duckdb}
+  & baseline       & 337  & ---    & --- \\
+  & compress-only  & 359    & -6.5\% & --- \\
+  & full \sys      & \textbf{49}   & \textbf{85.4\%} & --- \\
+\midrule
+\multirow{3}{*}{Memcached}
+  & baseline       & 33  & ---    & --- \\
+  & compress-only  & 56    & -72.1\% & --- \\
+  & full \sys      & \textbf{0}   & \textbf{0.0\%} & --- \\
+\midrule
+\multirow{3}{*}{Redis}
+  & baseline       & 55  & ---    & --- \\
+  & compress-only  & 78    & -40.5\% & --- \\
+  & full \sys      & \textbf{49}   & \textbf{11.8\%} & --- \\
+\midrule
+\multirow{3}{*}{Redis_ext}
+  & baseline       & 55  & ---    & --- \\
+  & compress-only  & 78    & -40.2\% & --- \\
+  & full \sys      & \textbf{48}   & \textbf{14.1\%} & --- \\
+\bottomrule
+\end{tabular}

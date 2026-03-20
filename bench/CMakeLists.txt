@@ -1,5 +1,11 @@
 # smash/bench/CMakeLists.txt - Standalone benchmark executables
 
+find_package(Threads REQUIRED)
+
+# ── Option to build external benchmark dependencies ──────────────────────────
+# Set -DSMASH_BUILD_BENCH_DEPS=ON to build Redis, memcached, DuckDB, RocksDB
+option(SMASH_BUILD_BENCH_DEPS "Build external benchmark dependencies (Redis, memcached, etc.)" OFF)
+
 set(SMASH_BENCH_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
   ${CMAKE_CURRENT_SOURCE_DIR}/../src
@@ -9,7 +15,7 @@ set(SMASH_BENCH_INCLUDE_DIRS
 function(smash_add_bench name source)
   add_executable(${name} ${source})
   target_include_directories(${name} PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
-  target_link_libraries(${name} PRIVATE alloc8::headers lz4_static libzstd_static)
+  target_link_libraries(${name} PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
   if(APPLE)
     target_compile_options(${name} PRIVATE -ftls-model=initial-exec)
   endif()
@@ -37,6 +43,7 @@ function(smash_add_standalone_bench name source)
   # Override compile options to exclude -fno-builtin-malloc etc.
   _get_filtered_dir_compile_options(clean_opts)
   set_target_properties(${name} PROPERTIES COMPILE_OPTIONS "${clean_opts}")
+  target_link_libraries(${name} PRIVATE Threads::Threads)
 endfunction()
 
 # ── cJSON library (for bench_json) ──────────────────────────────────────────
@@ -66,7 +73,7 @@ add_executable(bench_throughput
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
 )
 target_include_directories(bench_throughput PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
-target_link_libraries(bench_throughput PRIVATE alloc8::headers lz4_static libzstd_static)
+target_link_libraries(bench_throughput PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
 if(APPLE)
   target_compile_options(bench_throughput PRIVATE -ftls-model=initial-exec)
 endif()
@@ -86,7 +93,7 @@ add_executable(bench_rss
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
 )
 target_include_directories(bench_rss PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
-target_link_libraries(bench_rss PRIVATE alloc8::headers lz4_static libzstd_static)
+target_link_libraries(bench_rss PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
 if(APPLE)
   target_compile_options(bench_rss PRIVATE -ftls-model=initial-exec)
 endif()
@@ -97,7 +104,7 @@ add_executable(bench_latency
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
 )
 target_include_directories(bench_latency PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
-target_link_libraries(bench_latency PRIVATE alloc8::headers lz4_static libzstd_static)
+target_link_libraries(bench_latency PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
 if(APPLE)
   target_compile_options(bench_latency PRIVATE -ftls-model=initial-exec)
 endif()
@@ -393,3 +400,224 @@ endif()
 add_library(sample_heap SHARED libsample_heap.cpp)
 target_link_libraries(sample_heap PRIVATE lz4_static libzstd_static)
 set_target_properties(sample_heap PROPERTIES OUTPUT_NAME sample_heap)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# External Benchmark Dependencies (Redis, memcached, DuckDB, RocksDB)
+# ══════════════════════════════════════════════════════════════════════════════
+# Build with: cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON
+#
+# These are built from source to ensure they use system malloc (libc) instead of
+# their default allocators (jemalloc, etc.), which is required for Smash to
+# effectively compress their memory.
+
+if(SMASH_BUILD_BENCH_DEPS)
+  include(ExternalProject)
+
+  # Output directory for built binaries
+  set(BENCH_DEPS_DIR ${CMAKE_CURRENT_BINARY_DIR}/deps)
+  file(MAKE_DIRECTORY ${BENCH_DEPS_DIR}/bin)
+
+  # ── Redis (built with libc malloc instead of jemalloc) ─────────────────────
+  ExternalProject_Add(redis_build
+    GIT_REPOSITORY https://github.com/redis/redis.git
+    GIT_TAG 8.0.2
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/redis
+    CONFIGURE_COMMAND ""
+    BUILD_IN_SOURCE TRUE
+    BUILD_COMMAND make MALLOC=libc -j4
+    INSTALL_COMMAND
+      ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-server ${BENCH_DEPS_DIR}/bin/redis-server-libc
+      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-cli ${BENCH_DEPS_DIR}/bin/redis-cli
+      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-benchmark ${BENCH_DEPS_DIR}/bin/redis-benchmark
+    BUILD_BYPRODUCTS
+      ${BENCH_DEPS_DIR}/bin/redis-server-libc
+      ${BENCH_DEPS_DIR}/bin/redis-cli
+      ${BENCH_DEPS_DIR}/bin/redis-benchmark
+  )
+
+  # ── libevent (required by memcached) ────────────────────────────────────────
+  find_path(LIBEVENT_INCLUDE event.h HINTS /usr/include /usr/local/include ${BENCH_DEPS_DIR}/include)
+  find_library(LIBEVENT_LIB event HINTS /usr/lib /usr/lib64 /usr/local/lib ${BENCH_DEPS_DIR}/lib)
+  if(NOT LIBEVENT_INCLUDE OR NOT LIBEVENT_LIB)
+    # Build libevent from source
+    ExternalProject_Add(libevent_build
+      GIT_REPOSITORY https://github.com/libevent/libevent.git
+      GIT_TAG release-2.1.12-stable
+      GIT_SHALLOW TRUE
+      PREFIX ${BENCH_DEPS_DIR}/libevent
+      CMAKE_ARGS
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+        -DEVENT__DISABLE_TESTS=ON
+        -DEVENT__DISABLE_SAMPLES=ON
+        -DEVENT__DISABLE_BENCHMARK=ON
+      BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j4
+      INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+      BUILD_BYPRODUCTS
+        ${BENCH_DEPS_DIR}/lib/libevent.a
+        ${BENCH_DEPS_DIR}/include/event.h
+    )
+    set(LIBEVENT_INCLUDE ${BENCH_DEPS_DIR}/include)
+    set(LIBEVENT_LIB ${BENCH_DEPS_DIR}/lib)
+    set(LIBEVENT_BUILT TRUE)
+    message(STATUS "Will build libevent from source")
+  else()
+    set(LIBEVENT_BUILT FALSE)
+    message(STATUS "libevent found: ${LIBEVENT_LIB}")
+  endif()
+
+  # ── Memcached (built with system malloc) ───────────────────────────────────
+  # Memcached uses its own slab allocator on top of malloc, so system malloc works
+  find_program(AUTORECONF autoreconf)
+  if(AUTORECONF)
+    ExternalProject_Add(memcached_build
+      GIT_REPOSITORY https://github.com/memcached/memcached.git
+      GIT_TAG 1.6.34
+      GIT_SHALLOW TRUE
+      PREFIX ${BENCH_DEPS_DIR}/memcached
+      CONFIGURE_COMMAND
+        cd <SOURCE_DIR> && ./autogen.sh &&
+        <SOURCE_DIR>/configure --prefix=${BENCH_DEPS_DIR}
+          --with-libevent=${BENCH_DEPS_DIR}
+          CFLAGS=-I${LIBEVENT_INCLUDE}
+          LDFLAGS=-L${LIBEVENT_LIB}
+      BUILD_IN_SOURCE TRUE
+      BUILD_COMMAND make -j4
+      INSTALL_COMMAND
+        ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/memcached ${BENCH_DEPS_DIR}/bin/memcached
+      BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/memcached
+    )
+    if(LIBEVENT_BUILT)
+      add_dependencies(memcached_build libevent_build)
+    endif()
+    message(STATUS "Will build memcached from source")
+  else()
+    message(STATUS "autoreconf not found - skipping memcached build (install autoconf)")
+  endif()
+
+  # ── DuckDB (CLI with system malloc) ────────────────────────────────────────
+  # DuckDB's default config loads jemalloc on Linux which bypasses Smash interposition.
+  # Pass SKIP_EXTENSIONS via both cache args and local config file to ensure it takes effect.
+  ExternalProject_Add(duckdb_build
+    GIT_REPOSITORY https://github.com/duckdb/duckdb.git
+    GIT_TAG v1.2.0
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/duckdb
+    PATCH_COMMAND ${CMAKE_COMMAND} -E echo "set(SKIP_EXTENSIONS jemalloc CACHE STRING \"Extensions to skip\")" > <SOURCE_DIR>/extension/extension_config_local.cmake
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DBUILD_SHELL=ON
+      -DBUILD_UNITTESTS=OFF
+      -DENABLE_SANITIZER=OFF
+      -DENABLE_UBSAN=OFF
+      -DOVERRIDE_GIT_DESCRIBE=v1.2.0
+      -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+    CMAKE_CACHE_ARGS
+      "-DSKIP_EXTENSIONS:STRING=jemalloc"
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . --target shell -- -j4
+    INSTALL_COMMAND
+      ${CMAKE_COMMAND} -E copy <BINARY_DIR>/duckdb ${BENCH_DEPS_DIR}/bin/duckdb
+    BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/duckdb
+  )
+
+  # ── RocksDB (static library for benchmarks) ────────────────────────────────
+  ExternalProject_Add(rocksdb_build
+    GIT_REPOSITORY https://github.com/facebook/rocksdb.git
+    GIT_TAG v9.8.4
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/rocksdb
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DWITH_TESTS=OFF
+      -DWITH_BENCHMARK_TOOLS=OFF
+      -DWITH_TOOLS=OFF
+      -DWITH_GFLAGS=OFF
+      -DROCKSDB_BUILD_SHARED=OFF
+      -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j4
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    BUILD_BYPRODUCTS
+      ${BENCH_DEPS_DIR}/lib/librocksdb.a
+      ${BENCH_DEPS_DIR}/include/rocksdb/db.h
+  )
+
+  # Export paths for benchmark scripts
+  set(BENCH_REDIS_SERVER ${BENCH_DEPS_DIR}/bin/redis-server-libc CACHE PATH "Redis server with libc malloc")
+  set(BENCH_REDIS_CLI ${BENCH_DEPS_DIR}/bin/redis-cli CACHE PATH "Redis CLI")
+  set(BENCH_REDIS_BENCHMARK ${BENCH_DEPS_DIR}/bin/redis-benchmark CACHE PATH "Redis benchmark")
+  set(BENCH_MEMCACHED ${BENCH_DEPS_DIR}/bin/memcached CACHE PATH "Memcached server")
+  set(BENCH_DUCKDB ${BENCH_DEPS_DIR}/bin/duckdb CACHE PATH "DuckDB CLI")
+  set(BENCH_ROCKSDB_LIB ${BENCH_DEPS_DIR}/lib/librocksdb.a CACHE PATH "RocksDB library")
+  set(BENCH_ROCKSDB_INCLUDE ${BENCH_DEPS_DIR}/include CACHE PATH "RocksDB headers")
+
+  # Create a convenience target
+  add_custom_target(bench_deps)
+  add_dependencies(bench_deps redis_build duckdb_build rocksdb_build)
+  if(TARGET libevent_build)
+    add_dependencies(bench_deps libevent_build)
+  endif()
+  if(TARGET memcached_build)
+    add_dependencies(bench_deps memcached_build)
+  endif()
+
+  message(STATUS "External benchmark dependencies will be built in: ${BENCH_DEPS_DIR}")
+  message(STATUS "  Redis (libc malloc): ${BENCH_DEPS_DIR}/bin/redis-server-libc")
+  message(STATUS "  Memcached: ${BENCH_DEPS_DIR}/bin/memcached")
+  message(STATUS "  DuckDB: ${BENCH_DEPS_DIR}/bin/duckdb")
+  message(STATUS "  RocksDB: ${BENCH_DEPS_DIR}/lib/librocksdb.a")
+
+  # ── RocksDB benchmark linked against built RocksDB ─────────────────────────
+  # This version uses our freshly built RocksDB instead of system install
+  add_executable(bench_rocksdb_builtin bench_rocksdb.cpp)
+  _get_filtered_dir_compile_options(rocksdb_builtin_opts)
+  set_target_properties(bench_rocksdb_builtin PROPERTIES COMPILE_OPTIONS "${rocksdb_builtin_opts}")
+  target_include_directories(bench_rocksdb_builtin PRIVATE ${BENCH_DEPS_DIR}/include)
+  target_link_libraries(bench_rocksdb_builtin PRIVATE
+    ${BENCH_DEPS_DIR}/lib/librocksdb.a
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+  )
+  # Link against compression libs that RocksDB needs
+  find_package(ZLIB)
+  find_library(BZ2_LIB bz2)
+  find_library(LZ4_SYSTEM_LIB lz4)
+  find_library(ZSTD_SYSTEM_LIB zstd)
+  find_library(SNAPPY_LIB snappy)
+  if(ZLIB_FOUND)
+    target_link_libraries(bench_rocksdb_builtin PRIVATE ZLIB::ZLIB)
+  endif()
+  if(BZ2_LIB)
+    target_link_libraries(bench_rocksdb_builtin PRIVATE ${BZ2_LIB})
+  endif()
+  if(LZ4_SYSTEM_LIB)
+    target_link_libraries(bench_rocksdb_builtin PRIVATE ${LZ4_SYSTEM_LIB})
+  endif()
+  if(ZSTD_SYSTEM_LIB)
+    target_link_libraries(bench_rocksdb_builtin PRIVATE ${ZSTD_SYSTEM_LIB})
+  endif()
+  if(SNAPPY_LIB)
+    target_link_libraries(bench_rocksdb_builtin PRIVATE ${SNAPPY_LIB})
+  endif()
+  add_dependencies(bench_rocksdb_builtin rocksdb_build)
+
+endif() # SMASH_BUILD_BENCH_DEPS
+
+# ── Configure benchmark scripts with dependency paths ────────────────────────
+# These variables are used by the .sh.in templates
+if(DEFINED BENCH_REDIS_SERVER)
+  set(REDIS_SERVER_PATH ${BENCH_REDIS_SERVER})
+else()
+  set(REDIS_SERVER_PATH "redis-server")
+endif()
+if(DEFINED BENCH_MEMCACHED)
+  set(MEMCACHED_PATH ${BENCH_MEMCACHED})
+else()
+  set(MEMCACHED_PATH "memcached")
+endif()
+if(DEFINED BENCH_DUCKDB)
+  set(DUCKDB_PATH ${BENCH_DUCKDB})
+else()
+  set(DUCKDB_PATH "duckdb")
+endif()

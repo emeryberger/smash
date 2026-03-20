@@ -1,0 +1,51 @@
+=== KV Store Benchmark ===
+Entries: 500000, Hot: 25000 (5%), Cool: 5s, Serve: 10s
+
+Filled 500000 entries in 0.94s
+Peak RSS after fill: 232.4 MB
+
+Cooling phase: 5 seconds (no access, waiting for compression)...
+  t= 1s: RSS=232.4 MB
+  t= 2s: RSS=232.4 MB
+  t= 3s: RSS=232.4 MB
+  t= 4s: RSS=232.4 MB
+  t= 5s: RSS=232.4 MB
+Post-cooling RSS: 232.4 MB (-0.0% reduction from peak)
+
+Serve phase: 10 seconds (hot-only, keys 0..24999)...
+  t= 1s: RSS=234.6 MB  ops=2282722
+  t= 2s: RSS=235.6 MB  ops=2288014
+  t= 3s: RSS=236.6 MB  ops=2250444
+  t= 4s: RSS=237.9 MB  ops=2326219
+  t= 5s: RSS=239.0 MB  ops=2296779
+  t= 6s: RSS=240.0 MB  ops=2342990
+  t= 7s: RSS=241.0 MB  ops=1832403
+  t= 8s: RSS=242.0 MB  ops=2422064
+  t= 9s: RSS=243.3 MB  ops=2395998
+  t=10s: RSS=244.3 MB  ops=2478201
+
+Cold re-access: touching 47500 cold keys...
+Cold access p50/p99: 0.6 / 1.3 us
+Post re-access RSS: 244.8 MB
+
+Results:
+  Peak RSS: 244.3 MB
+  Post-cooling RSS: 232.4 MB (-0.0% reduction)
+  Steady-state RSS: 244.3 MB
+  Min serve RSS: 233.3 MB (4.5% reduction)
+  Ops/sec: 2291583
+  Hot p50/p99: 0.22 / 1.86 us
+  Cold p50/p99: 0.6 / 1.3 us
+METRIC fill_time_sec 0.94
+METRIC peak_rss_mb 232.4
+METRIC post_cool_rss_mb 232.4
+METRIC cool_reduction_pct -0.0
+METRIC steady_rss_mb 244.3
+METRIC min_rss_mb 233.3
+METRIC rss_reduction_pct 4.5
+METRIC ops_per_sec 2291583
+METRIC hot_p50_us 0.22
+METRIC hot_p99_us 1.86
+METRIC cold_p50_us 0.57
+METRIC cold_p99_us 1.26
+METRIC post_reaccess_rss_mb 244.8

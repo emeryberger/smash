@@ -4,6 +4,8 @@
 #include <alloc8/platform.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace smash {
 
@@ -119,5 +121,27 @@ inline constexpr size_t kLargeAllocVmThreshold = SMASH_LARGE_ALLOC_VM_THRESHOLD;
 // ── Virtual memory region ────────────────────────────────────────────────────
 inline constexpr size_t kVmMaxPages = 1024 * 1024;  // 1M pages (~16GB on 16K pages)
 inline constexpr size_t kVmRegionSize = kVmMaxPages * kPageSize;
+
+// ── Runtime mode detection ───────────────────────────────────────────────────
+// Set SMASH_MODE=compress_only to enable compress-only mode at runtime.
+// In compress-only mode, malloc is forwarded to the system allocator and
+// pages are tracked for compression. This works with any allocator (jemalloc,
+// tcmalloc, etc.) but doesn't benefit from Smash's allocation optimizations.
+
+enum class SmashMode { Full, CompressOnly };
+
+inline SmashMode getSmashMode() {
+    static SmashMode mode = []() {
+        const char* env = getenv("SMASH_MODE");
+        if (env && strcmp(env, "compress_only") == 0)
+            return SmashMode::CompressOnly;
+        return SmashMode::Full;
+    }();
+    return mode;
+}
+
+inline bool isCompressOnlyMode() {
+    return getSmashMode() == SmashMode::CompressOnly;
+}
 
 } // namespace smash

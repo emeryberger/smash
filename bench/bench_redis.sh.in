@@ -6,7 +6,7 @@
 #   2. Extended:  SET → DELETE 50% → cool → GET
 #
 # Uses redis-benchmark (LLAMA-style config: 5K connections, 100K ops, 1000B values).
-# Requires redis-server, redis-cli, and redis-benchmark in PATH.
+# Requires redis-server, redis-cli, and redis-benchmark in PATH or built by cmake.
 #
 # Usage:
 #   bash bench_redis.sh [--quick]
@@ -18,6 +18,19 @@ set -euo pipefail
 # ── Paths (substituted by CMake configure_file) ─────────────────────────────
 BUILD_DIR="@CMAKE_BINARY_DIR@"
 SMASH_LIB="${BUILD_DIR}/libsmash.dylib"
+
+# Redis paths - prefer built version with libc malloc
+BENCH_DEPS_DIR="${BUILD_DIR}/bench/deps"
+if [[ -x "${BENCH_DEPS_DIR}/bin/redis-server-libc" ]]; then
+    REDIS_SERVER="${BENCH_DEPS_DIR}/bin/redis-server-libc"
+    REDIS_CLI="${BENCH_DEPS_DIR}/bin/redis-cli"
+    REDIS_BENCHMARK="${BENCH_DEPS_DIR}/bin/redis-benchmark"
+    echo "Using built Redis with libc malloc: ${REDIS_SERVER}"
+else
+    REDIS_SERVER="redis-server"
+    REDIS_CLI="redis-cli"
+    REDIS_BENCHMARK="redis-benchmark"
+fi
 
 # ── Platform detection ───────────────────────────────────────────────────────
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -46,12 +59,19 @@ for arg in "$@"; do
 done
 
 # ── Check prerequisites ─────────────────────────────────────────────────────
-for cmd in redis-server redis-cli redis-benchmark; do
-    if ! command -v "$cmd" &>/dev/null; then
-        echo "SKIP: $cmd not found in PATH"
-        exit 0
-    fi
-done
+if ! command -v "$REDIS_SERVER" &>/dev/null; then
+    echo "SKIP: redis-server not found"
+    echo "Build with: cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON && make bench_deps"
+    exit 0
+fi
+if ! command -v "$REDIS_CLI" &>/dev/null; then
+    echo "SKIP: redis-cli not found"
+    exit 0
+fi
+if ! command -v "$REDIS_BENCHMARK" &>/dev/null; then
+    echo "SKIP: redis-benchmark not found"
+    exit 0
+fi
 
 if [[ ! -f "${SMASH_LIB}" ]]; then
     echo "ERROR: libsmash not found at ${SMASH_LIB}"
@@ -69,8 +89,8 @@ SMASH_PORT=16380
 
 # ── Cleanup trap ─────────────────────────────────────────────────────────────
 cleanup() {
-    redis-cli -p "$BASELINE_PORT" shutdown nosave 2>/dev/null || true
-    redis-cli -p "$SMASH_PORT" shutdown nosave 2>/dev/null || true
+    $REDIS_CLI -p "$BASELINE_PORT" shutdown nosave 2>/dev/null || true
+    $REDIS_CLI -p "$SMASH_PORT" shutdown nosave 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -78,7 +98,7 @@ trap cleanup EXIT
 get_redis_rss_mb() {
     local port="$1"
     local rss_bytes
-    rss_bytes=$(redis-cli -p "$port" INFO memory 2>/dev/null \
+    rss_bytes=$($REDIS_CLI -p "$port" INFO memory 2>/dev/null \
         | grep "used_memory_rss:" \
         | cut -d: -f2 \
         | tr -d '\r')
@@ -98,7 +118,7 @@ delete_half_keys() {
 
     while true; do
         local result
-        result=$(redis-cli -p "$port" SCAN "$cursor" COUNT 100 2>/dev/null)
+        result=$($REDIS_CLI -p "$port" SCAN "$cursor" COUNT 100 2>/dev/null)
         # SCAN returns: cursor\nkey1\nkey2\n...
         local new_cursor
         new_cursor=$(echo "$result" | head -1)
@@ -111,7 +131,7 @@ delete_half_keys() {
             fi
             # Delete every other key
             if [[ $((toggle % 2)) -eq 0 ]]; then
-                redis-cli -p "$port" DEL "$key" &>/dev/null
+                $REDIS_CLI -p "$port" DEL "$key" &>/dev/null
                 deleted=$((deleted + 1))
             fi
             toggle=$((toggle + 1))
@@ -136,15 +156,15 @@ run_config() {
     echo "[${label}] Starting Redis on port ${port}..."
     # --hz 1 --dynamic-hz no: minimize background memory touching during cool-down
     if [[ -n "$env_prefix" ]]; then
-        env ${env_prefix} redis-server --port "$port" --save "" --appendonly no \
+        env ${env_prefix} $REDIS_SERVER --port "$port" --save "" --appendonly no \
             --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
     else
-        redis-server --port "$port" --save "" --appendonly no \
+        $REDIS_SERVER --port "$port" --save "" --appendonly no \
             --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
     fi
     sleep 2
 
-    if ! redis-cli -p "$port" PING &>/dev/null; then
+    if ! $REDIS_CLI -p "$port" PING &>/dev/null; then
         echo "ERROR: Failed to start ${label} Redis"
         return 1
     fi
@@ -152,7 +172,7 @@ run_config() {
     # SET phase: populate with redis-benchmark
     echo "[${label}] SET phase: ${NUM_OPS} ops, ${NUM_CLIENTS} clients, ${VALUE_SIZE}B values..."
     local set_result
-    set_result=$(redis-benchmark -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+    set_result=$($REDIS_BENCHMARK -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
         -d "$VALUE_SIZE" -r "$KEYSPACE" -t set -q 2>&1 | grep SET)
     echo "  $set_result"
 
@@ -183,7 +203,7 @@ run_config() {
     # GET phase: measure throughput on cold data
     echo "[${label}] GET phase: ${NUM_OPS} ops, ${NUM_CLIENTS} clients..."
     local get_result
-    get_result=$(redis-benchmark -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+    get_result=$($REDIS_BENCHMARK -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
         -d "$VALUE_SIZE" -r "$KEYSPACE" -t get -q 2>&1 | grep GET)
     echo "  $get_result"
 
@@ -200,7 +220,7 @@ run_config() {
     echo "METRIC ${label}_get_throughput ${get_result}"
 
     # Shutdown
-    redis-cli -p "$port" shutdown nosave 2>/dev/null || true
+    $REDIS_CLI -p "$port" shutdown nosave 2>/dev/null || true
     sleep 1
 }
 
@@ -213,15 +233,15 @@ run_extended_config() {
     echo ""
     echo "[${label}] Starting Redis on port ${port}..."
     if [[ -n "$env_prefix" ]]; then
-        env ${env_prefix} redis-server --port "$port" --save "" --appendonly no \
+        env ${env_prefix} $REDIS_SERVER --port "$port" --save "" --appendonly no \
             --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
     else
-        redis-server --port "$port" --save "" --appendonly no \
+        $REDIS_SERVER --port "$port" --save "" --appendonly no \
             --daemonize no --loglevel warning --hz 1 --dynamic-hz no &>/dev/null &
     fi
     sleep 2
 
-    if ! redis-cli -p "$port" PING &>/dev/null; then
+    if ! $REDIS_CLI -p "$port" PING &>/dev/null; then
         echo "ERROR: Failed to start ${label} Redis"
         return 1
     fi
@@ -229,7 +249,7 @@ run_extended_config() {
     # SET phase: populate with redis-benchmark
     echo "[${label}] SET phase: ${NUM_OPS} ops, ${NUM_CLIENTS} clients, ${VALUE_SIZE}B values..."
     local set_result
-    set_result=$(redis-benchmark -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+    set_result=$($REDIS_BENCHMARK -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
         -d "$VALUE_SIZE" -r "$KEYSPACE" -t set -q 2>&1 | grep SET)
     echo "  $set_result"
 
@@ -270,7 +290,7 @@ run_extended_config() {
     # GET phase: measure throughput on cold data (will miss ~50% of keys)
     echo "[${label}] GET phase: ${NUM_OPS} ops, ${NUM_CLIENTS} clients..."
     local get_result
-    get_result=$(redis-benchmark -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
+    get_result=$($REDIS_BENCHMARK -p "$port" -c "$NUM_CLIENTS" -n "$NUM_OPS" \
         -d "$VALUE_SIZE" -r "$KEYSPACE" -t get -q 2>&1 | grep GET)
     echo "  $get_result"
 
@@ -288,7 +308,7 @@ run_extended_config() {
     echo "METRIC ${label}_get_throughput ${get_result}"
 
     # Shutdown
-    redis-cli -p "$port" shutdown nosave 2>/dev/null || true
+    $REDIS_CLI -p "$port" shutdown nosave 2>/dev/null || true
     sleep 1
 }
 

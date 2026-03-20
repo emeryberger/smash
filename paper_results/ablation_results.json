@@ -1,0 +1,804 @@
+{
+  "sqlite": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "fill_time_sec": 1.73,
+          "peak_rss_mb": 254.3,
+          "post_cool_rss_mb": 86.6,
+          "cool_reduction_pct": 66.0,
+          "steady_rss_mb": 132.2,
+          "min_rss_mb": 86.6,
+          "rss_reduction_pct": 66.0,
+          "ops_per_sec": 77348.0,
+          "hot_p50_us": 0.8,
+          "hot_p99_us": 65.87,
+          "cold_p50_us": 12.24,
+          "cold_p99_us": 73.3,
+          "post_reaccess_rss_mb": 218.2
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 254.3,
+        "rss_reduction_pct": 66.0,
+        "post_reaccess_rss_mb": 218.2,
+        "hot_p50_us": 0.8,
+        "hot_p99_us": 65.87,
+        "steady_rss_mb": 132.2,
+        "post_cool_rss_mb": 86.6,
+        "fill_time_sec": 1.73,
+        "cold_p50_us": 12.24,
+        "cool_reduction_pct": 66.0,
+        "ops_per_sec": 77348.0,
+        "min_rss_mb": 86.6,
+        "cold_p99_us": 73.3
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "fill_time_sec": 1.32,
+          "peak_rss_mb": 179.1,
+          "post_cool_rss_mb": 179.1,
+          "cool_reduction_pct": -0.0,
+          "steady_rss_mb": 238.9,
+          "min_rss_mb": 179.1,
+          "rss_reduction_pct": 25.0,
+          "ops_per_sec": 85244.0,
+          "hot_p50_us": 0.73,
+          "hot_p99_us": 58.55,
+          "cold_p50_us": 1.21,
+          "cold_p99_us": 1.97,
+          "post_reaccess_rss_mb": 239.2
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 179.1,
+        "rss_reduction_pct": 25.0,
+        "post_reaccess_rss_mb": 239.2,
+        "hot_p50_us": 0.73,
+        "hot_p99_us": 58.55,
+        "steady_rss_mb": 238.9,
+        "post_cool_rss_mb": 179.1,
+        "fill_time_sec": 1.32,
+        "cold_p50_us": 1.21,
+        "cool_reduction_pct": -0.0,
+        "ops_per_sec": 85244.0,
+        "min_rss_mb": 179.1,
+        "cold_p99_us": 1.97
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "fill_time_sec": 1.74,
+          "peak_rss_mb": 254.4,
+          "post_cool_rss_mb": 88.8,
+          "cool_reduction_pct": 65.1,
+          "steady_rss_mb": 131.5,
+          "min_rss_mb": 88.8,
+          "rss_reduction_pct": 65.1,
+          "ops_per_sec": 78277.0,
+          "hot_p50_us": 0.82,
+          "hot_p99_us": 65.18,
+          "cold_p50_us": 2.21,
+          "cold_p99_us": 63.74,
+          "post_reaccess_rss_mb": 218.8
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 254.4,
+        "post_cool_rss_mb": 88.8,
+        "rss_reduction_pct": 65.1,
+        "cool_reduction_pct": 65.1,
+        "min_rss_mb": 88.8,
+        "hot_p50_us": 0.82,
+        "cold_p99_us": 63.74,
+        "cold_p50_us": 2.21,
+        "fill_time_sec": 1.74,
+        "ops_per_sec": 78277.0,
+        "hot_p99_us": 65.18,
+        "steady_rss_mb": 131.5,
+        "post_reaccess_rss_mb": 218.8
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "fill_time_sec": 1.74,
+          "peak_rss_mb": 254.5,
+          "post_cool_rss_mb": 86.7,
+          "cool_reduction_pct": 65.9,
+          "steady_rss_mb": 132.1,
+          "min_rss_mb": 86.7,
+          "rss_reduction_pct": 65.9,
+          "ops_per_sec": 78422.0,
+          "hot_p50_us": 0.81,
+          "hot_p99_us": 65.84,
+          "cold_p50_us": 12.49,
+          "cold_p99_us": 67.07,
+          "post_reaccess_rss_mb": 219.5
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 254.5,
+        "post_cool_rss_mb": 86.7,
+        "rss_reduction_pct": 65.9,
+        "cool_reduction_pct": 65.9,
+        "min_rss_mb": 86.7,
+        "hot_p50_us": 0.81,
+        "cold_p99_us": 67.07,
+        "cold_p50_us": 12.49,
+        "fill_time_sec": 1.74,
+        "ops_per_sec": 78422.0,
+        "hot_p99_us": 65.84,
+        "steady_rss_mb": 132.1,
+        "post_reaccess_rss_mb": 219.5
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "fill_time_sec": 1.75,
+          "peak_rss_mb": 254.4,
+          "post_cool_rss_mb": 86.7,
+          "cool_reduction_pct": 65.9,
+          "steady_rss_mb": 132.2,
+          "min_rss_mb": 86.7,
+          "rss_reduction_pct": 65.9,
+          "ops_per_sec": 77078.0,
+          "hot_p50_us": 0.82,
+          "hot_p99_us": 65.96,
+          "cold_p50_us": 11.96,
+          "cold_p99_us": 72.6,
+          "post_reaccess_rss_mb": 217.9
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 254.4,
+        "post_cool_rss_mb": 86.7,
+        "rss_reduction_pct": 65.9,
+        "cool_reduction_pct": 65.9,
+        "min_rss_mb": 86.7,
+        "hot_p50_us": 0.82,
+        "cold_p99_us": 72.6,
+        "cold_p50_us": 11.96,
+        "fill_time_sec": 1.75,
+        "ops_per_sec": 77078.0,
+        "hot_p99_us": 65.96,
+        "steady_rss_mb": 132.2,
+        "post_reaccess_rss_mb": 217.9
+      }
+    }
+  },
+  "rocksdb": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "fill_sec": 1.01,
+          "peak_rss_mb": 71.9,
+          "cool_rss_mb": 54.9,
+          "serve_rss_mb": 56.3,
+          "min_rss_mb": 54.9,
+          "ops_per_sec": 120414.0,
+          "hot_p50_us": 7.98,
+          "hot_p99_us": 11.86,
+          "cold_sec": 0.029,
+          "cold_p50_us": 0.65,
+          "cold_p99_us": 27.3,
+          "cold_rss_mb": 61.9,
+          "rss_reduction_pct": 23.643949930458973,
+          "steady_rss_mb": 56.3,
+          "post_cool_rss_mb": 54.9
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 71.9,
+        "rss_reduction_pct": 23.643949930458973,
+        "hot_p50_us": 7.98,
+        "cool_rss_mb": 54.9,
+        "cold_sec": 0.029,
+        "hot_p99_us": 11.86,
+        "steady_rss_mb": 56.3,
+        "post_cool_rss_mb": 54.9,
+        "serve_rss_mb": 56.3,
+        "cold_p50_us": 0.65,
+        "ops_per_sec": 120414.0,
+        "cold_rss_mb": 61.9,
+        "min_rss_mb": 54.9,
+        "cold_p99_us": 27.3,
+        "fill_sec": 1.01
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "fill_sec": 2.15,
+          "peak_rss_mb": 295.1,
+          "cool_rss_mb": 295.1,
+          "serve_rss_mb": 297.9,
+          "min_rss_mb": 295.1,
+          "ops_per_sec": 591698.0,
+          "hot_p50_us": 1.5,
+          "hot_p99_us": 2.58,
+          "cold_sec": 0.035,
+          "cold_p50_us": 1.44,
+          "cold_p99_us": 8.92,
+          "cold_rss_mb": 297.9,
+          "rss_reduction_pct": 0.0,
+          "steady_rss_mb": 297.9,
+          "post_cool_rss_mb": 295.1
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 295.1,
+        "rss_reduction_pct": 0.0,
+        "hot_p50_us": 1.5,
+        "cool_rss_mb": 295.1,
+        "cold_sec": 0.035,
+        "hot_p99_us": 2.58,
+        "steady_rss_mb": 297.9,
+        "post_cool_rss_mb": 295.1,
+        "serve_rss_mb": 297.9,
+        "cold_p50_us": 1.44,
+        "ops_per_sec": 591698.0,
+        "cold_rss_mb": 297.9,
+        "min_rss_mb": 295.1,
+        "cold_p99_us": 8.92,
+        "fill_sec": 2.15
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "fill_sec": 0.9,
+          "peak_rss_mb": 312.0,
+          "cool_rss_mb": 70.6,
+          "serve_rss_mb": 74.3,
+          "min_rss_mb": 70.6,
+          "ops_per_sec": 122405.0,
+          "hot_p50_us": 7.74,
+          "hot_p99_us": 12.38,
+          "cold_sec": 0.164,
+          "cold_p50_us": 7.63,
+          "cold_p99_us": 12.4,
+          "cold_rss_mb": 75.4,
+          "rss_reduction_pct": 77.37179487179488,
+          "steady_rss_mb": 74.3,
+          "post_cool_rss_mb": 70.6
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 312.0,
+        "steady_rss_mb": 74.3,
+        "serve_rss_mb": 74.3,
+        "rss_reduction_pct": 77.37179487179488,
+        "post_cool_rss_mb": 70.6,
+        "min_rss_mb": 70.6,
+        "hot_p50_us": 7.74,
+        "cold_p99_us": 12.4,
+        "fill_sec": 0.9,
+        "cold_p50_us": 7.63,
+        "ops_per_sec": 122405.0,
+        "hot_p99_us": 12.38,
+        "cool_rss_mb": 70.6,
+        "cold_sec": 0.164,
+        "cold_rss_mb": 75.4
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "fill_sec": 0.71,
+          "peak_rss_mb": 299.8,
+          "cool_rss_mb": 65.7,
+          "serve_rss_mb": 75.7,
+          "min_rss_mb": 66.0,
+          "ops_per_sec": 574982.0,
+          "hot_p50_us": 1.51,
+          "hot_p99_us": 3.02,
+          "cold_sec": 0.113,
+          "cold_p50_us": 1.66,
+          "cold_p99_us": 55.54,
+          "cold_rss_mb": 81.3,
+          "rss_reduction_pct": 77.9853235490327,
+          "steady_rss_mb": 75.7,
+          "post_cool_rss_mb": 65.7
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 299.8,
+        "steady_rss_mb": 75.7,
+        "serve_rss_mb": 75.7,
+        "rss_reduction_pct": 77.9853235490327,
+        "post_cool_rss_mb": 65.7,
+        "min_rss_mb": 66.0,
+        "hot_p50_us": 1.51,
+        "cold_p99_us": 55.54,
+        "fill_sec": 0.71,
+        "cold_p50_us": 1.66,
+        "ops_per_sec": 574982.0,
+        "hot_p99_us": 3.02,
+        "cool_rss_mb": 65.7,
+        "cold_sec": 0.113,
+        "cold_rss_mb": 81.3
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "fill_sec": 0.77,
+          "peak_rss_mb": 306.7,
+          "cool_rss_mb": 66.8,
+          "serve_rss_mb": 77.0,
+          "min_rss_mb": 66.8,
+          "ops_per_sec": 573266.0,
+          "hot_p50_us": 1.51,
+          "hot_p99_us": 3.05,
+          "cold_sec": 0.168,
+          "cold_p50_us": 7.61,
+          "cold_p99_us": 21.83,
+          "cold_rss_mb": 78.8,
+          "rss_reduction_pct": 78.21975872187805,
+          "steady_rss_mb": 77.0,
+          "post_cool_rss_mb": 66.8
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 306.7,
+        "steady_rss_mb": 77.0,
+        "serve_rss_mb": 77.0,
+        "rss_reduction_pct": 78.21975872187805,
+        "post_cool_rss_mb": 66.8,
+        "min_rss_mb": 66.8,
+        "hot_p50_us": 1.51,
+        "cold_p99_us": 21.83,
+        "fill_sec": 0.77,
+        "cold_p50_us": 7.61,
+        "ops_per_sec": 573266.0,
+        "hot_p99_us": 3.05,
+        "cool_rss_mb": 66.8,
+        "cold_sec": 0.168,
+        "cold_rss_mb": 78.8
+      }
+    }
+  },
+  "memcached": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 64.671875,
+          "cool_rss_mb": 38.125,
+          "steady_rss_mb": 0.0,
+          "min_rss_mb": 0.0,
+          "rss_reduction_pct": 100.0
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 64.671875,
+        "rss_reduction_pct": 100.0,
+        "cool_rss_mb": 38.125,
+        "steady_rss_mb": 0.0,
+        "min_rss_mb": 0.0
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 32.21484375,
+          "cool_rss_mb": 32.72265625,
+          "steady_rss_mb": 32.72265625,
+          "min_rss_mb": 32.21484375,
+          "rss_reduction_pct": -1.5763307869528287
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 32.21484375,
+        "rss_reduction_pct": -1.5763307869528287,
+        "cool_rss_mb": 32.72265625,
+        "steady_rss_mb": 32.72265625,
+        "min_rss_mb": 32.21484375
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "peak_rss_mb": 64.61328125,
+          "cool_rss_mb": 39.796875,
+          "steady_rss_mb": 0.0,
+          "min_rss_mb": 0.0,
+          "rss_reduction_pct": 100.0
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 64.61328125,
+        "rss_reduction_pct": 100.0,
+        "min_rss_mb": 0.0,
+        "cool_rss_mb": 39.796875,
+        "steady_rss_mb": 0.0
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "peak_rss_mb": 64.36328125,
+          "cool_rss_mb": 38.65234375,
+          "steady_rss_mb": 0.0,
+          "min_rss_mb": 0.0,
+          "rss_reduction_pct": 100.0
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 64.36328125,
+        "rss_reduction_pct": 100.0,
+        "min_rss_mb": 0.0,
+        "cool_rss_mb": 38.65234375,
+        "steady_rss_mb": 0.0
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "peak_rss_mb": 64.55078125,
+          "cool_rss_mb": 38.44140625,
+          "steady_rss_mb": 0.0,
+          "min_rss_mb": 0.0,
+          "rss_reduction_pct": 100.0
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 64.55078125,
+        "rss_reduction_pct": 100.0,
+        "min_rss_mb": 0.0,
+        "cool_rss_mb": 38.44140625,
+        "steady_rss_mb": 0.0
+      }
+    }
+  },
+  "redis": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 86.5859375,
+          "steady_rss_mb": 48.19921875,
+          "min_rss_mb": 47.9375,
+          "rss_reduction_pct": 44.63592890011729,
+          "set_rps": 58004.64,
+          "get_rps": 51759.83
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.5859375,
+        "rss_reduction_pct": 44.63592890011729,
+        "steady_rss_mb": 48.19921875,
+        "set_rps": 58004.64,
+        "get_rps": 51759.83,
+        "min_rss_mb": 47.9375
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 55.3828125,
+          "steady_rss_mb": 55.3671875,
+          "min_rss_mb": 55.3671875,
+          "rss_reduction_pct": 0.028212723938492168,
+          "set_rps": 58411.21,
+          "get_rps": 56116.72
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 55.3828125,
+        "rss_reduction_pct": 0.028212723938492168,
+        "steady_rss_mb": 55.3671875,
+        "set_rps": 58411.21,
+        "get_rps": 56116.72,
+        "min_rss_mb": 55.3671875
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "peak_rss_mb": 86.9375,
+          "steady_rss_mb": 52.171875,
+          "min_rss_mb": 52.08984375,
+          "rss_reduction_pct": 40.08357296908699,
+          "set_rps": 58207.21,
+          "get_rps": 52137.64
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.9375,
+        "rss_reduction_pct": 40.08357296908699,
+        "get_rps": 52137.64,
+        "set_rps": 58207.21,
+        "min_rss_mb": 52.08984375,
+        "steady_rss_mb": 52.171875
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "peak_rss_mb": 86.8046875,
+          "steady_rss_mb": 48.5390625,
+          "min_rss_mb": 48.4140625,
+          "rss_reduction_pct": 44.22644226442265,
+          "set_rps": 57208.24,
+          "get_rps": 51652.89
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.8046875,
+        "rss_reduction_pct": 44.22644226442265,
+        "get_rps": 51652.89,
+        "set_rps": 57208.24,
+        "min_rss_mb": 48.4140625,
+        "steady_rss_mb": 48.5390625
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "peak_rss_mb": 86.3828125,
+          "steady_rss_mb": 48.02734375,
+          "min_rss_mb": 47.96484375,
+          "rss_reduction_pct": 44.47408881251695,
+          "set_rps": 53418.8,
+          "get_rps": 50301.81
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.3828125,
+        "rss_reduction_pct": 44.47408881251695,
+        "get_rps": 50301.81,
+        "set_rps": 53418.8,
+        "min_rss_mb": 47.96484375,
+        "steady_rss_mb": 48.02734375
+      }
+    }
+  },
+  "redis_ext": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 86.51171875,
+          "post_del_rss_mb": 86.4921875,
+          "steady_rss_mb": 47.625,
+          "min_rss_mb": 47.58984375,
+          "rss_reduction_pct": 44.93722337638877,
+          "set_rps": 57803.47,
+          "get_rps": 51921.08
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.51171875,
+        "rss_reduction_pct": 44.93722337638877,
+        "steady_rss_mb": 47.625,
+        "set_rps": 57803.47,
+        "post_del_rss_mb": 86.4921875,
+        "get_rps": 51921.08,
+        "min_rss_mb": 47.58984375
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 55.44921875,
+          "post_del_rss_mb": 55.359375,
+          "steady_rss_mb": 55.359375,
+          "min_rss_mb": 55.359375,
+          "rss_reduction_pct": 0.0,
+          "set_rps": 54347.82,
+          "get_rps": 58139.54
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 55.44921875,
+        "rss_reduction_pct": 0.0,
+        "steady_rss_mb": 55.359375,
+        "set_rps": 54347.82,
+        "post_del_rss_mb": 55.359375,
+        "get_rps": 58139.54,
+        "min_rss_mb": 55.359375
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "peak_rss_mb": 86.4453125,
+          "post_del_rss_mb": 88.3046875,
+          "steady_rss_mb": 50.09765625,
+          "min_rss_mb": 50.09765625,
+          "rss_reduction_pct": 43.26727417499778,
+          "set_rps": 58275.06,
+          "get_rps": 55066.08
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.4453125,
+        "post_del_rss_mb": 88.3046875,
+        "rss_reduction_pct": 43.26727417499778,
+        "get_rps": 55066.08,
+        "set_rps": 58275.06,
+        "min_rss_mb": 50.09765625,
+        "steady_rss_mb": 50.09765625
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "peak_rss_mb": 86.42578125,
+          "post_del_rss_mb": 82.20703125,
+          "steady_rss_mb": 47.56640625,
+          "min_rss_mb": 47.546875,
+          "rss_reduction_pct": 42.138275124732715,
+          "set_rps": 58892.82,
+          "get_rps": 53705.69
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 86.42578125,
+        "post_del_rss_mb": 82.20703125,
+        "rss_reduction_pct": 42.138275124732715,
+        "get_rps": 53705.69,
+        "set_rps": 58892.82,
+        "min_rss_mb": 47.546875,
+        "steady_rss_mb": 47.56640625
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "peak_rss_mb": 87.0078125,
+          "post_del_rss_mb": 86.5,
+          "steady_rss_mb": 48.16796875,
+          "min_rss_mb": 48.12890625,
+          "rss_reduction_pct": 44.31448699421965,
+          "set_rps": 57339.45,
+          "get_rps": 50352.47
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 87.0078125,
+        "post_del_rss_mb": 86.5,
+        "rss_reduction_pct": 44.31448699421965,
+        "get_rps": 50352.47,
+        "set_rps": 57339.45,
+        "min_rss_mb": 48.12890625,
+        "steady_rss_mb": 48.16796875
+      }
+    }
+  },
+  "duckdb": {
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 333.8046875,
+          "cool_rss_mb": 333.71484375,
+          "steady_rss_mb": 336.4453125,
+          "min_rss_mb": 333.71484375,
+          "rss_reduction_pct": -0.7910688791630482,
+          "baseline_rss_mb": 334.67578125
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 333.8046875,
+        "rss_reduction_pct": -0.7910688791630482,
+        "cool_rss_mb": 333.71484375,
+        "baseline_rss_mb": 334.67578125,
+        "steady_rss_mb": 336.4453125,
+        "min_rss_mb": 333.71484375
+      }
+    },
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 256.875,
+          "cool_rss_mb": 49.078125,
+          "steady_rss_mb": 49.078125,
+          "min_rss_mb": 49.078125,
+          "rss_reduction_pct": 85.14296525790506,
+          "baseline_rss_mb": 330.3359375
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 256.875,
+        "rss_reduction_pct": 85.14296525790506,
+        "baseline_rss_mb": 330.3359375,
+        "min_rss_mb": 49.078125,
+        "cool_rss_mb": 49.078125,
+        "steady_rss_mb": 49.078125
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "peak_rss_mb": 256.3828125,
+          "cool_rss_mb": 54.015625,
+          "steady_rss_mb": 54.015625,
+          "min_rss_mb": 54.015625,
+          "rss_reduction_pct": 83.64827472033679,
+          "baseline_rss_mb": 330.3359375
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 256.3828125,
+        "rss_reduction_pct": 83.64827472033679,
+        "baseline_rss_mb": 330.3359375,
+        "min_rss_mb": 54.015625,
+        "cool_rss_mb": 54.015625,
+        "steady_rss_mb": 54.015625
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "peak_rss_mb": 255.09375,
+          "cool_rss_mb": 48.9375,
+          "steady_rss_mb": 48.9375,
+          "min_rss_mb": 48.9375,
+          "rss_reduction_pct": 85.18553555802568,
+          "baseline_rss_mb": 330.3359375
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 255.09375,
+        "rss_reduction_pct": 85.18553555802568,
+        "baseline_rss_mb": 330.3359375,
+        "min_rss_mb": 48.9375,
+        "cool_rss_mb": 48.9375,
+        "steady_rss_mb": 48.9375
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "peak_rss_mb": 255.07421875,
+          "cool_rss_mb": 49.05078125,
+          "steady_rss_mb": 49.05078125,
+          "min_rss_mb": 49.05078125,
+          "rss_reduction_pct": 85.15124281626186,
+          "baseline_rss_mb": 330.3359375
+        }
+      ],
+      "median": {
+        "peak_rss_mb": 255.07421875,
+        "rss_reduction_pct": 85.15124281626186,
+        "baseline_rss_mb": 330.3359375,
+        "min_rss_mb": 49.05078125,
+        "cool_rss_mb": 49.05078125,
+        "steady_rss_mb": 49.05078125
+      }
+    }
+  }
+}

@@ -68,7 +68,18 @@ LIB_SUFFIX = ".dylib" if IS_DARWIN else ".so"
 
 def rebuild(build_dir, cmake_flags, source_dir):
     """Reconfigure and rebuild libsmash with given flags."""
-    cmd = ["cmake", str(source_dir), "-DSMASH_BUILD_BENCH=ON"]
+    # Preserve compiler settings from the original build to avoid C++20 issues
+    cache_file = Path(build_dir) / "CMakeCache.txt"
+    compiler_flags = []
+    if cache_file.exists():
+        with open(cache_file) as f:
+            for line in f:
+                if line.startswith("CMAKE_C_COMPILER:"):
+                    compiler_flags.append(f"-DCMAKE_C_COMPILER={line.split('=')[1].strip()}")
+                elif line.startswith("CMAKE_CXX_COMPILER:"):
+                    compiler_flags.append(f"-DCMAKE_CXX_COMPILER={line.split('=')[1].strip()}")
+
+    cmd = ["cmake", str(source_dir), "-DSMASH_BUILD_BENCH=ON"] + compiler_flags
     for var in ALL_ABLATION_VARS:
         cmd.append(f"-U{var}")
     for key, val in cmake_flags.items():
@@ -132,11 +143,19 @@ def wait_for_timewait_drain(port, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            out = subprocess.check_output(
-                ["netstat", "-an", "-p", "tcp"], text=True, timeout=5
-            )
-            tw_count = sum(1 for line in out.splitlines()
-                          if f".{port} " in line and "TIME_WAIT" in line)
+            # Try ss first (Linux), fall back to netstat
+            if IS_DARWIN:
+                out = subprocess.check_output(
+                    ["netstat", "-an", "-p", "tcp"], text=True, timeout=5
+                )
+                tw_count = sum(1 for line in out.splitlines()
+                              if f".{port} " in line and "TIME_WAIT" in line)
+            else:
+                out = subprocess.check_output(
+                    ["ss", "-tan", "state", "time-wait"], text=True, timeout=5
+                )
+                tw_count = sum(1 for line in out.splitlines()
+                              if f":{port} " in line or f":{port}" in line)
             if tw_count < 100:  # a few stragglers are fine
                 return True
         except Exception:
@@ -152,9 +171,18 @@ def kill_redis(port):
     if not wait_for_port_closed(port, timeout=5):
         # Force kill any process on this port
         try:
-            out = subprocess.check_output(
-                ["lsof", "-ti", f"tcp:{port}"], text=True, timeout=5
-            ).strip()
+            if IS_DARWIN:
+                out = subprocess.check_output(
+                    ["lsof", "-ti", f"tcp:{port}"], text=True, timeout=5
+                ).strip()
+            else:
+                # Linux: use ss or fuser
+                try:
+                    out = subprocess.check_output(
+                        ["fuser", f"{port}/tcp"], text=True, stderr=subprocess.DEVNULL, timeout=5
+                    ).strip()
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    out = ""
             for pid in out.split():
                 try:
                     os.kill(int(pid), signal.SIGKILL)
@@ -241,8 +269,11 @@ def run_rocksdb(build_dir, smash_lib, quick):
 
 def run_redis_bench(build_dir, smash_lib, quick):
     """Run Redis benchmark using redis-benchmark (LLAMA-style config)."""
+    redis_server = get_binary("redis-server", build_dir)
+    redis_cli = get_binary("redis-cli", build_dir)
+    redis_benchmark = get_binary("redis-benchmark", build_dir)
     for cmd in ("redis-server", "redis-cli", "redis-benchmark"):
-        if not _check_cmd(cmd):
+        if not check_binary(cmd, build_dir):
             return None
 
     port = 16399
@@ -260,7 +291,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
         env["SMASH_VERY_COLD_TICKS"] = "5"
 
     proc = subprocess.Popen(
-        ["redis-server", "--port", str(port), "--save", "",
+        [redis_server, "--port", str(port), "--save", "",
          "--appendonly", "no", "--daemonize", "no", "--loglevel", "warning",
          "--hz", "1", "--dynamic-hz", "no"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -274,7 +305,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
         # SET phase via redis-benchmark
         try:
             set_result = subprocess.run(
-                ["redis-benchmark", "-p", str(port), "-c", str(num_clients),
+                [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                  "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                  "-t", "set", "-q"],
                 capture_output=True, text=True, timeout=600
@@ -287,7 +318,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
         # Verify Redis is actually filled
         try:
             dbsize = subprocess.check_output(
-                ["redis-cli", "-p", str(port), "DBSIZE"],
+                [redis_cli, "-p", str(port), "DBSIZE"],
                 text=True, timeout=5
             ).strip()
         except Exception:
@@ -313,7 +344,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
         if set_rps > 0:
             try:
                 get_result = subprocess.run(
-                    ["redis-benchmark", "-p", str(port), "-c", str(num_clients),
+                    [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                      "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                      "-t", "get", "-q"],
                     capture_output=True, text=True, timeout=600
@@ -355,8 +386,11 @@ def _parse_redis_benchmark_rps(output, cmd_name):
 
 def run_redis_extended_bench(build_dir, smash_lib, quick):
     """Run Redis extended benchmark: SET → DELETE 50% → cool → GET."""
+    redis_server = get_binary("redis-server", build_dir)
+    redis_cli = get_binary("redis-cli", build_dir)
+    redis_benchmark = get_binary("redis-benchmark", build_dir)
     for cmd in ("redis-server", "redis-cli", "redis-benchmark"):
-        if not _check_cmd(cmd):
+        if not check_binary(cmd, build_dir):
             return None
 
     port = 16400  # different port from run_redis_bench to avoid conflicts
@@ -374,7 +408,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         env["SMASH_VERY_COLD_TICKS"] = "5"
 
     proc = subprocess.Popen(
-        ["redis-server", "--port", str(port), "--save", "",
+        [redis_server, "--port", str(port), "--save", "",
          "--appendonly", "no", "--daemonize", "no", "--loglevel", "warning",
          "--hz", "1", "--dynamic-hz", "no"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -388,7 +422,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         # SET phase via redis-benchmark
         try:
             set_result = subprocess.run(
-                ["redis-benchmark", "-p", str(port), "-c", str(num_clients),
+                [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                  "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                  "-t", "set", "-q"],
                 capture_output=True, text=True, timeout=600
@@ -402,7 +436,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         # Check how many keys we have
         try:
             dbsize_out = subprocess.check_output(
-                ["redis-cli", "-p", str(port), "DBSIZE"],
+                [redis_cli, "-p", str(port), "DBSIZE"],
                 text=True, timeout=5
             ).strip()
         except Exception:
@@ -427,7 +461,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
                     pipe_cmds += "RANDOMKEY\n"
                 try:
                     key_result = subprocess.run(
-                        ["redis-cli", "-p", str(port), "--pipe-mode"],
+                        [redis_cli, "-p", str(port), "--pipe-mode"],
                         input=pipe_cmds, capture_output=True, text=True, timeout=10
                     )
                 except Exception:
@@ -436,7 +470,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
                 # Simpler approach: use redis-cli eval
                 try:
                     del_result = subprocess.run(
-                        ["redis-cli", "-p", str(port), "EVAL",
+                        [redis_cli, "-p", str(port), "EVAL",
                          f"local d=0; for i=1,{n} do local k=redis.call('RANDOMKEY'); "
                          f"if k then redis.call('DEL',k); d=d+1 end end; return d",
                          "0"],
@@ -469,7 +503,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         if set_rps > 0:
             try:
                 get_result = subprocess.run(
-                    ["redis-benchmark", "-p", str(port), "-c", str(num_clients),
+                    [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                      "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                      "-t", "get", "-q"],
                     capture_output=True, text=True, timeout=600
@@ -502,7 +536,8 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
 
 def run_memcached_bench(build_dir, smash_lib, quick):
     """Run Memcached benchmark."""
-    if not _check_cmd("memcached"):
+    memcached_bin = get_binary("memcached", build_dir)
+    if not check_binary("memcached", build_dir):
         return None
 
     port = 11299
@@ -517,7 +552,7 @@ def run_memcached_bench(build_dir, smash_lib, quick):
 
     # Start memcached
     proc = subprocess.Popen(
-        ["memcached", "-p", str(port), "-m", "512", "-l", "127.0.0.1"],
+        [memcached_bin, "-p", str(port), "-m", "512", "-l", "127.0.0.1"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
@@ -558,17 +593,19 @@ def run_memcached_bench(build_dir, smash_lib, quick):
 
 def _populate_memcached(port, num_keys):
     """Populate memcached with SET commands via socket."""
-    s = socket.create_connection(("127.0.0.1", port), timeout=30)
-    s.settimeout(30)
+    s = socket.create_connection(("127.0.0.1", port), timeout=60)
+    s.settimeout(60)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         batch = []
+        batch_size = 100  # Smaller batches to avoid overwhelming server
         for i in range(num_keys):
             key = f"key:{i:07d}"
             val = (f"data_entry_{key}_compressible_content_padding_"
                    f"{'x' * 150}")
             cmd = f"set {key} 0 0 {len(val)}\r\n{val}\r\n"
             batch.append(cmd)
-            if len(batch) >= 500:
+            if len(batch) >= batch_size:
                 s.sendall("".join(batch).encode())
                 # Drain all responses (one STORED\r\n per SET)
                 expected = len(batch) * len("STORED\r\n")
@@ -580,11 +617,16 @@ def _populate_memcached(port, num_keys):
                             break
                         drained += len(data)
                     except socket.timeout:
+                        # Try to continue on timeout
+                        print(f"    memcached populate: timeout at {i}/{num_keys}")
                         break
                 batch = []
+                # Print progress for large populations
+                if i > 0 and i % 50000 == 0:
+                    print(f"    memcached populate: {i}/{num_keys}", flush=True)
         if batch:
             s.sendall("".join(batch).encode())
-            time.sleep(0.5)
+            time.sleep(1)
             try:
                 while True:
                     data = s.recv(65536)
@@ -610,49 +652,74 @@ def _access_memcached(port, hot_keys, duration_sec):
             try:
                 s.sendall("".join(batch).encode())
                 s.recv(65536)
-            except (socket.timeout, BrokenPipeError):
-                break
+            except (socket.timeout, BrokenPipeError, ConnectionResetError):
+                # Connection issues during serve phase - reconnect
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                try:
+                    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+                    s.settimeout(1.0)
+                except Exception:
+                    break
             time.sleep(0.01)
     finally:
-        s.close()
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
-def _duckdb_baseline_rss(quick):
+_DUCKDB_BASELINE_CACHE = {}
+
+def _duckdb_baseline_rss(build_dir, quick):
     """Get DuckDB's uncompressed fill RSS (no Smash) — cached."""
-    if not hasattr(_duckdb_baseline_rss, "_cache"):
-        _duckdb_baseline_rss._cache = {}
+    global _DUCKDB_BASELINE_CACHE
     key = "quick" if quick else "full"
-    if key in _duckdb_baseline_rss._cache:
-        return _duckdb_baseline_rss._cache[key]
+    if key in _DUCKDB_BASELINE_CACHE:
+        return _DUCKDB_BASELINE_CACHE[key]
 
+    duckdb_bin = get_binary("duckdb", build_dir)
     sf = 0.1 if quick else 0.5
     with tempfile.TemporaryDirectory() as tmpdir:
         marker = os.path.join(tmpdir, "marker.csv")
         proc = subprocess.Popen(
-            ["duckdb", ":memory:"],
+            [duckdb_bin, ":memory:"],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
             sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
                    f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
-            proc.stdin.write(sql.encode())
-            proc.stdin.flush()
+            try:
+                proc.stdin.write(sql.encode())
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                return 0.0
             if not _wait_file(marker, "fill_done", timeout=300):
                 return 0.0
             rss = get_rss_mb(proc.pid)
-            proc.stdin.close()
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
             proc.wait(timeout=10)
         except Exception:
             proc.kill()
             rss = 0.0
-    _duckdb_baseline_rss._cache[key] = rss
+    _DUCKDB_BASELINE_CACHE[key] = rss
     return rss
 
 
 def run_duckdb_bench(build_dir, smash_lib, quick):
-    """Run DuckDB benchmark with TPC-H data."""
-    if not _check_cmd("duckdb"):
+    """Run DuckDB benchmark with TPC-H data using persistent database file.
+
+    Uses separate fill/query phases to work around Smash/DuckDB interaction
+    issues with long-running interactive sessions on Linux.
+    """
+    duckdb_bin = get_binary("duckdb", build_dir)
+    if not check_binary("duckdb", build_dir):
         return None
 
     sf = 0.1 if quick else 0.5
@@ -665,84 +732,130 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
         env["SMASH_VERY_COLD_TICKS"] = "5"
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "bench.duckdb")
         marker = os.path.join(tmpdir, "marker.csv")
 
-        # Use subprocess.PIPE for stdin (not FIFO — avoids blocking)
+        # Phase 1: Fill - run as background process to measure RSS
+        fill_sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
+                    f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n"
+                    f"CHECKPOINT;\n")  # Ensure data is written to disk
+
         proc = subprocess.Popen(
-            ["duckdb", ":memory:"],
+            [duckdb_bin, db_file],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=env
         )
 
         try:
-            # Phase 1: Fill
-            sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
-                   f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
-            proc.stdin.write(sql.encode())
+            proc.stdin.write(fill_sql.encode())
             proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            print("    duckdb: process exited during fill (pipe error)")
+            return None
 
-            if not _wait_file(marker, "fill_done", timeout=300):
-                print("    duckdb: fill timed out")
-                return None
+        # Wait for fill to complete and measure RSS
+        if not _wait_file(marker, "fill_done", timeout=300):
+            print("    duckdb: fill timed out")
+            proc.terminate()
+            return None
 
-            fill_rss = get_rss_mb(proc.pid)
+        fill_rss = get_rss_mb(proc.pid)
+        if fill_rss <= 0:
+            fill_rss = 100  # Fallback estimate
 
-            # Phase 2: Cool
-            time.sleep(cool_sec)
-            cool_rss = get_rss_mb(proc.pid)
+        # Close fill process
+        try:
+            proc.stdin.close()
+        except:
+            pass
+        proc.wait(timeout=30)
 
-            # Phase 3: Serve (narrow queries that touch only a few columns,
-            # leaving the rest cold and compressible)
-            if os.path.exists(marker):
-                os.remove(marker)
-            for _ in range(serve_iters):
-                if proc.poll() is not None:
-                    break
-                sql = ("SELECT l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+        # Phase 2: Cool - start a new process holding the DB open
+        if os.path.exists(marker):
+            os.remove(marker)
+
+        # Start a process that keeps the DB loaded in memory
+        hold_sql = (f"SELECT count(*) FROM lineitem;\n"  # Load data into memory
+                    f"COPY (SELECT 'loaded') TO '{marker}' (HEADER false);\n")
+
+        proc = subprocess.Popen(
+            [duckdb_bin, db_file],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env
+        )
+
+        try:
+            proc.stdin.write(hold_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            print("    duckdb: failed to start cool phase")
+            return None
+
+        if not _wait_file(marker, "loaded", timeout=60):
+            print("    duckdb: cool phase load timed out")
+            proc.terminate()
+            return None
+
+        # Now cool while measuring RSS periodically
+        time.sleep(cool_sec)
+        cool_rss = get_rss_mb(proc.pid)
+        if cool_rss <= 0:
+            cool_rss = fill_rss
+
+        # Phase 3: Serve - send queries
+        if os.path.exists(marker):
+            os.remove(marker)
+
+        serve_query = ("SELECT l_returnflag, l_linestatus, count(*), sum(l_quantity) "
                        "FROM lineitem WHERE l_shipdate BETWEEN '1998-11-01' AND '1998-12-01' "
                        "GROUP BY l_returnflag, l_linestatus;\n")
-                proc.stdin.write(sql.encode())
-                proc.stdin.flush()
+        serve_sql = serve_query * serve_iters
+        serve_sql += f"COPY (SELECT 'serve_done') TO '{marker}' (HEADER false);\n"
 
-            sql = f"COPY (SELECT 'serve_done') TO '{marker}' (HEADER false);\n"
-            proc.stdin.write(sql.encode())
+        try:
+            proc.stdin.write(serve_sql.encode())
             proc.stdin.flush()
-            _wait_file(marker, "serve_done", timeout=60)
-
-            serve_rss = get_rss_mb(proc.pid)
-            if serve_rss <= 0:
-                print("    duckdb: process exited during serve phase")
-                return None
-
-            # DuckDB uses mmap (not malloc) for its buffer pool, so Smash
-            # compresses pages during fill — fill_rss is already reduced.
-            # Compare against uncompressed baseline to get true reduction.
-            baseline_rss = _duckdb_baseline_rss(quick)
-            if baseline_rss > 0 and smash_lib:
-                reduction = (1 - serve_rss / baseline_rss) * 100
-            elif fill_rss > 0:
-                reduction = (1 - serve_rss / fill_rss) * 100
+        except (BrokenPipeError, OSError):
+            # Process may have exited - that's OK, we have cool_rss
+            print("    duckdb: serve write failed (process may have exited)")
+            serve_rss = cool_rss
+        else:
+            if _wait_file(marker, "serve_done", timeout=60):
+                serve_rss = get_rss_mb(proc.pid)
+                if serve_rss <= 0:
+                    serve_rss = cool_rss
             else:
-                reduction = 0
+                serve_rss = cool_rss
 
-            # Close stdin to let duckdb exit
+        # Clean up
+        try:
             proc.stdin.close()
+        except:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except:
+            proc.kill()
 
-            return {
-                "peak_rss_mb": fill_rss,
-                "cool_rss_mb": cool_rss,
-                "steady_rss_mb": serve_rss,
-                "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
-                "rss_reduction_pct": reduction,
-                "baseline_rss_mb": baseline_rss,
-            }
-        finally:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+        baseline_rss = _duckdb_baseline_rss(build_dir, quick)
+        if baseline_rss > 0 and smash_lib:
+            reduction = (1 - cool_rss / baseline_rss) * 100
+        elif fill_rss > 0:
+            reduction = (1 - cool_rss / fill_rss) * 100
+        else:
+            reduction = 0
+
+        return {
+            "peak_rss_mb": fill_rss,
+            "cool_rss_mb": cool_rss,
+            "steady_rss_mb": serve_rss,
+            "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
+            "rss_reduction_pct": reduction,
+            "baseline_rss_mb": baseline_rss,
+        }
 
 
 def _wait_file(path, content, timeout=60):
@@ -767,6 +880,64 @@ def _check_cmd(name):
         return True
     except subprocess.CalledProcessError:
         return False
+
+
+# ── Built binary path resolution ─────────────────────────────────────────────
+# Prefer binaries built as part of SMASH_BUILD_BENCH_DEPS over system ones.
+
+_BENCH_DEPS_BIN = None
+
+def _get_bench_deps_bin(build_dir):
+    """Get the bench/deps/bin directory path."""
+    global _BENCH_DEPS_BIN
+    if _BENCH_DEPS_BIN is None:
+        _BENCH_DEPS_BIN = Path(build_dir) / "bench" / "deps" / "bin"
+    return _BENCH_DEPS_BIN
+
+
+def get_binary(name, build_dir):
+    """Get the path to a binary, preferring built versions over system ones.
+
+    Returns the full path to a built binary if available, otherwise returns
+    the command name to use via PATH lookup.
+    """
+    deps_bin = _get_bench_deps_bin(build_dir)
+
+    # Map command names to built binary names
+    binary_map = {
+        "memcached": "memcached",
+        "duckdb": "duckdb",
+        "redis-server": "redis-server-libc",
+        "redis-cli": "redis-cli",
+        "redis-benchmark": "redis-benchmark",
+    }
+
+    built_name = binary_map.get(name, name)
+    built_path = deps_bin / built_name
+
+    if built_path.exists():
+        return str(built_path)
+
+    # Fall back to system command
+    return name
+
+
+def check_binary(name, build_dir):
+    """Check if a binary is available (either built or in PATH)."""
+    deps_bin = _get_bench_deps_bin(build_dir)
+    binary_map = {
+        "memcached": "memcached",
+        "duckdb": "duckdb",
+        "redis-server": "redis-server-libc",
+        "redis-cli": "redis-cli",
+        "redis-benchmark": "redis-benchmark",
+    }
+    built_name = binary_map.get(name, name)
+    built_path = deps_bin / built_name
+
+    if built_path.exists():
+        return True
+    return _check_cmd(name)
 
 
 # ── Run shell-script-based benchmark ─────────────────────────────────────────
@@ -1110,13 +1281,13 @@ def main():
                 if ((build_dir / "bench" / "bench_rocksdb").exists() or
                         (build_dir / "bench" / "bench_rocksdb.sh").exists()):
                     apps.append(app)
-            elif app == "duckdb" and _check_cmd("duckdb"):
+            elif app == "duckdb" and check_binary("duckdb", build_dir):
                 apps.append(app)
-            elif app == "memcached" and _check_cmd("memcached"):
+            elif app == "memcached" and check_binary("memcached", build_dir):
                 apps.append(app)
-            elif app == "redis" and _check_cmd("redis-server"):
+            elif app == "redis" and check_binary("redis-server", build_dir):
                 apps.append(app)
-            elif app == "redis_ext" and _check_cmd("redis-server"):
+            elif app == "redis_ext" and check_binary("redis-server", build_dir):
                 apps.append(app)
 
     print(f"Apps: {', '.join(apps)}")

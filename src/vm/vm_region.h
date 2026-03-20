@@ -3,9 +3,10 @@
 // All slab data pages are allocated from this contiguous region.
 // Benefits: O(1) bounds check, page state tracking, reassignable pages.
 //
-// When compiled with SMASH_COMPRESS_ONLY, operates in "tracking mode":
-// no contiguous reservation; instead tracks arbitrary page addresses via
-// a hash map, allowing compression of pages owned by any allocator.
+// Supports two modes (selected at runtime via SMASH_MODE env var):
+// - Full mode: contiguous VM reservation, pages allocated via bump pointer
+// - Compress-only mode: tracks arbitrary page addresses via hash map,
+//   allowing compression of pages owned by any allocator
 #pragma once
 
 #include "smash/config.h"
@@ -21,12 +22,14 @@
 namespace smash {
 
 class VmRegion {
+    // Mode determined at init time
+    bool tracking_mode_ = false;
+
+    // ── Full mode: contiguous allocation ────────────────────────────────────
     char* base_ = nullptr;
     size_t total_pages_ = 0;
     std::atomic<size_t> next_page_{0};  // bump pointer (normal) or next index (tracking)
 
-#ifndef SMASH_COMPRESS_ONLY
-    // ── Normal mode: free page run management ────────────────────────────
     struct FreeRun {
         size_t page_index;
         size_t page_count;
@@ -51,8 +54,7 @@ class VmRegion {
         free_pool_ = r;
     }
 
-#else
-    // ── Tracking mode: hash map for arbitrary page addresses ─────────────
+    // ── Tracking mode: hash map for arbitrary page addresses ────────────────
     static constexpr size_t kTrackMaxPages = 128 * 1024;  // 128K pages (~2GB on 16K pages)
     static constexpr size_t kTrackHashCap  = 256 * 1024;  // 2x headroom
     static constexpr size_t kTrackHashMask = kTrackHashCap - 1;
@@ -66,6 +68,7 @@ class VmRegion {
     uintptr_t* track_reverse_ = nullptr;  // idx → page_addr (page-aligned)
 
     size_t lookupIdx(uintptr_t addr) const {
+        if (!tracking_mode_ || !track_hash_) return 0;
         uintptr_t key = addr >> kPageShift;
         if (key == 0) return 0;
         size_t slot = static_cast<size_t>(key * 0x9E3779B97F4A7C15ULL) >> (64 - 18);
@@ -79,37 +82,43 @@ class VmRegion {
         }
         return 0;
     }
-#endif
 
 public:
     bool init(size_t region_size) {
-#ifndef SMASH_COMPRESS_ONLY
-        total_pages_ = region_size / kPageSize;
-        base_ = static_cast<char*>(vm::reservePages(region_size));
-        return base_ != nullptr;
-#else
-        (void)region_size;
-        total_pages_ = kTrackMaxPages;
-        next_page_.store(1, std::memory_order_relaxed);  // index 0 reserved
+        tracking_mode_ = isCompressOnlyMode();
 
-        track_hash_ = static_cast<TrackEntry*>(
-            BootstrapAlloc::instance().allocate(
-                kTrackHashCap * sizeof(TrackEntry), 64));
-        track_reverse_ = static_cast<uintptr_t*>(
-            BootstrapAlloc::instance().allocate(
-                kTrackMaxPages * sizeof(uintptr_t), 8));
-        if (!track_hash_ || !track_reverse_) return false;
+        if (!tracking_mode_) {
+            // Full mode: reserve contiguous VM region
+            total_pages_ = region_size / kPageSize;
+            base_ = static_cast<char*>(vm::reservePages(region_size));
+            return base_ != nullptr;
+        } else {
+            // Compress-only mode: initialize tracking hash table
+            (void)region_size;
+            total_pages_ = kTrackMaxPages;
+            next_page_.store(1, std::memory_order_relaxed);  // index 0 reserved
 
-        // Zero-initialize hash table (0 = empty sentinel)
-        __builtin_memset(track_hash_, 0, kTrackHashCap * sizeof(TrackEntry));
-        __builtin_memset(track_reverse_, 0, kTrackMaxPages * sizeof(uintptr_t));
-        return true;
-#endif
+            track_hash_ = static_cast<TrackEntry*>(
+                BootstrapAlloc::instance().allocate(
+                    kTrackHashCap * sizeof(TrackEntry), 64));
+            track_reverse_ = static_cast<uintptr_t*>(
+                BootstrapAlloc::instance().allocate(
+                    kTrackMaxPages * sizeof(uintptr_t), 8));
+            if (!track_hash_ || !track_reverse_) return false;
+
+            // Zero-initialize hash table (0 = empty sentinel)
+            __builtin_memset(track_hash_, 0, kTrackHashCap * sizeof(TrackEntry));
+            __builtin_memset(track_reverse_, 0, kTrackMaxPages * sizeof(uintptr_t));
+            return true;
+        }
     }
 
-#ifndef SMASH_COMPRESS_ONLY
-    // Allocate num_pages contiguous pages. Returns page-aligned address.
+    bool isTrackingMode() const { return tracking_mode_; }
+
+    // ── Allocation (full mode only) ─────────────────────────────────────────
     void* allocatePages(size_t num_pages) {
+        if (tracking_mode_) return nullptr;
+
         {
             LockGuard guard(free_lock_);
             FreeRun** prev = &free_list_;
@@ -143,6 +152,8 @@ public:
     }
 
     void releasePages(void* addr, size_t num_pages) {
+        if (tracking_mode_) return;
+
         vm::protectPages(addr, num_pages * kPageSize, false, false);
         vm::decommitPages(addr, num_pages * kPageSize);
         size_t page_idx = pageIndex(reinterpret_cast<uintptr_t>(addr));
@@ -153,13 +164,13 @@ public:
         run->next = free_list_;
         free_list_ = run;
     }
-#else
-    void* allocatePages(size_t) { return nullptr; }
-    void releasePages(void*, size_t) {}
 
+    // ── Page tracking (compress-only mode) ──────────────────────────────────
     // Track a page address, assigning it a compact index.
-    // Returns the index (>0) on success, 0 on failure (table full).
+    // Returns the index (>0) on success, 0 on failure (table full or wrong mode).
     size_t trackPage(uintptr_t page_addr) {
+        if (!tracking_mode_ || !track_hash_) return 0;
+
         uintptr_t key = page_addr >> kPageShift;
         if (key == 0) return 0;
         size_t slot = static_cast<size_t>(key * 0x9E3779B97F4A7C15ULL) >> (64 - 18);
@@ -185,33 +196,32 @@ public:
         }
         return 0;
     }
-#endif
 
     bool contains(uintptr_t addr) const {
-#ifndef SMASH_COMPRESS_ONLY
-        auto a = addr;
-        auto b = reinterpret_cast<uintptr_t>(base_);
-        return a >= b && a < b + total_pages_ * kPageSize;
-#else
-        return lookupIdx(addr) != 0;
-#endif
+        if (!tracking_mode_) {
+            auto a = addr;
+            auto b = reinterpret_cast<uintptr_t>(base_);
+            return a >= b && a < b + total_pages_ * kPageSize;
+        } else {
+            return lookupIdx(addr) != 0;
+        }
     }
 
     size_t pageIndex(uintptr_t addr) const {
-#ifndef SMASH_COMPRESS_ONLY
-        return (addr - reinterpret_cast<uintptr_t>(base_)) / kPageSize;
-#else
-        return lookupIdx(addr);
-#endif
+        if (!tracking_mode_) {
+            return (addr - reinterpret_cast<uintptr_t>(base_)) / kPageSize;
+        } else {
+            return lookupIdx(addr);
+        }
     }
 
     void* pageAddress(size_t index) const {
-#ifndef SMASH_COMPRESS_ONLY
-        return base_ + index * kPageSize;
-#else
-        if (index == 0 || index >= total_pages_) return nullptr;
-        return reinterpret_cast<void*>(track_reverse_[index]);
-#endif
+        if (!tracking_mode_) {
+            return base_ + index * kPageSize;
+        } else {
+            if (index == 0 || index >= total_pages_) return nullptr;
+            return reinterpret_cast<void*>(track_reverse_[index]);
+        }
     }
 
     char* base() const { return base_; }

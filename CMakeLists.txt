@@ -15,6 +15,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ── Threads ───────────────────────────────────────────────────────────────────
+find_package(Threads REQUIRED)
+
 # ── macOS: build fat arm64+arm64e so interposition works with all binaries ───
 # System binaries (ls, cat, etc.) are arm64e (pointer authentication).
 # DYLD_INSERT_LIBRARIES requires the dylib to match the process architecture.
@@ -42,6 +45,12 @@ endif()
 # ── Pull in alloc8 ────────────────────────────────────────────────────────────
 # Look for alloc8 as a sibling directory, or allow override via ALLOC8_DIR
 set(ALLOC8_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../alloc8" CACHE PATH "Path to alloc8 source")
+
+# On Linux, use Smash's version script (extends alloc8's with syscall wrappers)
+# Must be set BEFORE add_subdirectory(alloc8) so alloc8 uses this path
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(ALLOC8_VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map" CACHE INTERNAL "Version script" FORCE)
+endif()
 if(NOT EXISTS "${ALLOC8_DIR}/CMakeLists.txt")
   message(FATAL_ERROR "alloc8 not found at ${ALLOC8_DIR}. Set ALLOC8_DIR to the alloc8 source directory.")
 endif()
@@ -100,12 +109,31 @@ add_library(smash SHARED
   ${_SMASH_COMMON_SOURCES}
 )
 
+# Linux syscall wrappers need default visibility for LD_PRELOAD interposition.
+# The global -fvisibility=hidden flag hides them otherwise.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set_source_files_properties(src/linux_syscall_wrappers.cpp PROPERTIES
+    COMPILE_FLAGS "-fvisibility=default -fno-lto"
+  )
+endif()
+
 target_include_directories(smash PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_libraries(smash PRIVATE alloc8::interpose lz4_static libzstd_static)
+# On Linux, link against alloc8 components manually instead of alloc8::interpose
+# to avoid the INTERFACE version script and use Smash's instead (includes syscall wrappers)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(smash PRIVATE alloc8::headers pthread dl)
+  target_link_options(smash PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map"
+    "-Bsymbolic"
+  )
+else()
+  target_link_libraries(smash PRIVATE alloc8::interpose)
+endif()
+target_link_libraries(smash PRIVATE lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash PROPERTIES
   OUTPUT_NAME "smash"
@@ -152,7 +180,7 @@ target_include_directories(smash_noopt PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_libraries(smash_noopt PRIVATE alloc8::interpose lz4_static libzstd_static)
+target_link_libraries(smash_noopt PRIVATE alloc8::interpose lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash_noopt PROPERTIES
   OUTPUT_NAME "smash_noopt"
@@ -169,10 +197,12 @@ if(APPLE)
   set_target_properties(smash_noopt PROPERTIES SUFFIX ".dylib")
 endif()
 
-# ── libsmash_compress_only: system malloc + Smash compression ────────────────
-# Interposes malloc/free but forwards to system allocator. Tracks pages and
-# runs the compression pipeline on system-allocated memory. Measures Smash
-# compression effectiveness without Smash's allocation design.
+# ── libsmash_compress_only: DEPRECATED - use libsmash with SMASH_MODE=compress_only
+# Kept for backwards compatibility. The main libsmash library now supports
+# compress-only mode at runtime: SMASH_MODE=compress_only LD_PRELOAD=libsmash.so
+#
+# This separate library can still be useful when you want a smaller binary
+# that doesn't include the full Smash allocator code.
 add_library(smash_compress_only SHARED
   src/compress_only/co_interpose_mac.cpp
   src/compress_only/co_interpose_linux.cpp
@@ -184,7 +214,7 @@ target_include_directories(smash_compress_only PRIVATE
 )
 
 # Only needs alloc8 headers (for platform.h), NOT the interpose machinery
-target_link_libraries(smash_compress_only PRIVATE alloc8::headers lz4_static libzstd_static)
+target_link_libraries(smash_compress_only PRIVATE alloc8::headers lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash_compress_only PROPERTIES
   OUTPUT_NAME "smash_compress_only"

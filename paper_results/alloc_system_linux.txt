@@ -1,0 +1,13 @@
+METRIC allocator system
+METRIC app memcached
+METRIC alloc_size 256
+METRIC obj_count 100000
+METRIC free_pct 50
+METRIC total_pages 6642
+METRIC resident_pages 6642
+METRIC avg_ratio_lz4 0.2340
+METRIC avg_ratio_zstd 0.1201
+METRIC median_ratio_lz4 0.2324
+METRIC median_ratio_zstd 0.1189
+METRIC pct_compressible_lz4 100.0
+METRIC pct_compressible_zstd 100.0

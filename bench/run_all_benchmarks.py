@@ -362,16 +362,24 @@ def run_memcached(build_dir, smash_lib, quick):
             # Populate with TPC-H JSON data
             log(f"Populating {num_keys} keys...")
             _populate_memcached(port, num_keys, corpus_file=corpus_file)
+
+            # Verify process survived populate
+            if proc.poll() is not None:
+                log(f"memcached: process died during populate (exit={proc.returncode})", "ERROR")
+                return None
             fill_rss = get_rss_mb(proc.pid)
 
             if fill_rss < 50:
-                log(f"memcached: fill_rss={fill_rss:.1f}MB (low)", "WARN")
+                log(f"memcached: fill_rss={fill_rss:.1f}MB (low) - populate may have failed", "WARN")
 
             # Cool phase - track minimum RSS during compression
             log(f"Cooling for {cool_sec}s...")
             min_rss = fill_rss
             for _ in range(cool_sec):
                 time.sleep(1)
+                if proc.poll() is not None:
+                    log(f"memcached: process died during cool phase (exit={proc.returncode})", "ERROR")
+                    return None
                 rss = get_rss_mb(proc.pid)
                 if rss > 0:
                     min_rss = min(min_rss, rss)
@@ -381,6 +389,11 @@ def run_memcached(build_dir, smash_lib, quick):
             hot_keys = max(1, num_keys // 20)
             log(f"Serving hot {hot_keys} keys for {serve_sec}s...")
             _access_memcached(port, hot_keys, serve_sec)
+
+            # Verify process survived serve phase
+            if proc.poll() is not None:
+                log(f"memcached: process died during serve phase (exit={proc.returncode})", "ERROR")
+                return None
             serve_rss = get_rss_mb(proc.pid)
 
             # Validate measurements - min_rss=0 means measurement failed

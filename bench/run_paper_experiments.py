@@ -580,15 +580,24 @@ def run_memcached_bench(build_dir, smash_lib, quick):
 
         # Populate with compressible values
         _populate_memcached(port, num_keys, value_size)
+
+        # Verify process is still running after populate
+        if proc.poll() is not None:
+            print(f"    memcached: process died during populate (exit={proc.returncode})")
+            return None
+
         fill_rss = get_rss_mb(proc.pid)
 
         if fill_rss < 50:
-            print(f"    memcached: fill_rss too low ({fill_rss:.1f}MB)")
+            print(f"    memcached: fill_rss too low ({fill_rss:.1f}MB) - populate may have failed")
 
         # Cool phase - track minimum RSS
         min_rss = fill_rss
         for _ in range(cool_sec):
             time.sleep(1)
+            if proc.poll() is not None:
+                print(f"    memcached: process died during cool phase (exit={proc.returncode})")
+                return None
             rss = get_rss_mb(proc.pid)
             if rss > 0:
                 min_rss = min(min_rss, rss)
@@ -597,6 +606,11 @@ def run_memcached_bench(build_dir, smash_lib, quick):
         # Serve phase: access hot 5%
         hot_keys = max(1, num_keys // 20)
         _access_memcached(port, hot_keys, serve_sec)
+
+        # Verify process survived serve phase
+        if proc.poll() is not None:
+            print(f"    memcached: process died during serve phase (exit={proc.returncode})")
+            return None
         serve_rss = get_rss_mb(proc.pid)
 
         # Validate measurements - min_rss=0 means measurement failed (process died)

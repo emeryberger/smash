@@ -304,7 +304,7 @@ def run_rocksdb(build_dir, smash_lib, quick):
         if metrics and "rss_reduction_pct" not in metrics:
             peak = metrics.get("peak_rss_mb", 0)
             min_rss = metrics.get("min_rss_mb", peak)
-            if peak > 0:
+            if peak > 0 and min_rss > 0:
                 metrics["rss_reduction_pct"] = (1 - min_rss / peak) * 100
         return metrics
     except Exception as e:
@@ -383,7 +383,12 @@ def run_memcached(build_dir, smash_lib, quick):
             _access_memcached(port, hot_keys, serve_sec)
             serve_rss = get_rss_mb(proc.pid)
 
-            reduction = (1 - min_rss / fill_rss) * 100 if fill_rss > 0 else 0
+            # Validate measurements - min_rss=0 means measurement failed
+            if min_rss <= 0 or fill_rss <= 0:
+                log(f"memcached: invalid RSS measurement (fill={fill_rss}, min={min_rss})", "ERROR")
+                return None
+
+            reduction = (1 - min_rss / fill_rss) * 100
 
             return {
                 "peak_rss_mb": fill_rss,
@@ -597,7 +602,10 @@ def run_redis(build_dir, smash_lib, quick):
             except subprocess.TimeoutExpired:
                 pass
 
-        reduction = (1 - min_rss / fill_rss) * 100 if fill_rss > 0 else 0
+        # Validate - min_rss=0 means measurement failed
+        if min_rss <= 0 or fill_rss <= 0:
+            return None
+        reduction = (1 - min_rss / fill_rss) * 100
 
         return {
             "peak_rss_mb": fill_rss,
@@ -692,7 +700,12 @@ def run_redis_ext(build_dir, smash_lib, quick):
                 min_rss = min(min_rss, rss)
 
         cool_rss = get_rss_mb(proc.pid)
-        reduction = (1 - cool_rss / post_del_rss) * 100 if post_del_rss > 0 else 0
+
+        # Validate measurements - cool_rss=0 means measurement failed (process died)
+        if cool_rss <= 0 or post_del_rss <= 0:
+            log(f"redis-ext: invalid RSS measurement (post_del={post_del_rss}, cool={cool_rss})", "ERROR")
+            return None
+        reduction = (1 - cool_rss / post_del_rss) * 100
 
         return {
             "peak_rss_mb": peak_rss,
@@ -788,7 +801,10 @@ def run_duckdb(build_dir, smash_lib, quick):
         except:
             proc.kill()
 
-        reduction = (1 - cool_rss / fill_rss) * 100 if fill_rss > 0 else 0
+        # Validate measurements
+        if cool_rss <= 0 or fill_rss <= 0:
+            return None
+        reduction = (1 - cool_rss / fill_rss) * 100
 
         return {
             "peak_rss_mb": fill_rss,

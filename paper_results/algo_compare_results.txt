@@ -1,0 +1,108 @@
+Page size: 4096 bytes
+
+═══════════════════════════════════════════════════════════════════
+  SINGLE PAGE COMPRESSION (4096 bytes/page, 100 pages averaged)
+═══════════════════════════════════════════════════════════════════
+
+Data     Algorithm  CompSize    Ratio  Comp MB/s   Dec MB/s    OK
+──────── ────────── ──────── ──────── ────────── ────────── ─────
+json     WKdm           3905    95.3%      1823      2943   yes
+         LZ4            1342    32.8%      1299      5976   yes
+         LZ4-HC         1251    30.5%       243      7447   yes
+         zstd-1          683    16.7%       322       585   yes
+         zstd-3          703    17.2%       275       603   yes
+         zstd-9          683    16.7%        93       597   yes
+
+kv       WKdm           3844    93.8%      1504      1724   yes
+         LZ4            1514    37.0%       987      4146   yes
+         LZ4-HC         1381    33.7%       100      4177   yes
+         zstd-1         1263    30.8%       217       491   yes
+         zstd-3         1286    31.4%       199       549   yes
+         zstd-9         1169    28.5%        58       704   yes
+
+sqlite   WKdm           1789    43.7%      2506      2923   yes
+         LZ4             901    22.0%      2036      7741   yes
+         LZ4-HC          893    21.8%       346      7338   yes
+         zstd-1          681    16.6%       324       607   yes
+         zstd-3          667    16.3%       285       583   yes
+         zstd-9          652    15.9%       139       583   yes
+
+zeroed   WKdm            351     8.6%      3611      3692   yes
+         LZ4             212     5.2%      4369     10214   yes
+         LZ4-HC          174     4.3%       164     10844   yes
+         zstd-1          164     4.0%       463      1265   yes
+         zstd-3          165     4.0%       451      1246   yes
+         zstd-9          154     3.8%       177      1145   yes
+
+random   WKdm              0   100.0%      2258         0   yes
+         LZ4            4114   100.4%      3865     37918   yes
+         LZ4-HC         4114   100.4%       187     36520   yes
+         zstd-1         4106   100.2%       662      1662   yes
+         zstd-3         4106   100.2%       527      1647   yes
+         zstd-9         4106   100.2%       194      1642   yes
+
+
+═══════════════════════════════════════════════════════════════════
+  MULTI-PAGE COMPRESSION (group size = 1, 2, 4 pages)
+═══════════════════════════════════════════════════════════════════
+
+Data     Algorithm   Group CompSize    Ratio  Comp MB/s   Dec MB/s
+──────── ────────── ────── ──────── ──────── ────────── ──────────
+json     LZ4           1x4     1342    32.8%      1306      6203
+         zstd-3        1x4      703    17.2%       281       611
+         zstd-9        1x4      683    16.7%        93       617
+         LZ4           2x4     2235    27.3%      1434      6002
+         zstd-3        2x4     1018    12.4%       407       960
+         zstd-9        2x4      985    12.0%       105       967
+         LZ4           4x4     3976    24.3%      1465      5903
+         zstd-3        4x4     1606     9.8%       503      1305
+         zstd-9        4x4     1517     9.3%        99      1320
+
+kv       LZ4           1x4     1514    37.0%      1001      4137
+         zstd-3        1x4     1286    31.4%       196       543
+         zstd-9        1x4     1169    28.5%        58       711
+         LZ4           2x4     2686    32.8%       971      3838
+         zstd-3        2x4     2238    27.3%       265       690
+         zstd-9        2x4     1963    24.0%        46       934
+         LZ4           4x4     4990    30.5%      1022      3895
+         zstd-3        4x4     4118    25.1%       304       821
+         zstd-9        4x4     3406    20.8%        34       974
+
+sqlite   LZ4           1x4      901    22.0%      2026      7578
+         zstd-3        1x4      667    16.3%       282       568
+         zstd-9        1x4      652    15.9%       140       590
+         LZ4           2x4     1627    19.9%      2111      8374
+         zstd-3        2x4     1105    13.5%       384       879
+         zstd-9        2x4     1099    13.4%       146       893
+         LZ4           4x4     3087    18.8%      2144      8359
+         zstd-3        4x4     1982    12.1%       474      1275
+         zstd-9        4x4     1960    12.0%       146      1279
+
+zeroed   LZ4           1x4      213     5.2%      4361     10107
+         zstd-3        1x4      165     4.0%       449      1262
+         zstd-9        1x4      153     3.7%       173      1135
+         LZ4           2x4      413     5.0%      4501     10825
+         zstd-3        2x4      300     3.7%       707      2000
+         zstd-9        2x4      284     3.5%       185      1874
+         LZ4           4x4      806     4.9%      4896     11590
+         zstd-3        4x4      555     3.4%       961      2562
+         zstd-9        4x4      542     3.3%       185      2654
+
+
+═══════════════════════════════════════════════════════════════════
+  OS VM COMPRESSOR COMPARISON NOTES
+═══════════════════════════════════════════════════════════════════
+
+macOS:   WKdm (word-key dictionary, 16-entry dict, 2-bit tags)
+         Operates on 32-bit words, very fast, lower ratios than LZ4.
+         Designed for 4KB pages; Apple has WKdm_compress_16k for ARM64.
+
+Linux:   LZ4 (default for zswap since kernel 5.x), LZO (older default)
+         zstd also available as zswap backend. 4KB pages.
+
+Windows: Xpress (LZ77 + Huffman). MemCompression process.
+         Similar performance profile to LZ4. 4KB pages.
+
+Smash:   LZ4 (cold) -> zstd-9 (very cold). 16KB pages (ARM64 macOS).
+         Multi-algorithm adaptive: best of both worlds.
+

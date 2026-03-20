@@ -180,7 +180,17 @@ target_include_directories(smash_noopt PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_libraries(smash_noopt PRIVATE alloc8::interpose lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
+# On Linux, use custom version script (same as smash target)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(smash_noopt PRIVATE alloc8::headers pthread dl)
+  target_link_options(smash_noopt PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map"
+    "-Bsymbolic"
+  )
+else()
+  target_link_libraries(smash_noopt PRIVATE alloc8::interpose)
+endif()
+target_link_libraries(smash_noopt PRIVATE lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash_noopt PROPERTIES
   OUTPUT_NAME "smash_noopt"

@@ -2,419 +2,393 @@
   "sqlite_baseline": {
     "runs": [
       {
-        "fill_time_sec": 1.29,
+        "fill_time_sec": 1.35,
         "peak_rss_mb": 179.1,
         "post_cool_rss_mb": 179.2,
         "cool_reduction_pct": -0.0,
-        "steady_rss_mb": 238.5,
+        "steady_rss_mb": 237.2,
         "min_rss_mb": 179.2,
-        "rss_reduction_pct": 24.9,
-        "ops_per_sec": 84482.0,
-        "hot_p50_us": 0.74,
-        "hot_p99_us": 61.23,
-        "cold_p50_us": 1.21,
-        "cold_p99_us": 1.94,
-        "post_reaccess_rss_mb": 238.5
+        "rss_reduction_pct": 24.5,
+        "ops_per_sec": 82695.0,
+        "hot_p50_us": 0.75,
+        "hot_p99_us": 63.89,
+        "cold_p50_us": 1.26,
+        "cold_p99_us": 2.04,
+        "post_reaccess_rss_mb": 237.5
       }
     ],
     "median": {
-      "peak_rss_mb": 179.1,
-      "rss_reduction_pct": 24.9,
-      "post_reaccess_rss_mb": 238.5,
-      "hot_p50_us": 0.74,
-      "hot_p99_us": 61.23,
-      "steady_rss_mb": 238.5,
-      "post_cool_rss_mb": 179.2,
-      "fill_time_sec": 1.29,
-      "cold_p50_us": 1.21,
-      "cool_reduction_pct": -0.0,
-      "ops_per_sec": 84482.0,
+      "hot_p99_us": 63.89,
+      "post_reaccess_rss_mb": 237.5,
       "min_rss_mb": 179.2,
-      "cold_p99_us": 1.94
+      "cold_p99_us": 2.04,
+      "ops_per_sec": 82695.0,
+      "fill_time_sec": 1.35,
+      "rss_reduction_pct": 24.5,
+      "post_cool_rss_mb": 179.2,
+      "cold_p50_us": 1.26,
+      "steady_rss_mb": 237.2,
+      "cool_reduction_pct": -0.0,
+      "peak_rss_mb": 179.1,
+      "hot_p50_us": 0.75
     }
   },
   "sqlite_compress_only": {
     "runs": [
       {
         "fill_time_sec": 1.32,
-        "peak_rss_mb": 201.4,
-        "post_cool_rss_mb": 201.4,
+        "peak_rss_mb": 201.5,
+        "post_cool_rss_mb": 201.6,
         "cool_reduction_pct": -0.0,
-        "steady_rss_mb": 261.4,
-        "min_rss_mb": 201.4,
-        "rss_reduction_pct": 22.9,
-        "ops_per_sec": 85106.0,
-        "hot_p50_us": 0.72,
-        "hot_p99_us": 54.96,
-        "cold_p50_us": 1.23,
-        "cold_p99_us": 1.97,
-        "post_reaccess_rss_mb": 261.4
+        "steady_rss_mb": 259.6,
+        "min_rss_mb": 201.6,
+        "rss_reduction_pct": 22.4,
+        "ops_per_sec": 82555.0,
+        "hot_p50_us": 0.75,
+        "hot_p99_us": 63.48,
+        "cold_p50_us": 1.38,
+        "cold_p99_us": 2.47,
+        "post_reaccess_rss_mb": 259.6
       }
     ],
     "median": {
-      "peak_rss_mb": 201.4,
-      "rss_reduction_pct": 22.9,
-      "post_reaccess_rss_mb": 261.4,
-      "hot_p50_us": 0.72,
-      "hot_p99_us": 54.96,
-      "steady_rss_mb": 261.4,
-      "post_cool_rss_mb": 201.4,
+      "hot_p99_us": 63.48,
+      "post_reaccess_rss_mb": 259.6,
+      "min_rss_mb": 201.6,
+      "cold_p99_us": 2.47,
+      "ops_per_sec": 82555.0,
       "fill_time_sec": 1.32,
-      "cold_p50_us": 1.23,
+      "rss_reduction_pct": 22.4,
+      "post_cool_rss_mb": 201.6,
+      "cold_p50_us": 1.38,
+      "steady_rss_mb": 259.6,
       "cool_reduction_pct": -0.0,
-      "ops_per_sec": 85106.0,
-      "min_rss_mb": 201.4,
-      "cold_p99_us": 1.97
+      "peak_rss_mb": 201.5,
+      "hot_p50_us": 0.75
     }
   },
   "sqlite_full_smash": {
     "runs": [
       {
         "fill_time_sec": 1.74,
-        "peak_rss_mb": 254.4,
-        "post_cool_rss_mb": 86.7,
-        "cool_reduction_pct": 65.9,
-        "steady_rss_mb": 132.1,
-        "min_rss_mb": 86.7,
-        "rss_reduction_pct": 65.9,
-        "ops_per_sec": 77325.0,
-        "hot_p50_us": 0.84,
-        "hot_p99_us": 65.95,
-        "cold_p50_us": 12.39,
-        "cold_p99_us": 72.13,
-        "post_reaccess_rss_mb": 218.3
+        "peak_rss_mb": 253.9,
+        "post_cool_rss_mb": 86.1,
+        "cool_reduction_pct": 66.1,
+        "steady_rss_mb": 131.8,
+        "min_rss_mb": 86.1,
+        "rss_reduction_pct": 66.1,
+        "ops_per_sec": 77934.0,
+        "hot_p50_us": 0.79,
+        "hot_p99_us": 65.61,
+        "cold_p50_us": 12.01,
+        "cold_p99_us": 63.85,
+        "post_reaccess_rss_mb": 219.9
       }
     ],
     "median": {
-      "peak_rss_mb": 254.4,
-      "rss_reduction_pct": 65.9,
-      "post_reaccess_rss_mb": 218.3,
-      "hot_p50_us": 0.84,
-      "hot_p99_us": 65.95,
-      "steady_rss_mb": 132.1,
-      "post_cool_rss_mb": 86.7,
+      "hot_p99_us": 65.61,
+      "post_reaccess_rss_mb": 219.9,
+      "min_rss_mb": 86.1,
+      "cold_p99_us": 63.85,
+      "ops_per_sec": 77934.0,
       "fill_time_sec": 1.74,
-      "cold_p50_us": 12.39,
-      "cool_reduction_pct": 65.9,
-      "ops_per_sec": 77325.0,
-      "min_rss_mb": 86.7,
-      "cold_p99_us": 72.13
+      "rss_reduction_pct": 66.1,
+      "post_cool_rss_mb": 86.1,
+      "cold_p50_us": 12.01,
+      "steady_rss_mb": 131.8,
+      "cool_reduction_pct": 66.1,
+      "peak_rss_mb": 253.9,
+      "hot_p50_us": 0.79
     }
   },
   "rocksdb_baseline": {
     "runs": [
       {
-        "fill_sec": 0.79,
-        "peak_rss_mb": 322.5,
-        "cool_rss_mb": 322.5,
-        "serve_rss_mb": 325.3,
-        "min_rss_mb": 322.5,
-        "ops_per_sec": 584496.0,
+        "fill_sec": 0.72,
+        "peak_rss_mb": 320.6,
+        "cool_rss_mb": 320.6,
+        "serve_rss_mb": 323.4,
+        "min_rss_mb": 320.6,
+        "ops_per_sec": 582181.0,
         "hot_p50_us": 1.52,
-        "hot_p99_us": 2.81,
+        "hot_p99_us": 2.96,
         "cold_sec": 0.036,
-        "cold_p50_us": 1.47,
-        "cold_p99_us": 9.35,
-        "cold_rss_mb": 325.6,
-        "rss_reduction_pct": 0.0,
-        "steady_rss_mb": 325.3,
-        "post_cool_rss_mb": 322.5
+        "cold_p50_us": 1.48,
+        "cold_p99_us": 9.51,
+        "cold_rss_mb": 323.7,
+        "rss_reduction_pct": 0.0
       }
     ],
     "median": {
-      "peak_rss_mb": 322.5,
-      "rss_reduction_pct": 0.0,
-      "hot_p50_us": 1.52,
-      "cool_rss_mb": 322.5,
+      "cool_rss_mb": 320.6,
+      "hot_p99_us": 2.96,
+      "min_rss_mb": 320.6,
       "cold_sec": 0.036,
-      "hot_p99_us": 2.81,
-      "steady_rss_mb": 325.3,
-      "post_cool_rss_mb": 322.5,
-      "serve_rss_mb": 325.3,
-      "cold_p50_us": 1.47,
-      "ops_per_sec": 584496.0,
-      "cold_rss_mb": 325.6,
-      "min_rss_mb": 322.5,
-      "cold_p99_us": 9.35,
-      "fill_sec": 0.79
+      "cold_p99_us": 9.51,
+      "ops_per_sec": 582181.0,
+      "fill_sec": 0.72,
+      "cold_rss_mb": 323.7,
+      "serve_rss_mb": 323.4,
+      "cold_p50_us": 1.48,
+      "rss_reduction_pct": 0.0,
+      "peak_rss_mb": 320.6,
+      "hot_p50_us": 1.52
     }
   },
   "rocksdb_full_smash": {
     "runs": [
       {
-        "fill_sec": 0.84,
-        "peak_rss_mb": 307.1,
-        "cool_rss_mb": 66.7,
-        "serve_rss_mb": 77.4,
-        "min_rss_mb": 66.7,
-        "ops_per_sec": 571258.0,
-        "hot_p50_us": 1.52,
-        "hot_p99_us": 3.09,
-        "cold_sec": 0.167,
-        "cold_p50_us": 7.78,
-        "cold_p99_us": 14.28,
-        "cold_rss_mb": 78.9,
-        "rss_reduction_pct": 78.2806903288831,
-        "steady_rss_mb": 77.4,
-        "post_cool_rss_mb": 66.7
+        "fill_sec": 0.91,
+        "peak_rss_mb": 307.3,
+        "cool_rss_mb": 67.6,
+        "serve_rss_mb": 78.1,
+        "min_rss_mb": 67.6,
+        "ops_per_sec": 571423.0,
+        "hot_p50_us": 1.51,
+        "hot_p99_us": 3.24,
+        "cold_sec": 0.059,
+        "cold_p50_us": 1.45,
+        "cold_p99_us": 66.67,
+        "cold_rss_mb": 87.4,
+        "rss_reduction_pct": 78.00195248942401
       }
     ],
     "median": {
-      "peak_rss_mb": 307.1,
-      "rss_reduction_pct": 78.2806903288831,
-      "hot_p50_us": 1.52,
-      "cool_rss_mb": 66.7,
-      "cold_sec": 0.167,
-      "hot_p99_us": 3.09,
-      "steady_rss_mb": 77.4,
-      "post_cool_rss_mb": 66.7,
-      "serve_rss_mb": 77.4,
-      "cold_p50_us": 7.78,
-      "ops_per_sec": 571258.0,
-      "cold_rss_mb": 78.9,
-      "min_rss_mb": 66.7,
-      "cold_p99_us": 14.28,
-      "fill_sec": 0.84
+      "cool_rss_mb": 67.6,
+      "hot_p99_us": 3.24,
+      "min_rss_mb": 67.6,
+      "cold_sec": 0.059,
+      "cold_p99_us": 66.67,
+      "ops_per_sec": 571423.0,
+      "fill_sec": 0.91,
+      "cold_rss_mb": 87.4,
+      "serve_rss_mb": 78.1,
+      "cold_p50_us": 1.45,
+      "rss_reduction_pct": 78.00195248942401,
+      "peak_rss_mb": 307.3,
+      "hot_p50_us": 1.51
     }
   },
   "duckdb_baseline": {
     "runs": [
       {
-        "peak_rss_mb": 334.65625,
-        "cool_rss_mb": 334.57421875,
-        "steady_rss_mb": 336.73046875,
-        "min_rss_mb": 334.57421875,
-        "rss_reduction_pct": -0.6198057708469484,
-        "baseline_rss_mb": 334.67578125
+        "peak_rss_mb": 255.9296875,
+        "cool_rss_mb": 18.12109375,
+        "steady_rss_mb": 18.12109375,
+        "min_rss_mb": 18.12109375,
+        "rss_reduction_pct": 92.91950303733326
       }
     ],
     "median": {
-      "peak_rss_mb": 334.65625,
-      "rss_reduction_pct": -0.6198057708469484,
-      "cool_rss_mb": 334.57421875,
-      "baseline_rss_mb": 334.67578125,
-      "steady_rss_mb": 336.73046875,
-      "min_rss_mb": 334.57421875
+      "cool_rss_mb": 18.12109375,
+      "min_rss_mb": 18.12109375,
+      "peak_rss_mb": 255.9296875,
+      "steady_rss_mb": 18.12109375,
+      "rss_reduction_pct": 92.91950303733326
     }
   },
   "duckdb_compress_only": {
     "runs": [
       {
-        "peak_rss_mb": 354.8046875,
-        "cool_rss_mb": 354.71875,
-        "steady_rss_mb": 358.66015625,
-        "min_rss_mb": 354.71875,
-        "rss_reduction_pct": -7.166450739404984,
-        "baseline_rss_mb": 334.67578125
+        "peak_rss_mb": 278.5390625,
+        "cool_rss_mb": 40.3828125,
+        "steady_rss_mb": 40.3828125,
+        "min_rss_mb": 40.3828125,
+        "rss_reduction_pct": 85.50192129694555
       }
     ],
     "median": {
-      "peak_rss_mb": 354.8046875,
-      "rss_reduction_pct": -7.166450739404984,
-      "cool_rss_mb": 354.71875,
-      "baseline_rss_mb": 334.67578125,
-      "steady_rss_mb": 358.66015625,
-      "min_rss_mb": 354.71875
-    }
-  },
-  "memcached_baseline": {
-    "runs": [
-      {
-        "peak_rss_mb": 32.203125,
-        "cool_rss_mb": 32.7109375,
-        "steady_rss_mb": 32.7109375,
-        "min_rss_mb": 32.203125,
-        "rss_reduction_pct": -1.5769044153323586
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 32.203125,
-      "rss_reduction_pct": -1.5769044153323586,
-      "cool_rss_mb": 32.7109375,
-      "steady_rss_mb": 32.7109375,
-      "min_rss_mb": 32.203125
-    }
-  },
-  "memcached_compress_only": {
-    "runs": [
-      {
-        "peak_rss_mb": 55.80078125,
-        "cool_rss_mb": 56.30859375,
-        "steady_rss_mb": 56.30859375,
-        "min_rss_mb": 55.80078125,
-        "rss_reduction_pct": -0.9100455022751142
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 55.80078125,
-      "rss_reduction_pct": -0.9100455022751142,
-      "cool_rss_mb": 56.30859375,
-      "steady_rss_mb": 56.30859375,
-      "min_rss_mb": 55.80078125
-    }
-  },
-  "memcached_full_smash": {
-    "runs": [
-      {
-        "peak_rss_mb": 64.74609375,
-        "cool_rss_mb": 38.578125,
-        "steady_rss_mb": 0.0,
-        "min_rss_mb": 0.0,
-        "rss_reduction_pct": 100.0
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 64.74609375,
-      "rss_reduction_pct": 100.0,
-      "cool_rss_mb": 38.578125,
-      "steady_rss_mb": 0.0,
-      "min_rss_mb": 0.0
-    }
-  },
-  "redis_baseline": {
-    "runs": [
-      {
-        "peak_rss_mb": 55.37890625,
-        "steady_rss_mb": 55.328125,
-        "min_rss_mb": 55.328125,
-        "rss_reduction_pct": 0.09169782041335006,
-        "set_rps": 57471.27,
-        "get_rps": 57870.37
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 55.37890625,
-      "rss_reduction_pct": 0.09169782041335006,
-      "steady_rss_mb": 55.328125,
-      "set_rps": 57471.27,
-      "get_rps": 57870.37,
-      "min_rss_mb": 55.328125
-    }
-  },
-  "redis_compress_only": {
-    "runs": [
-      {
-        "peak_rss_mb": 77.74609375,
-        "steady_rss_mb": 77.73828125,
-        "min_rss_mb": 77.73828125,
-        "rss_reduction_pct": 0.010048736371404132,
-        "set_rps": 56369.79,
-        "get_rps": 55126.79
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 77.74609375,
-      "rss_reduction_pct": 0.010048736371404132,
-      "steady_rss_mb": 77.73828125,
-      "set_rps": 56369.79,
-      "get_rps": 55126.79,
-      "min_rss_mb": 77.73828125
-    }
-  },
-  "redis_full_smash": {
-    "runs": [
-      {
-        "peak_rss_mb": 86.3671875,
-        "steady_rss_mb": 48.81640625,
-        "min_rss_mb": 48.81640625,
-        "rss_reduction_pct": 43.47806422433288,
-        "set_rps": 56561.09,
-        "get_rps": 50505.05
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 86.3671875,
-      "rss_reduction_pct": 43.47806422433288,
-      "steady_rss_mb": 48.81640625,
-      "set_rps": 56561.09,
-      "get_rps": 50505.05,
-      "min_rss_mb": 48.81640625
-    }
-  },
-  "redis_ext_baseline": {
-    "runs": [
-      {
-        "peak_rss_mb": 55.49609375,
-        "post_del_rss_mb": 55.40625,
-        "steady_rss_mb": 55.40625,
-        "min_rss_mb": 55.40625,
-        "rss_reduction_pct": 0.0,
-        "set_rps": 58411.21,
-        "get_rps": 57273.77
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 55.49609375,
-      "rss_reduction_pct": 0.0,
-      "steady_rss_mb": 55.40625,
-      "set_rps": 58411.21,
-      "post_del_rss_mb": 55.40625,
-      "get_rps": 57273.77,
-      "min_rss_mb": 55.40625
-    }
-  },
-  "redis_ext_compress_only": {
-    "runs": [
-      {
-        "peak_rss_mb": 77.78125,
-        "post_del_rss_mb": 77.70703125,
-        "steady_rss_mb": 77.70703125,
-        "min_rss_mb": 77.70703125,
-        "rss_reduction_pct": 0.0,
-        "set_rps": 57339.45,
-        "get_rps": 58275.06
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 77.78125,
-      "rss_reduction_pct": 0.0,
-      "steady_rss_mb": 77.70703125,
-      "set_rps": 57339.45,
-      "post_del_rss_mb": 77.70703125,
-      "get_rps": 58275.06,
-      "min_rss_mb": 77.70703125
-    }
-  },
-  "redis_ext_full_smash": {
-    "runs": [
-      {
-        "peak_rss_mb": 86.4609375,
-        "post_del_rss_mb": 82.33984375,
-        "steady_rss_mb": 47.6015625,
-        "min_rss_mb": 47.6015625,
-        "rss_reduction_pct": 42.18890839223872,
-        "set_rps": 58004.64,
-        "get_rps": 53879.31
-      }
-    ],
-    "median": {
-      "peak_rss_mb": 86.4609375,
-      "rss_reduction_pct": 42.18890839223872,
-      "steady_rss_mb": 47.6015625,
-      "set_rps": 58004.64,
-      "post_del_rss_mb": 82.33984375,
-      "get_rps": 53879.31,
-      "min_rss_mb": 47.6015625
+      "cool_rss_mb": 40.3828125,
+      "min_rss_mb": 40.3828125,
+      "peak_rss_mb": 278.5390625,
+      "steady_rss_mb": 40.3828125,
+      "rss_reduction_pct": 85.50192129694555
     }
   },
   "duckdb_full_smash": {
     "runs": [
       {
-        "peak_rss_mb": 256.62109375,
-        "cool_rss_mb": 49.0703125,
-        "steady_rss_mb": 49.0703125,
-        "min_rss_mb": 49.0703125,
-        "rss_reduction_pct": 85.25846388546617,
-        "baseline_rss_mb": 332.87109375
+        "peak_rss_mb": 254.3515625,
+        "cool_rss_mb": 48.9375,
+        "steady_rss_mb": 48.9375,
+        "min_rss_mb": 48.9375,
+        "rss_reduction_pct": 80.7598980250023
       }
     ],
     "median": {
-      "min_rss_mb": 49.0703125,
-      "rss_reduction_pct": 85.25846388546617,
-      "cool_rss_mb": 49.0703125,
-      "steady_rss_mb": 49.0703125,
-      "peak_rss_mb": 256.62109375,
-      "baseline_rss_mb": 332.87109375
+      "cool_rss_mb": 48.9375,
+      "min_rss_mb": 48.9375,
+      "peak_rss_mb": 254.3515625,
+      "steady_rss_mb": 48.9375,
+      "rss_reduction_pct": 80.7598980250023
+    }
+  },
+  "memcached_baseline": {
+    "runs": [
+      {
+        "peak_rss_mb": 24.8828125,
+        "cool_rss_mb": 24.8828125,
+        "steady_rss_mb": 24.8828125,
+        "min_rss_mb": 24.8828125,
+        "rss_reduction_pct": 0.0
+      }
+    ],
+    "median": {
+      "cool_rss_mb": 24.8828125,
+      "min_rss_mb": 24.8828125,
+      "peak_rss_mb": 24.8828125,
+      "steady_rss_mb": 24.8828125,
+      "rss_reduction_pct": 0.0
+    }
+  },
+  "memcached_compress_only": {
+    "runs": [
+      {
+        "peak_rss_mb": 48.6015625,
+        "cool_rss_mb": 48.6015625,
+        "steady_rss_mb": 48.6015625,
+        "min_rss_mb": 48.6015625,
+        "rss_reduction_pct": 0.0
+      }
+    ],
+    "median": {
+      "cool_rss_mb": 48.6015625,
+      "min_rss_mb": 48.6015625,
+      "peak_rss_mb": 48.6015625,
+      "steady_rss_mb": 48.6015625,
+      "rss_reduction_pct": 0.0
+    }
+  },
+  "memcached_full_smash": {
+    "runs": [
+      {
+        "peak_rss_mb": 57.76171875,
+        "cool_rss_mb": 37.921875,
+        "steady_rss_mb": 55.34375,
+        "min_rss_mb": 37.921875,
+        "rss_reduction_pct": 4.186109420436868
+      }
+    ],
+    "median": {
+      "cool_rss_mb": 37.921875,
+      "min_rss_mb": 37.921875,
+      "peak_rss_mb": 57.76171875,
+      "steady_rss_mb": 55.34375,
+      "rss_reduction_pct": 4.186109420436868
+    }
+  },
+  "redis_baseline": {
+    "runs": [
+      {
+        "peak_rss_mb": 52.26953125,
+        "steady_rss_mb": 52.26953125,
+        "min_rss_mb": 52.26953125,
+        "rss_reduction_pct": 0.0,
+        "set_rps": 58207.21,
+        "get_rps": 52966.1
+      }
+    ],
+    "median": {
+      "get_rps": 52966.1,
+      "set_rps": 58207.21,
+      "min_rss_mb": 52.26953125,
+      "peak_rss_mb": 52.26953125,
+      "steady_rss_mb": 52.26953125,
+      "rss_reduction_pct": 0.0
+    }
+  },
+  "redis_compress_only": {
+    "runs": [
+      {
+        "peak_rss_mb": 74.9765625,
+        "steady_rss_mb": 74.9765625,
+        "min_rss_mb": 74.9765625,
+        "rss_reduction_pct": 0.0,
+        "set_rps": 55248.62,
+        "get_rps": 58823.53
+      }
+    ],
+    "median": {
+      "get_rps": 58823.53,
+      "set_rps": 55248.62,
+      "min_rss_mb": 74.9765625,
+      "peak_rss_mb": 74.9765625,
+      "steady_rss_mb": 74.9765625,
+      "rss_reduction_pct": 0.0
+    }
+  },
+  "redis_full_smash": {
+    "runs": [
+      {
+        "peak_rss_mb": 84.140625,
+        "steady_rss_mb": 48.57421875,
+        "min_rss_mb": 48.46484375,
+        "rss_reduction_pct": 42.40018570102136,
+        "set_rps": 50352.47,
+        "get_rps": 53705.69
+      }
+    ],
+    "median": {
+      "get_rps": 53705.69,
+      "set_rps": 50352.47,
+      "min_rss_mb": 48.46484375,
+      "peak_rss_mb": 84.140625,
+      "steady_rss_mb": 48.57421875,
+      "rss_reduction_pct": 42.40018570102136
+    }
+  },
+  "redis_ext_baseline": {
+    "runs": [
+      {
+        "peak_rss_mb": 52.5390625,
+        "post_del_rss_mb": 50.890625,
+        "steady_rss_mb": 50.890625,
+        "min_rss_mb": 50.890625,
+        "rss_reduction_pct": 0.0
+      }
+    ],
+    "median": {
+      "min_rss_mb": 50.890625,
+      "post_del_rss_mb": 50.890625,
+      "peak_rss_mb": 52.5390625,
+      "steady_rss_mb": 50.890625,
+      "rss_reduction_pct": 0.0
+    }
+  },
+  "redis_ext_compress_only": {
+    "runs": [
+      {
+        "peak_rss_mb": 74.75,
+        "post_del_rss_mb": 74.35546875,
+        "steady_rss_mb": 74.35546875,
+        "min_rss_mb": 74.35546875,
+        "rss_reduction_pct": 0.0
+      }
+    ],
+    "median": {
+      "min_rss_mb": 74.35546875,
+      "post_del_rss_mb": 74.35546875,
+      "peak_rss_mb": 74.75,
+      "steady_rss_mb": 74.35546875,
+      "rss_reduction_pct": 0.0
+    }
+  },
+  "redis_ext_full_smash": {
+    "runs": [
+      {
+        "peak_rss_mb": 84.01953125,
+        "post_del_rss_mb": 83.6796875,
+        "steady_rss_mb": 40.171875,
+        "min_rss_mb": 40.0625,
+        "rss_reduction_pct": 51.99327793856783
+      }
+    ],
+    "median": {
+      "min_rss_mb": 40.0625,
+      "post_del_rss_mb": 83.6796875,
+      "peak_rss_mb": 84.01953125,
+      "steady_rss_mb": 40.171875,
+      "rss_reduction_pct": 51.99327793856783
     }
   }
 }

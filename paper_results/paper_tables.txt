@@ -1,58 +1,47 @@
-ABLATION TABLE
 ======================================================================
-% Auto-generated ablation table
-\begin{tabular}{llrrrrrrr}
-\toprule
-ID & Configuration & \textbf{Sqlite} & \textbf{Rocksdb} & \textbf{Duckdb} & \textbf{Memcached} & \textbf{Redis} & \textbf{Redis_ext} & Avg.\ $\Delta$ \\
-\midrule
-    & \textbf{Default} & \textbf{66.0\%} & \textbf{23.6\%} & --- & \textbf{100.0\%} & \textbf{44.6\%} & \textbf{44.9\%} & --- \\
-B0  & System malloc & 25.0\% ($-$41.0) & 0.0\% ($-$23.6) & --- & -1.6\% ($-$101.6) & 0.0\% ($-$44.6) & 0.0\% ($-$44.9) & -51.2 \\
-\midrule
-    & With dicts & --- & --- & --- & --- & --- & --- & --- \\
-    & No arenas & --- & --- & --- & --- & --- & --- & --- \\
-    & LZ4 only & --- & --- & --- & --- & --- & --- & --- \\
-    & No zero-deferred & --- & --- & --- & --- & --- & --- & --- \\
-    & No prefetch & --- & --- & --- & --- & --- & --- & --- \\
-    & Single worker & --- & --- & --- & --- & --- & --- & --- \\
-B2  & No compression & --- & --- & --- & --- & --- & --- & --- \\
-\bottomrule
-\end{tabular}
+SMASH BENCHMARK RESULTS
+Generated: 2026-03-20T14:45:32.480699
+Platform: Linux x86_64
+======================================================================
 
-COMPRESS-ONLY TABLE
-======================================================================
-% Auto-generated compress-only table
-\begin{tabular}{llrrr}
-\toprule
-Benchmark & Config & Cool RSS & Reduction & Ops/s \\
-\midrule
-\multirow{3}{*}{Sqlite}
-  & baseline       & 238  & ---    & --- \\
-  & compress-only  & 261    & -9.6\% & --- \\
-  & full \sys      & \textbf{132}   & \textbf{44.6\%} & --- \\
-\midrule
-\multirow{3}{*}{Rocksdb}
-  & baseline       & 325  & ---    & --- \\
-  & compress-only  & 0    & 0.0\% & --- \\
-  & full \sys      & \textbf{77}   & \textbf{76.2\%} & --- \\
-\midrule
-\multirow{3}{*}{Duckdb}
-  & baseline       & 337  & ---    & --- \\
-  & compress-only  & 359    & -6.5\% & --- \\
-  & full \sys      & \textbf{49}   & \textbf{85.4\%} & --- \\
-\midrule
-\multirow{3}{*}{Memcached}
-  & baseline       & 33  & ---    & --- \\
-  & compress-only  & 56    & -72.1\% & --- \\
-  & full \sys      & \textbf{0}   & \textbf{0.0\%} & --- \\
-\midrule
-\multirow{3}{*}{Redis}
-  & baseline       & 55  & ---    & --- \\
-  & compress-only  & 78    & -40.5\% & --- \\
-  & full \sys      & \textbf{49}   & \textbf{11.8\%} & --- \\
-\midrule
-\multirow{3}{*}{Redis_ext}
-  & baseline       & 55  & ---    & --- \\
-  & compress-only  & 78    & -40.2\% & --- \\
-  & full \sys      & \textbf{48}   & \textbf{14.1\%} & --- \\
-\bottomrule
-\end{tabular}
+ABLATION STUDY - RSS Reduction (%)
+----------------------------------------------------------------------
+Config                   sqlite    rocksdb     duckdb  memcached      redis  redis_ext
+----------------------------------------------------------------------
+Default                    66.1       78.1       80.9        4.8       42.6       52.7
+System malloc              25.0        0.0       92.7        0.0        0.0        0.0
+With dicts                 65.3       76.8       78.9        4.4       39.0       48.4
+No arenas                  65.9       78.1       81.0        3.3       42.6       52.5
+LZ4 only                   66.0       78.0       81.0        4.5       42.6       52.5
+No zero-deferred           65.9       77.6       81.2        4.9       42.5       42.8
+No prefetch                65.9       78.1       80.9       24.9       42.7       52.5
+Single worker              66.0       78.3       80.8        4.3       42.9       52.6
+No compression             20.3       -0.0       80.4       -0.4        0.0       -0.0
+
+COMPRESS-ONLY EXPERIMENT - RSS (MB)
+----------------------------------------------------------------------
+sqlite:
+  baseline:         237.2 MB
+  compress-only:    259.6 MB
+  full smash:       131.8 MB
+rocksdb:
+  baseline:         320.6 MB
+  compress-only:      0.0 MB
+  full smash:         0.0 MB
+duckdb:
+  baseline:          18.1 MB
+  compress-only:     40.4 MB
+  full smash:        48.9 MB
+memcached:
+  baseline:          24.9 MB
+  compress-only:     48.6 MB
+  full smash:        55.3 MB
+redis:
+  baseline:          52.3 MB
+  compress-only:     75.0 MB
+  full smash:        48.6 MB
+redis_ext:
+  baseline:          50.9 MB
+  compress-only:     74.4 MB
+  full smash:        40.2 MB
+

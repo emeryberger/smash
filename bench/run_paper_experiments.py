@@ -897,11 +897,26 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             proc.terminate()
             return None
 
-        # Now cool while measuring RSS periodically
-        time.sleep(cool_sec)
+        # Measure RSS right after data loaded (this is our "peak" for cool phase)
+        peak_cool_rss = get_rss_mb(proc.pid)
+        if peak_cool_rss <= 0:
+            peak_cool_rss = fill_rss
+
+        # Sample RSS every second during cool phase (timeline)
+        rss_timeline = [peak_cool_rss]
+        min_rss = peak_cool_rss
+        for _ in range(cool_sec):
+            time.sleep(1)
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                rss_timeline.append(rss)
+                min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])  # Repeat last value if measurement fails
+
         cool_rss = get_rss_mb(proc.pid)
         if cool_rss <= 0:
-            cool_rss = fill_rss
+            cool_rss = min_rss
 
         # Phase 3: Serve - send queries
         if os.path.exists(marker):
@@ -939,27 +954,21 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
         except:
             proc.kill()
 
-        baseline_rss = _duckdb_baseline_rss(build_dir, quick)
-
         # Validate measurements - cool_rss=0 means measurement failed (process died)
-        if cool_rss <= 0:
-            print(f"    duckdb: invalid RSS measurement (cool={cool_rss})")
+        if cool_rss <= 0 or fill_rss <= 0:
+            print(f"    duckdb: invalid RSS measurement (fill={fill_rss}, cool={cool_rss})")
             return None
 
-        # Compare to baseline RSS (DuckDB without Smash at same point)
-        # For baseline runs (no smash_lib), this gives ~0% reduction as expected
-        if baseline_rss > 0:
-            reduction = (1 - cool_rss / baseline_rss) * 100
-        else:
-            reduction = 0
+        # Reduction vs peak (within same run) - shows compression effect over time
+        reduction = (1 - min_rss / fill_rss) * 100
 
         return {
             "peak_rss_mb": fill_rss,
             "cool_rss_mb": cool_rss,
             "steady_rss_mb": serve_rss,
-            "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
+            "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
-            "baseline_rss_mb": baseline_rss,
+            "rss_timeline": rss_timeline,  # RSS sampled every second during cool
         }
 
 

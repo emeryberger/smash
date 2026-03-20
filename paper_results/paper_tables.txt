@@ -38,7 +38,7 @@ Benchmark & Config & Cool RSS & Reduction & Ops/s \\
 \multirow{3}{*}{Duckdb}
   & baseline       & 337  & ---    & --- \\
   & compress-only  & 359    & -6.5\% & --- \\
-  & full \sys      & \textbf{0}   & \textbf{0.0\%} & --- \\
+  & full \sys      & \textbf{49}   & \textbf{85.4\%} & --- \\
 \midrule
 \multirow{3}{*}{Memcached}
   & baseline       & 33  & ---    & --- \\

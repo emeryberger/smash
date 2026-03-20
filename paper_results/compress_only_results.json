@@ -396,5 +396,25 @@
       "get_rps": 53879.31,
       "min_rss_mb": 47.6015625
     }
+  },
+  "duckdb_full_smash": {
+    "runs": [
+      {
+        "peak_rss_mb": 256.62109375,
+        "cool_rss_mb": 49.0703125,
+        "steady_rss_mb": 49.0703125,
+        "min_rss_mb": 49.0703125,
+        "rss_reduction_pct": 85.25846388546617,
+        "baseline_rss_mb": 332.87109375
+      }
+    ],
+    "median": {
+      "min_rss_mb": 49.0703125,
+      "rss_reduction_pct": 85.25846388546617,
+      "cool_rss_mb": 49.0703125,
+      "steady_rss_mb": 49.0703125,
+      "peak_rss_mb": 256.62109375,
+      "baseline_rss_mb": 332.87109375
+    }
   }
 }

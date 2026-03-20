@@ -717,7 +717,17 @@ def _access_memcached(port, hot_keys, duration_sec):
 _DUCKDB_BASELINE_CACHE = {}
 
 def _duckdb_baseline_rss(build_dir, quick):
-    """Get DuckDB's uncompressed fill RSS (no Smash) — cached."""
+    """Get DuckDB's cool-phase RSS without Smash — cached.
+
+    Measures at the same workload point as the main benchmark:
+    1. Fill TPC-H data to file-based database
+    2. CHECKPOINT to flush to disk
+    3. Start new process to load data
+    4. Sleep for cool_sec
+    5. Measure RSS
+
+    This gives an apples-to-apples comparison with Smash runs.
+    """
     global _DUCKDB_BASELINE_CACHE
     key = "quick" if quick else "full"
     if key in _DUCKDB_BASELINE_CACHE:
@@ -725,32 +735,77 @@ def _duckdb_baseline_rss(build_dir, quick):
 
     duckdb_bin = get_binary("duckdb", build_dir)
     sf = 0.1 if quick else 0.5
+    cool_sec = 5 if quick else 10
+
     with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "baseline.duckdb")
         marker = os.path.join(tmpdir, "marker.csv")
+
+        # Phase 1: Fill (no Smash) - same as main benchmark
         proc = subprocess.Popen(
-            [duckdb_bin, ":memory:"],
+            [duckdb_bin, db_file],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        fill_sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
+                    f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n"
+                    f"CHECKPOINT;\n")
         try:
-            sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
-                   f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
-            try:
-                proc.stdin.write(sql.encode())
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                return 0.0
-            if not _wait_file(marker, "fill_done", timeout=300):
-                return 0.0
-            rss = get_rss_mb(proc.pid)
-            try:
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
-            proc.wait(timeout=10)
-        except Exception:
+            proc.stdin.write(fill_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
             proc.kill()
-            rss = 0.0
+            return 0.0
+
+        if not _wait_file(marker, "fill_done", timeout=600):
+            proc.terminate()
+            return 0.0
+
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+        # Phase 2: Cool - new process loads data (same as main benchmark)
+        if os.path.exists(marker):
+            os.remove(marker)
+
+        proc = subprocess.Popen(
+            [duckdb_bin, db_file],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        hold_sql = (f"SELECT count(*) FROM lineitem;\n"
+                    f"COPY (SELECT 'loaded') TO '{marker}' (HEADER false);\n")
+        try:
+            proc.stdin.write(hold_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            proc.kill()
+            return 0.0
+
+        if not _wait_file(marker, "loaded", timeout=60):
+            proc.terminate()
+            return 0.0
+
+        # Cool down and measure RSS at same point as main benchmark
+        time.sleep(cool_sec)
+        rss = get_rss_mb(proc.pid)
+
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except:
+            proc.kill()
+
     _DUCKDB_BASELINE_CACHE[key] = rss
     return rss
 
@@ -798,7 +853,7 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             return None
 
         # Wait for fill to complete and measure RSS (longer timeout for full mode)
-        fill_timeout = 300 if quick else 600
+        fill_timeout = 300 if quick else 900  # 15 min for full mode with Smash overhead
         if not _wait_file(marker, "fill_done", timeout=fill_timeout):
             print(f"    duckdb: fill timed out after {fill_timeout}s")
             proc.terminate()

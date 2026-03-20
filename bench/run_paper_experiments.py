@@ -797,9 +797,10 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             print("    duckdb: process exited during fill (pipe error)")
             return None
 
-        # Wait for fill to complete and measure RSS
-        if not _wait_file(marker, "fill_done", timeout=300):
-            print("    duckdb: fill timed out")
+        # Wait for fill to complete and measure RSS (longer timeout for full mode)
+        fill_timeout = 300 if quick else 600
+        if not _wait_file(marker, "fill_done", timeout=fill_timeout):
+            print(f"    duckdb: fill timed out after {fill_timeout}s")
             proc.terminate()
             return None
 
@@ -890,10 +891,10 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             print(f"    duckdb: invalid RSS measurement (cool={cool_rss})")
             return None
 
-        if baseline_rss > 0 and smash_lib:
+        # Compare to baseline RSS (DuckDB without Smash at same point)
+        # For baseline runs (no smash_lib), this gives ~0% reduction as expected
+        if baseline_rss > 0:
             reduction = (1 - cool_rss / baseline_rss) * 100
-        elif fill_rss > 0:
-            reduction = (1 - cool_rss / fill_rss) * 100
         else:
             reduction = 0
 

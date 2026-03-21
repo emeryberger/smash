@@ -214,7 +214,7 @@ def parse_metrics(text):
 # ── In-process benchmark runners ─────────────────────────────────────────────
 
 def run_sqlite(build_dir, smash_lib, quick):
-    """Run bench_sqlite in-process."""
+    """Run bench_sqlite with RSS timeline sampling."""
     exe = build_dir / "bench" / "bench_sqlite"
     if not exe.exists():
         return None
@@ -224,17 +224,35 @@ def run_sqlite(build_dir, smash_lib, quick):
         env[PRELOAD_VAR] = str(smash_lib)
         env["SMASH_VERY_COLD_TICKS"] = "5"
     try:
-        r = subprocess.run([str(exe)] + args, capture_output=True, text=True,
-                           env=env, timeout=300)
-        return parse_metrics(r.stdout)
+        # Run as background process to sample RSS during execution
+        proc = subprocess.Popen([str(exe)] + args, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env)
+
+        # Sample RSS every second while process runs
+        rss_timeline = []
+        while proc.poll() is None:
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                rss_timeline.append(rss)
+            time.sleep(1)
+
+        stdout, _ = proc.communicate(timeout=10)
+        metrics = parse_metrics(stdout)
+
+        if metrics and rss_timeline:
+            metrics["rss_timeline"] = rss_timeline
+            metrics["auc_mb_sec"] = sum(rss_timeline)
+            metrics["peak_rss_mb"] = max(rss_timeline) if rss_timeline else metrics.get("peak_rss_mb", 0)
+            metrics["min_rss_mb"] = min(rss_timeline) if rss_timeline else metrics.get("min_rss_mb", 0)
+
+        return metrics
     except Exception as e:
         print(f"    sqlite error: {e}")
         return None
 
 
 def run_rocksdb(build_dir, smash_lib, quick):
-    """Run bench_rocksdb C++ binary (preferred) or shell script."""
-    # Prefer C++ binary — the shell script requires bash 4+ (declare -A)
+    """Run bench_rocksdb C++ binary with RSS timeline sampling."""
     exe = build_dir / "bench" / "bench_rocksdb"
     if exe.exists():
         args = ["--keys", "200000", "--value-size", "256",
@@ -244,16 +262,37 @@ def run_rocksdb(build_dir, smash_lib, quick):
             env[PRELOAD_VAR] = str(smash_lib)
             env["SMASH_VERY_COLD_TICKS"] = "5"
         try:
-            r = subprocess.run([str(exe)] + args, capture_output=True, text=True,
-                               env=env, timeout=600)
-            metrics = parse_metrics(r.stdout)
-            if metrics and "rss_reduction_pct" not in metrics:
-                peak = metrics.get("peak_rss_mb", 0)
-                min_rss = metrics.get("min_rss_mb", peak)
-                if peak > 0 and min_rss > 0:
-                    metrics["rss_reduction_pct"] = (1 - min_rss / peak) * 100
-                    metrics["steady_rss_mb"] = metrics.get("serve_rss_mb", min_rss)
-                    metrics["post_cool_rss_mb"] = metrics.get("cool_rss_mb", min_rss)
+            # Run as background process to sample RSS during execution
+            proc = subprocess.Popen([str(exe)] + args, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, env=env)
+
+            # Sample RSS every second while process runs
+            rss_timeline = []
+            while proc.poll() is None:
+                rss = get_rss_mb(proc.pid)
+                if rss > 0:
+                    rss_timeline.append(rss)
+                time.sleep(1)
+
+            stdout, _ = proc.communicate(timeout=10)
+            metrics = parse_metrics(stdout)
+
+            if metrics:
+                if rss_timeline:
+                    metrics["rss_timeline"] = rss_timeline
+                    metrics["auc_mb_sec"] = sum(rss_timeline)
+                    if "peak_rss_mb" not in metrics:
+                        metrics["peak_rss_mb"] = max(rss_timeline)
+                    if "min_rss_mb" not in metrics:
+                        metrics["min_rss_mb"] = min(rss_timeline)
+
+                if "rss_reduction_pct" not in metrics:
+                    peak = metrics.get("peak_rss_mb", 0)
+                    min_rss = metrics.get("min_rss_mb", peak)
+                    if peak > 0 and min_rss > 0:
+                        metrics["rss_reduction_pct"] = (1 - min_rss / peak) * 100
+                        metrics["steady_rss_mb"] = metrics.get("serve_rss_mb", min_rss)
+                        metrics["post_cool_rss_mb"] = metrics.get("cool_rss_mb", min_rss)
             return metrics
         except Exception as e:
             print(f"    rocksdb error: {e}")
@@ -329,13 +368,17 @@ def run_redis_bench(build_dir, smash_lib, quick):
             print(f"    redis: fill_rss={fill_rss:.1f}MB (too low, DBSIZE={dbsize})")
             return None
 
-        # Cool-down: let compression run
+        # Cool-down: let compression run, sample RSS timeline
+        rss_timeline = [fill_rss]
         min_rss = fill_rss
         for i in range(cool_sec):
             time.sleep(1)
             rss = get_rss_mb(proc.pid)
             if rss > 0:
+                rss_timeline.append(rss)
                 min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])
 
         cool_rss = get_rss_mb(proc.pid)
 
@@ -359,12 +402,16 @@ def run_redis_bench(build_dir, smash_lib, quick):
             print(f"    redis: invalid RSS measurement (fill={fill_rss}, min={min_rss})")
             return None
         reduction = (1 - min_rss / fill_rss) * 100
+        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        auc_mb_sec = sum(rss_timeline)  # Each sample is 1 second apart
 
         return {
             "peak_rss_mb": fill_rss,
             "steady_rss_mb": cool_rss,
             "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc_mb_sec,
             "set_rps": set_rps,
             "get_rps": get_rps,
         }
@@ -492,13 +539,17 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         post_del_rss = get_rss_mb(proc.pid)
         print(f"    deleted {deleted}/{total_keys} keys", flush=True)
 
-        # Cool-down: let compression run
+        # Cool-down: let compression run, sample RSS timeline
+        rss_timeline = [post_del_rss]
         min_rss = post_del_rss
         for i in range(cool_sec):
             time.sleep(1)
             rss = get_rss_mb(proc.pid)
             if rss > 0:
+                rss_timeline.append(rss)
                 min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])
 
         cool_rss = get_rss_mb(proc.pid)
 
@@ -522,6 +573,8 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
             print(f"    redis-ext: invalid RSS measurement (post_del={post_del_rss}, cool={cool_rss})")
             return None
         reduction = (1 - cool_rss / post_del_rss) * 100
+        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        auc_mb_sec = sum(rss_timeline)
 
         return {
             "peak_rss_mb": peak_rss,
@@ -529,6 +582,8 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
             "steady_rss_mb": cool_rss,
             "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc_mb_sec,
             "set_rps": set_rps,
             "get_rps": get_rps,
         }
@@ -591,7 +646,8 @@ def run_memcached_bench(build_dir, smash_lib, quick):
         if fill_rss < 50:
             print(f"    memcached: fill_rss too low ({fill_rss:.1f}MB) - populate may have failed")
 
-        # Cool phase - track minimum RSS
+        # Cool phase - track RSS timeline and minimum
+        rss_timeline = [fill_rss]
         min_rss = fill_rss
         for _ in range(cool_sec):
             time.sleep(1)
@@ -600,7 +656,10 @@ def run_memcached_bench(build_dir, smash_lib, quick):
                 return None
             rss = get_rss_mb(proc.pid)
             if rss > 0:
+                rss_timeline.append(rss)
                 min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])
         cool_rss = get_rss_mb(proc.pid)
 
         # Serve phase: access hot 5%
@@ -618,6 +677,8 @@ def run_memcached_bench(build_dir, smash_lib, quick):
             print(f"    memcached: invalid RSS measurement (fill={fill_rss}, min={min_rss})")
             return None
         reduction = (1 - min_rss / fill_rss) * 100
+        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        auc_mb_sec = sum(rss_timeline)
 
         return {
             "peak_rss_mb": fill_rss,
@@ -625,6 +686,8 @@ def run_memcached_bench(build_dir, smash_lib, quick):
             "steady_rss_mb": serve_rss,
             "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc_mb_sec,
         }
     finally:
         proc.terminate()
@@ -961,6 +1024,8 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
 
         # Reduction vs peak (within same run) - shows compression effect over time
         reduction = (1 - min_rss / fill_rss) * 100
+        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        auc_mb_sec = sum(rss_timeline)
 
         return {
             "peak_rss_mb": fill_rss,
@@ -968,7 +1033,8 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             "steady_rss_mb": serve_rss,
             "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
-            "rss_timeline": rss_timeline,  # RSS sampled every second during cool
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc_mb_sec,
         }
 
 

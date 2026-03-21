@@ -1,47 +1,58 @@
+ABLATION TABLE
 ======================================================================
-SMASH BENCHMARK RESULTS
-Generated: 2026-03-20T14:45:32.480699
-Platform: Linux x86_64
+% Auto-generated ablation table
+\begin{tabular}{llrrrrrrr}
+\toprule
+ID & Configuration & \textbf{Sqlite} & \textbf{Rocksdb} & \textbf{Duckdb} & \textbf{Memcached} & \textbf{Redis} & \textbf{Redis_ext} & Avg.\ $\Delta$ \\
+\midrule
+    & \textbf{Default} & \textbf{69.3\%} & \textbf{78.3\%} & \textbf{2.5\%} & \textbf{83.4\%} & \textbf{53.1\%} & \textbf{52.1\%} & --- \\
+B0  & System malloc & 24.9\% ($-$44.4) & -0.0\% ($-$78.3) & 0.0\% ($-$2.5) & 0.0\% ($-$83.4) & 0.0\% ($-$53.1) & 0.0\% ($-$52.1) & -52.3 \\
+\midrule
+    & With dicts & 69.2\% ($-$0.1) & 78.3\% ($-$0.0) & 2.5\% (+0.0) & 83.3\% ($-$0.1) & 52.9\% ($-$0.1) & 52.0\% ($-$0.1) & -0.1 \\
+    & No arenas & 69.3\% (+0.0) & 78.2\% ($-$0.1) & 2.6\% (+0.1) & 83.3\% ($-$0.1) & 52.7\% ($-$0.3) & 52.0\% ($-$0.1) & -0.1 \\
+    & LZ4 only & 69.3\% (+0.0) & 78.3\% (+0.0) & 2.5\% (+0.0) & 83.5\% (+0.1) & 53.1\% (+0.0) & 51.8\% ($-$0.3) & -0.0 \\
+    & No zero-deferred & 69.3\% (+0.0) & 78.1\% ($-$0.2) & 2.6\% (+0.1) & 83.4\% (+0.0) & 52.8\% ($-$0.2) & 52.2\% (+0.1) & -0.0 \\
+    & No prefetch & 69.3\% (+0.0) & 78.2\% ($-$0.1) & 2.5\% (+0.0) & 83.4\% ($-$0.0) & 52.7\% ($-$0.3) & 51.9\% ($-$0.2) & -0.1 \\
+    & Single worker & 69.3\% (+0.0) & 78.1\% ($-$0.2) & 2.5\% (+0.0) & 83.4\% (+0.0) & 52.9\% ($-$0.2) & 52.1\% (+0.0) & -0.0 \\
+B2  & No compression & 69.2\% ($-$0.1) & 78.2\% ($-$0.1) & 2.4\% ($-$0.1) & 83.2\% ($-$0.2) & 53.2\% (+0.1) & 52.2\% (+0.1) & -0.0 \\
+\bottomrule
+\end{tabular}
+
+COMPRESS-ONLY TABLE
 ======================================================================
-
-ABLATION STUDY - RSS Reduction (%)
-----------------------------------------------------------------------
-Config                   sqlite    rocksdb     duckdb  memcached      redis  redis_ext
-----------------------------------------------------------------------
-Default                    66.1       78.1       80.9        4.8       42.6       52.7
-System malloc              25.0        0.0       92.7        0.0        0.0        0.0
-With dicts                 65.3       76.8       78.9        4.4       39.0       48.4
-No arenas                  65.9       78.1       81.0        3.3       42.6       52.5
-LZ4 only                   66.0       78.0       81.0        4.5       42.6       52.5
-No zero-deferred           65.9       77.6       81.2        4.9       42.5       42.8
-No prefetch                65.9       78.1       80.9       24.9       42.7       52.5
-Single worker              66.0       78.3       80.8        4.3       42.9       52.6
-No compression             20.3       -0.0       80.4       -0.4        0.0       -0.0
-
-COMPRESS-ONLY EXPERIMENT - RSS (MB)
-----------------------------------------------------------------------
-sqlite:
-  baseline:         237.2 MB
-  compress-only:    259.6 MB
-  full smash:       131.8 MB
-rocksdb:
-  baseline:         320.6 MB
-  compress-only:      0.0 MB
-  full smash:         0.0 MB
-duckdb:
-  baseline:          18.1 MB
-  compress-only:     40.4 MB
-  full smash:        48.9 MB
-memcached:
-  baseline:          24.9 MB
-  compress-only:     48.6 MB
-  full smash:        55.3 MB
-redis:
-  baseline:          52.3 MB
-  compress-only:     75.0 MB
-  full smash:        48.6 MB
-redis_ext:
-  baseline:          50.9 MB
-  compress-only:     74.4 MB
-  full smash:        40.2 MB
-
+% Auto-generated compress-only table
+\begin{tabular}{llrrr}
+\toprule
+Benchmark & Config & Cool RSS & Reduction & Ops/s \\
+\midrule
+\multirow{3}{*}{Sqlite}
+  & baseline       & 468  & ---    & --- \\
+  & compress-only  & 490    & -4.7\% & --- \\
+  & full \sys      & \textbf{204}   & \textbf{56.4\%} & --- \\
+\midrule
+\multirow{3}{*}{Rocksdb}
+  & baseline       & 283  & ---    & --- \\
+  & compress-only  & 0    & 0.0\% & --- \\
+  & full \sys      & \textbf{106}   & \textbf{62.4\%} & --- \\
+\midrule
+\multirow{3}{*}{Duckdb}
+  & baseline       & 35  & ---    & --- \\
+  & compress-only  & 58    & -65.5\% & --- \\
+  & full \sys      & \textbf{49}   & \textbf{-40.8\%} & --- \\
+\midrule
+\multirow{3}{*}{Memcached}
+  & baseline       & 287  & ---    & --- \\
+  & compress-only  & 310    & -8.2\% & --- \\
+  & full \sys      & \textbf{94}   & \textbf{67.3\%} & --- \\
+\midrule
+\multirow{3}{*}{Redis}
+  & baseline       & 88  & ---    & --- \\
+  & compress-only  & 110    & -26.0\% & --- \\
+  & full \sys      & \textbf{55}   & \textbf{37.4\%} & --- \\
+\midrule
+\multirow{3}{*}{Redis_ext}
+  & baseline       & 87  & ---    & --- \\
+  & compress-only  & 110    & -25.7\% & --- \\
+  & full \sys      & \textbf{60}   & \textbf{31.9\%} & --- \\
+\bottomrule
+\end{tabular}

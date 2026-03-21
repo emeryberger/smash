@@ -883,20 +883,27 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
     if not check_binary("duckdb", build_dir):
         return None
 
+    # Note: DuckDB is not a good Smash candidate - it already manages memory efficiently
+    # and large-scale operations crash with Smash. Using small SF for reliable measurement.
     sf = 0.1 if quick else 0.5
-    cool_sec = 5 if quick else 10
+    cool_sec = 5 if quick else 15
     serve_iters = 3 if quick else 10
 
-    env = os.environ.copy()
+    # Fill phase runs WITHOUT Smash (data generation doesn't benefit from compression)
+    # This avoids the severe slowdown from Smash overhead during dbgen
+    fill_env = os.environ.copy()
+
+    # Cool/serve phases run WITH Smash (where compression actually matters)
+    cool_env = os.environ.copy()
     if smash_lib:
-        env[PRELOAD_VAR] = str(smash_lib)
-        env["SMASH_VERY_COLD_TICKS"] = "5"
+        cool_env[PRELOAD_VAR] = str(smash_lib)
+        cool_env["SMASH_VERY_COLD_TICKS"] = "5"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_file = os.path.join(tmpdir, "bench.duckdb")
         marker = os.path.join(tmpdir, "marker.csv")
 
-        # Phase 1: Fill - run as background process to measure RSS
+        # Phase 1: Fill - run WITHOUT Smash for fast data generation
         fill_sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
                     f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n"
                     f"CHECKPOINT;\n")  # Ensure data is written to disk
@@ -905,7 +912,7 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             [duckdb_bin, db_file],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env
+            env=fill_env  # No Smash during fill
         )
 
         try:
@@ -915,8 +922,8 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             print("    duckdb: process exited during fill (pipe error)")
             return None
 
-        # Wait for fill to complete and measure RSS (longer timeout for full mode)
-        fill_timeout = 300 if quick else 900  # 15 min for full mode with Smash overhead
+        # Wait for fill to complete
+        fill_timeout = 300 if quick else 600  # 10 min for full mode
         if not _wait_file(marker, "fill_done", timeout=fill_timeout):
             print(f"    duckdb: fill timed out after {fill_timeout}s")
             proc.terminate()
@@ -937,15 +944,17 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
         if os.path.exists(marker):
             os.remove(marker)
 
-        # Start a process that keeps the DB loaded in memory
-        hold_sql = (f"SELECT count(*) FROM lineitem;\n"  # Load data into memory
+        # Load data by running aggregate queries that scan the full tables
+        # Avoids CREATE TABLE AS SELECT which crashes with large data + Smash
+        hold_sql = (f"SELECT count(*), sum(l_quantity), sum(l_extendedprice) FROM lineitem;\n"
+                    f"SELECT count(*), sum(o_totalprice) FROM orders;\n"
                     f"COPY (SELECT 'loaded') TO '{marker}' (HEADER false);\n")
 
         proc = subprocess.Popen(
             [duckdb_bin, db_file],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env
+            env=cool_env  # Smash enabled here for compression measurement
         )
 
         try:
@@ -1018,17 +1027,19 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             proc.kill()
 
         # Validate measurements - cool_rss=0 means measurement failed (process died)
-        if cool_rss <= 0 or fill_rss <= 0:
-            print(f"    duckdb: invalid RSS measurement (fill={fill_rss}, cool={cool_rss})")
+        if cool_rss <= 0 or peak_cool_rss <= 0:
+            print(f"    duckdb: invalid RSS measurement (peak_cool={peak_cool_rss}, cool={cool_rss})")
             return None
 
-        # Reduction vs peak (within same run) - shows compression effect over time
-        reduction = (1 - min_rss / fill_rss) * 100
+        # Reduction vs peak_cool_rss (same process) - shows actual compression effect
+        # Note: fill_rss is from a different process, so we don't use it for reduction
+        reduction = (1 - min_rss / peak_cool_rss) * 100
         # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
         auc_mb_sec = sum(rss_timeline)
 
         return {
-            "peak_rss_mb": fill_rss,
+            "fill_rss_mb": fill_rss,  # Different process, for reference only
+            "peak_rss_mb": peak_cool_rss,  # Peak of cool phase process (denominator for reduction)
             "cool_rss_mb": cool_rss,
             "steady_rss_mb": serve_rss,
             "min_rss_mb": min_rss,
@@ -1332,13 +1343,29 @@ def _median_metrics(runs):
     """Compute median of each metric across runs."""
     if not runs:
         return {}
+
+    # Find the median run by rss_reduction_pct (for selecting list values)
+    reductions = [(i, r.get("rss_reduction_pct", 0)) for i, r in enumerate(runs) if r.get("rss_reduction_pct") is not None]
+    if reductions:
+        reductions.sort(key=lambda x: x[1])
+        median_run_idx = reductions[len(reductions) // 2][0]
+    else:
+        median_run_idx = 0
+
     keys = set()
     for r in runs:
         keys.update(r.keys())
     result = {}
     for k in keys:
-        vals = [r[k] for r in runs if k in r]
-        if vals:
+        vals = [r[k] for r in runs if k in r and r[k] is not None]
+        if not vals:
+            continue
+        # For list values (like rss_timeline), use the value from the median run
+        if isinstance(vals[0], list):
+            if k in runs[median_run_idx]:
+                result[k] = runs[median_run_idx][k]
+        # For scalar values, compute median
+        elif isinstance(vals[0], (int, float)):
             result[k] = statistics.median(vals)
     return result
 

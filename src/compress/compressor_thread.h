@@ -50,6 +50,9 @@ class CompressorThread {
     CompressEngine* engine_ = nullptr;      // shared: dict training, dict lookup
     PageMap* page_map_ = nullptr;
     vm::FaultHandler* fault_handler_ = nullptr;
+#ifdef SMASH_USE_USERFAULTFD
+    vm::FaultHandlerUffd* fault_handler_uffd_ = nullptr;  // per-page registration
+#endif
 
     // Optional pre-tick callback (e.g., for VM region scanning in compress-only mode)
     using PreTickFn = void(*)();
@@ -551,13 +554,10 @@ class CompressorThread {
         compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
 
         // Decommit physical backing while holding lock
+        // Note: With signal-based fault handling (default), page stays PROT_NONE
+        // and SIGSEGV is caught for decompression.
+        // userfaultfd (SMASH_USE_USERFAULTFD) is experimental and not fully working.
         vm::decommitPages(page_addr, kPageSize);
-
-#ifdef SMASH_USE_USERFAULTFD
-        // Restore RW protection so userfaultfd catches "missing" fault.
-        // Without this, the page stays PROT_NONE and triggers SIGSEGV instead.
-        vm::protectPages(page_addr, kPageSize, true, true);
-#endif
 
         states_->set(page_idx, PageState::COMPRESSED);
         locks_->unlock(page_idx);
@@ -899,7 +899,11 @@ public:
     void init(VmRegion* vm, PageStateTable* states, PageLockTable* locks,
               CompressStore* store, CompressEngine* engine,
               PageMap* page_map = nullptr,
-              vm::FaultHandler* fault_handler = nullptr) {
+              vm::FaultHandler* fault_handler = nullptr
+#ifdef SMASH_USE_USERFAULTFD
+              , vm::FaultHandlerUffd* fault_handler_uffd = nullptr
+#endif
+              ) {
         vm_ = vm;
         states_ = states;
         locks_ = locks;
@@ -907,6 +911,9 @@ public:
         engine_ = engine;
         page_map_ = page_map;
         fault_handler_ = fault_handler;
+#ifdef SMASH_USE_USERFAULTFD
+        fault_handler_uffd_ = fault_handler_uffd;
+#endif
         pre_tick_fn_ = nullptr;
 
         size_t max_pages = vm->totalPages();

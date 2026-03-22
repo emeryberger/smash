@@ -198,6 +198,38 @@ public:
         return true;
     }
 
+    // Register a single page for fault handling (for per-page registration).
+    // More efficient than registerRegion for individual pages.
+    bool registerPage(void* page_addr) {
+        if (uffd_ < 0) return false;
+
+        struct uffdio_register reg{};
+        reg.range.start = reinterpret_cast<unsigned long>(page_addr);
+        reg.range.len = kPageSize;
+        reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+
+        // EEXIST is OK - page might already be registered
+        if (ioctl(uffd_, UFFDIO_REGISTER, &reg) < 0 && errno != EEXIST) {
+            return false;
+        }
+        return true;
+    }
+
+    // Unregister a single page.
+    bool unregisterPage(void* page_addr) {
+        if (uffd_ < 0) return false;
+
+        struct uffdio_range range{};
+        range.start = reinterpret_cast<unsigned long>(page_addr);
+        range.len = kPageSize;
+
+        // ENOENT is OK - page might not be registered
+        if (ioctl(uffd_, UFFDIO_UNREGISTER, &range) < 0 && errno != ENOENT) {
+            return false;
+        }
+        return true;
+    }
+
     // Unregister a memory region.
     bool unregisterRegion(void* start, size_t len) {
         if (uffd_ < 0) return false;

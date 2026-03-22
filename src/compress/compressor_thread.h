@@ -553,6 +553,12 @@ class CompressorThread {
         // Decommit physical backing while holding lock
         vm::decommitPages(page_addr, kPageSize);
 
+#ifdef SMASH_USE_USERFAULTFD
+        // Restore RW protection so userfaultfd catches "missing" fault.
+        // Without this, the page stays PROT_NONE and triggers SIGSEGV instead.
+        vm::protectPages(page_addr, kPageSize, true, true);
+#endif
+
         states_->set(page_idx, PageState::COMPRESSED);
         locks_->unlock(page_idx);
         return true;

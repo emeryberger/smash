@@ -135,14 +135,25 @@ class SmashHeap {
         fault_handler_.start(faultCallback, this);
 
 #ifdef SMASH_USE_USERFAULTFD
-        // userfaultfd mode: also start userfaultfd handler for missing pages
-        // (handles COMPRESSED/EMPTY states after MADV_DONTNEED)
+        // NOTE: userfaultfd MODE_MISSING is NOT suitable for Smash because it
+        // catches ALL first-touch faults, not just compressed pages. This makes
+        // every allocation go through userfaultfd (~100x slower than kernel's
+        // native page-fault handling).
+        //
+        // For userfaultfd to be beneficial, we would need:
+        // 1. Per-page registration (only register compressed pages)
+        // 2. Or use memfd + UFFD_FEATURE_MINOR_SHMEM (Linux 5.13+)
+        //
+        // For now, userfaultfd is disabled even when compiled in.
+        // The signal-based approach is more efficient because it only triggers
+        // on PROT_NONE (compressed) or PROT_READ (monitoring) pages.
+        (void)fault_handler_uffd_;  // Suppress unused warning
+#if 0  // Disabled - too slow with whole-region registration
         if (fault_handler_uffd_.init()) {
-            // Register the entire VM region for missing-page faults
-            fault_handler_uffd_.registerRegion(vm_region_.base(), vm_region_.reservedSize());
             fault_handler_uffd_.start(faultCallbackUffd, this);
+            fault_handler_uffd_.registerRegion(vm_region_.base(), vm_region_.totalPages() * kPageSize);
         }
-        // If userfaultfd init fails, signal handler still works for all states
+#endif
 #endif
         compressor_.start();
     }

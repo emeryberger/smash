@@ -140,6 +140,16 @@ set_target_properties(smash PROPERTIES
   PREFIX "lib"
 )
 
+# ── Userfaultfd option (Linux only) ──────────────────────────────────────────
+# Use userfaultfd(2) instead of SIGSEGV for page fault handling.
+# Advantages: dedicated handler thread, no signal restrictions, no conflicts.
+# Requires: Linux 4.3+ kernel, CAP_SYS_PTRACE or unprivileged_userfaultfd=1.
+option(SMASH_USE_USERFAULTFD "Use userfaultfd instead of signals (Linux only)" OFF)
+if(SMASH_USE_USERFAULTFD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(smash PRIVATE SMASH_USE_USERFAULTFD=1)
+  message(STATUS "Smash: Using userfaultfd for page fault handling")
+endif()
+
 # ── Ablation defines (override config.h defaults via -DSMASH_*=value) ────────
 # Numeric overrides (only when non-empty)
 foreach(_var NUM_ARENAS COLD_TICKS VERY_COLD_TICKS DICT_TRAIN_SAMPLES

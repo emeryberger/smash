@@ -1075,6 +1075,96 @@ public:
         }
     }
 
+#ifdef SMASH_USE_USERFAULTFD
+    // Called by the userfaultfd handler when a missing page is accessed.
+    // Fills page_buf with 4096 bytes of page data.
+    // Returns true if the fault was handled (page_buf filled).
+    bool handleFaultUffd(uintptr_t addr, void* page_buf) {
+        if (!vm_->contains(addr)) return false;
+
+        size_t page_idx = vm_->pageIndex(addr);
+        locks_->lock(page_idx);
+
+        PageState st = states_->get(page_idx);
+
+        switch (st) {
+        case PageState::COMPRESSED: {
+            CompressAlgo algo = compressed_[page_idx].algorithm();
+            uint8_t sc = lookupSizeClass(page_idx);
+
+            // Spin-wait for a fault slot
+            int slot;
+            while ((slot = acquireFaultSlot()) < 0) {
+#if defined(__x86_64__)
+                __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                asm volatile("yield");
+#endif
+            }
+
+            // Decompress using per-slot DCtx
+            engine_->decompressWithDCtx(
+                fault_slots_[slot].dctx,
+                compressed_[page_idx].data, fault_slots_[slot].buf,
+                compressed_[page_idx].compressedSize(), kPageSize,
+                algo, sc);
+
+            // Copy to caller's buffer (userfaultfd will install via UFFDIO_COPY)
+            __builtin_memcpy(page_buf, fault_slots_[slot].buf, kPageSize);
+            releaseFaultSlot(slot);
+
+            // Release compressed blob
+            store_->release(compressed_[page_idx].data,
+                           compressed_[page_idx].alloc_size, page_idx);
+            compressed_[page_idx] = {};
+
+            states_->set(page_idx, PageState::ACTIVE);
+            cold_count_[page_idx] = 0;
+            locks_->unlock(page_idx);
+
+            // Note: no prefetchAdjacent() here - userfaultfd handler runs in
+            // dedicated thread, can't decompress into other threads' address space
+            // without UFFDIO_COPY for each page.
+
+            return true;
+        }
+
+        case PageState::COMPRESSING: {
+            // Race with compressor - page is being compressed but not yet done.
+            // The compressor has a copy in its scratch buffer.
+            // Return zeros; compressor will detect the state change and abort.
+            __builtin_memset(page_buf, 0, kPageSize);
+            states_->set(page_idx, PageState::ACTIVE);
+            cold_count_[page_idx] = 0;
+            locks_->unlock(page_idx);
+            return true;
+        }
+
+        case PageState::ACTIVE:
+        case PageState::ACTIVE_MONITORING: {
+            // Page should be present - userfaultfd shouldn't have caught this.
+            // This can happen if MADV_DONTNEED races with page access.
+            // Return zeros to avoid deadlock.
+            __builtin_memset(page_buf, 0, kPageSize);
+            locks_->unlock(page_idx);
+            return true;
+        }
+
+        case PageState::EMPTY: {
+            // Empty page - return zeros (normal case for first-touch allocation)
+            __builtin_memset(page_buf, 0, kPageSize);
+            states_->set(page_idx, PageState::ACTIVE);
+            locks_->unlock(page_idx);
+            return true;
+        }
+
+        default:
+            locks_->unlock(page_idx);
+            return false;
+        }
+    }
+#endif // SMASH_USE_USERFAULTFD
+
     // Release any compressed data for a range of pages (called during span release)
     void releaseCompressedPages(size_t start_page, size_t num_pages) {
         for (size_t i = start_page; i < start_page + num_pages; ++i) {

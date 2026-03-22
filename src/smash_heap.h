@@ -97,17 +97,28 @@ class SmashHeap {
     CompressStore compress_store_;
     CompressEngine compress_engine_;
     CompressorThread compressor_;
-    vm::FaultHandler fault_handler_;
+    vm::FaultHandler fault_handler_;  // Signal-based (always present)
+#ifdef SMASH_USE_USERFAULTFD
+    vm::FaultHandlerUffd fault_handler_uffd_;  // userfaultfd (for missing pages)
+#endif
 
     bool compression_inited_ = false;
     std::atomic<bool> compression_started_{false};
     std::atomic<int> warmup_count_{0};
 
-    // Fault callback: decompress on access to compressed/monitored pages
+    // Fault callback (signal mode): decompress on access to compressed/monitored pages
     static bool faultCallback(uintptr_t fault_addr, void* ctx) {
         auto* self = static_cast<SmashHeap*>(ctx);
         return self->compressor_.handleFault(fault_addr);
     }
+
+#ifdef SMASH_USE_USERFAULTFD
+    // Fault callback (userfaultfd mode): fill page_buf with decompressed data
+    static bool faultCallbackUffd(uintptr_t fault_addr, void* page_buf, void* ctx) {
+        auto* self = static_cast<SmashHeap*>(ctx);
+        return self->compressor_.handleFaultUffd(fault_addr, page_buf);
+    }
+#endif
 
     // Release hook: called by slab when freeing spans that may be compressed
     static void releaseHook(size_t page_idx, size_t page_count, void* ctx) {
@@ -119,7 +130,20 @@ class SmashHeap {
         bool expected = false;
         if (!compression_started_.compare_exchange_strong(expected, true))
             return;
+
+        // Always start signal handler (handles COMPRESSING/ACTIVE_MONITORING/ACTIVE)
         fault_handler_.start(faultCallback, this);
+
+#ifdef SMASH_USE_USERFAULTFD
+        // userfaultfd mode: also start userfaultfd handler for missing pages
+        // (handles COMPRESSED/EMPTY states after MADV_DONTNEED)
+        if (fault_handler_uffd_.init()) {
+            // Register the entire VM region for missing-page faults
+            fault_handler_uffd_.registerRegion(vm_region_.base(), vm_region_.reservedSize());
+            fault_handler_uffd_.start(faultCallbackUffd, this);
+        }
+        // If userfaultfd init fails, signal handler still works for all states
+#endif
         compressor_.start();
     }
 

@@ -166,7 +166,7 @@ handler restores write~permission.
 \EndFunction
 \end{algorithmic}
 \caption{\textbf{Signal-handler decompression}
-  (\S\ref{sec:impl:fault}).  Each of 32~pre-allocated fault slots
+  (\S\ref{sec:impl:fault}).  Each of 128~pre-allocated fault slots
   has an independent decompression context, supporting concurrent
   faults with no heap allocation.}
 \label{fig:algo:fault}
@@ -175,12 +175,26 @@ handler restores write~permission.
 \paragraph{Per-slot decompression contexts}
 The signal handler must not call \texttt{malloc}.  All decompression
 state is pre-allocated from a bootstrap allocator.  \sys maintains
-32~fault slots, each with a pre-allocated page buffer and an
+128~fault slots, each with a pre-allocated page buffer and an
 independent zstd decompression context.  A faulting thread atomically
 acquires a slot via compare-and-swap, decompresses into the slot's
 buffer, copies the result to the faulting page, and releases the slot.
-This design supports up to 32~concurrent page faults without
-data~races.
+If all slots are in use, the handler spin-waits with architecture-specific
+pause instructions (\texttt{pause} on x86, \texttt{yield} on ARM) until
+a slot becomes available---since the thread is already blocked on the
+page fault, it cannot proceed without decompressing.  Prefetch, which is
+an optional optimization, instead skips any page for which no slot is
+available.  This design supports high-concurrency workloads (e.g.,
+DuckDB with 16+ threads) without data~races on zstd internal state.
+
+\paragraph{Concurrent faults on the same page}
+When multiple threads fault on the same compressed page simultaneously,
+the per-page lock serializes access: only the first thread (the ``winner'')
+decompresses the page; subsequent threads acquire the lock after the
+winner releases it, observe that the page is now \textsc{active}, and
+return immediately.  The lock uses acquire-release memory ordering,
+ensuring that the winner's \texttt{memcpy} of decompressed data
+happens-before any loser's read of that data.
 
 \paragraph{Prefetch}
 After decompressing a faulted page, the handler speculatively

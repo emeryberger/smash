@@ -46,9 +46,49 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 - **PageState machine**: EMPTY → ACTIVE → ACTIVE_MONITORING → COMPRESSING → COMPRESSED → ACTIVE. CAS transitions ensure safe coordination between compressor thread and fault handler.
 - **CompressEngine**: Supports LZ4, zstd, and zstd+dictionary. Algorithm packed in top 2 bits of `CompressedPageInfo::comp_size`. All zstd contexts pre-allocated via `ZSTD_customMem` routing to BootstrapAlloc.
 - **Parallel compressor**: Coordinator thread + worker threads (`kCompressorWorkers`). Chunk bitmap (`live_chunks_[]`) skips EMPTY pages. Sharded `CompressStore` (8 shards) eliminates lock contention. Per-worker compression contexts (LZ4 state, ZSTD CCtx, scratch buffers, SizeClassStats).
-- **Per-fault-slot DCtx**: Each of 32 fault slots has its own `ZSTD_DCtx*`, fixing data race between concurrent decompressions from app threads and prefetch.
+- **Per-fault-slot DCtx**: Each of 128 fault slots has its own `ZSTD_DCtx*`, fixing data race between concurrent decompressions from app threads and prefetch.
 - **Sliding-window stats**: `SizeClassStats` is a 64-entry ring buffer tracking compression ratios (0-255). Size classes can recover after data patterns change.
 - **Signal handler path**: No malloc allowed. Decompression uses pre-allocated per-slot contexts only.
+
+## Fault Handling Modes
+
+Smash supports two fault handling mechanisms on Linux:
+
+### Signal-based (default)
+Uses `SIGSEGV`/`SIGBUS` to intercept page faults. Works on all platforms.
+- Compressed pages: `mprotect(PROT_NONE)` → access triggers `SIGSEGV` → decompress
+- Monitoring: `mprotect(PROT_READ)` → write triggers `SIGSEGV` → restore `PROT_RW`
+
+### userfaultfd (Linux only, optional)
+Uses `userfaultfd(2)` for a dedicated handler thread. Enable with `-DSMASH_USE_USERFAULTFD=ON`.
+
+```bash
+cmake .. -DSMASH_USE_USERFAULTFD=ON && make -j$(nproc)
+```
+
+**Requirements:**
+- Linux 4.3+ kernel
+- Either `CAP_SYS_PTRACE` or `/proc/sys/vm/unprivileged_userfaultfd=1`
+
+**Architecture (hybrid):**
+```
+Page State          Fault Mechanism         Handler
+─────────────────────────────────────────────────────
+COMPRESSED/EMPTY    userfaultfd (missing)   handleFaultUffd() → UFFDIO_COPY
+COMPRESSING         SIGSEGV (PROT_NONE)     handleFault() → mprotect
+ACTIVE_MONITORING   SIGSEGV (PROT_READ)     handleFault() → mprotect
+```
+
+**Benefits over signals:**
+- Dedicated handler thread (no async-signal-safe restrictions)
+- No signal handler conflicts with debuggers/sanitizers
+- Can use malloc, mutexes, etc. in handler
+- More precise read/write fault distinction
+
+**Implementation files:**
+- `src/vm/fault_handler_signal.h`: Signal-based handler
+- `src/vm/fault_handler_uffd.h`: userfaultfd handler
+- `src/vm/fault_handler.h`: Dispatcher (includes both when userfaultfd enabled)
 
 ## Syscall & Buffered I/O Compatibility
 

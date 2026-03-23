@@ -41,6 +41,7 @@ ALL_ABLATION_VARS = [
 ABLATION_CONFIGS = OrderedDict([
     ("B1", {"name": "Default", "cmake_flags": {}, "use_smash": True}),
     ("B0", {"name": "System malloc", "cmake_flags": {}, "use_smash": False}),
+    ("MESH", {"name": "Mesh", "cmake_flags": {}, "use_smash": False, "use_mesh": True}),
     ("DICT", {"name": "With dicts",
               "cmake_flags": {"SMASH_DICT_TRAIN_SAMPLES": "16"}, "use_smash": True}),
     ("T1a", {"name": "No arenas",
@@ -57,7 +58,10 @@ ABLATION_CONFIGS = OrderedDict([
             "cmake_flags": {"SMASH_COLD_TICKS": "9999"}, "use_smash": True}),
 ])
 
-APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext"]
+# Mesh library path (Linux)
+MESH_LIB = "/usr/lib/libmesh.so"
+
+APPS = ["sqlite", "rocksdb", "memcached", "redis", "redis_ext"]
 
 IS_DARWIN = platform.system() == "Darwin"
 PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
@@ -1175,8 +1179,6 @@ def run_app(app, build_dir, smash_lib, quick):
         return run_sqlite(build_dir, smash_lib, quick)
     elif app == "rocksdb":
         return run_rocksdb(build_dir, smash_lib, quick)
-    elif app == "duckdb":
-        return run_duckdb_bench(build_dir, smash_lib, quick)
     elif app == "memcached":
         return run_memcached_bench(build_dir, smash_lib, quick)
     elif app == "redis":
@@ -1222,7 +1224,12 @@ def run_ablation(build_dir, source_dir, apps, quick, output_dir, runs=1):
                 print(f"  {app}: cached")
                 continue
 
-            lib = smash_lib if cfg["use_smash"] else None
+            if cfg["use_smash"]:
+                lib = smash_lib
+            elif cfg.get("use_mesh"):
+                lib = MESH_LIB
+            else:
+                lib = None
             run_results = []
 
             max_attempts = runs + 2  # allow a couple retries for transient failures

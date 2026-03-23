@@ -30,30 +30,37 @@ OUTDIR = os.path.dirname(os.path.abspath(__file__))
 COLORS = sns.color_palette("colorblind", 8)
 SMASH_COLOR = COLORS[0]      # blue
 BASELINE_COLOR = COLORS[7]   # gray
+MESH_COLOR = COLORS[2]       # green
 ACCENT_COLOR = COLORS[3]     # red
 
 
 def fig_rss_reduction():
     """Figure 1: RSS reduction across applications (grouped bar chart)."""
     # Linux results from run_paper_experiments.py (March 2026)
-    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis-ext', 'Redis', 'DuckDB']
-    smash_rss = [82.4, 79.5, 69.1, 23.0, 21.2, 3.0]
+    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis-ext', 'Redis']
+    mesh_rss =  [0.0,  0.5, 23.0, 30.7, 28.7]
+    smash_rss = [82.4, 79.5, 69.1, 23.0, 21.2]
 
-    fig, ax = plt.subplots(figsize=(3.5, 2.2))
+    fig, ax = plt.subplots(figsize=(4.5, 2.5))
     x = np.arange(len(apps))
-    bars = ax.bar(x, smash_rss, width=0.6, color=SMASH_COLOR, edgecolor='white',
-                  linewidth=0.5, zorder=3)
+    width = 0.35
 
-    # Value labels on bars
-    for bar, val in zip(bars, smash_rss):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.8,
-                f'{val:.0f}%', ha='center', va='bottom', fontsize=8, fontweight='bold')
+    bars_mesh = ax.bar(x - width/2, mesh_rss, width, label='Mesh',
+                       color=MESH_COLOR, edgecolor='white', linewidth=0.5, zorder=3)
+    bars_smash = ax.bar(x + width/2, smash_rss, width, label='Smash',
+                        color=SMASH_COLOR, edgecolor='white', linewidth=0.5, zorder=3)
+
+    # Value labels on Smash bars only (to avoid clutter)
+    for bar, val in zip(bars_smash, smash_rss):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f'{val:.0f}%', ha='center', va='bottom', fontsize=7, fontweight='bold')
 
     ax.set_ylabel('RSS Reduction (%)')
-    ax.set_title('RSS Reduction by Application')
+    ax.set_title('RSS Reduction: Mesh vs Smash')
     ax.set_xticks(x)
     ax.set_xticklabels(apps, rotation=25, ha='right')
     ax.set_ylim(0, 95)
+    ax.legend(loc='upper right', fontsize=8)
     ax.yaxis.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
     sns.despine(left=False, bottom=False)

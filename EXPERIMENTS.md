@@ -952,11 +952,77 @@ The paper presents results from both Linux and macOS. Current status:
 - Redis: 21% RSS reduction (Mesh: 0%)
 - Redis-ext: 23% RSS reduction (Mesh: 0%)
 
-**After running macOS experiments:**
-1. Copy results: `cp -r paper_results paper_results_macos`
-2. Update `paper/evaluation.tex` tables with macOS numbers (replace `---` placeholders)
-3. Update `paper/figures/plot_all.py` and `plot_rss_timeline.py` with macOS data
-4. Regenerate figures: `cd paper/figures && python3 plot_all.py`
+---
+
+### Completing macOS Results
+
+Run the following steps on a macOS machine (M1/M2/M3 with 16 KiB pages):
+
+**Step 1: Build and run experiments**
+```bash
+cd build
+cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
+python3 ../bench/run_paper_experiments.py --runs 3
+```
+
+**Step 2: Save results**
+```bash
+cp -r paper_results paper_results_macos
+```
+
+**Step 3: Extract key metrics**
+```bash
+python3 -c "
+import json
+with open('paper_results/ablation_results.json') as f:
+    data = json.load(f)
+
+print('=== macOS Results for Paper ===')
+for app in ['sqlite', 'rocksdb', 'memcached', 'redis', 'redis_ext']:
+    if app not in data:
+        continue
+    b0 = data[app].get('B0', {}).get('runs', [])
+    mesh = data[app].get('MESH', {}).get('runs', [])
+    b1 = data[app].get('B1', {}).get('runs', [])
+
+    b0_rss = b0[0].get('steady_rss_mb', 0) if b0 else 0
+    mesh_rss = mesh[0].get('steady_rss_mb', 0) if mesh else 0
+    b1_rss = b1[0].get('steady_rss_mb', 0) if b1 else 0
+    b1_red = sum(r.get('rss_reduction_pct', 0) for r in b1) / len(b1) if b1 else 0
+
+    print(f'{app}: Sys={b0_rss:.0f}, Mesh={mesh_rss:.0f}, Smash={b1_rss:.0f} ({b1_red:.0f}%)')
+"
+```
+
+**Step 4: Update paper with macOS numbers**
+
+Edit `paper/evaluation.tex` and replace `---` placeholders in:
+- Table 1 (`tab:apps_summary`): macOS columns for Sys, Mesh, Smash
+- Application paragraphs: macOS-specific numbers
+- Summary paragraph: macOS reduction range
+
+**Step 5: Update plotting scripts**
+
+Edit `paper/figures/plot_all.py`:
+- Add macOS data to `fig_rss_reduction()`
+- Update `fig_auc_comparison()` with macOS AUC values
+
+Edit `paper/figures/plot_rss_timeline.py`:
+- Update `SYNTH_DATA` dict with macOS (fill, cool, serve) tuples
+
+**Step 6: Regenerate figures**
+```bash
+cd paper/figures
+python3 plot_all.py
+python3 plot_rss_timeline.py
+python3 plot_cdf.py
+```
+
+**Step 7: Commit results**
+```bash
+git add paper/ paper_results_macos/
+git commit -m "Add macOS experimental results"
+```
 
 ### Updating Figures with New Data
 

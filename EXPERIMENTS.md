@@ -812,7 +812,11 @@ pip install matplotlib seaborn numpy
 
 ### Step 1: Run Paper Experiments
 
-Run the unified experiment runner to collect all data:
+**Important: The paper requires results from BOTH platforms:**
+- **Linux** (x86_64, 4 KiB pages, glibc)
+- **macOS** (ARM64, 16 KiB pages, libmalloc)
+
+Run the unified experiment runner on each platform:
 
 ```bash
 cd build
@@ -827,10 +831,15 @@ python3 ../bench/run_paper_experiments.py --quick --runs 1
 python3 ../bench/run_paper_experiments.py --apps sqlite,rocksdb,redis --runs 3
 ```
 
-This produces:
-- `paper_results/ablation_results.json` — Ablation study data (9 configs × 6 apps)
+This produces (per platform):
+- `paper_results/ablation_results.json` — Ablation study data (10 configs × 5 apps)
 - `paper_results/compress_only_results.json` — Compress-only comparison data
 - `paper_results/paper_tables.txt` — Pre-formatted LaTeX tables
+
+**To collect results for both platforms:**
+1. Run experiments on Linux → save `paper_results/` as `paper_results_linux/`
+2. Run experiments on macOS → save `paper_results/` as `paper_results_macos/`
+3. Merge results into paper tables (see below)
 
 ### Step 2: Generate Main Figures
 
@@ -926,6 +935,28 @@ AUC is stored in the JSON results and can be used for:
 | Main figures | `paper/figures/*.pdf` |
 | RSS timelines | `paper/figures/rss_*.pdf` |
 | Latency CDFs | `paper/figures/cdf_*.pdf` |
+
+### Dual-Platform Results Status
+
+The paper presents results from both Linux and macOS. Current status:
+
+| Platform | Status | Results Location |
+|----------|--------|------------------|
+| **Linux** (x86_64, Amazon Linux 2, 4 KiB pages) | ✅ Complete | `paper_results/` |
+| **macOS** (ARM64, M1 Max, 16 KiB pages) | ❌ Needed | TBD |
+
+**Linux results summary (March 2026):**
+- Memcached: 52% RSS reduction (Mesh: 0%)
+- RocksDB: 76% RSS reduction (Mesh: 0%)
+- SQLite: 71% RSS reduction (Mesh: -85% overhead)
+- Redis: 21% RSS reduction (Mesh: 0%)
+- Redis-ext: 23% RSS reduction (Mesh: 0%)
+
+**After running macOS experiments:**
+1. Copy results: `cp -r paper_results paper_results_macos`
+2. Update `paper/evaluation.tex` tables with macOS numbers (replace `---` placeholders)
+3. Update `paper/figures/plot_all.py` and `plot_rss_timeline.py` with macOS data
+4. Regenerate figures: `cd paper/figures && python3 plot_all.py`
 
 ### Updating Figures with New Data
 

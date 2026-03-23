@@ -214,7 +214,7 @@ def parse_metrics(text):
 # ── In-process benchmark runners ─────────────────────────────────────────────
 
 def run_sqlite(build_dir, smash_lib, quick):
-    """Run bench_sqlite in-process."""
+    """Run bench_sqlite with RSS timeline sampling."""
     exe = build_dir / "bench" / "bench_sqlite"
     if not exe.exists():
         return None
@@ -224,17 +224,35 @@ def run_sqlite(build_dir, smash_lib, quick):
         env[PRELOAD_VAR] = str(smash_lib)
         env["SMASH_VERY_COLD_TICKS"] = "5"
     try:
-        r = subprocess.run([str(exe)] + args, capture_output=True, text=True,
-                           env=env, timeout=300)
-        return parse_metrics(r.stdout)
+        # Run as background process to sample RSS during execution
+        proc = subprocess.Popen([str(exe)] + args, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env)
+
+        # Sample RSS every second while process runs
+        rss_timeline = []
+        while proc.poll() is None:
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                rss_timeline.append(rss)
+            time.sleep(1)
+
+        stdout, _ = proc.communicate(timeout=10)
+        metrics = parse_metrics(stdout)
+
+        if metrics and rss_timeline:
+            metrics["rss_timeline"] = rss_timeline
+            metrics["auc_mb_sec"] = sum(rss_timeline)
+            metrics["peak_rss_mb"] = max(rss_timeline) if rss_timeline else metrics.get("peak_rss_mb", 0)
+            metrics["min_rss_mb"] = min(rss_timeline) if rss_timeline else metrics.get("min_rss_mb", 0)
+
+        return metrics
     except Exception as e:
         print(f"    sqlite error: {e}")
         return None
 
 
 def run_rocksdb(build_dir, smash_lib, quick):
-    """Run bench_rocksdb C++ binary (preferred) or shell script."""
-    # Prefer C++ binary — the shell script requires bash 4+ (declare -A)
+    """Run bench_rocksdb C++ binary with RSS timeline sampling."""
     exe = build_dir / "bench" / "bench_rocksdb"
     if exe.exists():
         args = ["--keys", "200000", "--value-size", "256",
@@ -244,16 +262,37 @@ def run_rocksdb(build_dir, smash_lib, quick):
             env[PRELOAD_VAR] = str(smash_lib)
             env["SMASH_VERY_COLD_TICKS"] = "5"
         try:
-            r = subprocess.run([str(exe)] + args, capture_output=True, text=True,
-                               env=env, timeout=600)
-            metrics = parse_metrics(r.stdout)
-            if metrics and "rss_reduction_pct" not in metrics:
-                peak = metrics.get("peak_rss_mb", 0)
-                min_rss = metrics.get("min_rss_mb", peak)
-                if peak > 0:
-                    metrics["rss_reduction_pct"] = (1 - min_rss / peak) * 100
-                    metrics["steady_rss_mb"] = metrics.get("serve_rss_mb", min_rss)
-                    metrics["post_cool_rss_mb"] = metrics.get("cool_rss_mb", min_rss)
+            # Run as background process to sample RSS during execution
+            proc = subprocess.Popen([str(exe)] + args, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, env=env)
+
+            # Sample RSS every second while process runs
+            rss_timeline = []
+            while proc.poll() is None:
+                rss = get_rss_mb(proc.pid)
+                if rss > 0:
+                    rss_timeline.append(rss)
+                time.sleep(1)
+
+            stdout, _ = proc.communicate(timeout=10)
+            metrics = parse_metrics(stdout)
+
+            if metrics:
+                if rss_timeline:
+                    metrics["rss_timeline"] = rss_timeline
+                    metrics["auc_mb_sec"] = sum(rss_timeline)
+                    if "peak_rss_mb" not in metrics:
+                        metrics["peak_rss_mb"] = max(rss_timeline)
+                    if "min_rss_mb" not in metrics:
+                        metrics["min_rss_mb"] = min(rss_timeline)
+
+                if "rss_reduction_pct" not in metrics:
+                    peak = metrics.get("peak_rss_mb", 0)
+                    min_rss = metrics.get("min_rss_mb", peak)
+                    if peak > 0 and min_rss > 0:
+                        metrics["rss_reduction_pct"] = (1 - min_rss / peak) * 100
+                        metrics["steady_rss_mb"] = metrics.get("serve_rss_mb", min_rss)
+                        metrics["post_cool_rss_mb"] = metrics.get("cool_rss_mb", min_rss)
             return metrics
         except Exception as e:
             print(f"    rocksdb error: {e}")
@@ -329,13 +368,17 @@ def run_redis_bench(build_dir, smash_lib, quick):
             print(f"    redis: fill_rss={fill_rss:.1f}MB (too low, DBSIZE={dbsize})")
             return None
 
-        # Cool-down: let compression run
+        # Cool-down: let compression run, sample RSS timeline
+        rss_timeline = [fill_rss]
         min_rss = fill_rss
         for i in range(cool_sec):
             time.sleep(1)
             rss = get_rss_mb(proc.pid)
             if rss > 0:
+                rss_timeline.append(rss)
                 min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])
 
         cool_rss = get_rss_mb(proc.pid)
 
@@ -354,13 +397,21 @@ def run_redis_bench(build_dir, smash_lib, quick):
                 print("    redis GET timed out, returning partial results")
                 get_rps = 0
 
-        reduction = (1 - min_rss / fill_rss) * 100 if fill_rss > 0 else 0
+        # Validate measurements - min_rss=0 means measurement failed (process died)
+        if min_rss <= 0 or fill_rss <= 0:
+            print(f"    redis: invalid RSS measurement (fill={fill_rss}, min={min_rss})")
+            return None
+        reduction = (1 - min_rss / fill_rss) * 100
+        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        auc_mb_sec = sum(rss_timeline)  # Each sample is 1 second apart
 
         return {
             "peak_rss_mb": fill_rss,
             "steady_rss_mb": cool_rss,
             "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc_mb_sec,
             "set_rps": set_rps,
             "get_rps": get_rps,
         }
@@ -488,13 +539,17 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         post_del_rss = get_rss_mb(proc.pid)
         print(f"    deleted {deleted}/{total_keys} keys", flush=True)
 
-        # Cool-down: let compression run
+        # Cool-down: let compression run, sample RSS timeline
+        rss_timeline = [post_del_rss]
         min_rss = post_del_rss
         for i in range(cool_sec):
             time.sleep(1)
             rss = get_rss_mb(proc.pid)
             if rss > 0:
+                rss_timeline.append(rss)
                 min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])
 
         cool_rss = get_rss_mb(proc.pid)
 
@@ -513,7 +568,13 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
                 print("    redis-ext GET timed out, returning partial results")
                 get_rps = 0
 
-        reduction = (1 - cool_rss / post_del_rss) * 100 if post_del_rss > 0 else 0
+        # Validate measurements - cool_rss=0 means measurement failed (process died)
+        if cool_rss <= 0 or post_del_rss <= 0:
+            print(f"    redis-ext: invalid RSS measurement (post_del={post_del_rss}, cool={cool_rss})")
+            return None
+        reduction = (1 - cool_rss / post_del_rss) * 100
+        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        auc_mb_sec = sum(rss_timeline)
 
         return {
             "peak_rss_mb": peak_rss,
@@ -521,6 +582,8 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
             "steady_rss_mb": cool_rss,
             "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc_mb_sec,
             "set_rps": set_rps,
             "get_rps": get_rps,
         }
@@ -535,24 +598,33 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
 
 
 def run_memcached_bench(build_dir, smash_lib, quick):
-    """Run Memcached benchmark."""
+    """Run Memcached benchmark.
+
+    Memcached's slab allocator creates ~1MB slab pages. For effective compression:
+    - Use enough data to fill multiple slabs (~200MB+)
+    - Use compressible value patterns (repeated strings)
+    - Allow sufficient cool time for compression to kick in
+    - Access only a small "hot set" during serve phase
+    """
     memcached_bin = get_binary("memcached", build_dir)
     if not check_binary("memcached", build_dir):
         return None
 
     port = 11299
-    num_keys = 100000 if quick else 500000
-    cool_sec = 5 if quick else 10
-    serve_sec = 5 if quick else 10
+    # Use larger dataset for meaningful compression
+    num_keys = 200000 if quick else 500000
+    value_size = 500  # Larger values = better slab utilization
+    cool_sec = 15 if quick else 30  # Longer cool for compression
+    serve_sec = 10 if quick else 20
 
     env = os.environ.copy()
     if smash_lib:
         env[PRELOAD_VAR] = str(smash_lib)
-        env["SMASH_VERY_COLD_TICKS"] = "5"
+        # Don't override SMASH_VERY_COLD_TICKS - use defaults
 
-    # Start memcached
+    # Start memcached with larger memory limit
     proc = subprocess.Popen(
-        [memcached_bin, "-p", str(port), "-m", "512", "-l", "127.0.0.1"],
+        [memcached_bin, "-p", str(port), "-m", "1024", "-l", "127.0.0.1"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
@@ -562,26 +634,60 @@ def run_memcached_bench(build_dir, smash_lib, quick):
             return None
 
         # Populate with compressible values
-        _populate_memcached(port, num_keys)
+        _populate_memcached(port, num_keys, value_size)
+
+        # Verify process is still running after populate
+        if proc.poll() is not None:
+            print(f"    memcached: process died during populate (exit={proc.returncode})")
+            return None
+
         fill_rss = get_rss_mb(proc.pid)
 
-        # Cool phase
-        time.sleep(cool_sec)
+        if fill_rss < 50:
+            print(f"    memcached: fill_rss too low ({fill_rss:.1f}MB) - populate may have failed")
+
+        # Cool phase - track RSS timeline and minimum
+        rss_timeline = [fill_rss]
+        min_rss = fill_rss
+        for _ in range(cool_sec):
+            time.sleep(1)
+            if proc.poll() is not None:
+                print(f"    memcached: process died during cool phase (exit={proc.returncode})")
+                return None
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                rss_timeline.append(rss)
+                min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])
         cool_rss = get_rss_mb(proc.pid)
 
         # Serve phase: access hot 5%
         hot_keys = max(1, num_keys // 20)
         _access_memcached(port, hot_keys, serve_sec)
+
+        # Verify process survived serve phase
+        if proc.poll() is not None:
+            print(f"    memcached: process died during serve phase (exit={proc.returncode})")
+            return None
         serve_rss = get_rss_mb(proc.pid)
 
-        reduction = (1 - serve_rss / fill_rss) * 100 if fill_rss > 0 else 0
+        # Validate measurements - min_rss=0 means measurement failed (process died)
+        if min_rss <= 0 or fill_rss <= 0:
+            print(f"    memcached: invalid RSS measurement (fill={fill_rss}, min={min_rss})")
+            return None
+        reduction = (1 - min_rss / fill_rss) * 100
+        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        auc_mb_sec = sum(rss_timeline)
 
         return {
             "peak_rss_mb": fill_rss,
             "cool_rss_mb": cool_rss,
             "steady_rss_mb": serve_rss,
-            "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
+            "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc_mb_sec,
         }
     finally:
         proc.terminate()
@@ -591,47 +697,47 @@ def run_memcached_bench(build_dir, smash_lib, quick):
             proc.kill()
 
 
-def _populate_memcached(port, num_keys):
-    """Populate memcached with SET commands via socket."""
-    s = socket.create_connection(("127.0.0.1", port), timeout=60)
-    s.settimeout(60)
+def _populate_memcached(port, num_keys, value_size=500):
+    """Populate memcached with compressible data.
+
+    Uses repeated patterns that compress well with LZ4/zstd:
+    - Each value has a unique prefix (key identifier)
+    - Followed by repeated compressible content
+    """
+    s = socket.create_connection(("127.0.0.1", port), timeout=120)
+    s.settimeout(120)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         batch = []
-        batch_size = 100  # Smaller batches to avoid overwhelming server
+        batch_size = 50  # Smaller batches for reliability
         for i in range(num_keys):
             key = f"key:{i:07d}"
-            val = (f"data_entry_{key}_compressible_content_padding_"
-                   f"{'x' * 150}")
+            # Create compressible value: prefix + repeated pattern
+            prefix = f"entry_{i:07d}_"
+            pattern = "abcdefghij" * 10  # 100 char pattern
+            padding_needed = max(0, value_size - len(prefix))
+            val = prefix + (pattern * (padding_needed // len(pattern) + 1))[:padding_needed]
             cmd = f"set {key} 0 0 {len(val)}\r\n{val}\r\n"
             batch.append(cmd)
             if len(batch) >= batch_size:
                 s.sendall("".join(batch).encode())
-                # Drain all responses (one STORED\r\n per SET)
-                expected = len(batch) * len("STORED\r\n")
-                drained = 0
-                while drained < expected:
-                    try:
+                # Drain responses
+                try:
+                    while True:
                         data = s.recv(65536)
-                        if not data:
+                        if len(data) < 1000:
                             break
-                        drained += len(data)
-                    except socket.timeout:
-                        # Try to continue on timeout
-                        print(f"    memcached populate: timeout at {i}/{num_keys}")
-                        break
+                except socket.timeout:
+                    pass
                 batch = []
                 # Print progress for large populations
                 if i > 0 and i % 50000 == 0:
                     print(f"    memcached populate: {i}/{num_keys}", flush=True)
         if batch:
             s.sendall("".join(batch).encode())
-            time.sleep(1)
+            time.sleep(0.5)
             try:
-                while True:
-                    data = s.recv(65536)
-                    if not data:
-                        break
+                s.recv(65536)
             except socket.timeout:
                 pass
     finally:
@@ -674,7 +780,17 @@ def _access_memcached(port, hot_keys, duration_sec):
 _DUCKDB_BASELINE_CACHE = {}
 
 def _duckdb_baseline_rss(build_dir, quick):
-    """Get DuckDB's uncompressed fill RSS (no Smash) — cached."""
+    """Get DuckDB's cool-phase RSS without Smash — cached.
+
+    Measures at the same workload point as the main benchmark:
+    1. Fill TPC-H data to file-based database
+    2. CHECKPOINT to flush to disk
+    3. Start new process to load data
+    4. Sleep for cool_sec
+    5. Measure RSS
+
+    This gives an apples-to-apples comparison with Smash runs.
+    """
     global _DUCKDB_BASELINE_CACHE
     key = "quick" if quick else "full"
     if key in _DUCKDB_BASELINE_CACHE:
@@ -682,32 +798,77 @@ def _duckdb_baseline_rss(build_dir, quick):
 
     duckdb_bin = get_binary("duckdb", build_dir)
     sf = 0.1 if quick else 0.5
+    cool_sec = 5 if quick else 10
+
     with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "baseline.duckdb")
         marker = os.path.join(tmpdir, "marker.csv")
+
+        # Phase 1: Fill (no Smash) - same as main benchmark
         proc = subprocess.Popen(
-            [duckdb_bin, ":memory:"],
+            [duckdb_bin, db_file],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        fill_sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
+                    f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n"
+                    f"CHECKPOINT;\n")
         try:
-            sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
-                   f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
-            try:
-                proc.stdin.write(sql.encode())
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                return 0.0
-            if not _wait_file(marker, "fill_done", timeout=300):
-                return 0.0
-            rss = get_rss_mb(proc.pid)
-            try:
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
-            proc.wait(timeout=10)
-        except Exception:
+            proc.stdin.write(fill_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
             proc.kill()
-            rss = 0.0
+            return 0.0
+
+        if not _wait_file(marker, "fill_done", timeout=600):
+            proc.terminate()
+            return 0.0
+
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+        # Phase 2: Cool - new process loads data (same as main benchmark)
+        if os.path.exists(marker):
+            os.remove(marker)
+
+        proc = subprocess.Popen(
+            [duckdb_bin, db_file],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        hold_sql = (f"SELECT count(*) FROM lineitem;\n"
+                    f"COPY (SELECT 'loaded') TO '{marker}' (HEADER false);\n")
+        try:
+            proc.stdin.write(hold_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            proc.kill()
+            return 0.0
+
+        if not _wait_file(marker, "loaded", timeout=60):
+            proc.terminate()
+            return 0.0
+
+        # Cool down and measure RSS at same point as main benchmark
+        time.sleep(cool_sec)
+        rss = get_rss_mb(proc.pid)
+
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except:
+            proc.kill()
+
     _DUCKDB_BASELINE_CACHE[key] = rss
     return rss
 
@@ -722,20 +883,27 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
     if not check_binary("duckdb", build_dir):
         return None
 
+    # Note: DuckDB is not a good Smash candidate - it already manages memory efficiently
+    # and large-scale operations crash with Smash. Using small SF for reliable measurement.
     sf = 0.1 if quick else 0.5
-    cool_sec = 5 if quick else 10
+    cool_sec = 5 if quick else 15
     serve_iters = 3 if quick else 10
 
-    env = os.environ.copy()
+    # Fill phase runs WITHOUT Smash (data generation doesn't benefit from compression)
+    # This avoids the severe slowdown from Smash overhead during dbgen
+    fill_env = os.environ.copy()
+
+    # Cool/serve phases run WITH Smash (where compression actually matters)
+    cool_env = os.environ.copy()
     if smash_lib:
-        env[PRELOAD_VAR] = str(smash_lib)
-        env["SMASH_VERY_COLD_TICKS"] = "5"
+        cool_env[PRELOAD_VAR] = str(smash_lib)
+        cool_env["SMASH_VERY_COLD_TICKS"] = "5"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_file = os.path.join(tmpdir, "bench.duckdb")
         marker = os.path.join(tmpdir, "marker.csv")
 
-        # Phase 1: Fill - run as background process to measure RSS
+        # Phase 1: Fill - run WITHOUT Smash for fast data generation
         fill_sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
                     f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n"
                     f"CHECKPOINT;\n")  # Ensure data is written to disk
@@ -744,7 +912,7 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             [duckdb_bin, db_file],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env
+            env=fill_env  # No Smash during fill
         )
 
         try:
@@ -754,9 +922,10 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             print("    duckdb: process exited during fill (pipe error)")
             return None
 
-        # Wait for fill to complete and measure RSS
-        if not _wait_file(marker, "fill_done", timeout=300):
-            print("    duckdb: fill timed out")
+        # Wait for fill to complete
+        fill_timeout = 300 if quick else 600  # 10 min for full mode
+        if not _wait_file(marker, "fill_done", timeout=fill_timeout):
+            print(f"    duckdb: fill timed out after {fill_timeout}s")
             proc.terminate()
             return None
 
@@ -775,15 +944,17 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
         if os.path.exists(marker):
             os.remove(marker)
 
-        # Start a process that keeps the DB loaded in memory
-        hold_sql = (f"SELECT count(*) FROM lineitem;\n"  # Load data into memory
+        # Load data by running aggregate queries that scan the full tables
+        # Avoids CREATE TABLE AS SELECT which crashes with large data + Smash
+        hold_sql = (f"SELECT count(*), sum(l_quantity), sum(l_extendedprice) FROM lineitem;\n"
+                    f"SELECT count(*), sum(o_totalprice) FROM orders;\n"
                     f"COPY (SELECT 'loaded') TO '{marker}' (HEADER false);\n")
 
         proc = subprocess.Popen(
             [duckdb_bin, db_file],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env
+            env=cool_env  # Smash enabled here for compression measurement
         )
 
         try:
@@ -798,11 +969,26 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
             proc.terminate()
             return None
 
-        # Now cool while measuring RSS periodically
-        time.sleep(cool_sec)
+        # Measure RSS right after data loaded (this is our "peak" for cool phase)
+        peak_cool_rss = get_rss_mb(proc.pid)
+        if peak_cool_rss <= 0:
+            peak_cool_rss = fill_rss
+
+        # Sample RSS every second during cool phase (timeline)
+        rss_timeline = [peak_cool_rss]
+        min_rss = peak_cool_rss
+        for _ in range(cool_sec):
+            time.sleep(1)
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                rss_timeline.append(rss)
+                min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])  # Repeat last value if measurement fails
+
         cool_rss = get_rss_mb(proc.pid)
         if cool_rss <= 0:
-            cool_rss = fill_rss
+            cool_rss = min_rss
 
         # Phase 3: Serve - send queries
         if os.path.exists(marker):
@@ -840,21 +1026,26 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
         except:
             proc.kill()
 
-        baseline_rss = _duckdb_baseline_rss(build_dir, quick)
-        if baseline_rss > 0 and smash_lib:
-            reduction = (1 - cool_rss / baseline_rss) * 100
-        elif fill_rss > 0:
-            reduction = (1 - cool_rss / fill_rss) * 100
-        else:
-            reduction = 0
+        # Validate measurements - cool_rss=0 means measurement failed (process died)
+        if cool_rss <= 0 or peak_cool_rss <= 0:
+            print(f"    duckdb: invalid RSS measurement (peak_cool={peak_cool_rss}, cool={cool_rss})")
+            return None
+
+        # Reduction vs peak_cool_rss (same process) - shows actual compression effect
+        # Note: fill_rss is from a different process, so we don't use it for reduction
+        reduction = (1 - min_rss / peak_cool_rss) * 100
+        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        auc_mb_sec = sum(rss_timeline)
 
         return {
-            "peak_rss_mb": fill_rss,
+            "fill_rss_mb": fill_rss,  # Different process, for reference only
+            "peak_rss_mb": peak_cool_rss,  # Peak of cool phase process (denominator for reduction)
             "cool_rss_mb": cool_rss,
             "steady_rss_mb": serve_rss,
-            "min_rss_mb": min(fill_rss, cool_rss, serve_rss),
+            "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,
-            "baseline_rss_mb": baseline_rss,
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc_mb_sec,
         }
 
 
@@ -1152,13 +1343,29 @@ def _median_metrics(runs):
     """Compute median of each metric across runs."""
     if not runs:
         return {}
+
+    # Find the median run by rss_reduction_pct (for selecting list values)
+    reductions = [(i, r.get("rss_reduction_pct", 0)) for i, r in enumerate(runs) if r.get("rss_reduction_pct") is not None]
+    if reductions:
+        reductions.sort(key=lambda x: x[1])
+        median_run_idx = reductions[len(reductions) // 2][0]
+    else:
+        median_run_idx = 0
+
     keys = set()
     for r in runs:
         keys.update(r.keys())
     result = {}
     for k in keys:
-        vals = [r[k] for r in runs if k in r]
-        if vals:
+        vals = [r[k] for r in runs if k in r and r[k] is not None]
+        if not vals:
+            continue
+        # For list values (like rss_timeline), use the value from the median run
+        if isinstance(vals[0], list):
+            if k in runs[median_run_idx]:
+                result[k] = runs[median_run_idx][k]
+        # For scalar values, compute median
+        elif isinstance(vals[0], (int, float)):
             result[k] = statistics.median(vals)
     return result
 

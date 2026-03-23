@@ -35,8 +35,9 @@ ACCENT_COLOR = COLORS[3]     # red
 
 def fig_rss_reduction():
     """Figure 1: RSS reduction across applications (grouped bar chart)."""
-    apps = ['RocksDB', 'Redis', 'Redis-ext', 'SQLite', 'DuckDB', 'Memcached']
-    smash_rss = [87.1, 63.9, 64.5, 43.6, 30.8, 27.1]
+    # Linux results from run_paper_experiments.py (March 2026)
+    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis-ext', 'Redis', 'DuckDB']
+    smash_rss = [82.4, 79.5, 69.1, 23.0, 21.2, 3.0]
 
     fig, ax = plt.subplots(figsize=(3.5, 2.2))
     x = np.arange(len(apps))
@@ -190,11 +191,11 @@ def fig_ablation():
         'No compress',
     ]
 
-    # Deltas (pp) from default for each benchmark
-    sqlite_delta    = [-5.1,   0.0,   0.0,   0.0,   0.0,   0.0,  -20.3]
-    rocksdb_delta   = [-7.7,  -0.6,  -1.2,  -1.5,  -1.1,  -0.9,  -80.3]
-    memcached_delta = [-24.5, -0.1,   0.0,   0.0,   0.0,  +0.2,  -40.0]
-    redis_delta     = [-30.2, -0.2,  -0.1,  -0.2,  +0.1,  +0.1,  -42.3]
+    # Deltas (pp) from default for each benchmark - Linux results (March 2026)
+    sqlite_delta    = [-0.2,   0.0,   0.0,   0.0,   0.0,   0.0,  -47.8]
+    rocksdb_delta   = [-1.2,  -1.5,   0.0,  -1.1,  -0.3,   0.1,  -79.0]
+    memcached_delta = [-0.4,  -0.2,  -0.4,  -0.1,  -0.6,  -0.4,  -82.4]
+    redis_delta     = [-0.4,  -2.5,   0.0,   0.6,   0.8,  -1.0,   0.4]
 
     fig, ax = plt.subplots(figsize=(7.0, 4.5))
     x = np.arange(len(configs))

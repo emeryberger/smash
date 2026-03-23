@@ -74,7 +74,7 @@ class CompressorThread {
         ZSTD_DCtx* dctx = nullptr;
         std::atomic<bool> used{false};
     };
-    static constexpr int kFaultSlotCount = 32;
+    static constexpr int kFaultSlotCount = 128;  // Enough for many concurrent faults + prefetch
     FaultSlot fault_slots_[kFaultSlotCount]{};
 
     int acquireFaultSlot() {
@@ -726,25 +726,22 @@ class CompressorThread {
                 CompressAlgo algo = compressed_[adj].algorithm();
                 uint8_t sc = lookupSizeClass(adj);
 
+                // Try to acquire a fault slot. If none available, skip this prefetch
+                // (it's just an optimization - the page will be decompressed on demand).
                 int slot = acquireFaultSlot();
-                if (slot >= 0) {
-                    engine_->decompressWithDCtx(
-                        fault_slots_[slot].dctx,
-                        compressed_[adj].data, fault_slots_[slot].buf,
-                        compressed_[adj].compressedSize(), kPageSize,
-                        algo, sc);
-                    vm::commitPages(adj_addr, kPageSize);
-                    __builtin_memcpy(adj_addr, fault_slots_[slot].buf, kPageSize);
-                    releaseFaultSlot(slot);
-                } else {
-                    // All slots in use — fall back to direct decompress.
-                    // This races with other DCtx users but is the last resort.
-                    vm::commitPages(adj_addr, kPageSize);
-                    engine_->decompress(
-                        compressed_[adj].data, adj_addr,
-                        compressed_[adj].compressedSize(), kPageSize,
-                        algo, sc);
+                if (slot < 0) {
+                    locks_->unlock(adj);
+                    continue;
                 }
+
+                engine_->decompressWithDCtx(
+                    fault_slots_[slot].dctx,
+                    compressed_[adj].data, fault_slots_[slot].buf,
+                    compressed_[adj].compressedSize(), kPageSize,
+                    algo, sc);
+                vm::commitPages(adj_addr, kPageSize);
+                __builtin_memcpy(adj_addr, fault_slots_[slot].buf, kPageSize);
+                releaseFaultSlot(slot);
 
                 // Release compressed blob (sharded by page index)
                 store_->release(compressed_[adj].data, compressed_[adj].alloc_size, adj);
@@ -1007,26 +1004,28 @@ public:
             CompressAlgo algo = compressed_[page_idx].algorithm();
             uint8_t sc = lookupSizeClass(page_idx);
 
-            int slot = acquireFaultSlot();
-            if (slot >= 0) {
-                // Decompress using per-slot DCtx (no data race)
-                engine_->decompressWithDCtx(
-                    fault_slots_[slot].dctx,
-                    compressed_[page_idx].data, fault_slots_[slot].buf,
-                    compressed_[page_idx].compressedSize(), kPageSize,
-                    algo, sc);
-
-                vm::commitPages(page_addr, kPageSize);
-                __builtin_memcpy(page_addr, fault_slots_[slot].buf, kPageSize);
-                releaseFaultSlot(slot);
-            } else {
-                // All slots in use — fall back to direct decompress
-                vm::commitPages(page_addr, kPageSize);
-                engine_->decompress(
-                    compressed_[page_idx].data, page_addr,
-                    compressed_[page_idx].compressedSize(), kPageSize,
-                    algo, sc);
+            // Spin-wait for a fault slot - cannot skip since thread is faulted.
+            // With 128 slots this should rarely spin, but under extreme load
+            // it ensures we always use thread-safe per-slot DCtx.
+            int slot;
+            while ((slot = acquireFaultSlot()) < 0) {
+#if defined(__x86_64__)
+                __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                asm volatile("yield");
+#endif
             }
+
+            // Decompress using per-slot DCtx (no data race)
+            engine_->decompressWithDCtx(
+                fault_slots_[slot].dctx,
+                compressed_[page_idx].data, fault_slots_[slot].buf,
+                compressed_[page_idx].compressedSize(), kPageSize,
+                algo, sc);
+
+            vm::commitPages(page_addr, kPageSize);
+            __builtin_memcpy(page_addr, fault_slots_[slot].buf, kPageSize);
+            releaseFaultSlot(slot);
 
             // Release compressed blob (sharded store)
             store_->release(compressed_[page_idx].data,

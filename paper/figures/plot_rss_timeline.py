@@ -65,44 +65,35 @@ def synth_rss(fill_rss, cool_rss, serve_rss, fill_sec=3, cool_sec=10,
 
     return np.concatenate([t_fill, t_cool, t_serve]), np.concatenate([r_fill, r_cool, r_serve])
 
-# Current measured data from bench_sqlite, bench_rocksdb, DuckDB CLI,
-# Redis, and Memcached benchmarks.
+# Linux measured data from run_paper_experiments.py (March 2026)
 # Tuples are (fill_rss, cool_rss, serve_rss)
 SYNTH_DATA = {
     'sqlite':    {'title': 'SQLite',
-                  'baseline': (424, 424, 555),
-                  'mesh':     (429, 429, 558),
-                  'smash':    (448, 239, 315)},
+                  'baseline': (464, 354, 469),
+                  'smash':    (583, 136, 207)},
     'rocksdb':   {'title': 'RocksDB',
-                  'baseline': (434, 434, 454),
-                  'mesh':     (281, 281, 297),
-                  'smash':    (298, 56, 110)},
+                  'baseline': (279, 279, 283),
+                  'smash':    (330, 68, 109)},
     'duckdb':    {'title': 'DuckDB',
-                  'baseline': (1322, 1322, 1372),
-                  'mesh':     (772, 772, 764),
-                  'smash':    (922, 915, 939)},
+                  'baseline': (44, 56, 56),
+                  'smash':    (81, 78, 78)},
     'memcached': {'title': 'Memcached',
-                  'baseline': (240, 240, 240),
-                  'mesh':     (241, 241, 241),
-                  'smash':    (240, 175, 180)},
+                  'baseline': (287, 287, 287),
+                  'smash':    (323, 136, 136)},
     'redis':     {'title': 'Redis',
-                  'baseline': (122, 122, 122),
-                  'mesh':     (109, 96, 96),
-                  'smash':    (133, 44, 111)},
+                  'baseline': (107, 79, 79),
+                  'smash':    (141, 113, 113)},
     'redis_ext': {'title': 'Redis (extended)',
-                  'baseline': (120, 121, 121),
-                  'mesh':     (109, 74, 83),
-                  'smash':    (133, 43, 110)},
+                  'baseline': (108, 72, 72),
+                  'smash':    (136, 106, 106)},
 }
 
 def _plot_bench(ax, key):
     """Plot a single benchmark's RSS timeline on the given axes."""
     d = SYNTH_DATA[key]
     t_b, r_b = synth_rss(*d['baseline'])
-    t_m, r_m = synth_rss(*d['mesh'])
     t_s, r_s = synth_rss(*d['smash'])
     plot_timeline(ax, t_b, r_b, 'System malloc', COLORS['baseline'])
-    plot_timeline(ax, t_m, r_m, 'Mesh', COLORS['mesh'], linestyle='-.')
     plot_timeline(ax, t_s, r_s, 'Smash', COLORS['smash'], linestyle='--')
     ax.set_title(d['title'], fontsize=9)
     ax.set_xlabel('Time (s)', fontsize=8)

@@ -5,16 +5,16 @@ ABLATION TABLE
 \toprule
 ID & Configuration & \textbf{Sqlite} & \textbf{Rocksdb} & \textbf{Duckdb} & \textbf{Memcached} & \textbf{Redis} & \textbf{Redis_ext} & Avg.\ $\Delta$ \\
 \midrule
-    & \textbf{Default} & \textbf{66.0\%} & \textbf{23.6\%} & --- & \textbf{100.0\%} & \textbf{44.6\%} & \textbf{44.9\%} & --- \\
-B0  & System malloc & 25.0\% ($-$41.0) & 0.0\% ($-$23.6) & --- & -1.6\% ($-$101.6) & 0.0\% ($-$44.6) & 0.0\% ($-$44.9) & -51.2 \\
+    & \textbf{Default} & \textbf{69.1\%} & \textbf{79.3\%} & \textbf{3.0\%} & \textbf{82.4\%} & \textbf{21.8\%} & \textbf{22.9\%} & --- \\
+B0  & System malloc & 24.5\% ($-$44.6) & 0.0\% ($-$79.3) & 0.0\% ($-$3.0) & 0.0\% ($-$82.4) & 26.5\% (+4.6) & 29.8\% (+6.9) & -33.0 \\
 \midrule
-    & With dicts & --- & --- & --- & --- & --- & --- & --- \\
-    & No arenas & --- & --- & --- & --- & --- & --- & --- \\
-    & LZ4 only & --- & --- & --- & --- & --- & --- & --- \\
-    & No zero-deferred & --- & --- & --- & --- & --- & --- & --- \\
-    & No prefetch & --- & --- & --- & --- & --- & --- & --- \\
-    & Single worker & --- & --- & --- & --- & --- & --- & --- \\
-B2  & No compression & --- & --- & --- & --- & --- & --- & --- \\
+    & With dicts & 68.9\% ($-$0.2) & 78.0\% ($-$1.3) & 0.0\% ($-$3.0) & 81.9\% ($-$0.5) & 21.5\% ($-$0.3) & 23.6\% (+0.7) & -0.8 \\
+    & No arenas & 69.1\% (+0.0) & 78.0\% ($-$1.3) & 2.9\% ($-$0.1) & 82.4\% ($-$0.1) & 19.3\% ($-$2.5) & 24.0\% (+1.1) & -0.5 \\
+    & LZ4 only & 69.1\% (+0.0) & 79.2\% ($-$0.1) & 3.1\% (+0.1) & 82.0\% ($-$0.4) & 22.0\% (+0.1) & 23.2\% (+0.4) & +0.0 \\
+    & No zero-deferred & 69.1\% (+0.0) & 78.2\% ($-$1.1) & 3.1\% (+0.1) & 82.4\% ($-$0.1) & 21.8\% ($-$0.0) & 24.0\% (+1.1) & +0.0 \\
+    & No prefetch & 69.2\% (+0.1) & 79.3\% (+0.0) & 3.1\% (+0.0) & 81.8\% ($-$0.6) & 22.0\% (+0.2) & 23.9\% (+1.0) & +0.1 \\
+    & Single worker & 69.1\% (+0.0) & 79.9\% (+0.6) & 3.2\% (+0.1) & 81.9\% ($-$0.6) & 21.9\% (+0.1) & 23.8\% (+0.9) & +0.2 \\
+B2  & No compression & 21.4\% ($-$47.7) & 0.4\% ($-$78.9) & 0.0\% ($-$3.0) & 0.0\% ($-$82.4) & 21.9\% (+0.1) & 23.6\% (+0.7) & -35.2 \\
 \bottomrule
 \end{tabular}
 
@@ -26,33 +26,33 @@ COMPRESS-ONLY TABLE
 Benchmark & Config & Cool RSS & Reduction & Ops/s \\
 \midrule
 \multirow{3}{*}{Sqlite}
-  & baseline       & 238  & ---    & --- \\
-  & compress-only  & 261    & -9.6\% & --- \\
-  & full \sys      & \textbf{132}   & \textbf{44.6\%} & --- \\
+  & baseline       & 470  & ---    & --- \\
+  & compress-only  & 495    & -5.3\% & --- \\
+  & full \sys      & \textbf{207}   & \textbf{56.0\%} & --- \\
 \midrule
 \multirow{3}{*}{Rocksdb}
-  & baseline       & 325  & ---    & --- \\
+  & baseline       & 283  & ---    & --- \\
   & compress-only  & 0    & 0.0\% & --- \\
-  & full \sys      & \textbf{77}   & \textbf{76.2\%} & --- \\
+  & full \sys      & \textbf{109}   & \textbf{61.5\%} & --- \\
 \midrule
 \multirow{3}{*}{Duckdb}
-  & baseline       & 337  & ---    & --- \\
-  & compress-only  & 359    & -6.5\% & --- \\
-  & full \sys      & \textbf{49}   & \textbf{85.4\%} & --- \\
+  & baseline       & 56  & ---    & --- \\
+  & compress-only  & 78    & -40.8\% & --- \\
+  & full \sys      & \textbf{78}   & \textbf{-40.5\%} & --- \\
 \midrule
 \multirow{3}{*}{Memcached}
-  & baseline       & 33  & ---    & --- \\
-  & compress-only  & 56    & -72.1\% & --- \\
-  & full \sys      & \textbf{0}   & \textbf{0.0\%} & --- \\
+  & baseline       & 287  & ---    & --- \\
+  & compress-only  & 311    & -8.5\% & --- \\
+  & full \sys      & \textbf{137}   & \textbf{52.1\%} & --- \\
 \midrule
 \multirow{3}{*}{Redis}
-  & baseline       & 55  & ---    & --- \\
-  & compress-only  & 78    & -40.5\% & --- \\
-  & full \sys      & \textbf{49}   & \textbf{11.8\%} & --- \\
+  & baseline       & 77  & ---    & --- \\
+  & compress-only  & 101    & -31.2\% & --- \\
+  & full \sys      & \textbf{110}   & \textbf{-43.7\%} & --- \\
 \midrule
 \multirow{3}{*}{Redis_ext}
-  & baseline       & 55  & ---    & --- \\
-  & compress-only  & 78    & -40.2\% & --- \\
-  & full \sys      & \textbf{48}   & \textbf{14.1\%} & --- \\
+  & baseline       & 73  & ---    & --- \\
+  & compress-only  & 100    & -37.4\% & --- \\
+  & full \sys      & \textbf{106}   & \textbf{-46.2\%} & --- \\
 \bottomrule
 \end{tabular}

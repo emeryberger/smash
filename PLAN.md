@@ -207,6 +207,76 @@ Migrate data pages into a single large virtual reservation. Add page state track
 | Internal metadata | Bootstrap bump allocator | No dependency on the managed heap. 64MB initial, expandable. |
 | Compression default | LZ4 | Decompression at ~5 GB/s minimizes fault latency. zstd for cold pages. |
 
+## Concurrency Safety Analysis
+
+The fault handler path must handle concurrent threads faulting on the same compressed page simultaneously. This section documents the synchronization mechanisms and memory ordering guarantees.
+
+### Scenario: Multiple Threads Fault on Same Compressed Page
+
+```
+Time    Thread A                        Thread B
+────────────────────────────────────────────────────────────
+t0      Access page P (SIGSEGV)         Access page P (SIGSEGV)
+t1      handleFault(P)                  handleFault(P)
+t2      locks_->lock(idx) → wins        locks_->lock(idx) → spins
+t3      page_states_->get(idx) = COMPRESSED
+t4      decompress(info, dst)
+t5      memcpy(page_addr, dst, 4096)
+t6      CAS(COMPRESSED → ACTIVE)
+t7      mprotect(page_addr, PROT_READ|PROT_WRITE)
+t8      locks_->unlock(idx)             locks_->lock(idx) → wins
+t9      return true                     page_states_->get(idx) = ACTIVE
+t10                                     return true (nothing to do)
+```
+
+### Thread Safety Guarantees
+
+1. **Page Lock Serialization**: `PageLockTable::lock(idx)` uses `compare_exchange_weak` with `memory_order_acquire` on success and `memory_order_relaxed` on failure. Only one thread can hold the lock at a time.
+
+2. **Memory Ordering**: The winner's `memcpy()` happens-before the lock release (`memory_order_release`). The loser's lock acquire (`memory_order_acquire`) synchronizes-with that release. Therefore, the loser sees the fully decompressed page data.
+
+3. **State Transition**: Only the lock-holder reads/modifies page state. The CAS transition `COMPRESSED → ACTIVE` is protected by the lock, so no ABA issues.
+
+4. **Per-Slot Decompression Context**: Each fault slot has its own `ZSTD_DCtx*` and scratch buffer (`fault_slot_buffers_[]`, `fault_dctxs_[]`). This prevents data races on zstd internal state.
+
+### Race Condition Fix (2026-03)
+
+**Bug**: When all 32 fault slots were exhausted, the code fell back to using the shared `CompressEngine::zstd_dctx_`. Under extreme concurrent load (e.g., DuckDB with 16+ threads), multiple decompressions using the same DCtx caused data corruption.
+
+**Fix**:
+1. Increased fault slots from 32 to 128 (`kFaultSlotCount`)
+2. `handleFault()` now spin-waits for an available slot instead of falling back to shared DCtx (thread is already blocked on fault, must wait)
+3. `prefetchAdjacent()` skips prefetch if no slot available (prefetch is optional optimization)
+
+```cpp
+// handleFault: spin-wait for slot (cannot skip - thread is faulted)
+int slot;
+while ((slot = acquireFaultSlot()) < 0) {
+    #if defined(__x86_64__)
+        __builtin_ia32_pause();
+    #elif defined(__aarch64__)
+        asm volatile("yield");
+    #endif
+}
+
+// prefetchAdjacent: skip if no slot (optional optimization)
+int slot = acquireFaultSlot();
+if (slot < 0) {
+    locks_->unlock(adj);
+    continue;  // Skip this prefetch
+}
+```
+
+### Verified Safe Operations
+
+| Operation | Synchronization | Memory Ordering |
+|-----------|-----------------|-----------------|
+| State read/write | Page lock held | Lock acquire/release |
+| Decompress | Per-slot DCtx | No shared state |
+| memcpy to page | Lock held | Release at unlock |
+| Page read by loser | After lock acquire | Happens-after memcpy |
+| mprotect | Lock held | N/A (kernel synchronization) |
+
 ## Verification Plan
 
 1. **Phase 1**: `LD_PRELOAD=./libsmash.so ls` (or any program) completes without crash. Run alloc8's existing test harness against smash.

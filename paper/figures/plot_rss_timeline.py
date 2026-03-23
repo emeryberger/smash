@@ -70,21 +70,23 @@ def synth_rss(fill_rss, cool_rss, serve_rss, fill_sec=3, cool_sec=10,
 SYNTH_DATA = {
     'sqlite':    {'title': 'SQLite',
                   'baseline': (464, 354, 469),
+                  'mesh':     (857, 660, 857),
                   'smash':    (583, 136, 207)},
     'rocksdb':   {'title': 'RocksDB',
                   'baseline': (279, 279, 283),
+                  'mesh':     (294, 292, 301),
                   'smash':    (330, 68, 109)},
-    'duckdb':    {'title': 'DuckDB',
-                  'baseline': (44, 56, 56),
-                  'smash':    (81, 78, 78)},
     'memcached': {'title': 'Memcached',
                   'baseline': (287, 287, 287),
+                  'mesh':     (288, 288, 288),
                   'smash':    (323, 136, 136)},
     'redis':     {'title': 'Redis',
                   'baseline': (107, 79, 79),
+                  'mesh':     (108, 77, 77),
                   'smash':    (141, 113, 113)},
     'redis_ext': {'title': 'Redis (extended)',
                   'baseline': (108, 72, 72),
+                  'mesh':     (108, 73, 73),
                   'smash':    (136, 106, 106)},
 }
 
@@ -92,8 +94,10 @@ def _plot_bench(ax, key):
     """Plot a single benchmark's RSS timeline on the given axes."""
     d = SYNTH_DATA[key]
     t_b, r_b = synth_rss(*d['baseline'])
+    t_m, r_m = synth_rss(*d['mesh'])
     t_s, r_s = synth_rss(*d['smash'])
     plot_timeline(ax, t_b, r_b, 'System malloc', COLORS['baseline'])
+    plot_timeline(ax, t_m, r_m, 'Mesh', COLORS['mesh'], linestyle='-.')
     plot_timeline(ax, t_s, r_s, 'Smash', COLORS['smash'], linestyle='--')
     ax.set_title(d['title'], fontsize=9)
     ax.set_xlabel('Time (s)', fontsize=8)

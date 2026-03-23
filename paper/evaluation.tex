@@ -18,18 +18,12 @@ We structure the evaluation around five questions:
 \subsection{Methodology}
 \label{sec:eval:method}
 
-All experiments run on an Apple M1 Max (64\,GiB RAM,
-16\,KiB page size, macOS~15).  \sys is loaded via dyld library
-interposition; baselines use the system allocator.  Each
-configuration is run three times; we report the median.
-RSS is sampled via Mach task info at 100\,ms intervals.
-We have also verified \sys on Linux aarch64 (Ubuntu~24.04,
-glibc~2.39, 4\,KiB pages) via \texttt{LD\_PRELOAD}, where it
-achieves 45--63\% RSS reduction on the same workloads.  Linux
-results are comparable to macOS despite the 4$\times$ smaller
-page size; Linux's \texttt{madvise} immediately releases
-physical pages (versus macOS's lazy free), so RSS drops appear
-more promptly after data goes~cold.
+All experiments run on Linux x86\_64 (Amazon Linux~2, kernel~5.10,
+glibc~2.26, 4\,KiB pages, 64\,GiB RAM, 16 cores).
+\sys is loaded via \texttt{LD\_PRELOAD}; baselines use the system
+allocator (glibc).  Each configuration is run three times; we report
+the median.  RSS is sampled via \texttt{/proc/[pid]/statm} at 1\,s
+intervals.
 
 Benchmark applications: Redis~8.0.2 (built with libc malloc),
 memcached~1.6.34, RocksDB~9.8.4, SQLite~3.51.0.
@@ -326,7 +320,7 @@ disable individual features and measure the change in RSS reduction.
 We run each configuration across all four applications (five workloads),
 each with 3 runs.  Ablation requires rebuilding \sys with different
 compile-time constants; external-process benchmarks (memcached, Redis)
-are run via dyld library interposition against each rebuilt library.
+are run via \texttt{LD\_PRELOAD} against each rebuilt library.
 Figure~\ref{fig:ablation} shows the~results.
 
 The most striking result is that enabling dictionaries
@@ -381,9 +375,7 @@ zeroed, and whether allocations are segregated by call site.
 \begin{table}[t]
 \caption{\textbf{Only \sys combines all three design properties
   that improve compressibility} (\S\ref{sec:eval:allocator}).
-  \ding{51} = feature present.
-  $\dagger$macOS \texttt{libmalloc} zeroes freed memory
-  to enable fast \texttt{calloc}; Linux glibc does not.}
+  \ding{51} = feature present.}
 \label{tab:allocator_features}
 \centering\small
 \begin{tabular}{lccc}
@@ -391,7 +383,7 @@ zeroed, and whether allocations are segregated by call site.
 Allocator & External & Zero-on- & Arena \\
           & metadata & free     & segregation \\
 \midrule
-System malloc & & \ding{51}$^\dagger$ &  \\
+System malloc (glibc) &  &  &  \\
 mimalloc      &  &  &  \\
 jemalloc      &  &  &  \\
 tcmalloc      &  &  &  \\
@@ -412,29 +404,22 @@ DieHarder     & \ding{51} & \ding{51} &  \\
   (\S\ref{sec:eval:allocator}).  Compression ratio =
   original\,/\,compressed (higher is better) with zstd-9 on
   real application heap pages.
-  \dag~marks allocators that zero freed memory:
-  System (macOS \texttt{libmalloc}), DieHarder (security zeroing),
-  and Smash (deferred to compression time---not yet applied in
-  this static measurement).}
+  DieHarder zeroes for security; \sys defers zeroing to compression
+  time (not yet applied in this static measurement).}
 \label{fig:allocator_compare}
 \end{figure*}
 
 Figure~\ref{fig:allocator_compare} presents the compression ratios.
-The results yield three observations.
+The results yield two observations.
 
 First, zero-on-free is the dominant factor for page compressibility,
 and its effect is workload-dependent.  Adding explicit zeroing before
 \texttt{free} improves every allocator, confirming the effect is
-causal.
+causal.  On Linux, glibc does not zero freed memory, so only DieHarder
+(security zeroing) and \sys (deferred zeroing) benefit from this
+optimization.
 
-Second, macOS \texttt{libmalloc} zeroes freed memory as an
-implementation detail (to support fast \texttt{calloc} via
-pre-zeroed free lists), giving it an inherent advantage that other
-allocators lack.  This behavior is platform-specific---Linux glibc
-does not zero on free---and represents a hidden confound when
-benchmarking allocators on macOS.
-
-Third, when frees are absent, allocator choice barely matters.
+Second, when frees are absent, allocator choice barely matters.
 All allocators achieve similar compression because every byte on the
 page is live, structured data.
 
@@ -464,17 +449,14 @@ decompression, and prefetching to those pages.  Because allocation is still perf
 by system malloc, pages contain embedded freelists, objects are
 not zeroed, and allocations are not segregated by call site.
 
-On macOS, system malloc uses Mach VM traps for heap regions,
-which cannot be intercepted by dyld interposition.  The
-compress-only library periodically scans VM regions using Mach's
-region enumeration API, filtering for malloc-tagged anonymous
-regions.  On Linux, it parses \texttt{/proc/self/maps}.
+The compress-only library periodically scans VM regions by parsing
+\texttt{/proc/self/maps}, filtering for heap-tagged anonymous regions.
 
 \begin{table}[t]
 \caption{\textbf{Full \sys achieves large RSS reductions; compress-only
-  adds overhead on Linux} (\S\ref{sec:eval:pipeline}).  Compress-only
-  uses system malloc + \sys pipeline.  On Linux, glibc does not zero
-  on free, so compress-only cannot match macOS results.}
+  adds overhead} (\S\ref{sec:eval:pipeline}).  Compress-only
+  uses system malloc + \sys pipeline.  glibc does not zero
+  on free, so compress-only cannot achieve good compression ratios.}
 \label{tab:compress_only}
 \centering\footnotesize
 \begin{tabular}{llrrr}
@@ -504,10 +486,9 @@ Benchmark & Config & Cool RSS & Reduction & Ops/s \\
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:compress_only} presents the results on Linux.
-Unlike macOS (where \texttt{libmalloc} zeroes memory on \texttt{free}),
-Linux's glibc does not zero freed memory, so the compress-only
-pipeline cannot achieve the same compression ratios.
+Table~\ref{tab:compress_only} presents the results.
+Because glibc does not zero freed memory, the compress-only
+pipeline cannot achieve good compression ratios.
 In fact, compress-only \emph{increases} RSS by 5--26\% due to
 metadata overhead without corresponding compression~benefit.
 

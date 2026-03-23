@@ -68,36 +68,40 @@ def synth_rss(fill_rss, cool_rss, serve_rss, fill_sec=3, cool_sec=10,
 # Linux measured data from run_paper_experiments.py (March 2026)
 # Tuples are (fill_rss, cool_rss, serve_rss)
 SYNTH_DATA = {
-    'sqlite':    {'title': 'SQLite',
+    'sqlite':    {'title': 'SQLite (Linux)',
                   'baseline': (464, 354, 469),
                   'mesh':     (857, 660, 857),
                   'smash':    (583, 136, 207)},
-    'rocksdb':   {'title': 'RocksDB',
+    'rocksdb':   {'title': 'RocksDB (Linux)',
                   'baseline': (279, 279, 283),
                   'mesh':     (294, 292, 301),
                   'smash':    (330, 68, 109)},
-    'memcached': {'title': 'Memcached',
+    'memcached': {'title': 'Memcached (Linux)',
                   'baseline': (287, 287, 287),
                   'mesh':     (288, 288, 288),
                   'smash':    (323, 136, 136)},
-    'redis':     {'title': 'Redis',
+    'redis':     {'title': 'Redis (Linux)',
                   'baseline': (107, 79, 79),
                   'mesh':     (108, 77, 77),
                   'smash':    (141, 113, 113)},
-    'redis_ext': {'title': 'Redis (extended)',
+    'redis_ext': {'title': 'Redis-ext (Linux)',
                   'baseline': (108, 72, 72),
                   'mesh':     (108, 73, 73),
                   'smash':    (136, 106, 106)},
+    'sqlite_macos': {'title': 'SQLite (macOS)',
+                  'baseline': (614, 424, 618),
+                  'smash':    (452, 111, 179)},
 }
 
 def _plot_bench(ax, key):
     """Plot a single benchmark's RSS timeline on the given axes."""
     d = SYNTH_DATA[key]
     t_b, r_b = synth_rss(*d['baseline'])
-    t_m, r_m = synth_rss(*d['mesh'])
-    t_s, r_s = synth_rss(*d['smash'])
     plot_timeline(ax, t_b, r_b, 'System malloc', COLORS['baseline'])
-    plot_timeline(ax, t_m, r_m, 'Mesh', COLORS['mesh'], linestyle='-.')
+    if 'mesh' in d:
+        t_m, r_m = synth_rss(*d['mesh'])
+        plot_timeline(ax, t_m, r_m, 'Mesh', COLORS['mesh'], linestyle='-.')
+    t_s, r_s = synth_rss(*d['smash'])
     plot_timeline(ax, t_s, r_s, 'Smash', COLORS['smash'], linestyle='--')
     ax.set_title(d['title'], fontsize=9)
     ax.set_xlabel('Time (s)', fontsize=8)

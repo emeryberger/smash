@@ -371,6 +371,41 @@ def fig_dict_overhead():
     plt.close(fig)
 
 
+def fig_auc_comparison():
+    """Figure: AUC (Area Under Curve) reduction - total memory pressure over time."""
+    # Linux results from run_paper_experiments.py (March 2026)
+    # AUC = sum of RSS samples (MB-seconds), lower = better
+    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis-ext', 'Redis']
+
+    # AUC reduction % from baseline (positive = better)
+    mesh_auc_red =  [-0.9, -9.5, -91.2, -0.5, 0.3]
+    smash_auc_red = [71.9, 59.8, 33.9, -40.0, -36.7]
+
+    fig, ax = plt.subplots(figsize=(4.5, 2.5))
+    x = np.arange(len(apps))
+    width = 0.35
+
+    ax.bar(x - width/2, mesh_auc_red, width, label='Mesh',
+           color=MESH_COLOR, edgecolor='white', linewidth=0.5, zorder=3)
+    ax.bar(x + width/2, smash_auc_red, width, label='Smash',
+           color=SMASH_COLOR, edgecolor='white', linewidth=0.5, zorder=3)
+
+    ax.axhline(y=0, color='black', linewidth=0.5, zorder=2)
+    ax.set_ylabel('AUC Reduction (%)\n(higher = better)')
+    ax.set_title('Memory Pressure Over Time (AUC)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(apps, rotation=25, ha='right')
+    ax.set_ylim(-100, 85)
+    ax.legend(loc='upper right', fontsize=8)
+    ax.yaxis.grid(True, alpha=0.3)
+    ax.set_axisbelow(True)
+    sns.despine(left=False, bottom=False)
+
+    fig.savefig(os.path.join(OUTDIR, 'auc_comparison.pdf'))
+    fig.savefig(os.path.join(OUTDIR, 'auc_comparison.png'))
+    plt.close(fig)
+
+
 if __name__ == '__main__':
     print("Generating figures...")
     fig_rss_reduction()
@@ -389,4 +424,6 @@ if __name__ == '__main__':
     print("  dict_overhead.pdf")
     fig_allocator_compare()
     print("  allocator_compare.pdf")
+    fig_auc_comparison()
+    print("  auc_comparison.pdf")
     print("Done.")

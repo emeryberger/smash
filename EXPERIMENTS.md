@@ -840,7 +840,8 @@ python3 plot_all.py
 ```
 
 This generates:
-- `rss_reduction.pdf` — Bar chart of RSS reduction by application
+- `rss_reduction.pdf` — Grouped bar chart comparing Mesh vs Smash RSS reduction
+- `auc_comparison.pdf` — AUC (memory pressure over time) comparison
 - `algo_compare.pdf` — Compression ratio comparison across algorithms
 - `algo_throughput.pdf` — Compression/decompression throughput
 - `memcached.pdf` — Memcached RSS by phase

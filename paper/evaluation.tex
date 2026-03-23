@@ -92,6 +92,27 @@ RocksDB achieves 78\% reduction (283\,MiB to 106\,MiB).
 \label{fig:rss_timeline}
 \end{figure*}
 
+Figure~\ref{fig:auc} shows the \emph{area under the curve} (AUC) of
+RSS over time---the integral of memory pressure across the benchmark.
+Lower AUC means less total memory consumption.  \sys reduces AUC by
+34--72\% on memcached, RocksDB, and SQLite, where compression keeps
+RSS low throughout the cooling and serving phases.  On Redis, \sys's
+higher peak RSS (due to metadata overhead) outweighs its cooling-phase
+reduction, yielding higher AUC than baseline.  Mesh shows minimal AUC
+change on most workloads; on SQLite, Mesh \emph{increases} AUC by
+91\% because its page-meshing overhead raises peak RSS without
+sufficient cooling-phase~benefit.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/auc_comparison.pdf}
+\caption{\textbf{\sys reduces total memory pressure (AUC) by 34--72\%
+  on compression-friendly workloads} (\S\ref{sec:eval:apps}).
+  AUC = integral of RSS over time; positive reduction = less memory pressure.
+  Redis's higher peak RSS under \sys offsets its cooling benefit.}
+\label{fig:auc}
+\end{figure}
+
 Figure~\ref{fig:cdf_cold} shows the CDF of cold-access latency
 (the time to access a previously compressed page).  Under the system
 allocator, cold accesses complete in under 1\,$\mu$s (no

@@ -792,3 +792,147 @@ Script-based benchmarks (memcached, Redis, DuckDB, Polars) don't have per-operat
 - **PostgreSQL shared buffers** — OLTP+OLAP mixed workload
 - **Node.js server** — Express/Fastify with in-memory session cache
 - **lmdb** — memory-mapped B-tree with cold record access patterns
+
+---
+
+## Generating Paper Figures
+
+This section documents how to generate all graphs and figures for the paper from benchmark data.
+
+### Prerequisites
+
+```bash
+# Build with benchmarks enabled
+cd build
+cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
+
+# Install Python plotting dependencies
+pip install matplotlib seaborn numpy
+```
+
+### Step 1: Run Paper Experiments
+
+Run the unified experiment runner to collect all data:
+
+```bash
+cd build
+
+# Full experiment suite (paper-quality, 3 runs each)
+python3 ../bench/run_paper_experiments.py --runs 3
+
+# Quick smoke test (smaller datasets, 1 run)
+python3 ../bench/run_paper_experiments.py --quick --runs 1
+
+# Subset of apps
+python3 ../bench/run_paper_experiments.py --apps sqlite,rocksdb,redis --runs 3
+```
+
+This produces:
+- `paper_results/ablation_results.json` — Ablation study data (9 configs × 6 apps)
+- `paper_results/compress_only_results.json` — Compress-only comparison data
+- `paper_results/paper_tables.txt` — Pre-formatted LaTeX tables
+
+### Step 2: Generate Main Figures
+
+```bash
+cd paper/figures
+python3 plot_all.py
+```
+
+This generates:
+- `rss_reduction.pdf` — Bar chart of RSS reduction by application
+- `algo_compare.pdf` — Compression ratio comparison across algorithms
+- `algo_throughput.pdf` — Compression/decompression throughput
+- `memcached.pdf` — Memcached RSS by phase
+- `ablation.pdf` — Ablation study (delta from default)
+- `multipage.pdf` — Multi-page compression ratios
+- `dict_overhead.pdf` — Dictionary CDict overhead vs benefit
+- `allocator_compare.pdf` — Compression ratios across allocator substrates
+
+### Step 3: Generate RSS Timeline Figures
+
+RSS timeline graphs show memory usage over time (fill → cool → serve phases).
+
+```bash
+cd paper/figures
+
+# Generate from synthetic data (based on measured results)
+python3 plot_rss_timeline.py
+
+# Generate from actual benchmark RSS data (if collected)
+python3 plot_rss_timeline.py <baseline_dir> <smash_dir> <output_dir>
+```
+
+This generates:
+- `rss_combined.pdf` — Combined 2×3 grid of all benchmarks
+- Individual `rss_<benchmark>.pdf` files (when using real data)
+
+**Note**: The benchmark runner (`run_paper_experiments.py`) automatically samples RSS every second during benchmark execution and stores the timeline in `rss_timeline` field of the JSON output.
+
+### Step 4: Generate Latency CDF Figures
+
+CDF plots show cold-access latency distributions.
+
+```bash
+cd paper/figures
+
+# Generate from synthetic data (matching Table 4 p50/p99)
+python3 plot_cdf.py
+
+# Generate from actual latency data (if collected)
+python3 plot_cdf.py <baseline_dir> <smash_dir> <output_dir>
+```
+
+This generates:
+- `cdf_cold_combined.pdf` — Combined cold-access CDF for all benchmarks
+
+**To collect real latency data**: Set the `SMASH_LATENCY_DIR` environment variable when running C++ benchmarks:
+
+```bash
+export SMASH_LATENCY_DIR=/path/to/latency_data
+./bench/bench_sqlite --quick
+./bench/bench_rocksdb --quick
+```
+
+Latency CSVs are written to `<SMASH_LATENCY_DIR>/<benchmark>_cold.csv`, etc.
+
+### Step 5: Understanding AUC (Area Under Curve)
+
+The benchmark runner calculates AUC metrics for RSS-over-time analysis:
+
+- **`auc_mb_sec`**: Sum of RSS samples (MB) over the measurement period
+  - Each sample is 1 second apart, so this represents MB-seconds
+  - Lower AUC = less memory pressure over time
+  - Useful for comparing total memory footprint, not just peak/min
+
+**AUC Reduction Calculation**:
+```
+auc_reduction_pct = (1 - smash_auc / baseline_auc) * 100
+```
+
+AUC is stored in the JSON results and can be used for:
+- Comparing memory efficiency across configs
+- Showing sustained compression benefit (not just instantaneous)
+- Computing "memory-time" cost for batch workloads
+
+### Quick Reference: Output Locations
+
+| Data | Location |
+|------|----------|
+| Ablation results | `build/paper_results/ablation_results.json` |
+| Compress-only results | `build/paper_results/compress_only_results.json` |
+| LaTeX tables | `build/paper_results/paper_tables.txt` |
+| Main figures | `paper/figures/*.pdf` |
+| RSS timelines | `paper/figures/rss_*.pdf` |
+| Latency CDFs | `paper/figures/cdf_*.pdf` |
+
+### Updating Figures with New Data
+
+The plotting scripts in `paper/figures/` contain hardcoded data matching current benchmark results. To update:
+
+1. Run experiments: `python3 ../bench/run_paper_experiments.py --runs 3`
+2. Extract values from `paper_results/ablation_results.json`
+3. Update the data arrays in `plot_all.py`, `plot_rss_timeline.py`
+4. Re-run: `python3 plot_all.py`
+
+Alternatively, modify the scripts to read directly from JSON (future work).

@@ -40,16 +40,20 @@ else
 fi
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
-TPCH_SF=0.5
-COOL_DURATION=10
+TPCH_SF=2
+COOL_DURATION=20
 SERVE_ITERATIONS=10
+DUCKDB_COMPRESSION="yes"
 
 for arg in "$@"; do
     case "$arg" in
         --quick)
-            TPCH_SF=0.1
+            TPCH_SF=0.5
             COOL_DURATION=5
             SERVE_ITERATIONS=5
+            ;;
+        --no-compression)
+            DUCKDB_COMPRESSION="no"
             ;;
         *) echo "Unknown flag: $arg"; exit 1 ;;
     esac
@@ -195,9 +199,18 @@ run_duckdb_pass() {
     local monitor_pid=$!
 
     # ── Phase 1: Fill (TPC-H data) ───────────────────────────────────────────
-    echo "[${label}] Phase 1: Generate TPC-H data (sf=${TPCH_SF})..."
+    echo "[${label}] Phase 1: Generate TPC-H data (sf=${TPCH_SF}, compression=${DUCKDB_COMPRESSION})..."
     rm -f "$marker"
+
+    # Disable DuckDB's internal storage compression if requested.
+    # This forces uncompressed columnar storage, isolating Smash's effect.
+    local compression_pragma=""
+    if [[ "$DUCKDB_COMPRESSION" == "no" ]]; then
+        compression_pragma="SET force_compression='Uncompressed';"
+    fi
+
     cat >&3 << SQLEOF
+${compression_pragma}
 INSTALL tpch;
 LOAD tpch;
 CALL dbgen(sf=${TPCH_SF});
@@ -356,7 +369,7 @@ echo "========================================================================"
 echo "  DuckDB OLAP A/B Comparison"
 echo "========================================================================"
 echo ""
-echo "TPC-H sf=${TPCH_SF}, Cool: ${COOL_DURATION}s, Iterations: ${SERVE_ITERATIONS}"
+echo "TPC-H sf=${TPCH_SF}, Cool: ${COOL_DURATION}s, Iterations: ${SERVE_ITERATIONS}, DuckDB compression: ${DUCKDB_COMPRESSION}"
 echo ""
 
 # Run baseline

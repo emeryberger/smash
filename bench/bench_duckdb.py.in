@@ -34,6 +34,8 @@ SMASH_LIB = os.path.join(BUILD_DIR, "libsmash.dylib" if IS_DARWIN else "libsmash
 
 # ── SQL templates ────────────────────────────────────────────────────────
 
+SQL_DISABLE_COMPRESSION = "SET force_compression='Uncompressed';\n"
+
 SQL_FILL = """\
 INSTALL tpch;
 LOAD tpch;
@@ -186,11 +188,17 @@ def run_pass(label, use_smash, cfg, tmpdir):
     mon.start()
 
     # ── Phase 1: Fill ────────────────────────────────────────────────────
-    print(f"[{label}] Phase 1: Generate TPC-H data (sf={cfg.sf})...")
+    compress_label = "off" if cfg.no_compression else "on"
+    print(f"[{label}] Phase 1: Generate TPC-H data (sf={cfg.sf}, compression={compress_label})...")
     try:
         os.unlink(marker)
     except FileNotFoundError:
         pass
+
+    # Disable DuckDB's internal storage compression if requested.
+    # This forces uncompressed columnar storage, isolating Smash's effect.
+    if cfg.no_compression:
+        send_sql(proc, SQL_DISABLE_COMPRESSION)
 
     t_fill = time.time()
     if not send_sql(proc, SQL_FILL.format(sf=cfg.sf)):
@@ -336,19 +344,22 @@ def print_results(base, smash):
 def main():
     parser = argparse.ArgumentParser(description="DuckDB OLAP A/B: system malloc vs Smash")
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--no-compression", action="store_true",
+                        help="Disable DuckDB's internal storage compression")
     args = parser.parse_args()
 
     class Cfg:
         pass
     cfg = Cfg()
     if args.quick:
-        cfg.sf = 0.1
+        cfg.sf = 0.5
         cfg.cool = 5
         cfg.iterations = 5
     else:
-        cfg.sf = 0.5
-        cfg.cool = 10
+        cfg.sf = 2
+        cfg.cool = 20
         cfg.iterations = 10
+    cfg.no_compression = args.no_compression
 
     check_prereqs()
 
@@ -357,7 +368,8 @@ def main():
     print("  DuckDB OLAP A/B Comparison")
     print("=" * 72)
     print()
-    print(f"TPC-H sf={cfg.sf}, Cool: {cfg.cool}s, Iterations: {cfg.iterations}")
+    compress_label = "off" if cfg.no_compression else "on"
+    print(f"TPC-H sf={cfg.sf}, Cool: {cfg.cool}s, Iterations: {cfg.iterations}, DuckDB compression: {compress_label}")
 
     tmpdir = tempfile.mkdtemp()
     try:

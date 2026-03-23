@@ -61,7 +61,7 @@ ABLATION_CONFIGS = OrderedDict([
 # Mesh library path (Linux)
 MESH_LIB = "/usr/lib/libmesh.so"
 
-APPS = ["sqlite", "rocksdb", "memcached", "redis", "redis_ext"]
+APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext"]
 
 IS_DARWIN = platform.system() == "Darwin"
 PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
@@ -801,8 +801,8 @@ def _duckdb_baseline_rss(build_dir, quick):
         return _DUCKDB_BASELINE_CACHE[key]
 
     duckdb_bin = get_binary("duckdb", build_dir)
-    sf = 0.1 if quick else 0.5
-    cool_sec = 5 if quick else 10
+    sf = 0.5 if quick else 2
+    cool_sec = 5 if quick else 20
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_file = os.path.join(tmpdir, "baseline.duckdb")
@@ -877,20 +877,25 @@ def _duckdb_baseline_rss(build_dir, quick):
     return rss
 
 
-def run_duckdb_bench(build_dir, smash_lib, quick):
+def run_duckdb_bench(build_dir, smash_lib, quick, no_compression=False):
     """Run DuckDB benchmark with TPC-H data using persistent database file.
 
     Uses separate fill/query phases to work around Smash/DuckDB interaction
     issues with long-running interactive sessions on Linux.
+
+    Args:
+        no_compression: If True, disable DuckDB's internal storage compression
+            via SET force_compression='Uncompressed'. This isolates Smash's
+            compression effect from DuckDB's own column compression.
     """
     duckdb_bin = get_binary("duckdb", build_dir)
     if not check_binary("duckdb", build_dir):
         return None
 
-    # Note: DuckDB is not a good Smash candidate - it already manages memory efficiently
-    # and large-scale operations crash with Smash. Using small SF for reliable measurement.
-    sf = 0.1 if quick else 0.5
-    cool_sec = 5 if quick else 15
+    # sf=2 produces ~500 MB uncompressed RSS, comparable to other benchmarks.
+    # DuckDB's internal compression reduces this to ~200 MB.
+    sf = 0.5 if quick else 2
+    cool_sec = 5 if quick else 20
     serve_iters = 3 if quick else 10
 
     # Fill phase runs WITHOUT Smash (data generation doesn't benefit from compression)
@@ -903,12 +908,16 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
         cool_env[PRELOAD_VAR] = str(smash_lib)
         cool_env["SMASH_VERY_COLD_TICKS"] = "5"
 
+    # Optionally disable DuckDB's internal storage compression
+    compression_pragma = "SET force_compression='Uncompressed';\n" if no_compression else ""
+
     with tempfile.TemporaryDirectory() as tmpdir:
         db_file = os.path.join(tmpdir, "bench.duckdb")
         marker = os.path.join(tmpdir, "marker.csv")
 
         # Phase 1: Fill - run WITHOUT Smash for fast data generation
-        fill_sql = (f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
+        fill_sql = (f"{compression_pragma}"
+                    f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
                     f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n"
                     f"CHECKPOINT;\n")  # Ensure data is written to disk
 
@@ -950,7 +959,8 @@ def run_duckdb_bench(build_dir, smash_lib, quick):
 
         # Load data by running aggregate queries that scan the full tables
         # Avoids CREATE TABLE AS SELECT which crashes with large data + Smash
-        hold_sql = (f"SELECT count(*), sum(l_quantity), sum(l_extendedprice) FROM lineitem;\n"
+        hold_sql = (f"{compression_pragma}"
+                    f"SELECT count(*), sum(l_quantity), sum(l_extendedprice) FROM lineitem;\n"
                     f"SELECT count(*), sum(o_totalprice) FROM orders;\n"
                     f"COPY (SELECT 'loaded') TO '{marker}' (HEADER false);\n")
 
@@ -1185,6 +1195,8 @@ def run_app(app, build_dir, smash_lib, quick):
         return run_redis_bench(build_dir, smash_lib, quick)
     elif app == "redis_ext":
         return run_redis_extended_bench(build_dir, smash_lib, quick)
+    elif app == "duckdb":
+        return run_duckdb_bench(build_dir, smash_lib, quick)
     return None
 
 
@@ -1344,6 +1356,81 @@ def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1):
     return all_results
 
 
+# ── DuckDB compression experiment ─────────────────────────────────────────────
+
+def run_duckdb_compression_experiment(build_dir, source_dir, quick, output_dir, runs=1):
+    """Compare DuckDB's internal compression vs Smash compression.
+
+    Four configurations:
+      1. baseline:       system malloc, DuckDB compression ON
+      2. duckdb-uncomp:  system malloc, DuckDB compression OFF
+      3. smash:          Smash, DuckDB compression ON
+      4. smash-uncomp:   Smash, DuckDB compression OFF
+
+    This isolates the contribution of each compression layer.
+    """
+    results_path = output_dir / "duckdb_compression_results.json"
+    smash_lib = build_dir / f"libsmash{LIB_SUFFIX}"
+
+    # Ensure default build
+    rebuild(build_dir, {}, source_dir)
+
+    all_results = {}
+    if results_path.exists():
+        all_results = json.loads(results_path.read_text())
+
+    configs = [
+        ("baseline",      None,      False),  # (name, smash_lib, no_compression)
+        ("duckdb-uncomp", None,      True),
+        ("smash",         smash_lib, False),
+        ("smash-uncomp",  smash_lib, True),
+    ]
+
+    t0 = time.time()
+    for config_name, lib, no_compress in configs:
+        if config_name in all_results:
+            print(f"  {config_name}: cached")
+            continue
+
+        run_results = []
+        for run_num in range(1, runs + 1):
+            print(f"  {config_name} run {run_num}...", end="", flush=True)
+            metrics = run_duckdb_bench(build_dir, lib, quick,
+                                       no_compression=no_compress)
+            if metrics:
+                rss = metrics.get("steady_rss_mb", 0)
+                red = metrics.get("rss_reduction_pct", 0)
+                print(f" rss={rss:.1f}MB reduction={red:.1f}%")
+                run_results.append(metrics)
+            else:
+                print(" SKIP")
+                break
+
+        if run_results:
+            all_results[config_name] = {
+                "runs": run_results,
+                "median": _median_metrics(run_results),
+            }
+
+        results_path.write_text(json.dumps(all_results, indent=2))
+
+    # Print summary table
+    print(f"\n  {'Config':<20s} {'Cool RSS':>10s} {'Serve RSS':>10s} {'Reduction':>10s}")
+    print("  " + "-" * 52)
+    for config_name, _, _ in configs:
+        if config_name not in all_results:
+            continue
+        med = all_results[config_name].get("median", {})
+        cool = med.get("cool_rss_mb", med.get("post_cool_rss_mb", 0))
+        serve = med.get("steady_rss_mb", 0)
+        red = med.get("rss_reduction_pct", 0)
+        print(f"  {config_name:<20s} {cool:>9.0f}MB {serve:>9.0f}MB {red:>9.1f}%")
+
+    elapsed = time.time() - t0
+    print(f"\nDuckDB compression experiment complete in {elapsed:.0f}s. Results: {results_path}")
+    return all_results
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _median_metrics(runs):
@@ -1472,6 +1559,8 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Use --quick for faster runs")
     parser.add_argument("--ablation-only", action="store_true")
     parser.add_argument("--compress-only-only", action="store_true")
+    parser.add_argument("--duckdb-compression-only", action="store_true",
+                        help="Run only the DuckDB compression comparison experiment")
     parser.add_argument("--build-dir", default=".", help="Build directory (default: .)")
     parser.add_argument("--runs", type=int, default=1, help="Runs per config (default: 1)")
     parser.add_argument("--apps", default=None,
@@ -1513,19 +1602,27 @@ def main():
     ablation_results = {}
     co_results = {}
 
-    if not args.compress_only_only:
+    if not args.compress_only_only and not args.duckdb_compression_only:
         print("=" * 70)
         print("  ABLATION STUDY")
         print("=" * 70)
         ablation_results = run_ablation(build_dir, source_dir, apps, args.quick,
                                         output_dir, runs=args.runs)
 
-    if not args.ablation_only:
+    if not args.ablation_only and not args.duckdb_compression_only:
         print("\n" + "=" * 70)
         print("  COMPRESS-ONLY EXPERIMENT")
         print("=" * 70)
         co_results = run_compress_only(build_dir, source_dir, apps, args.quick,
                                        output_dir, runs=args.runs)
+
+    # DuckDB compression comparison (if duckdb is in app list)
+    if "duckdb" in apps and not args.ablation_only and not args.compress_only_only:
+        print("\n" + "=" * 70)
+        print("  DUCKDB COMPRESSION EXPERIMENT")
+        print("=" * 70)
+        run_duckdb_compression_experiment(build_dir, source_dir, args.quick,
+                                          output_dir, runs=args.runs)
 
     # Generate tables
     tables_path = output_dir / "paper_tables.txt"

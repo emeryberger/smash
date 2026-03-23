@@ -3,19 +3,19 @@ ABLATION TABLE
 % Auto-generated ablation table
 \begin{tabular}{llrr}
 \toprule
-ID & Configuration & \textbf{Sqlite} & Avg.\ $\Delta$ \\
+ID & Configuration & \textbf{Duckdb} & Avg.\ $\Delta$ \\
 \midrule
-    & \textbf{Default} & \textbf{75.5\%} & --- \\
-B0  & System malloc & 31.4\% ($-$44.1) & -44.1 \\
+    & \textbf{Default} & \textbf{2.9\%} & --- \\
+B0  & System malloc & 0.0\% ($-$2.9) & -2.9 \\
 \midrule
     & Mesh & --- & --- \\
-    & With dicts & 72.9\% ($-$2.6) & -2.6 \\
-    & No arenas & 75.5\% (+0.0) & +0.0 \\
-    & LZ4 only & 75.5\% (+0.0) & +0.0 \\
-    & No zero-deferred & 75.5\% (+0.0) & +0.0 \\
-    & No prefetch & 75.5\% (+0.0) & +0.0 \\
-    & Single worker & 75.6\% (+0.1) & +0.1 \\
-B2  & No compression & 28.9\% ($-$46.6) & -46.6 \\
+    & With dicts & 0.0\% ($-$2.9) & -2.9 \\
+    & No arenas & 2.7\% ($-$0.3) & -0.3 \\
+    & LZ4 only & 3.0\% (+0.0) & +0.0 \\
+    & No zero-deferred & 3.0\% (+0.0) & +0.0 \\
+    & No prefetch & 3.0\% (+0.0) & +0.0 \\
+    & Single worker & 3.1\% (+0.2) & +0.2 \\
+B2  & No compression & 0.0\% ($-$2.9) & -2.9 \\
 \bottomrule
 \end{tabular}
 
@@ -26,14 +26,9 @@ COMPRESS-ONLY TABLE
 \toprule
 Benchmark & Config & Cool RSS & Reduction & Ops/s \\
 \midrule
-\multirow{3}{*}{Sqlite}
-  & baseline       & 611  & ---    & --- \\
-  & compress-only  & 627    & -2.7\% & --- \\
-  & full \sys      & \textbf{178}   & \textbf{70.9\%} & --- \\
-\midrule
-\multirow{3}{*}{Rocksdb}
-  & baseline       & 0  & ---    & --- \\
-  & compress-only  & 0    & 0.0\% & --- \\
-  & full \sys      & \textbf{0}   & \textbf{0.0\%} & --- \\
+\multirow{3}{*}{Duckdb}
+  & baseline       & 146  & ---    & --- \\
+  & compress-only  & 172    & -18.1\% & --- \\
+  & full \sys      & \textbf{176}   & \textbf{-20.3\%} & --- \\
 \bottomrule
 \end{tabular}

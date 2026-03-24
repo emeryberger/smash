@@ -41,7 +41,7 @@ fi
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 TPCH_SF=2
-COOL_DURATION=20
+COOL_DURATION=60
 SERVE_ITERATIONS=10
 DUCKDB_COMPRESSION="yes"
 

@@ -353,11 +353,11 @@ def main():
     cfg = Cfg()
     if args.quick:
         cfg.sf = 0.5
-        cfg.cool = 5
+        cfg.cool = 15
         cfg.iterations = 5
     else:
         cfg.sf = 2
-        cfg.cool = 20
+        cfg.cool = 60
         cfg.iterations = 10
     cfg.no_compression = args.no_compression
 

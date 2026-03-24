@@ -802,7 +802,7 @@ def _duckdb_baseline_rss(build_dir, quick):
 
     duckdb_bin = get_binary("duckdb", build_dir)
     sf = 0.5 if quick else 2
-    cool_sec = 5 if quick else 20
+    cool_sec = 15 if quick else 60
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_file = os.path.join(tmpdir, "baseline.duckdb")
@@ -878,119 +878,66 @@ def _duckdb_baseline_rss(build_dir, quick):
 
 
 def run_duckdb_bench(build_dir, smash_lib, quick, no_compression=False):
-    """Run DuckDB benchmark with TPC-H data using persistent database file.
+    """Run DuckDB benchmark with TPC-H data in :memory: mode.
 
-    Uses separate fill/query phases to work around Smash/DuckDB interaction
-    issues with long-running interactive sessions on Linux.
+    Single-process approach: Smash is loaded from the start so it can track
+    all malloc'd pages.  DuckDB with a persistent file only reads data lazily
+    via vectorized scans, keeping RSS low — :memory: forces all data into RAM.
 
-    Args:
-        no_compression: If True, disable DuckDB's internal storage compression
-            via SET force_compression='Uncompressed'. This isolates Smash's
-            compression effect from DuckDB's own column compression.
+    DuckDB needs a longer cool period (~45s) because its many small columnar
+    allocations take multiple compressor ticks to fully compress.
     """
     duckdb_bin = get_binary("duckdb", build_dir)
     if not check_binary("duckdb", build_dir):
         return None
 
-    # sf=2 produces ~500 MB uncompressed RSS, comparable to other benchmarks.
-    # DuckDB's internal compression reduces this to ~200 MB.
     sf = 0.5 if quick else 2
-    cool_sec = 5 if quick else 20
+    cool_sec = 15 if quick else 60
     serve_iters = 3 if quick else 10
 
-    # Fill phase runs WITHOUT Smash (data generation doesn't benefit from compression)
-    # This avoids the severe slowdown from Smash overhead during dbgen
-    fill_env = os.environ.copy()
-
-    # Cool/serve phases run WITH Smash (where compression actually matters)
-    cool_env = os.environ.copy()
+    env = os.environ.copy()
     if smash_lib:
-        cool_env[PRELOAD_VAR] = str(smash_lib)
-        cool_env["SMASH_VERY_COLD_TICKS"] = "5"
+        env[PRELOAD_VAR] = str(smash_lib)
 
-    # Optionally disable DuckDB's internal storage compression
     compression_pragma = "SET force_compression='Uncompressed';\n" if no_compression else ""
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        db_file = os.path.join(tmpdir, "bench.duckdb")
         marker = os.path.join(tmpdir, "marker.csv")
 
-        # Phase 1: Fill - run WITHOUT Smash for fast data generation
-        fill_sql = (f"{compression_pragma}"
-                    f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
-                    f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n"
-                    f"CHECKPOINT;\n")  # Ensure data is written to disk
-
         proc = subprocess.Popen(
-            [duckdb_bin, db_file],
+            [duckdb_bin, ":memory:"],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=fill_env  # No Smash during fill
+            env=env,
         )
+
+        # Phase 1: Fill — generate TPC-H data in memory
+        fill_sql = (f"{compression_pragma}"
+                    f"INSTALL tpch;\nLOAD tpch;\nCALL dbgen(sf={sf});\n"
+                    f"COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);\n")
 
         try:
             proc.stdin.write(fill_sql.encode())
             proc.stdin.flush()
         except (BrokenPipeError, OSError):
-            print("    duckdb: process exited during fill (pipe error)")
+            print("    duckdb: process exited during fill")
             return None
 
-        # Wait for fill to complete
-        fill_timeout = 300 if quick else 600  # 10 min for full mode
+        fill_timeout = 300 if quick else 600
         if not _wait_file(marker, "fill_done", timeout=fill_timeout):
             print(f"    duckdb: fill timed out after {fill_timeout}s")
             proc.terminate()
             return None
 
-        fill_rss = get_rss_mb(proc.pid)
-        if fill_rss <= 0:
-            fill_rss = 100  # Fallback estimate
-
-        # Close fill process
-        try:
-            proc.stdin.close()
-        except:
-            pass
-        proc.wait(timeout=30)
-
-        # Phase 2: Cool - start a new process holding the DB open
-        if os.path.exists(marker):
-            os.remove(marker)
-
-        # Load data by running aggregate queries that scan the full tables
-        # Avoids CREATE TABLE AS SELECT which crashes with large data + Smash
-        hold_sql = (f"{compression_pragma}"
-                    f"SELECT count(*), sum(l_quantity), sum(l_extendedprice) FROM lineitem;\n"
-                    f"SELECT count(*), sum(o_totalprice) FROM orders;\n"
-                    f"COPY (SELECT 'loaded') TO '{marker}' (HEADER false);\n")
-
-        proc = subprocess.Popen(
-            [duckdb_bin, db_file],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=cool_env  # Smash enabled here for compression measurement
-        )
-
-        try:
-            proc.stdin.write(hold_sql.encode())
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            print("    duckdb: failed to start cool phase")
-            return None
-
-        if not _wait_file(marker, "loaded", timeout=60):
-            print("    duckdb: cool phase load timed out")
+        peak_rss = get_rss_mb(proc.pid)
+        if peak_rss <= 0:
+            print("    duckdb: could not measure fill RSS")
             proc.terminate()
             return None
 
-        # Measure RSS right after data loaded (this is our "peak" for cool phase)
-        peak_cool_rss = get_rss_mb(proc.pid)
-        if peak_cool_rss <= 0:
-            peak_cool_rss = fill_rss
-
-        # Sample RSS every second during cool phase (timeline)
-        rss_timeline = [peak_cool_rss]
-        min_rss = peak_cool_rss
+        # Phase 2: Cool — let Smash compress idle pages
+        rss_timeline = [peak_rss]
+        min_rss = peak_rss
         for _ in range(cool_sec):
             time.sleep(1)
             rss = get_rss_mb(proc.pid)
@@ -998,13 +945,13 @@ def run_duckdb_bench(build_dir, smash_lib, quick, no_compression=False):
                 rss_timeline.append(rss)
                 min_rss = min(min_rss, rss)
             else:
-                rss_timeline.append(rss_timeline[-1])  # Repeat last value if measurement fails
+                rss_timeline.append(rss_timeline[-1])
 
         cool_rss = get_rss_mb(proc.pid)
         if cool_rss <= 0:
             cool_rss = min_rss
 
-        # Phase 3: Serve - send queries
+        # Phase 3: Serve — narrow date-range queries (hot subset)
         if os.path.exists(marker):
             os.remove(marker)
 
@@ -1018,8 +965,7 @@ def run_duckdb_bench(build_dir, smash_lib, quick, no_compression=False):
             proc.stdin.write(serve_sql.encode())
             proc.stdin.flush()
         except (BrokenPipeError, OSError):
-            # Process may have exited - that's OK, we have cool_rss
-            print("    duckdb: serve write failed (process may have exited)")
+            print("    duckdb: serve write failed")
             serve_rss = cool_rss
         else:
             if _wait_file(marker, "serve_done", timeout=60):
@@ -1032,29 +978,24 @@ def run_duckdb_bench(build_dir, smash_lib, quick, no_compression=False):
         # Clean up
         try:
             proc.stdin.close()
-        except:
+        except Exception:
             pass
         try:
             proc.terminate()
             proc.wait(timeout=5)
-        except:
+        except Exception:
             proc.kill()
 
-        # Validate measurements - cool_rss=0 means measurement failed (process died)
-        if cool_rss <= 0 or peak_cool_rss <= 0:
-            print(f"    duckdb: invalid RSS measurement (peak_cool={peak_cool_rss}, cool={cool_rss})")
+        if cool_rss <= 0 or peak_rss <= 0:
+            print(f"    duckdb: invalid RSS (peak={peak_rss}, cool={cool_rss})")
             return None
 
-        # Reduction vs peak_cool_rss (same process) - shows actual compression effect
-        # Note: fill_rss is from a different process, so we don't use it for reduction
-        reduction = (1 - min_rss / peak_cool_rss) * 100
-        # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
+        reduction = (1 - min_rss / peak_rss) * 100
         auc_mb_sec = sum(rss_timeline)
 
         return {
-            "fill_rss_mb": fill_rss,  # Different process, for reference only
-            "peak_rss_mb": peak_cool_rss,  # Peak of cool phase process (denominator for reduction)
-            "cool_rss_mb": cool_rss,
+            "peak_rss_mb": peak_rss,
+            "post_cool_rss_mb": cool_rss,
             "steady_rss_mb": serve_rss,
             "min_rss_mb": min_rss,
             "rss_reduction_pct": reduction,

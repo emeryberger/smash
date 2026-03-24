@@ -783,6 +783,120 @@ Script-based benchmarks (memcached, Redis, DuckDB, Polars) don't have per-operat
 
 ---
 
+## Mesh on macOS (ARM64, 16 KiB pages)
+
+**Status**: Investigated March 2026. Mesh does not effectively reduce RSS on macOS.
+
+### Building Mesh for macOS ARM64
+
+Mesh builds on macOS ARM64 with one source fix (`src/meshable_arena.cc` line 100:
+redefinition of `r` — change `int r =` to `r =`). Must build as fat binary
+(`-DCMAKE_OSX_ARCHITECTURES="arm64;arm64e"`) for DYLD interposition to work.
+
+### Finding 1: Mesh's page meshing is mathematically ineffective on 16 KiB pages
+
+Two pages are meshable iff their live-object bitmaps don't overlap. The probability:
+
+```
+q = (1 - p²)^n
+```
+
+where `p` = occupancy fraction, `n` = slots per page (`PageSize / ObjectSize`).
+
+| Object size | Slots/page (16 KiB) | q at 50% occ | q at 6% occ |
+|------------|--------------------:|-------------:|------------:|
+| 128 B      | 128                 | 10⁻¹⁶       | 0.60        |
+| 256 B      | 64                  | 10⁻⁸        | 0.77        |
+| 512 B      | 32                  | 10⁻⁴        | 0.88        |
+| 1024 B     | 16                  | 0.01         | 0.94        |
+| 2048 B     | 8                   | 0.10         | 0.97        |
+| 4096 B     | 4                   | 0.32         | 0.98        |
+
+For comparison, 4 KiB pages with 128 B objects have 32 slots — equivalent to
+16 KiB pages with 512 B objects. This is the regime Mesh was designed for.
+
+At typical occupancies (25-50%) with small objects (≤256 B), meshing on 16 KiB
+pages is essentially impossible. Only at very low occupancy (<12.5%) or with
+large objects (≥512 B) does meshing become feasible.
+
+From the Mesh paper (Lemma 5.3): the probe count should be `t = k/q`. The paper
+uses `t = 64` for 4 KiB pages. For 16 KiB pages at 25% occupancy with 128 B
+objects: `t = 8 / 2.5e-4 ≈ 32,000`. This is computationally expensive and
+still yields very few meshable pairs.
+
+### Finding 2: Mesh's mmap remapping doesn't release physical pages on macOS
+
+Even when Mesh successfully finds meshable pairs (confirmed with `MALLOCSTATS=1`
+showing `MESH COUNT > 0`), RSS does not decrease. Mesh uses `mmap(MAP_FIXED |
+MAP_SHARED)` over a file descriptor to remap virtual pages. On Linux with
+`memfd_create`, this releases physical pages. On macOS with file-backed
+`MAP_SHARED` mappings (via `mkstemp`), macOS's VM subsystem does not release
+the physical backing when mappings are remapped.
+
+**Test results** (128 B objects, 50% freed randomly, 1M objects ≈ 128 MB):
+
+| Config                    | RSS    | Mesh count |
+|--------------------------|--------|-----------|
+| Baseline (no Mesh)        | 131 MB | —         |
+| Mesh (default period)     | 132 MB | 0         |
+| Mesh (period=1ms)         | 132 MB | 0         |
+
+At 6% occupancy (where meshing probability is reasonable):
+
+| Config                    | RSS    | Mesh count |
+|--------------------------|--------|-----------|
+| Baseline                  | 137 MB | —         |
+| Mesh (period=100ms)       | 139 MB | 2,501     |
+
+2,501 pages meshed (39 MB worth) but **zero RSS reduction**.
+
+### Finding 3: Default mesh period too slow for benchmarks
+
+Mesh's `kDefaultMeshPeriod` is 10,000 ms (10 seconds). The `_lastMeshEffective`
+threshold (`totalMeshCount > 256`) was calibrated for 4 KiB pages and is too
+aggressive for 16 KiB pages where fewer meshable pairs exist.
+
+### Conclusion
+
+The macOS Mesh results in the paper's Table 1 reflected Mesh's different
+**allocation layout** (e.g., RocksDB: 309 MB vs 416 MB baseline), not actual
+page compaction. These RSS differences are real but come from Mesh's slab
+organization, not from its meshing mechanism.
+
+macOS results were removed from the paper evaluation. The implementation
+sections retain macOS descriptions since Smash does work on macOS.
+
+---
+
+## DuckDB Experiments
+
+**Status**: Investigated March 2026. DuckDB is not a good Smash candidate.
+
+### Finding 1: DuckDB's internal compression leaves no room for Smash
+
+DuckDB uses column-level compression (dictionary encoding, bitpacking, RLE,
+FSST, etc.). With `SET force_compression='Uncompressed'` disabled, RSS at
+sf=2 is ~146 MB; without DuckDB compression, ~428 MB. DuckDB's compression
+reduces RSS by 66% internally.
+
+With Smash on top of DuckDB-compressed data: only 2.9% additional reduction.
+
+### Finding 2: Persistent DB mode doesn't load data into RSS
+
+DuckDB reads data lazily from disk via vectorized scans. A persistent-file
+benchmark (`duckdb file.db`) keeps RSS at ~106 MB regardless of dataset size.
+Must use `:memory:` mode for data to reside in malloc'd RAM.
+
+### Finding 3: DuckDB's buffer manager releases memory on idle
+
+DuckDB's buffer manager drops unused buffers after ~45s of idle time. This
+natural memory release was initially mistaken for Smash compression in early
+tests.
+
+DuckDB was removed from the paper evaluation.
+
+---
+
 ## Planned Experiments
 
 ### Additional Real-World Applications (PLANNED)

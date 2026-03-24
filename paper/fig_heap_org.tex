@@ -125,6 +125,6 @@
   bitmaps, so data pages receive no metadata writes and can go truly
   cold.  Freed slots are zeroed lazily at compression time
   (\S\ref{sec:design:zero}), replacing stale data with long zero runs
-  that LZ4 and zstd compress efficiently.}
+  that zstd compresses efficiently.}
 \label{fig:heap_org}
 \end{figure*}

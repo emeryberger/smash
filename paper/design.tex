@@ -49,7 +49,7 @@ phases (Figure~\ref{fig:arch}).  \emph{Phase~1} updates per-page
 cold counts: for each active or monitored page, if the page was
 accessed since the last tick its cold count resets to zero; otherwise
 the count increments.  \emph{Phase~2} compresses pages whose ROI exceeds a
-threshold, selecting LZ4 or zstd based on the cost--benefit
+threshold, selecting the zstd compression level based on the cost--benefit
 model (\S\ref{sec:design:adaptive}).  \emph{Phase~3}
 marks all remaining ACTIVE pages read-only (\texttt{PROT\_READ}),
 transitioning them to MONITORING.  This is how \sys detects writes:
@@ -229,7 +229,7 @@ Partially-filled slab pages therefore contain a mix of live objects
 and freed slots.  Freed slots hold stale data from their previous
 occupants, which lowers compression ratios.  \sys zeros freed
 slots \emph{lazily at compression time}, replacing stale data with
-zero runs that LZ4 and zstd compress efficiently.
+zero runs that zstd compresses efficiently.
 
 Before compressing a page, the compressor copies the page into a
 scratch buffer, iterates the span's free bitmap to identify freed

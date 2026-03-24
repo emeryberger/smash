@@ -15,7 +15,7 @@
   \node[state, right=of active, minimum width=2.0cm] (monitor) {\shortstack{MONITORING}};
   \node[state, below=of monitor] (compressing) {COMPRESS};
   \node[state, below=1.4cm of compressing, minimum width=2.4cm] (compressed)
-    {\shortstack{COMPRESSED\\[-2pt]\scriptsize(LZ4 or zstd)}};
+    {\shortstack{COMPRESSED\\[-2pt]\scriptsize(zstd-1 or zstd-9)}};
 
   % Forward transitions (compressor thread) with phase labels
   \draw (empty) edge node[above, font=\scriptsize] {alloc} (active);

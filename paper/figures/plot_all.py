@@ -193,7 +193,7 @@ def fig_ablation():
     configs = [
         'With dicts',
         'No arenas',
-        'No adaptive\n(LZ4 only)',
+        'No adaptive\n(zstd-1 only)',
         'No zero-defer',
         'No prefetch',
         'Single worker',

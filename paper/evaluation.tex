@@ -354,8 +354,8 @@ dictionaries by default.
 Disabling compression entirely ($-$45.7\,\pp average) confirms that
 compression is the dominant mechanism; without it, \sys reduces to
 a standard allocator with no RSS benefit beyond what the allocator
-design alone provides.  The remaining optimizations---arenas, LZ4-only
-mode (disabling zstd-1), deferred zeroing, prefetch, and
+design alone provides.  The remaining optimizations---arenas, fast-only
+mode (disabling zstd-9 re-compression), deferred zeroing, prefetch, and
 parallelism---each contribute less than 1.5\,\pp individually.
 
 \begin{figure}[t]

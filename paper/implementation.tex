@@ -185,7 +185,7 @@ a slot becomes available---since the thread is already blocked on the
 page fault, it cannot proceed without decompressing.  Prefetch, which is
 an optional optimization, instead skips any page for which no slot is
 available.  This design supports high-concurrency workloads (e.g.,
-DuckDB with 16+ threads) without data~races on zstd internal state.
+multi-threaded servers) without data~races on zstd internal state.
 
 \paragraph{Concurrent faults on the same page}
 When multiple threads fault on the same compressed page simultaneously,

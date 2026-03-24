@@ -76,14 +76,14 @@ def fig_algo_compare():
     """Figure 2: Compression ratio comparison across algorithms.
     Compression ratio = original / compressed (higher = better)."""
     algos = ['LZ4', 'zstd-1', 'zstd-3', 'zstd-9']
-    apps = ['SQLite', 'RocksDB', 'Memcached', 'Redis', 'DuckDB']
+    apps = ['SQLite', 'RocksDB', 'Memcached', 'Redis']
 
     # Compression ratio (original/compressed, ×) from real application heap page sampling
     ratios = {
-        'LZ4':    [100/8.1,  100/11.6, 100/21.3, 100/15.9, 100/48.6],
-        'zstd-1': [100/4.9,  100/6.5,  100/11.4, 100/8.5,  100/35.7],
-        'zstd-3': [100/4.9,  100/6.4,  100/10.8, 100/8.4,  100/34.9],
-        'zstd-9': [100/4.8,  100/6.0,  100/10.8, 100/7.9,  100/33.4],
+        'LZ4':    [100/8.1,  100/11.6, 100/21.3, 100/15.9],
+        'zstd-1': [100/4.9,  100/6.5,  100/11.4, 100/8.5],
+        'zstd-3': [100/4.9,  100/6.4,  100/10.8, 100/8.4],
+        'zstd-9': [100/4.8,  100/6.0,  100/10.8, 100/7.9],
     }
 
     fig, ax = plt.subplots(figsize=(4.5, 2.8))
@@ -285,7 +285,7 @@ def fig_allocator_compare():
     allocs = ['System\u2020', 'mimalloc', 'jemalloc', 'tcmalloc',
               'Hoard', 'Mesh', 'DieHard', 'DieHarder\u2020', 'Smash\u2020']
 
-    apps = ['SQLite', 'Memcached', 'Redis', 'DuckDB']
+    apps = ['SQLite', 'Memcached', 'Redis']
 
     # Real measured data: compression ratio = 1/ratio (original/compressed)
     # SQLite: 50K rows, no frees; others: 100K objects, 256B, 50% freed
@@ -294,13 +294,12 @@ def fig_allocator_compare():
         'SQLite':    [1/0.041, 1/0.041, 1/0.043, 1/0.043, 1/0.029, 1/0.041, 1/0.025, 1/0.024, 1/0.025],
         'Memcached': [1/0.054, 1/0.074, 1/0.071, 1/0.074, 1/0.074, 1/0.055, 1/0.086, 1/0.051, 1/0.071],
         'Redis':     [1/0.030, 1/0.030, 1/0.024, 1/0.030, 1/0.030, 1/0.030, 1/0.032, 1/0.024, 1/0.024],
-        'DuckDB':    [1/0.352, 1/0.682, 1/0.686, 1/0.685, 1/0.685, 1/0.352, 1/0.642, 1/0.313, 1/0.681],
     }
 
     fig, ax = plt.subplots(1, 1, figsize=(7.0, 3.5))
 
-    app_colors = [COLORS[0], COLORS[1], COLORS[2], COLORS[3]]
-    width = 0.18
+    app_colors = [COLORS[0], COLORS[1], COLORS[2]]
+    width = 0.22
 
     x = np.arange(len(allocs))
     offsets = np.arange(len(apps)) - len(apps)/2 + 0.5
@@ -313,13 +312,13 @@ def fig_allocator_compare():
     ax.set_xticks(x)
     ax.set_xticklabels(allocs, fontsize=9, rotation=25, ha='right')
     ax.set_yscale('log')
-    ax.set_ylim(1, 50)
+    ax.set_ylim(1, 65)
     ax.yaxis.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
     ax.tick_params(axis='y', labelsize=9)
 
-    ax.legend(apps, ncol=4, loc='upper left', frameon=True,
-              framealpha=0.9, fontsize=9)
+    ax.legend(apps, ncol=3, loc='upper center', frameon=True,
+              framealpha=0.9, fontsize=9, bbox_to_anchor=(0.5, 1.12))
 
     sns.despine(ax=ax, left=False, bottom=False)
 

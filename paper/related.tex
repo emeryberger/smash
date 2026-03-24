@@ -78,8 +78,8 @@ memory waste rather than compressing cold data.
 Mesh~\cite{powers2019mesh} reduces fragmentation by physically
 merging pages with non-overlapping live objects via virtual memory
 remapping.  In our evaluation (\S\ref{sec:eval:apps}), Mesh
-reduces RSS on workloads with sparse pages (e.g., 26\% AUC reduction
-on RocksDB on macOS) but not on workloads where pages remain fully occupied.
+can reduce RSS on workloads with sparse pages but provides no benefit
+when pages remain fully occupied.
 The two techniques are complementary: Mesh eliminates internal
 waste, while \sys compresses cold data.
 Hoard~\cite{berger2000hoard} and

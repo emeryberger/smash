@@ -30,7 +30,7 @@ Redis-ext       & 55.1\%  & \textbf{0\%}        & --- \\
 \begin{table}[h]
 \caption{\textbf{Only \sys reduces RSS below fill level}
   (\S\ref{sec:eval:apps}).  Serve-phase RSS (MiB) across all five
-  workloads (macOS).}
+  workloads (Linux).}
 \label{tab:multi_alloc_apps}
 \centering\small
 \begin{tabular}{lrrrrr}
@@ -58,7 +58,7 @@ Mesh    & 618   & 309   & 97   & 78   & 298 \\
 \begin{table}[h]
 \caption{\textbf{zstd-1 achieves near-zstd-9 ratios at LZ4-class
   throughput} (\S\ref{sec:eval:algo}).  Compression ratio =
-  original\,/\,compressed (higher is better) on 16\,KiB heap pages
+  original\,/\,compressed (higher is better) on heap pages
   sampled from each application.}
 \label{tab:algo_compare}
 \centering\small
@@ -117,7 +117,7 @@ entire pages, making per-page optimizations more visible.
   page compressibility}
   (\S\ref{sec:eval:allocator}).  Compression ratio =
   original\,/\,compressed (higher is better) with zstd-9.
-  $\dagger$Already zeroes on macOS.}
+  $\dagger$Zeroes freed memory (DieHarder: security; Smash: deferred).}
 \label{tab:allocator_compare}
 \centering\small
 \begin{tabular}{lrrr}
@@ -151,11 +151,10 @@ is replaced with compressible zeros.  DieHard+zero matches DieHarder
 exactly, confirming that DieHarder's advantage comes entirely from its
 security zeroing.
 
-We verified macOS zeroing by reading memory immediately after
-\texttt{free}: 100\% of bytes are zeroed across all tested sizes
-(32--4096\,B).  On workloads with frees, system malloc
-(18.5$\times$ on memcached) outperforms allocators that leave stale
-data in freed slots (mimalloc: 13.5$\times$).
+DieHard+zero matches DieHarder exactly (confirming DieHarder's
+advantage comes entirely from security zeroing), while allocators
+without zeroing show lower compression ratios on workloads with
+frees.
 
 On SQLite (no frees), all allocators achieve 23--42$\times$
 compression because every byte on the page is live, structured data.

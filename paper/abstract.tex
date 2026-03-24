@@ -10,7 +10,7 @@ expected CPU cost and RSS savings for each page, with signal-based
 decompression on~demand.
 
 Across four applications---memcached, RocksDB,
-SQLite, and Redis---\sys reduces resident set size (RSS) by 21--86\% with negligible throughput
+SQLite, and Redis---\sys reduces resident set size (RSS) by 21--76\% with negligible throughput
 impact. We show that \sys{}'s compression
 pipeline and allocator design are synergistic: its pipeline achieves
 20--61\% RSS reduction even atop an unmodified system allocator,

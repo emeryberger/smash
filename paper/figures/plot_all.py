@@ -36,14 +36,12 @@ ACCENT_COLOR = COLORS[3]     # red
 
 def fig_rss_reduction():
     """Figure 1: RSS reduction across applications (grouped bar chart)."""
-    # Linux + macOS results from run_paper_experiments.py (March 2026)
-    apps = ['Memc.\n(Linux)', 'Memc.\n(macOS)', 'Rocks\n(Linux)', 'Rocks\n(macOS)',
-            'SQLite\n(Linux)', 'SQLite\n(macOS)', 'Redis\n(Linux)', 'Redis\n(macOS)',
-            'R-ext\n(Linux)', 'R-ext\n(macOS)']
-    mesh_rss =  [0.0,  0.0,  0.5,  0.0, 23.0, 0.0, 28.7, 0.0, 30.7, 0.0]
-    smash_rss = [82.4, 73.0, 79.5, 71.0, 69.1, 71.0, 21.2, 66.0, 23.0, 60.0]
+    # Linux results from run_paper_experiments.py (March 2026)
+    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis-ext', 'Redis']
+    mesh_rss =  [0.0,  0.5, 23.0, 30.7, 28.7]
+    smash_rss = [82.4, 79.5, 69.1, 23.0, 21.2]
 
-    fig, ax = plt.subplots(figsize=(7.0, 2.8))
+    fig, ax = plt.subplots(figsize=(4.5, 2.5))
     x = np.arange(len(apps))
     width = 0.35
 
@@ -60,7 +58,7 @@ def fig_rss_reduction():
     ax.set_ylabel('RSS Reduction (%)')
     ax.set_title('RSS Reduction: Mesh vs Smash')
     ax.set_xticks(x)
-    ax.set_xticklabels(apps, rotation=25, ha='right', fontsize=7)
+    ax.set_xticklabels(apps, rotation=25, ha='right')
     ax.set_ylim(0, 95)
     ax.legend(loc='upper right', fontsize=8)
     ax.yaxis.grid(True, alpha=0.3)
@@ -374,16 +372,14 @@ def fig_dict_overhead():
 
 def fig_auc_comparison():
     """Figure: AUC (Area Under Curve) reduction - total memory pressure over time."""
-    # Linux + macOS results from run_paper_experiments.py (March 2026)
-    apps = ['Memc.\n(Linux)', 'Memc.\n(macOS)', 'Rocks\n(Linux)', 'Rocks\n(macOS)',
-            'SQLite\n(Linux)', 'SQLite\n(macOS)', 'Redis\n(Linux)', 'Redis\n(macOS)',
-            'R-ext\n(Linux)', 'R-ext\n(macOS)']
+    # Linux results from run_paper_experiments.py (March 2026)
+    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis-ext', 'Redis']
 
     # AUC reduction % from baseline (positive = better)
-    mesh_auc_red =  [-0.9, 0.0, -9.5, 0.0, -91.2, 0.0, 0.3, 0.0, -0.5, 0.0]
-    smash_auc_red = [71.9, 73.0, 59.8, 74.0, 33.9, 57.0, -36.7, 54.0, -40.0, 57.0]
+    mesh_auc_red =  [-0.9, -9.5, -91.2, -0.5, 0.3]
+    smash_auc_red = [71.9, 59.8, 33.9, -40.0, -36.7]
 
-    fig, ax = plt.subplots(figsize=(7.0, 2.8))
+    fig, ax = plt.subplots(figsize=(4.5, 2.5))
     x = np.arange(len(apps))
     width = 0.35
 
@@ -396,7 +392,7 @@ def fig_auc_comparison():
     ax.set_ylabel('AUC Reduction (%)\n(higher = better)')
     ax.set_title('Memory Pressure Over Time (AUC)')
     ax.set_xticks(x)
-    ax.set_xticklabels(apps, rotation=25, ha='right', fontsize=7)
+    ax.set_xticklabels(apps, rotation=25, ha='right')
     ax.set_ylim(-100, 85)
     ax.legend(loc='upper right', fontsize=8)
     ax.yaxis.grid(True, alpha=0.3)

@@ -91,8 +91,8 @@ The multi-allocator comparison (\S\ref{sec:eval:apps})
 reinforces this point: across seven alternative allocators
 (mimalloc, jemalloc, tcmalloc, Hoard, Mesh, DieHard, DieHarder),
 none reduces RSS below its fill level.  Mesh's virtual-memory
-remapping helps on workloads with sparse pages (e.g., 26\% AUC
-reduction on RocksDB on macOS) but provides no benefit when pages are fully
+remapping can help on workloads with sparse pages but provides no
+benefit when pages are fully
 occupied.  Without a compression
 pipeline, an allocator can only return empty pages to the OS.
 

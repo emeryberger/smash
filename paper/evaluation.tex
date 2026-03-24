@@ -99,21 +99,26 @@ SQLite achieves 71\% (464\,MiB to 136\,MiB).
 Figure~\ref{fig:auc} shows the \emph{area under the curve} (AUC) of
 RSS over time---the integral of memory pressure across the benchmark.
 Lower AUC means less total memory consumption.  \sys reduces AUC by
-34--72\% on memcached, RocksDB, and SQLite, where compression keeps
-RSS low throughout the cooling and serving phases.  On Redis, \sys's
-higher peak RSS (due to metadata overhead) outweighs its cooling-phase
-reduction, yielding higher AUC than baseline.  Mesh shows minimal AUC
-change on most workloads; on SQLite, Mesh \emph{increases} AUC by
-91\% because its page-meshing overhead raises peak RSS without
-sufficient cooling-phase~benefit.
+55--74\% on macOS across all five workloads.  On Linux, \sys reduces AUC by
+34--72\% on memcached, RocksDB, and SQLite; on Redis, \sys's higher
+peak RSS (metadata overhead) outweighs its cooling-phase reduction.
+
+Mesh's AUC results are platform-dependent.  On macOS, Mesh reduces
+AUC by 18--34\% on Redis, Redis-ext, and RocksDB by achieving a
+\emph{lower constant} RSS via page meshing (e.g., RocksDB: 309\,MiB
+vs 416\,MiB baseline).  However, Mesh's RSS is flat---it cannot
+compress further once data goes cold.  On Linux, Mesh shows no AUC
+benefit; on SQLite, it \emph{increases} AUC by 91\% because
+page-meshing overhead raises peak RSS.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/auc_comparison.pdf}
-\caption{\textbf{\sys reduces total memory pressure (AUC) by 34--72\%
-  on compression-friendly workloads} (\S\ref{sec:eval:apps}).
-  AUC = integral of RSS over time; positive reduction = less memory pressure.
-  Redis's higher peak RSS under \sys offsets its cooling benefit.}
+\caption{\textbf{\sys reduces total memory pressure (AUC) by 55--74\%
+  on macOS} (\S\ref{sec:eval:apps}).
+  AUC = integral of RSS over time; positive = less pressure.
+  Mesh reduces AUC on macOS via lower constant RSS (page meshing)
+  but cannot compress cold data further.}
 \label{fig:auc}
 \end{figure}
 
@@ -192,10 +197,12 @@ On Linux, Mesh provides no benefit on memcached, RocksDB, or Redis
 (matching or exceeding baseline RSS).  On SQLite, Mesh \emph{increases}
 RSS by 85\% due to page-meshing overhead.  \sys achieves 52--76\%
 reduction on these workloads via compression.
-On macOS, Mesh provides no benefit on any workload (0\% reduction
-on memcached, Redis, and Redis-ext; matching system malloc on SQLite).
-Without a compression pipeline, even Mesh's aggressive page
-remapping cannot reclaim space from pages with live~objects.
+On macOS, Mesh achieves a lower \emph{constant} RSS on three workloads
+via page meshing: RocksDB (309 vs 416\,MiB, 26\% AUC reduction),
+Redis-ext (78 vs 117\,MiB, 34\%), and Redis (97 vs 117\,MiB, 18\%).
+However, Mesh's RSS is flat throughout---it cannot compress further
+once data goes cold, while \sys continues reducing RSS via compression
+(55--74\% AUC reduction on macOS).
 
 \punt{
 \paragraph{Mesh-paper Redis workload}

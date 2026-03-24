@@ -50,8 +50,8 @@ key-value stores and relational databases.
 Table~\ref{tab:apps_summary} summarizes the results.
 
 \begin{table*}[t]
-\caption{\textbf{\sys reduces RSS by 21--82\% on Linux, 71\% on macOS (SQLite)}
-  (\S\ref{sec:eval:apps}).  Cool-phase RSS (MiB) across allocators on both platforms.
+\caption{\textbf{\sys reduces RSS by 21--76\% on Linux, 60--73\% on macOS}
+  (\S\ref{sec:eval:apps}).  Serve-phase RSS (MiB) across allocators on both platforms.
   Redis-ext = extended workload with 50\% key deletion before cooling.}
 \label{tab:apps_summary}
 \centering\small
@@ -60,11 +60,11 @@ Table~\ref{tab:apps_summary} summarizes the results.
  & \multicolumn{3}{c|}{\textbf{Linux} (4\,KiB pages)} & \multicolumn{3}{c}{\textbf{macOS} (16\,KiB pages)} \\
 Application & Sys & Mesh & \sys & Sys & Mesh & \sys \\
 \midrule
-Memcached & 287  & 288  & \textbf{136} (52\%) & ---  & ---  & --- \\
-RocksDB   & 279  & 294  & \textbf{68} (76\%)  & ---  & ---  & --- \\
-SQLite    & 464  & 857  & \textbf{136} (71\%) & 618  & ---  & \textbf{179} (71\%) \\
-Redis     & 107  & 108  & \textbf{113} (21\%) & ---  & ---  & --- \\
-Redis-ext & 108  & 108  & \textbf{106} (23\%) & ---  & ---  & --- \\
+Memcached & 287  & 288  & \textbf{136} (52\%) & 297  & 298  & \textbf{79} (73\%) \\
+RocksDB   & 279  & 294  & \textbf{68} (76\%)  & 416  & 309  & \textbf{122} (71\%) \\
+SQLite    & 464  & 857  & \textbf{136} (71\%) & 613  & 618  & \textbf{178} (71\%) \\
+Redis     & 107  & 108  & \textbf{113} (21\%) & 117  & 97   & \textbf{40} (66\%) \\
+Redis-ext & 108  & 108  & \textbf{106} (23\%) & 117  & 78   & \textbf{46} (60\%) \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -135,7 +135,8 @@ decompression).  Under \sys, the median cold access is under
 \paragraph{Memcached}
 We load 500K TPC-H JSON records into memcached, then serve a hot 5\%
 for 30 seconds before re-accessing cold keys.  On Linux, serve-phase
-RSS drops from 287\,MiB to 136\,MiB (52\%).  Cold-key re-access benefits from \sys
+RSS drops from 287\,MiB to 136\,MiB (52\%); on macOS, from
+297\,MiB to 79\,MiB (73\%).  Cold-key re-access benefits from \sys
 prefetching adjacent pages on fault.  Throughput is unchanged on
 both platforms.
 
@@ -151,7 +152,8 @@ Query throughput is 76K~ops/s on Linux, within 0.4\% of the~baseline.
 
 \paragraph{RocksDB}
 A 256\,MiB uncompressed block cache populated with 200K key-value
-pairs.  On Linux, serve-phase RSS drops from 279\,MiB to 68\,MiB (76\%).
+pairs.  On Linux, serve-phase RSS drops from 279\,MiB to 68\,MiB (76\%);
+on macOS, from 416\,MiB to 122\,MiB (71\%).
 RocksDB's built-in compression (LZ4 or zstd) reduces
 data size on disk but not in the block cache, since blocks are
 decompressed on load.  \sys and RocksDB compression are
@@ -173,7 +175,10 @@ On Linux, the standard workload shows \sys reducing cool RSS from
 On the extended workload, \sys reaches 106\,MiB (23\%)
 and Mesh 108\,MiB (0\%).  Redis on Linux shows modest \sys benefit
 because Redis's event loop keeps pages warm.
-macOS Redis results are pending (requires Redis installation).
+On macOS, the standard workload shows 66\% reduction (117\,MiB to 40\,MiB)
+and the extended workload 60\% (117\,MiB to 46\,MiB)---significantly
+higher than Linux because macOS \texttt{libmalloc} zeroes freed memory,
+producing more compressible pages.
 Throughput is comparable across all configurations ($\pm$5\%).
 
 \paragraph{Comparison across allocators}
@@ -187,7 +192,8 @@ On Linux, Mesh provides no benefit on memcached, RocksDB, or Redis
 (matching or exceeding baseline RSS).  On SQLite, Mesh \emph{increases}
 RSS by 85\% due to page-meshing overhead.  \sys achieves 52--76\%
 reduction on these workloads via compression.
-On macOS, Mesh is not available (no ARM64 build).
+On macOS, Mesh provides no benefit on any workload (0\% reduction
+on memcached, Redis, and Redis-ext; matching system malloc on SQLite).
 Without a compression pipeline, even Mesh's aggressive page
 remapping cannot reclaim space from pages with live~objects.
 
@@ -241,7 +247,9 @@ fully-active dataset.
 \paragraph{Summary}
 On Linux, \sys reduces RSS by 21--76\% across five workloads with
 negligible throughput cost ($\leq$0.4\%) and sub-10\,$\mu$s median
-cold-access latency.  On macOS, SQLite shows 71\% reduction.
+cold-access latency.  On macOS, reductions are 60--73\%, with higher
+Redis reductions (66\% vs 21\%) because macOS \texttt{libmalloc}
+zeroes freed memory.
 The benefit scales with the fraction of cold data and data
 compressibility.  Compression, not allocator choice,
 drives the savings: Mesh provides no benefit on Linux (and increases

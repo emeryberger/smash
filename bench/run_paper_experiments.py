@@ -58,14 +58,12 @@ ABLATION_CONFIGS = OrderedDict([
             "cmake_flags": {"SMASH_COLD_TICKS": "9999"}, "use_smash": True}),
 ])
 
-# Mesh library path (Linux)
-MESH_LIB = "/usr/lib/libmesh.so"
-
 APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext"]
 
 IS_DARWIN = platform.system() == "Darwin"
 PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
 LIB_SUFFIX = ".dylib" if IS_DARWIN else ".so"
+MESH_LIB = "/usr/local/lib/libmesh.dylib" if IS_DARWIN else "/usr/lib/libmesh.so"
 
 
 # ── Build helpers ────────────────────────────────────────────────────────────

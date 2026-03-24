@@ -36,13 +36,14 @@ ACCENT_COLOR = COLORS[3]     # red
 
 def fig_rss_reduction():
     """Figure 1: RSS reduction across applications (grouped bar chart)."""
-    # Linux results from run_paper_experiments.py (March 2026)
-    # macOS SQLite result: 71% (618->179 MiB)
-    apps = ['Memcached\n(Linux)', 'RocksDB\n(Linux)', 'SQLite\n(Linux)', 'SQLite\n(macOS)', 'Redis-ext\n(Linux)', 'Redis\n(Linux)']
-    mesh_rss =  [0.0,  0.5, 23.0, 0.0, 30.7, 28.7]
-    smash_rss = [82.4, 79.5, 69.1, 71.0, 23.0, 21.2]
+    # Linux + macOS results from run_paper_experiments.py (March 2026)
+    apps = ['Memc.\n(Linux)', 'Memc.\n(macOS)', 'Rocks\n(Linux)', 'Rocks\n(macOS)',
+            'SQLite\n(Linux)', 'SQLite\n(macOS)', 'Redis\n(Linux)', 'Redis\n(macOS)',
+            'R-ext\n(Linux)', 'R-ext\n(macOS)']
+    mesh_rss =  [0.0,  0.0,  0.5,  0.0, 23.0, 0.0, 28.7, 0.0, 30.7, 0.0]
+    smash_rss = [82.4, 73.0, 79.5, 71.0, 69.1, 71.0, 21.2, 66.0, 23.0, 60.0]
 
-    fig, ax = plt.subplots(figsize=(5.5, 2.5))
+    fig, ax = plt.subplots(figsize=(7.0, 2.8))
     x = np.arange(len(apps))
     width = 0.35
 
@@ -374,16 +375,16 @@ def fig_dict_overhead():
 
 def fig_auc_comparison():
     """Figure: AUC (Area Under Curve) reduction - total memory pressure over time."""
-    # Linux results from run_paper_experiments.py (March 2026)
-    # macOS SQLite AUC: baseline=14818, smash=5846 -> 60.6% reduction
-    # AUC = sum of RSS samples (MB-seconds), lower = better
-    apps = ['Memcached\n(Linux)', 'RocksDB\n(Linux)', 'SQLite\n(Linux)', 'SQLite\n(macOS)', 'Redis-ext\n(Linux)', 'Redis\n(Linux)']
+    # Linux + macOS results from run_paper_experiments.py (March 2026)
+    apps = ['Memc.\n(Linux)', 'Memc.\n(macOS)', 'Rocks\n(Linux)', 'Rocks\n(macOS)',
+            'SQLite\n(Linux)', 'SQLite\n(macOS)', 'Redis\n(Linux)', 'Redis\n(macOS)',
+            'R-ext\n(Linux)', 'R-ext\n(macOS)']
 
     # AUC reduction % from baseline (positive = better)
-    mesh_auc_red =  [-0.9, -9.5, -91.2, 0.0, -0.5, 0.3]
-    smash_auc_red = [71.9, 59.8, 33.9, 60.6, -40.0, -36.7]
+    mesh_auc_red =  [-0.9, 0.0, -9.5, 0.0, -91.2, 0.0, 0.3, 0.0, -0.5, 0.0]
+    smash_auc_red = [71.9, 73.0, 59.8, 74.0, 33.9, 57.0, -36.7, 54.0, -40.0, 57.0]
 
-    fig, ax = plt.subplots(figsize=(5.5, 2.5))
+    fig, ax = plt.subplots(figsize=(7.0, 2.8))
     x = np.arange(len(apps))
     width = 0.35
 

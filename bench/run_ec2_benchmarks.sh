@@ -123,7 +123,7 @@ if ! aws sts get-caller-identity >/dev/null 2>&1; then
     error "AWS credentials not configured. Run: aws configure"
 fi
 AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-AWS_REGION=$(aws configure get region || echo "us-east-1")
+AWS_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-$(aws configure get region 2>/dev/null || echo "us-east-1")}}"
 log "Account: $AWS_ACCOUNT, Region: $AWS_REGION"
 
 # Find or create key pair

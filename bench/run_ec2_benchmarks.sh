@@ -204,37 +204,85 @@ touch /tmp/setup-complete
 USERDATA
 )
 
-# Launch instance with fallback instance types on capacity errors
-INSTANCE_TYPES=("$INSTANCE_TYPE" "c5.2xlarge" "c5a.2xlarge" "c6i.2xlarge" "m5.2xlarge")
+# Query actually available instance types in this region (8-16 vCPUs, current gen)
+log "Querying available instance types in $AWS_REGION..."
+AVAILABLE_TYPES=$(aws ec2 describe-instance-type-offerings \
+    --location-type region \
+    --query 'InstanceTypeOfferings[*].InstanceType' \
+    --output text | tr '\t' '\n' | grep -E '\.(2xlarge|4xlarge)$' | sort -u)
+
+# Filter to preferred types for benchmarking (compute/general purpose, 8-16 vCPU)
+PREFERRED_PATTERNS="c7i c7a c6i c6a c5 m7i m7a m6i m6a m5 r7i r6i r5 t3"
+INSTANCE_TYPES=()
+
+# Add user-specified type first
+INSTANCE_TYPES+=("$INSTANCE_TYPE")
+
+# Add available types in preference order
+for pattern in $PREFERRED_PATTERNS; do
+    for size in 4xlarge 2xlarge; do
+        candidate="${pattern}.${size}"
+        if echo "$AVAILABLE_TYPES" | grep -q "^${candidate}$"; then
+            # Avoid duplicates
+            if [[ ! " ${INSTANCE_TYPES[*]} " =~ " ${candidate} " ]]; then
+                INSTANCE_TYPES+=("$candidate")
+            fi
+        fi
+    done
+done
+
+log "Will try instance types: ${INSTANCE_TYPES[*]:0:10}..."
+
+# Get available AZs
+AZS=($(aws ec2 describe-availability-zones --query 'AvailabilityZones[?State==`available`].ZoneName' --output text))
+log "Available AZs: ${AZS[*]}"
+
+# Launch instance - try each AZ and instance type
 INSTANCE_ID=""
+for az in "${AZS[@]}"; do
+    # Find a subnet in this AZ
+    SUBNET_ID=$(aws ec2 describe-subnets \
+        --filters "Name=availability-zone,Values=$az" "Name=default-for-az,Values=true" \
+        --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "None")
 
-for itype in "${INSTANCE_TYPES[@]}"; do
-    log "Attempting to launch $itype instance..."
-    INSTANCE_ID=$(aws ec2 run-instances \
-        --image-id "$AMI_ID" \
-        --instance-type "$itype" \
-        --key-name "$KEY_NAME" \
-        --security-group-ids "$SG_ID" \
-        --user-data "$USER_DATA" \
-        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=smash-benchmark}]" \
-        --query 'Instances[0].InstanceId' \
-        --output text 2>&1) || true
+    [[ "$SUBNET_ID" == "None" || -z "$SUBNET_ID" ]] && continue
 
-    if [[ "$INSTANCE_ID" =~ ^i- ]]; then
-        INSTANCE_TYPE="$itype"
-        log "Successfully launched $itype: $INSTANCE_ID"
-        break
-    elif [[ "$INSTANCE_ID" == *"InsufficientInstanceCapacity"* ]]; then
-        log "No capacity for $itype, trying next..."
-        INSTANCE_ID=""
-    else
-        error "Failed to launch instance: $INSTANCE_ID"
-    fi
+    for itype in "${INSTANCE_TYPES[@]:0:15}"; do
+        log "Trying $itype in $az..."
+        RESULT=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --instance-type "$itype" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "$SG_ID" \
+            --subnet-id "$SUBNET_ID" \
+            --user-data "$USER_DATA" \
+            --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=smash-benchmark}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text 2>&1) || true
+
+        if [[ "$RESULT" =~ ^i- ]]; then
+            INSTANCE_ID="$RESULT"
+            INSTANCE_TYPE="$itype"
+            log "Successfully launched $itype in $az: $INSTANCE_ID"
+            break 2
+        elif [[ "$RESULT" == *"InsufficientInstanceCapacity"* ]]; then
+            log "  No capacity"
+        elif [[ "$RESULT" == *"Unsupported"* ]]; then
+            log "  Unsupported in this AZ"
+        else
+            log "  Error: ${RESULT:0:100}"
+        fi
+    done
 done
 
 if [[ -z "$INSTANCE_ID" ]]; then
-    error "Could not launch any instance type due to capacity constraints. Try a different region."
+    echo ""
+    echo "Could not launch any instance. Suggestions:"
+    echo "  1. Try a different region: AWS_DEFAULT_REGION=us-east-1 $0"
+    echo "  2. Try a specific type: $0 --instance-type t3.xlarge"
+    echo "  3. Wait and retry (capacity fluctuates)"
+    error "No instance capacity available"
 fi
 log "Instance ID: $INSTANCE_ID (type: $INSTANCE_TYPE)"
 

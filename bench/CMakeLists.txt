@@ -194,16 +194,107 @@ else()
   message(STATUS "jemalloc not found (optional)")
 endif()
 
-# tcmalloc (system install, optional)
-find_library(TCMALLOC_LIB tcmalloc_minimal)
-if(TCMALLOC_LIB)
+# tcmalloc - build from source
+#
+# google/tcmalloc (Bazel-based, per-CPU caches) requires glibc >= 2.35 for
+# RSEQ TLS support.  On older glibc (e.g., Amazon Linux 2 with glibc 2.26)
+# it segfaults during ld.so initialization.  We attempt google/tcmalloc first
+# when both Bazel and a suitable glibc are available; otherwise fall back to
+# gperftools 2.16 (the stable autotools-based fork).
+include(ExternalProject)
+
+# Detect glibc version for google/tcmalloc compatibility
+set(_GLIBC_VERSION "0")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  execute_process(
+    COMMAND ldd --version
+    OUTPUT_VARIABLE _ldd_output ERROR_VARIABLE _ldd_output
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  string(REGEX MATCH "[0-9]+\\.[0-9]+" _GLIBC_VERSION "${_ldd_output}")
+endif()
+
+find_program(BAZEL_PROG bazel bazelisk)
+if(BAZEL_PROG AND _GLIBC_VERSION VERSION_GREATER_EQUAL "2.35")
+  # ── google/tcmalloc via Bazel ────────────────────────────────────────────
+  set(TCMALLOC_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/tcmalloc)
+  set(TCMALLOC_SO ${TCMALLOC_PREFIX}/lib/libtcmalloc.so)
+
+  ExternalProject_Add(tcmalloc_build
+    GIT_REPOSITORY https://github.com/google/tcmalloc.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+    PREFIX ${TCMALLOC_PREFIX}
+    CONFIGURE_COMMAND ""
+    PATCH_COMMAND
+      ${CMAKE_COMMAND} -E echo "" > <SOURCE_DIR>/tcmalloc/tcmalloc_so.cc &&
+      ${CMAKE_COMMAND}
+        -DBUILD_FILE=<SOURCE_DIR>/tcmalloc/BUILD
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tcmalloc_patch_build.cmake
+    BUILD_IN_SOURCE TRUE
+    BUILD_COMMAND
+      ${CMAKE_COMMAND} -E env USE_BAZEL_VERSION=8.2.1
+      ${BAZEL_PROG} build -c opt //tcmalloc:libtcmalloc_preload.so
+    INSTALL_COMMAND
+      ${CMAKE_COMMAND} -E make_directory ${TCMALLOC_PREFIX}/lib &&
+      ${CMAKE_COMMAND} -E copy
+        <SOURCE_DIR>/bazel-bin/tcmalloc/libtcmalloc_preload.so
+        ${TCMALLOC_SO}
+    BUILD_BYPRODUCTS ${TCMALLOC_SO}
+  )
+
   smash_add_alloc_bench(bench_alloc_tcmalloc "tcmalloc")
-  target_link_libraries(bench_alloc_tcmalloc PRIVATE ${TCMALLOC_LIB})
+  target_link_libraries(bench_alloc_tcmalloc PRIVATE ${TCMALLOC_SO} Threads::Threads)
+  add_dependencies(bench_alloc_tcmalloc tcmalloc_build)
+
   smash_add_alloc_bench_zero(bench_alloc_tcmalloc_zero "tcmalloc+zero")
-  target_link_libraries(bench_alloc_tcmalloc_zero PRIVATE ${TCMALLOC_LIB})
-  message(STATUS "tcmalloc found: ${TCMALLOC_LIB}")
+  target_link_libraries(bench_alloc_tcmalloc_zero PRIVATE ${TCMALLOC_SO} Threads::Threads)
+  add_dependencies(bench_alloc_tcmalloc_zero tcmalloc_build)
+
+  set(BENCH_TCMALLOC_LIB ${TCMALLOC_SO} CACHE PATH "")
+  message(STATUS "google/tcmalloc (latest) will be built from source using Bazel 8.2.1")
 else()
-  message(STATUS "tcmalloc not found (optional)")
+  # ── gperftools/tcmalloc 2.16 (works on all glibc versions) ──────────────
+  if(BAZEL_PROG AND _GLIBC_VERSION VERSION_LESS "2.35")
+    message(STATUS "glibc ${_GLIBC_VERSION} < 2.35: google/tcmalloc requires RSEQ TLS; using gperftools instead")
+  endif()
+
+  include(ProcessorCount)
+  ProcessorCount(_TCMALLOC_NCPU)
+  if(_TCMALLOC_NCPU EQUAL 0)
+    set(_TCMALLOC_NCPU 4)
+  endif()
+
+  set(GPERFTOOLS_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/gperftools)
+  ExternalProject_Add(tcmalloc_build
+    URL https://github.com/gperftools/gperftools/releases/download/gperftools-2.16/gperftools-2.16.tar.gz
+    URL_HASH SHA256=f12624af5c5987f2cc830ee534f754c3c5961eec08004c26a8b80de015cf056f
+    PREFIX ${GPERFTOOLS_PREFIX}
+    CONFIGURE_COMMAND
+      <SOURCE_DIR>/configure
+        --prefix=${GPERFTOOLS_PREFIX}/install
+        --enable-minimal
+        --disable-debugalloc
+    BUILD_COMMAND make -j${_TCMALLOC_NCPU}
+    INSTALL_COMMAND make install
+    BUILD_BYPRODUCTS
+      ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal.so
+      ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal.a
+  )
+  set(TCMALLOC_LIB_BUILTIN ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal.so)
+  set(TCMALLOC_INCLUDE_BUILTIN ${GPERFTOOLS_PREFIX}/install/include)
+
+  smash_add_alloc_bench(bench_alloc_tcmalloc "tcmalloc")
+  target_link_libraries(bench_alloc_tcmalloc PRIVATE ${TCMALLOC_LIB_BUILTIN} Threads::Threads)
+  target_include_directories(bench_alloc_tcmalloc PRIVATE ${TCMALLOC_INCLUDE_BUILTIN})
+  add_dependencies(bench_alloc_tcmalloc tcmalloc_build)
+
+  smash_add_alloc_bench_zero(bench_alloc_tcmalloc_zero "tcmalloc+zero")
+  target_link_libraries(bench_alloc_tcmalloc_zero PRIVATE ${TCMALLOC_LIB_BUILTIN} Threads::Threads)
+  target_include_directories(bench_alloc_tcmalloc_zero PRIVATE ${TCMALLOC_INCLUDE_BUILTIN})
+  add_dependencies(bench_alloc_tcmalloc_zero tcmalloc_build)
+
+  set(BENCH_TCMALLOC_LIB ${TCMALLOC_LIB_BUILTIN} CACHE PATH "")
+  message(STATUS "gperftools/tcmalloc 2.16 will be built from source")
 endif()
 
 # Hoard (system install, optional)
@@ -591,12 +682,22 @@ if(SMASH_BUILD_BENCH_DEPS)
   if(TARGET memcached_build)
     add_dependencies(bench_deps memcached_build)
   endif()
+  if(TARGET tcmalloc_build)
+    add_dependencies(bench_deps tcmalloc_build)
+  endif()
 
   message(STATUS "Benchmark dependencies (${BENCH_DEPS_DIR}):")
   message(STATUS "  Redis 8.0.2 (libc malloc)")
   message(STATUS "  Memcached 1.6.34")
   message(STATUS "  RocksDB 9.8.4 (static)")
   message(STATUS "  DuckDB 1.2.2 (no jemalloc)")
+  if(TARGET tcmalloc_build)
+    if(BAZEL_PROG AND _GLIBC_VERSION VERSION_GREATER_EQUAL "2.35")
+      message(STATUS "  google/tcmalloc (latest, via Bazel 8.2.1)")
+    else()
+      message(STATUS "  gperftools/tcmalloc 2.16")
+    endif()
+  endif()
 
   # ── bench_rocksdb linked against our static RocksDB ────────────────────────
   add_executable(bench_rocksdb_builtin bench_rocksdb.cpp)

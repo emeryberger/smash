@@ -5,11 +5,11 @@
 #   1. Standard:  SET → cool → GET
 #   2. Extended:  SET → DELETE 50% → cool → GET
 #
-# Uses redis-benchmark (LLAMA-style config: 5K connections, 100K ops, 1000B values).
+# Uses redis-benchmark (~1GB footprint: 5K connections, 500K ops, 1KB values, 1M keyspace).
 # Requires redis-server, redis-cli, and redis-benchmark in PATH or built by cmake.
 #
 # Usage:
-#   bash bench_redis.sh [--quick]
+#   bash bench_redis.sh [--quick|--small]
 #
 # Compatible with bash 3.2+ (macOS default).
 
@@ -41,18 +41,26 @@ else
 fi
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
-NUM_OPS=100000
+# Default: ~1GB footprint (1M keys × 1KB values)
+NUM_OPS=500000
 NUM_CLIENTS=5000
 VALUE_SIZE=1000
-KEYSPACE=100000
-COOL_DURATION=15
+KEYSPACE=1000000
+COOL_DURATION=30
 
 for arg in "$@"; do
     case "$arg" in
         --quick)
-            NUM_OPS=50000
+            NUM_OPS=100000
             NUM_CLIENTS=1000
-            COOL_DURATION=8
+            KEYSPACE=100000
+            COOL_DURATION=15
+            ;;
+        --small)
+            NUM_OPS=50000
+            NUM_CLIENTS=500
+            KEYSPACE=50000
+            COOL_DURATION=10
             ;;
         *) echo "Unknown flag: $arg"; exit 1 ;;
     esac

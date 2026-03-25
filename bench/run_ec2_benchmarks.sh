@@ -130,18 +130,24 @@ log "Account: $AWS_ACCOUNT, Region: $AWS_REGION"
 if [[ -z "$KEY_NAME" ]]; then
     KEY_NAME="smash-bench-$(whoami)"
 fi
+TMP_KEY_FILE="$HOME/.ssh/${KEY_NAME}.pem"
 
-if ! aws ec2 describe-key-pairs --key-names "$KEY_NAME" >/dev/null 2>&1; then
+if aws ec2 describe-key-pairs --key-names "$KEY_NAME" >/dev/null 2>&1; then
+    # Key exists in AWS
+    if [[ ! -f "$TMP_KEY_FILE" ]]; then
+        log "Key pair '$KEY_NAME' exists but local .pem missing - recreating..."
+        aws ec2 delete-key-pair --key-name "$KEY_NAME"
+        aws ec2 create-key-pair --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$TMP_KEY_FILE"
+        chmod 600 "$TMP_KEY_FILE"
+        log "Key recreated and saved to $TMP_KEY_FILE"
+    fi
+else
+    # Key doesn't exist - create it
     log "Creating new key pair: $KEY_NAME"
-    TMP_KEY_FILE="$HOME/.ssh/${KEY_NAME}.pem"
+    mkdir -p "$(dirname "$TMP_KEY_FILE")"
     aws ec2 create-key-pair --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$TMP_KEY_FILE"
     chmod 600 "$TMP_KEY_FILE"
     log "Key saved to $TMP_KEY_FILE"
-else
-    TMP_KEY_FILE="$HOME/.ssh/${KEY_NAME}.pem"
-    if [[ ! -f "$TMP_KEY_FILE" ]]; then
-        error "Key pair '$KEY_NAME' exists but $TMP_KEY_FILE not found. Specify --key-name with a valid key."
-    fi
 fi
 
 # Find latest Amazon Linux 2023 AMI
@@ -198,19 +204,39 @@ touch /tmp/setup-complete
 USERDATA
 )
 
-# Launch instance
-log "Launching $INSTANCE_TYPE instance..."
-INSTANCE_ID=$(aws ec2 run-instances \
-    --image-id "$AMI_ID" \
-    --instance-type "$INSTANCE_TYPE" \
-    --key-name "$KEY_NAME" \
-    --security-group-ids "$SG_ID" \
-    --user-data "$USER_DATA" \
-    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=smash-benchmark}]" \
-    --query 'Instances[0].InstanceId' \
-    --output text)
-log "Instance ID: $INSTANCE_ID"
+# Launch instance with fallback instance types on capacity errors
+INSTANCE_TYPES=("$INSTANCE_TYPE" "c5.2xlarge" "c5a.2xlarge" "c6i.2xlarge" "m5.2xlarge")
+INSTANCE_ID=""
+
+for itype in "${INSTANCE_TYPES[@]}"; do
+    log "Attempting to launch $itype instance..."
+    INSTANCE_ID=$(aws ec2 run-instances \
+        --image-id "$AMI_ID" \
+        --instance-type "$itype" \
+        --key-name "$KEY_NAME" \
+        --security-group-ids "$SG_ID" \
+        --user-data "$USER_DATA" \
+        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=smash-benchmark}]" \
+        --query 'Instances[0].InstanceId' \
+        --output text 2>&1) || true
+
+    if [[ "$INSTANCE_ID" =~ ^i- ]]; then
+        INSTANCE_TYPE="$itype"
+        log "Successfully launched $itype: $INSTANCE_ID"
+        break
+    elif [[ "$INSTANCE_ID" == *"InsufficientInstanceCapacity"* ]]; then
+        log "No capacity for $itype, trying next..."
+        INSTANCE_ID=""
+    else
+        error "Failed to launch instance: $INSTANCE_ID"
+    fi
+done
+
+if [[ -z "$INSTANCE_ID" ]]; then
+    error "Could not launch any instance type due to capacity constraints. Try a different region."
+fi
+log "Instance ID: $INSTANCE_ID (type: $INSTANCE_TYPE)"
 
 # Wait for instance to be running
 log "Waiting for instance to start..."

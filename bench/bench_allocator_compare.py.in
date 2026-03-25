@@ -45,7 +45,7 @@ ALLOCATORS = OrderedDict([
     ("tcmalloc", {
         "exe": "bench_alloc_tcmalloc",
         "env": {"TCMALLOC_RELEASE_RATE": "0"},
-        "desc": "tcmalloc (embedded freelists)",
+        "desc": "tcmalloc (built from source)",
         "optional": True,
     }),
     ("hoard", {
@@ -92,7 +92,7 @@ ALLOCATORS = OrderedDict([
     ("tcmalloc+zero", {
         "exe": "bench_alloc_tcmalloc_zero",
         "env": {"TCMALLOC_RELEASE_RATE": "0"},
-        "desc": "tcmalloc + zero-on-free",
+        "desc": "tcmalloc + zero-on-free (built from source)",
         "optional": True,
     }),
     ("hoard+zero", {

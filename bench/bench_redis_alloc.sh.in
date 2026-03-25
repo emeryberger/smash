@@ -7,7 +7,7 @@
 #   Extended: SET → DELETE ~50% → cool → GET
 #
 # Usage:
-#   bash bench_redis_alloc.sh [--quick]
+#   bash bench_redis_alloc.sh [--quick|--small]
 #
 # Compatible with bash 3.2+ (macOS default).
 
@@ -25,18 +25,26 @@ else
     SMASH_LIB="${BUILD_DIR}/libsmash.so"
 fi
 
-NUM_OPS=100000
+# Default: ~1GB footprint (1M keys × 1KB values)
+NUM_OPS=500000
 NUM_CLIENTS=5000
 VALUE_SIZE=1000
-KEYSPACE=100000
-COOL_DURATION=15
+KEYSPACE=1000000
+COOL_DURATION=30
 
 for arg in "$@"; do
     case "$arg" in
         --quick)
-            NUM_OPS=50000
+            NUM_OPS=100000
             NUM_CLIENTS=1000
-            COOL_DURATION=5
+            KEYSPACE=100000
+            COOL_DURATION=15
+            ;;
+        --small)
+            NUM_OPS=50000
+            NUM_CLIENTS=500
+            KEYSPACE=50000
+            COOL_DURATION=10
             ;;
         *) echo "Unknown flag: $arg"; exit 1 ;;
     esac
@@ -50,11 +58,20 @@ for cmd in redis-server redis-cli redis-benchmark; do
     fi
 done
 
+# Allocator library paths - prefer built versions, fall back to system
+TCMALLOC_LIB_PATH="@BENCH_TCMALLOC_LIB@"
+if [[ -z "$TCMALLOC_LIB_PATH" || "$TCMALLOC_LIB_PATH" == "@BENCH_TCMALLOC_LIB@" ]]; then
+    # Fallback to common system locations
+    for p in /opt/homebrew/lib/libtcmalloc.dylib /usr/lib64/libtcmalloc.so /usr/local/lib/libtcmalloc.so; do
+        [[ -f "$p" ]] && TCMALLOC_LIB_PATH="$p" && break
+    done
+fi
+
 declare -a ALLOCATORS=(
     "system||"
     "mimalloc|/opt/homebrew/lib/libmimalloc.dylib|MIMALLOC_PURGE_DELAY=-1"
     "jemalloc|/opt/homebrew/lib/libjemalloc.dylib|MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"
-    "tcmalloc|/opt/homebrew/lib/libtcmalloc.dylib|TCMALLOC_RELEASE_RATE=0"
+    "tcmalloc|${TCMALLOC_LIB_PATH}|TCMALLOC_RELEASE_RATE=0"
     "hoard|/usr/local/lib/libhoard.dylib|"
     "mesh|/Users/emery/git/mesh/build/lib/libmesh.dylib|"
     "diehard|/usr/local/lib/libdiehard.dylib|"

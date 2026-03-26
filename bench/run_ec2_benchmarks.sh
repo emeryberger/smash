@@ -123,7 +123,25 @@ if ! aws sts get-caller-identity >/dev/null 2>&1; then
     error "AWS credentials not configured. Run: aws configure"
 fi
 AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-AWS_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-$(aws configure get region 2>/dev/null || echo "us-east-1")}}"
+AWS_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-$(aws configure get region 2>/dev/null || echo "us-west-2")}}"
+
+# Verify we have a default VPC with subnets in this region
+DEFAULT_SUBNETS=$(aws ec2 describe-subnets --region "$AWS_REGION" \
+    --filters "Name=default-for-az,Values=true" \
+    --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "None")
+if [[ "$DEFAULT_SUBNETS" == "None" || -z "$DEFAULT_SUBNETS" ]]; then
+    # Try to find a region with default subnets
+    for try_region in us-west-2 us-east-1 us-east-2 eu-west-1; do
+        check=$(aws ec2 describe-subnets --region "$try_region" \
+            --filters "Name=default-for-az,Values=true" \
+            --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "None")
+        if [[ "$check" != "None" && -n "$check" ]]; then
+            log "No default VPC in $AWS_REGION, switching to $try_region"
+            AWS_REGION="$try_region"
+            break
+        fi
+    done
+fi
 log "Account: $AWS_ACCOUNT, Region: $AWS_REGION"
 
 # Find or create key pair
@@ -132,12 +150,12 @@ if [[ -z "$KEY_NAME" ]]; then
 fi
 TMP_KEY_FILE="$HOME/.ssh/${KEY_NAME}.pem"
 
-if aws ec2 describe-key-pairs --key-names "$KEY_NAME" >/dev/null 2>&1; then
+if aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
     # Key exists in AWS
     if [[ ! -f "$TMP_KEY_FILE" ]]; then
         log "Key pair '$KEY_NAME' exists but local .pem missing - recreating..."
-        aws ec2 delete-key-pair --key-name "$KEY_NAME"
-        aws ec2 create-key-pair --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$TMP_KEY_FILE"
+        aws ec2 delete-key-pair --region "$AWS_REGION" --key-name "$KEY_NAME"
+        aws ec2 create-key-pair --region "$AWS_REGION" --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$TMP_KEY_FILE"
         chmod 600 "$TMP_KEY_FILE"
         log "Key recreated and saved to $TMP_KEY_FILE"
     fi
@@ -145,7 +163,7 @@ else
     # Key doesn't exist - create it
     log "Creating new key pair: $KEY_NAME"
     mkdir -p "$(dirname "$TMP_KEY_FILE")"
-    aws ec2 create-key-pair --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$TMP_KEY_FILE"
+    aws ec2 create-key-pair --region "$AWS_REGION" --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$TMP_KEY_FILE"
     chmod 600 "$TMP_KEY_FILE"
     log "Key saved to $TMP_KEY_FILE"
 fi
@@ -153,6 +171,7 @@ fi
 # Find latest Amazon Linux 2023 AMI
 log "Finding latest Amazon Linux 2023 AMI..."
 AMI_ID=$(aws ec2 describe-images \
+    --region "$AWS_REGION" \
     --owners amazon \
     --filters "Name=name,Values=$AMI_NAME_PATTERN" "Name=state,Values=available" \
     --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
@@ -162,11 +181,11 @@ log "Using AMI: $AMI_ID"
 
 # Create security group if needed
 SG_NAME="smash-bench-sg"
-SG_ID=$(aws ec2 describe-security-groups --group-names "$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
+SG_ID=$(aws ec2 describe-security-groups --region "$AWS_REGION" --group-names "$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
 if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
     log "Creating security group: $SG_NAME"
-    SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "Smash benchmark access" --query 'GroupId' --output text)
-    aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+    SG_ID=$(aws ec2 create-security-group --region "$AWS_REGION" --group-name "$SG_NAME" --description "Smash benchmark access" --query 'GroupId' --output text)
+    aws ec2 authorize-security-group-ingress --region "$AWS_REGION" --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
 fi
 log "Security group: $SG_ID"
 
@@ -204,31 +223,42 @@ touch /tmp/setup-complete
 USERDATA
 )
 
-# Query actually available instance types in this region (8-16 vCPUs, current gen)
+# Query actually available instance types in this region
 log "Querying available instance types in $AWS_REGION..."
 AVAILABLE_TYPES=$(aws ec2 describe-instance-type-offerings \
+    --region "$AWS_REGION" \
     --location-type region \
     --query 'InstanceTypeOfferings[*].InstanceType' \
-    --output text | tr '\t' '\n' | grep -E '\.(2xlarge|4xlarge)$' | sort -u)
+    --output text | tr '\t' '\n' | grep -E '\.(xlarge|2xlarge|4xlarge)$' | sort -u)
 
-# Filter to preferred types for benchmarking (compute/general purpose, 8-16 vCPU)
-PREFERRED_PATTERNS="c7i c7a c6i c6a c5 m7i m7a m6i m6a m5 r7i r6i r5 t3"
+# Filter to preferred types for benchmarking (need 32GB RAM)
+# General-purpose (m-series) often has better availability than compute-optimized (c-series)
+# Memory per instance:
+#   *.4xlarge = 16 vCPU: c=32GB, m=64GB, r=128GB
+#   *.2xlarge = 8 vCPU:  c=16GB, m=32GB, r=64GB
+#   r*.xlarge = 4 vCPU, 32GB (memory-optimized)
+#   t3.2xlarge = 8 vCPU, 32GB (burstable, usually available)
 INSTANCE_TYPES=()
 
 # Add user-specified type first
 INSTANCE_TYPES+=("$INSTANCE_TYPE")
 
-# Add available types in preference order
-for pattern in $PREFERRED_PATTERNS; do
-    for size in 4xlarge 2xlarge; do
-        candidate="${pattern}.${size}"
-        if echo "$AVAILABLE_TYPES" | grep -q "^${candidate}$"; then
-            # Avoid duplicates
-            if [[ ! " ${INSTANCE_TYPES[*]} " =~ " ${candidate} " ]]; then
-                INSTANCE_TYPES+=("$candidate")
-            fi
+# Preferred types in order: general purpose > compute > memory > burstable
+# For 32GB: m*.2xlarge, c*.4xlarge, r*.xlarge, t3.2xlarge
+PREFERRED_32GB=(
+    "m7i.2xlarge" "m7a.2xlarge" "m6i.2xlarge" "m6a.2xlarge" "m5.2xlarge" "m5a.2xlarge"
+    "c7i.4xlarge" "c7a.4xlarge" "c6i.4xlarge" "c6a.4xlarge" "c5.4xlarge" "c5a.4xlarge"
+    "r7i.xlarge" "r6i.xlarge" "r6a.xlarge" "r5.xlarge" "r5a.xlarge"
+    "t3.2xlarge" "t3a.2xlarge"
+)
+
+for candidate in "${PREFERRED_32GB[@]}"; do
+    if echo "$AVAILABLE_TYPES" | grep -q "^${candidate}$"; then
+        # Avoid duplicates
+        if [[ ! " ${INSTANCE_TYPES[*]} " =~ " ${candidate} " ]]; then
+            INSTANCE_TYPES+=("$candidate")
         fi
-    done
+    fi
 done
 
 log "Will try instance types: ${INSTANCE_TYPES[*]:0:10}..."
@@ -270,8 +300,10 @@ for az in "${AZS[@]}"; do
             log "  No capacity"
         elif [[ "$RESULT" == *"Unsupported"* ]]; then
             log "  Unsupported in this AZ"
+        elif [[ "$RESULT" == *"InvalidSubnetID"* || "$RESULT" == *"subnet"* ]]; then
+            log "  Invalid/missing subnet in $az"
         else
-            log "  Error: ${RESULT:0:100}"
+            log "  Error: ${RESULT:0:150}"
         fi
     done
 done

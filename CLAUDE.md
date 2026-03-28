@@ -235,6 +235,53 @@ python3 plot_cdf.py              # Cold-access latency CDF (Figure 8)
 cd paper && pdflatex paper && bibtex paper && pdflatex paper && pdflatex paper
 ```
 
+## Application-Specific Configuration
+
+### Redis
+
+Redis's event loop and background tasks can prevent Smash from compressing pages effectively. By default, Redis touches heap pages frequently via:
+
+- **Event loop timer** (`hz` setting): Runs background tasks at 10 Hz by default
+- **Active defragmentation** (`activedefrag`): Scans memory for fragmentation
+- **Incremental rehashing** (`activerehashing`): Resizes hash tables incrementally
+- **Lazy-free operations**: Background deletion of large objects
+
+To achieve effective compression with Smash, disable these background activities:
+
+```bash
+redis-server --port 6379 \
+    --hz 1 --dynamic-hz no \          # Minimize event loop frequency
+    --activedefrag no \               # Disable active defragmentation
+    --activerehashing no \            # Disable incremental rehashing
+    --lazyfree-lazy-user-del no \     # Synchronous deletes
+    --lazyfree-lazy-expire no \       # Synchronous expirations
+    --lazyfree-lazy-eviction no \     # Synchronous evictions
+    --maxmemory-policy noeviction \   # Prevent LRU eviction touching pages
+    --save "" --appendonly no         # Disable persistence
+```
+
+**EC2 benchmark results (200K ops, 2KB values, 20s cooling):**
+
+**Standard workload (SET → cool → GET):**
+| Config | Fill RSS | Min RSS | Reduction | AUC |
+|--------|----------|---------|-----------|-----|
+| jemalloc (default) | 333 MB | 332 MB | 0.4% | 6651 MB*s |
+| jemalloc (bg disabled) | 334 MB | 333 MB | 0.4% | 6672 MB*s |
+| **Smash (bg disabled)** | 382 MB | 204 MB | **47%** | **4388 MB*s** |
+
+**Extended workload (SET → DELETE 50% → cool → GET):**
+| Config | Fill RSS | Min RSS | Reduction | AUC |
+|--------|----------|---------|-----------|-----|
+| jemalloc (bg disabled) | 333 MB | 331 MB | 0.7% | 6623 MB*s |
+| Smash (bg disabled) | 386 MB | 637 MB | **-65%** | 12750 MB*s |
+
+Key findings:
+- **Disabling background tasks has no effect on jemalloc** (RSS, AUC identical)
+- **Standard workload: Smash achieves 47% RSS reduction and 34% lower AUC**
+- **Extended workload: Smash shows NEGATIVE benefit** (-65% RSS, +93% AUC) because DELETE operations cause decompression, and the fragmented pages don't re-compress well
+
+Without these flags, Redis's background tasks keep pages warm and Smash cannot compress them effectively.
+
 ## Config Tuning
 
 Key constants in `include/smash/config.h`:

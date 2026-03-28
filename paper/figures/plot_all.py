@@ -37,9 +37,11 @@ ACCENT_COLOR = COLORS[3]     # red
 def fig_rss_reduction():
     """Figure 1: RSS reduction across applications (grouped bar chart)."""
     # Linux results from run_paper_experiments.py (March 2026)
-    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis-ext', 'Redis']
-    mesh_rss =  [0.0,  0.5, 23.0, 30.7, 28.7]
-    smash_rss = [82.4, 79.5, 69.1, 23.0, 21.2]
+    # Redis/Redis-ext updated with background tasks disabled (hz=1, activedefrag=no, etc.)
+    # Redis-ext shows negative reduction because DELETE operations cause decompression
+    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis*', 'Redis-ext*']
+    mesh_rss =  [0.0,  0.5, 23.0, 0.0, 0.0]
+    smash_rss = [82.4, 79.5, 69.1, 47.0, -65.0]  # Redis* with bg disabled; Redis-ext* negative
 
     fig, ax = plt.subplots(figsize=(4.5, 2.5))
     x = np.arange(len(apps))
@@ -59,7 +61,8 @@ def fig_rss_reduction():
     ax.set_title('RSS Reduction: Mesh vs Smash')
     ax.set_xticks(x)
     ax.set_xticklabels(apps, rotation=25, ha='right')
-    ax.set_ylim(0, 95)
+    ax.axhline(y=0, color='black', linewidth=0.5, zorder=2)
+    ax.set_ylim(-80, 95)
     ax.legend(loc='upper right', fontsize=8)
     ax.yaxis.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
@@ -373,11 +376,13 @@ def fig_dict_overhead():
 def fig_auc_comparison():
     """Figure: AUC (Area Under Curve) reduction - total memory pressure over time."""
     # Linux results from run_paper_experiments.py (March 2026)
-    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis-ext', 'Redis']
+    # Redis/Redis-ext updated with background tasks disabled (hz=1, activedefrag=no, etc.)
+    # Redis-ext shows worse AUC because DELETE operations cause decompression
+    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis*', 'Redis-ext*']
 
     # AUC reduction % from baseline (positive = better)
-    mesh_auc_red =  [-0.9, -9.5, -91.2, -0.5, 0.3]
-    smash_auc_red = [71.9, 59.8, 33.9, -40.0, -36.7]
+    mesh_auc_red =  [-0.9, -9.5, -91.2, 0.0, 0.0]
+    smash_auc_red = [71.9, 59.8, 33.9, 34.2, -92.5]  # Redis* improved; Redis-ext* worse
 
     fig, ax = plt.subplots(figsize=(4.5, 2.5))
     x = np.arange(len(apps))

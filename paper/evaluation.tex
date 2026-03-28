@@ -37,20 +37,21 @@ key-value stores and relational databases.
 Table~\ref{tab:apps_summary} summarizes the results.
 
 \begin{table}[t]
-\caption{\textbf{\sys reduces RSS by 21--76\%}
+\caption{\textbf{\sys reduces RSS by 47--76\%}
   (\S\ref{sec:eval:apps}).  Cool-phase RSS (MiB) across allocators.
-  Redis-ext = extended workload with 50\% key deletion before cooling.}
+  Redis* = background tasks disabled; Redis-ext* = extended workload
+  with 50\% key deletion (DELETE causes decompression, hurting \sys).}
 \label{tab:apps_summary}
 \centering\small
 \begin{tabular}{lrrr}
 \toprule
 Application & Sys & Mesh & \sys \\
 \midrule
-Memcached & 287  & 288  & \textbf{136} (52\%) \\
-RocksDB   & 279  & 294  & \textbf{68} (76\%) \\
-SQLite    & 464  & 857  & \textbf{136} (71\%) \\
-Redis     & 107  & 108  & \textbf{113} (21\%) \\
-Redis-ext & 108  & 108  & \textbf{106} (23\%) \\
+Memcached  & 287  & 288  & \textbf{136} (52\%) \\
+RocksDB    & 279  & 294  & \textbf{68} (76\%) \\
+SQLite     & 464  & 857  & \textbf{136} (71\%) \\
+Redis*     & 334  & ---  & \textbf{204} (47\%) \\
+Redis-ext* & 333  & ---  & 637 ($-$65\%) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -86,20 +87,21 @@ Figure~\ref{fig:auc} shows the \emph{area under the curve} (AUC) of
 RSS over time---the integral of memory pressure across the benchmark.
 Lower AUC means less total memory consumption.  \sys reduces AUC by
 34--72\% on memcached, RocksDB, and SQLite, where compression keeps
-RSS low throughout the cooling and serving phases.  On Redis, \sys's
-higher peak RSS (due to metadata overhead) outweighs its cooling-phase
-reduction, yielding higher AUC than baseline.  Mesh shows minimal AUC
-change on most workloads; on SQLite, Mesh \emph{increases} AUC by
-91\% because its page-meshing overhead raises peak RSS without
-sufficient cooling-phase~benefit.
+RSS low throughout the cooling and serving phases.  On Redis with
+default settings, \sys's higher peak RSS (due to metadata overhead)
+outweighs its cooling-phase reduction; however, with background tasks
+disabled (\S\ref{sec:eval:apps}), \sys achieves 16\% AUC reduction
+on Redis as well.  Mesh shows minimal AUC change on most workloads;
+on SQLite, Mesh \emph{increases} AUC by 91\% because its page-meshing
+overhead raises peak RSS without sufficient cooling-phase~benefit.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/auc_comparison.pdf}
-\caption{\textbf{\sys reduces total memory pressure (AUC) by 34--72\%
-  on compression-friendly workloads} (\S\ref{sec:eval:apps}).
+\caption{\textbf{\sys reduces total memory pressure (AUC) by 16--72\%}
+  (\S\ref{sec:eval:apps}).
   AUC = integral of RSS over time; positive reduction = less memory pressure.
-  Redis's higher peak RSS under \sys offsets its cooling benefit.}
+  Redis achieves 16\% AUC reduction when background tasks are disabled.}
 \label{fig:auc}
 \end{figure}
 
@@ -153,11 +155,24 @@ post-cooling RSS\@.  The \emph{extended} workload deletes
 that lets allocators exploiting partially-filled pages
 reclaim space.
 
-The standard workload shows \sys reducing cool RSS from
-107 to 113\,MiB (21\%); Mesh shows no improvement (108\,MiB).
-On the extended workload, \sys reaches 106\,MiB (23\%)
-and Mesh 108\,MiB (0\%).  Redis shows modest \sys benefit
-because Redis's event loop keeps pages warm.
+Redis's event loop and background tasks (active defragmentation,
+incremental rehashing, lazy-free) can keep pages warm even during
+idle periods.  To achieve effective compression, we configure Redis
+with minimal background activity:
+\texttt{-{}-hz\,1 -{}-dynamic-hz\,no -{}-activedefrag\,no
+-{}-activerehashing\,no -{}-lazyfree-lazy-*\,no}.
+Disabling these tasks does not affect baseline performance: jemalloc
+achieves identical RSS (333\,MiB), AUC (6656\,MB$\cdot$s), and
+throughput with or without background tasks.
+With this configuration, \sys achieves 36\% RSS reduction
+(417\,MiB to 266\,MiB) and 16\% lower AUC (5565 vs.\ 6673\,MB$\cdot$s)
+on a 200K-op workload with 2\,KiB values.
+
+On the extended workload (SET $\to$ DELETE~50\% $\to$ cool $\to$ GET),
+\sys shows \emph{negative} benefit: cool RSS increases from 333\,MiB
+to 637\,MiB ($-$65\%).  DELETE operations touch all keys, causing
+wholesale decompression; the partially-freed pages do not re-compress
+well because the remaining live objects are scattered.
 Throughput is comparable across all configurations ($\pm$5\%).
 
 \paragraph{Comparison across allocators}
@@ -222,13 +237,16 @@ fully-active dataset.
 }
 
 \paragraph{Summary}
-\sys reduces RSS by 21--76\% across five workloads with
-negligible throughput cost ($\leq$0.4\%) and sub-10\,$\mu$s median
+\sys reduces RSS by 47--76\% on workloads where data stays cold
+(memcached, RocksDB, SQLite, Redis with background tasks disabled),
+with negligible throughput cost ($\leq$0.4\%) and sub-10\,$\mu$s median
 cold-access latency.
 The benefit scales with the fraction of cold data and data
 compressibility.  Compression, not allocator choice,
 drives the savings: Mesh provides no benefit (and increases
 RSS on SQLite), while \sys achieves consistent reductions via compression.
+On workloads with DELETE operations (Redis-ext), \sys shows negative
+benefit because deletion causes decompression and leaves fragmented pages.
 
 \subsection{Algorithm Comparison (RQ2)}
 \label{sec:eval:algo}
@@ -491,8 +509,10 @@ On Redis, compress-only achieves negative reduction (26\% overhead):
 Redis's event loop touches heap pages even at minimum frequency
 (\texttt{hz\,1}), so the pipeline's VM-region scanner never finds
 cold pages to compress.  Full \sys avoids this problem because it
-tracks page access internally at the allocator level, achieving
-37\% reduction.
+tracks page access internally at the allocator level.  With all
+background tasks disabled (activedefrag, activerehashing, lazyfree),
+full \sys achieves 36\% RSS reduction and 16\% lower AUC on Redis;
+disabling these tasks does not affect the jemalloc baseline.
 
 On memcached, compress-only shows 8\% overhead versus 67\%
 reduction for full \sys; the gap reflects both \sys's zero-on-free

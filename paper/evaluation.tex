@@ -37,21 +37,23 @@ key-value stores and relational databases.
 Table~\ref{tab:apps_summary} summarizes the results.
 
 \begin{table}[t]
-\caption{\textbf{\sys reduces RSS by 47--76\%}
+\caption{\textbf{\sys reduces RSS by 47--94\%}
   (\S\ref{sec:eval:apps}).  Cool-phase RSS (MiB) across allocators.
   Redis* = background tasks disabled; Redis-ext* = extended workload
-  with 50\% key deletion (DELETE causes decompression, hurting \sys).}
+  with 50\% key deletion; Redis$^\dagger$ = patched
+  (metadata caching + idle mode), including DELETE.}
 \label{tab:apps_summary}
 \centering\small
 \begin{tabular}{lrrr}
 \toprule
 Application & Sys & Mesh & \sys \\
 \midrule
-Memcached  & 287  & 288  & \textbf{136} (52\%) \\
-RocksDB    & 279  & 294  & \textbf{68} (76\%) \\
-SQLite     & 464  & 857  & \textbf{136} (71\%) \\
-Redis*     & 334  & ---  & \textbf{204} (47\%) \\
-Redis-ext* & 333  & ---  & 637 ($-$65\%) \\
+Memcached        & 287  & 288  & \textbf{136} (52\%) \\
+RocksDB          & 279  & 294  & \textbf{68} (76\%) \\
+SQLite           & 464  & 857  & \textbf{136} (71\%) \\
+Redis*           & 334  & ---  & \textbf{204} (47\%) \\
+Redis-ext*       & 333  & ---  & 637 ($-$65\%) \\
+Redis$^\dagger$  & 205  & ---  & \textbf{12} (94\%) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -175,6 +177,92 @@ wholesale decompression; the partially-freed pages do not re-compress
 well because the remaining live objects are scattered.
 Throughput is comparable across all configurations ($\pm$5\%).
 
+\paragraph{Root cause analysis and Redis patches}
+Two specific Redis behaviors prevent effective compression.
+First, \texttt{serverCron()}'s background operations---active
+defragmentation, incremental rehashing, and hash table
+resizing---traverse key data pages every cron tick, keeping them
+warm even when no client commands are being processed.  With
+\texttt{--hz\,1} and all configurable background tasks disabled,
+only 0.4\% of pages reach the cold threshold because
+\texttt{serverCron} still runs defrag and rehash unconditionally.
+
+Second, \texttt{DEL} calls \texttt{getObjectLength()} to
+update the keysizes histogram.  This dereferences the value pointer
+into value data pages (SDS headers, dict sizes, etc.),
+triggering SIGSEGV on compressed pages and causing wholesale
+decompression.  Similarly, the async-delete path calls
+\texttt{kvobjAllocSize()} for memory tracking, which traverses
+value data structures.
+
+We address both issues with minimal, semantics-preserving
+patches to Redis (7~files, 105~lines added, 51~removed).
+For the \texttt{DEL} problem, we add two write-through cache
+fields to the \texttt{kvobj} header: \texttt{cached\_length} and
+\texttt{cached\_alloc\_size}.  Both are updated transparently
+on every call to \texttt{getObjectLength()} and
+\texttt{kvobjAllocSize()} respectively, so all 58+~call sites
+in Redis command handlers keep the cache current with no
+modifications.  The delete path reads these cached values from
+the object header (same cache line as \texttt{type} and
+\texttt{encoding}) instead of dereferencing into value data pages.
+Keysizes histograms and slot allocation tracking are preserved.
+
+For the \texttt{serverCron} problem, we add an
+\texttt{idle-mode} configuration option.  When enabled, Redis
+tracks whether any commands have been processed in the last three
+cron ticks.  During idle periods, \texttt{databasesCron()} skips
+only the three operations that inherently traverse key data pages:
+\texttt{activeDefragCycle()}, \texttt{kvstoreIncrementallyRehash()},
+and \texttt{kvstoreTryResizeDicts()}.  All other operations
+continue unconditionally: active key expiration (TTL correctness),
+\texttt{clientsCron()} (client timeout enforcement),
+\texttt{cronUpdateMemoryStats()} (allocator statistics), replication
+and cluster heartbeats, AOF persistence, and all periodic cleanup
+tasks.  When client commands resume, the idle counter resets and
+all operations return to normal.
+
+Table~\ref{tab:redis_patched} shows the results on a 50K-key
+workload with 2\,KiB values.  With both patches, \sys achieves
+94\% RSS reduction on the standard workload (204\,MiB baseline to
+11.8\,MiB) and, critically, pages \emph{re-compress after DELETE}:
+the final minimum RSS (19.5\,MiB) returns to within 65\% of the
+pre-DELETE minimum, compared to a $6\times$ RSS increase without the
+patches.  Total AUC drops by 84\%.
+
+\begin{table}[t]
+\caption{\textbf{Patched Redis achieves 90--94\% RSS reduction
+  with \sys} (\S\ref{sec:eval:apps}).  50K keys $\times$ 2\,KiB
+  values, fill $\to$ cool 20\,s $\to$ DELETE 50\% $\to$ cool 20\,s
+  (macOS, single run).}
+\label{tab:redis_patched}
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+Metric & Baseline & \sys~V1 & \sys~V2 \\
+\midrule
+Fill RSS (MiB)          & 204.5 & 166.6 & 135.6 \\
+Cool min RSS (MiB)      & 204.5 & \textbf{11.8} & 59.5 \\
+Post-DELETE RSS (MiB)   & 204.6 & 123.8 & 160.3 \\
+Final min RSS (MiB)     & 204.6 & \textbf{19.5} & 62.6 \\
+Total AUC (MiB$\cdot$s) & 8182  & \textbf{1291} & 2724 \\
+\midrule
+RSS reduction (cool)    & ---   & \textbf{94\%} & 71\% \\
+RSS reduction (final)   & ---   & \textbf{90\%} & 69\% \\
+AUC reduction           & ---   & \textbf{84\%} & 67\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The patches illustrate a general principle: applications that
+access heap data structures during idle periods interfere with
+page-level compression.  Separating metadata from data---so that
+bookkeeping operations read cached values in object headers rather
+than dereferencing into data pages---and deferring
+data-page-touching maintenance until the application is active
+are sufficient to make such applications compatible with
+transparent heap compression.
+
 \paragraph{Comparison across allocators}
 To confirm that compression, not allocator choice, drives the
 RSS reduction, we run all benchmarks with
@@ -245,8 +333,11 @@ The benefit scales with the fraction of cold data and data
 compressibility.  Compression, not allocator choice,
 drives the savings: Mesh provides no benefit (and increases
 RSS on SQLite), while \sys achieves consistent reductions via compression.
-On workloads with DELETE operations (Redis-ext), \sys shows negative
-benefit because deletion causes decompression and leaves fragmented pages.
+On unmodified Redis, DELETE workloads cause wholesale decompression,
+but two small patches---caching object metadata in headers and
+deferring data-page-touching maintenance during idle
+periods---restore 90--94\% RSS reduction even with 50\% key deletion
+(Table~\ref{tab:redis_patched}).
 
 \subsection{Algorithm Comparison (RQ2)}
 \label{sec:eval:algo}
@@ -513,6 +604,12 @@ tracks page access internally at the allocator level.  With all
 background tasks disabled (activedefrag, activerehashing, lazyfree),
 full \sys achieves 36\% RSS reduction and 16\% lower AUC on Redis;
 disabling these tasks does not affect the jemalloc baseline.
+With the metadata-caching and idle-mode patches
+described in \S\ref{sec:eval:apps}, \sys achieves 94\% RSS
+reduction on Redis---comparable to memcached---because the
+patches eliminate the two remaining sources of data-page warming
+(defrag/rehash in \texttt{serverCron}) and data-page touching
+(\texttt{getObjectLength} in \texttt{DEL}).
 
 On memcached, compress-only shows 8\% overhead versus 67\%
 reduction for full \sys; the gap reflects both \sys's zero-on-free

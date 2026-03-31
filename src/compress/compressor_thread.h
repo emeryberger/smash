@@ -346,6 +346,18 @@ class CompressorThread {
     }
 
     // Phase 2: Compress cold pages and upgrade LZ4→zstd
+    //
+    // Two-level monitoring: Phase 3 sets pages to PROT_READ, which detects
+    // writes but not reads.  A read-hot page (e.g., YCSB Workload B: 95%
+    // reads) would appear cold and get compressed, only to be immediately
+    // decompressed on the next read — wasteful churn.
+    //
+    // To avoid this, when a page first reaches the cold threshold we
+    // escalate it from PROT_READ to PROT_NONE (deep monitoring) instead
+    // of compressing.  Under PROT_NONE any access (read or write) triggers
+    // the fault handler, which sets accessed_[]=true.  If the page
+    // survives one full tick at PROT_NONE without any access, it is truly
+    // cold and Phase 2 compresses it on the next tick.
     void phase2Range(int worker_id, size_t start, size_t end) {
         uint32_t floor = ROIConfig::instance().cold_ticks_floor;
         uint32_t upgrade_ticks = ROIConfig::instance().very_cold_ticks;
@@ -353,12 +365,32 @@ class CompressorThread {
             if (cold_count_[i] < floor) return;
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
-                compressPage(i, workers_[worker_id]);
+                if (cold_count_[i] == floor && st == PageState::ACTIVE_MONITORING) {
+                    // First tick at cold threshold: escalate to PROT_NONE to
+                    // detect reads as well as writes.  Don't compress yet.
+                    escalateToDeepMonitoring(i);
+                } else if (cold_count_[i] > floor) {
+                    // Survived deep monitoring (or was ACTIVE at floor, meaning
+                    // a write just happened and was caught).  Truly cold — compress.
+                    compressPage(i, workers_[worker_id]);
+                }
+                // cold_count == floor && st == ACTIVE: page was written between
+                // Phase 1 and Phase 2; skip — Phase 1 will reset cold next tick.
             } else if (st == PageState::COMPRESSED &&
                        cold_count_[i] >= upgrade_ticks) {
                 upgradePage(i, workers_[worker_id]);
             }
         });
+    }
+
+    // Escalate a PROT_READ-monitored page to PROT_NONE (deep monitoring).
+    // Any access (read or write) will now trigger the fault handler.
+    void escalateToDeepMonitoring(size_t page_idx) {
+        bool pinned = vm::g_page_pins &&
+            vm::g_page_pins[page_idx].load(std::memory_order_acquire) > 0;
+        if (pinned) return;
+        void* page_addr = vm_->pageAddress(page_idx);
+        vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
     }
 
     // Phase 3: Set up access monitoring for remaining active pages

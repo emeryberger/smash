@@ -545,6 +545,23 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/bin/redis-benchmark
   )
 
+  # ── Redis-Smash (patched Redis with idle-mode, MALLOC=libc) ────────────────
+  ExternalProject_Add(redis_smash_build
+    GIT_REPOSITORY https://github.com/plasma-umass/redis-smash.git
+    GIT_TAG smash-compat
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/redis-smash
+    CONFIGURE_COMMAND ""
+    BUILD_IN_SOURCE TRUE
+    BUILD_COMMAND make MALLOC=libc -j${NCPU}
+    INSTALL_COMMAND
+      ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-server ${BENCH_DEPS_DIR}/bin/redis-server-smash
+      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-cli ${BENCH_DEPS_DIR}/bin/redis-cli-smash
+    BUILD_BYPRODUCTS
+      ${BENCH_DEPS_DIR}/bin/redis-server-smash
+      ${BENCH_DEPS_DIR}/bin/redis-cli-smash
+  )
+
   # ── libevent (required by memcached) ───────────────────────────────────────
   # Prefer system/brew install; build from source only if missing.
   find_path(LIBEVENT_INCLUDE_DIR event.h
@@ -668,6 +685,8 @@ if(SMASH_BUILD_BENCH_DEPS)
   set(BENCH_REDIS_SERVER   ${BENCH_DEPS_DIR}/bin/redis-server-libc CACHE PATH "")
   set(BENCH_REDIS_CLI      ${BENCH_DEPS_DIR}/bin/redis-cli         CACHE PATH "")
   set(BENCH_REDIS_BENCHMARK ${BENCH_DEPS_DIR}/bin/redis-benchmark  CACHE PATH "")
+  set(BENCH_REDIS_SMASH_SERVER ${BENCH_DEPS_DIR}/bin/redis-server-smash CACHE PATH "")
+  set(BENCH_REDIS_SMASH_CLI    ${BENCH_DEPS_DIR}/bin/redis-cli-smash    CACHE PATH "")
   set(BENCH_MEMCACHED      ${BENCH_DEPS_DIR}/bin/memcached         CACHE PATH "")
   set(BENCH_DUCKDB         ${BENCH_DEPS_DIR}/bin/duckdb            CACHE PATH "")
   set(BENCH_ROCKSDB_LIB    ${BENCH_DEPS_DIR}/lib/librocksdb.a      CACHE PATH "")
@@ -675,7 +694,7 @@ if(SMASH_BUILD_BENCH_DEPS)
 
   # Convenience target: `make bench_deps`
   add_custom_target(bench_deps)
-  add_dependencies(bench_deps redis_build rocksdb_build duckdb_build)
+  add_dependencies(bench_deps redis_build redis_smash_build rocksdb_build duckdb_build)
   if(TARGET libevent_build)
     add_dependencies(bench_deps libevent_build)
   endif()
@@ -688,6 +707,7 @@ if(SMASH_BUILD_BENCH_DEPS)
 
   message(STATUS "Benchmark dependencies (${BENCH_DEPS_DIR}):")
   message(STATUS "  Redis 8.0.2 (libc malloc)")
+  message(STATUS "  Redis-Smash (patched, libc malloc, idle-mode)")
   message(STATUS "  Memcached 1.6.34")
   message(STATUS "  RocksDB 9.8.4 (static)")
   message(STATUS "  DuckDB 1.2.2 (no jemalloc)")

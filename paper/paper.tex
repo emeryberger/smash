@@ -18,6 +18,10 @@
 \newcommand{\sys}{\textsc{Smash}\xspace}
 \newcommand{\pp}{\%\xspace}
 \newcommand{\punt}[1]{}
+% Allow line breaks inside \texttt at underscores, camelCase boundaries, etc.
+\newcommand{\tcode}[1]{\texttt{\hspace{0pt}#1}}
+% Give LaTeX extra stretch to avoid marginal overfull hboxes
+\emergencystretch=3pt
 
 % Auto-generated macros from benchmark results (see gen_macros.py)
 \input{results_macros}

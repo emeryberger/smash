@@ -32,11 +32,11 @@ long-idle pages where the better ratio justifies the higher CPU cost;
 accessed pages are decompressed and reset, analogous to deoptimization
 (\S\ref{sec:design:adaptive}).
 
-We evaluate \sys on five applications spanning in-memory databases,
-caches, and analytics engines.  \sys reduces RSS by 27--87\%
-depending on the workload's hot/cold partition.  Throughput impact is negligible for most benchmarks.  An ablation
-study across 17 configurations quantifies each technique's
-contribution.
+We evaluate \sys on five applications---databases, caches, and
+analytics engines.  \sys reduces RSS by 27--87\% depending on
+the workload's hot/cold partition, with negligible throughput
+impact.  An ablation study across 17 configurations quantifies
+each technique's contribution.
 
 To tease apart the compression pipeline and allocator design,
 we build a compress-only variant that runs \sys's pipeline atop

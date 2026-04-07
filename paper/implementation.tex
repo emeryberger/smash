@@ -31,7 +31,7 @@ count-trailing-zeros to jump to set bits, reducing scan time from
 $O(\text{committed})$ to $O(\text{active pages})$.
 
 \paragraph{Per-worker state}  Each worker has its own LZ4 state
-buffer, zstd compression context (\texttt{ZSTD\_CCtx}), page-sized
+buffer, zstd compression context (\tcode{ZSTD\_\allowbreak CCtx}), page-sized
 scratch buffer, and compression output buffer.  Workers share only the
 dictionary lookup table (read-only during compression) and the
 sharded compressed data~store.
@@ -44,7 +44,7 @@ blob consumes exactly 512~bytes (rounded to alignment), not
 1\,KiB.  Pages are assigned to shards by index modulo~8.
 Each shard's backing regions (16\,MiB each) track live bytes;
 when a region's live bytes drop to zero, its data pages are
-decommitted (\texttt{MADV\_FREE} on macOS, \texttt{MADV\_DONTNEED}
+decommitted (\tcode{MADV\_\allowbreak FREE} on macOS, \tcode{MADV\_\allowbreak DONTNEED}
 on Linux), releasing physical memory while preserving the virtual
 mapping.  With two workers and eight shards, lock contention is
 near~zero.
@@ -173,14 +173,14 @@ handler restores write~permission.
 \end{figure}
 
 \paragraph{Per-slot decompression contexts}
-The signal handler must not call \texttt{malloc}.  All decompression
+The signal handler must not call \tcode{malloc}.  All decompression
 state is pre-allocated from a bootstrap allocator.  \sys maintains
 128~fault slots, each with a pre-allocated page buffer and an
 independent zstd decompression context.  A faulting thread atomically
 acquires a slot via compare-and-swap, decompresses into the slot's
 buffer, copies the result to the faulting page, and releases the slot.
-If all slots are in use, the handler spin-waits with architecture-specific
-pause instructions (\texttt{pause} on x86, \texttt{yield} on ARM) until
+If all slots are in use, the handler spin-waits with
+architecture-specific pause instructions (\tcode{pause} on x86, \tcode{yield} on ARM) until
 a slot becomes available---since the thread is already blocked on the
 page fault, it cannot proceed without decompressing.  Prefetch, which is
 an optional optimization, instead skips any page for which no slot is

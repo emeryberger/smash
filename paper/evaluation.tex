@@ -20,8 +20,8 @@ We structure the evaluation around five questions:
 
 We evaluate on Linux x86\_64 (Amazon Linux~2, kernel~5.10,
 glibc~2.26, 4\,KiB pages, 64\,GiB RAM, 16 cores).  \sys is loaded
-via \texttt{LD\_PRELOAD}; RSS is sampled via
-\texttt{/proc/[pid]/statm} at 1\,s intervals.
+via \tcode{LD\_\allowbreak PRELOAD}; RSS is sampled via
+\tcode{/proc/\allowbreak[pid]/\allowbreak statm} at 1\,s intervals.
 Each configuration is run three times; we report the median.
 
 Benchmark applications: Redis~8.0.2 (built with libc malloc),
@@ -157,9 +157,8 @@ reclaim space.
 Redis's event loop and background tasks (active defragmentation,
 incremental rehashing, lazy-free) can keep pages warm even during
 idle periods.  To achieve effective compression, we configure Redis
-with minimal background activity:
-\texttt{-{}-hz\,1 -{}-dynamic-hz\,no -{}-activedefrag\,no
--{}-activerehashing\,no -{}-lazyfree-lazy-*\,no}.
+with minimal background activity
+(\tcode{hz\,1}, \tcode{activedefrag\,no}, etc.).
 Disabling these tasks does not affect baseline performance: jemalloc
 achieves identical RSS and throughput with or without background tasks.
 With this configuration, \sys achieves \ablRedisDefaultRssRedInt\% RSS reduction
@@ -173,45 +172,44 @@ Throughput is comparable across all configurations ($\pm$5\%).
 
 \paragraph{Root cause analysis and Redis patches}
 Two specific Redis behaviors prevent effective compression.
-First, \texttt{serverCron()}'s background operations---active
-defragmentation, incremental rehashing, and hash table
-resizing---traverse key data pages every cron tick, keeping them
+First, \tcode{server\-Cron()}'s background
+operations---active defragmentation, incremental rehashing, and hash
+table resizing---traverse key data pages every cron tick, keeping them
 warm even when no client commands are being processed.  With
-\texttt{--hz\,1} and all configurable background tasks disabled,
+\tcode{-{}-hz\,1} and all configurable background tasks disabled,
 only 0.4\% of pages reach the cold threshold because
-\texttt{serverCron} still runs defrag and rehash unconditionally.
+\tcode{server\-Cron} still runs defrag and rehash unconditionally.
 
-Second, \texttt{DEL} calls \texttt{getObjectLength()} to
+Second, \tcode{DEL} calls \tcode{get\-Object\-Length()} to
 update the keysizes histogram.  This dereferences the value pointer
 into value data pages (SDS headers, dict sizes, etc.),
 triggering SIGSEGV on compressed pages and causing wholesale
 decompression.  Similarly, the async-delete path calls
-\texttt{kvobjAllocSize()} for memory tracking, which traverses
+\tcode{kvobj\-Alloc\-Size()} for memory tracking, which traverses
 value data structures.
 
 We address both issues with minimal, semantics-preserving
 patches to Redis (7~files, 105~lines added, 51~removed).
-For the \texttt{DEL} problem, we add two write-through cache
-fields to the \texttt{kvobj} header: \texttt{cached\_length} and
-\texttt{cached\_alloc\_size}.  Both are updated transparently
-on every call to \texttt{getObjectLength()} and
-\texttt{kvobjAllocSize()} respectively, so all 58+~call sites
+For the \tcode{DEL} problem, we add two write-through cache
+fields to the \tcode{kvobj} header: \tcode{cached\_\allowbreak length} and
+\tcode{cached\_\allowbreak alloc\_\allowbreak size}.  Both are updated transparently
+on every call to \tcode{get\-Object\-Length()} and
+\tcode{kvobj\-Alloc\-Size()} respectively, so all 58+~call sites
 in Redis command handlers keep the cache current with no
 modifications.  The delete path reads these cached values from
-the object header (same cache line as \texttt{type} and
-\texttt{encoding}) instead of dereferencing into value data pages.
+the object header (same cache line as \tcode{type} and
+\tcode{encoding}) instead of dereferencing into value data pages.
 Keysizes histograms and slot allocation tracking are preserved.
 
-For the \texttt{serverCron} problem, we add an
-\texttt{idle-mode} configuration option.  When enabled, Redis
+For the \tcode{server\-Cron} problem, we add an
+\tcode{idle-mode} configuration option.  When enabled, Redis
 tracks whether any commands have been processed in the last three
-cron ticks.  During idle periods, \texttt{databasesCron()} skips
-only the three operations that inherently traverse key data pages:
-\texttt{activeDefragCycle()}, \texttt{kvstoreIncrementallyRehash()},
-and \texttt{kvstoreTryResizeDicts()}.  All other operations
+cron ticks.  During idle periods, \tcode{databases\-Cron()} skips
+only the three operations that inherently traverse key data
+pages: active defragmentation, incremental rehashing, and
+dictionary resizing.  All other operations
 continue unconditionally: active key expiration (TTL correctness),
-\texttt{clientsCron()} (client timeout enforcement),
-\texttt{cronUpdateMemoryStats()} (allocator statistics), replication
+client timeout enforcement, allocator statistics, replication
 and cluster heartbeats, AOF persistence, and all periodic cleanup
 tasks.  When client commands resume, the idle counter resets and
 all operations return to normal.
@@ -582,9 +580,11 @@ pipeline cannot achieve high compression ratios.
 In fact, compress-only \emph{increases} RSS by \coSqliteCompOnlyOverhead--\coRedisCompOnlyOverhead\% due to
 metadata overhead without corresponding compression~benefit.
 
-Full \sys achieves \coRedisFullSmashReduction--\coMemcachedFullSmashReduction\% reduction by combining allocator-level
-page tracking with zero-on-free.  The allocator design contributes
-most on RocksDB, where full \sys achieves \coRocksdbFullSmashReduction\% reduction.
+Full \sys achieves
+\coRedisFullSmashReduction--\coMemcachedFullSmashReduction\%
+reduction by combining allocator-level page tracking with
+zero-on-free.  The allocator design contributes most on RocksDB
+(\coRocksdbFullSmashReduction\% reduction).
 RocksDB's block cache entries span entire pages;
 embedded freelist pointers from the system allocator degrade
 compression across each page.

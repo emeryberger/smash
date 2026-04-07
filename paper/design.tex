@@ -20,27 +20,27 @@ create compressible runs, routes allocations by call site to produce
 homogeneous pages, and applies progressively stronger compression to
 longer-idle~pages.
 
-\sys is a slab-based allocator that interposes on \texttt{malloc},
-\texttt{free}, \texttt{realloc}, and related functions via the alloc8
-interposition framework~\cite{berger2025alloc8}, which uses
-\texttt{DYLD\_INSERT\_LIBRARIES} on macOS and \texttt{LD\_PRELOAD} on
-Linux.  Applications link against the system allocator normally; \sys
+\sys is a slab-based allocator that interposes on \tcode{malloc},
+\tcode{free}, \tcode{realloc}, and related functions via the alloc8
+interposition framework~\cite{berger2025alloc8}
+(\tcode{DYLD\_\allowbreak INSERT\_\allowbreak LIBRARIES} on macOS,
+\tcode{LD\_\allowbreak PRELOAD} on Linux).
+Applications link against the system allocator normally; \sys
 replaces it at load~time.
 
 Figure~\ref{fig:heap_org} shows the heap organization and key data
 structures; Figure~\ref{fig:arch} shows the page state machine.  The
 allocator manages heap pages through a virtual memory region (up to
 16\,GiB).  Each page transitions through five states:
-(1)~\textbf{EMPTY}: never allocated or returned to the OS;
-(2)~\textbf{ACTIVE}: contains live objects with full read/write
-access;
-(3)~\textbf{MONITORING}: marked read-only
-(\texttt{PROT\_READ}) to detect future writes;
-(4)~\textbf{COMPRESSING}: being compressed by a background worker;
-and
-(5)~\textbf{COMPRESSED}: compressed with zstd (level~1 or~9,
-selected by ROI; \S\ref{sec:design:adaptive}), physical page
-decommitted.
+\begin{enumerate}\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}
+\item[\textbf{(1)}] \textbf{EMPTY}: never allocated or returned to the~OS.
+\item[\textbf{(2)}] \textbf{ACTIVE}: live objects, full read/write access.
+\item[\textbf{(3)}] \textbf{MONITORING}: read-only to detect writes.
+\item[\textbf{(4)}] \textbf{COMPRESSING}: being compressed by a worker.
+\item[\textbf{(5)}] \textbf{COMPRESSED}: data compressed with zstd
+  (level~1 or~9, selected by ROI; \S\ref{sec:design:adaptive}),
+  physical page decommitted.
+\end{enumerate}
 
 \input{fig_arch}
 

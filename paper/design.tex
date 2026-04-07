@@ -28,6 +28,8 @@ interposition framework~\cite{berger2025alloc8}
 Applications link against the system allocator normally; \sys
 replaces it at load~time.
 
+\input{fig_arch}
+
 Figure~\ref{fig:heap_org} shows the heap organization and key data
 structures; Figure~\ref{fig:arch} shows the page state machine.  The
 allocator manages heap pages through a virtual memory region (up to
@@ -41,8 +43,6 @@ allocator manages heap pages through a virtual memory region (up to
   (level~1 or~9, selected by ROI; \S\ref{sec:design:adaptive}),
   physical page decommitted.
 \end{enumerate}
-
-\input{fig_arch}
 
 A background compressor thread wakes every second and executes three
 phases (Figure~\ref{fig:arch}).  \emph{Phase~1} updates per-page

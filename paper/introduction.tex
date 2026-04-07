@@ -90,16 +90,24 @@ including Mesh~\cite{powers2019mesh}, reduces RSS below its fill
 level without compression).  The two components are synergistic:
 neither alone achieves the full benefit.
 
-\paragraph{Limitations}
-Redis represents an important class of long-running servers
-with background maintenance tasks, where compression effectiveness
-depends on application-level behavior.  Our Redis workloads use
-\tcode{redis-benchmark} with a fill-cool-serve pattern rather than
-a standard benchmark like YCSB\@.
-We evaluate both stock and patched Redis, finding that small,
-targeted patches (metadata caching and idle-mode deferral) lower
-the baseline RSS and enable consistent compression
+In some cases, modest application changes can dramatically improve
+\sys's effectiveness.  Redis's background maintenance tasks
+(defragmentation, incremental rehashing) traverse heap data pages
+even during idle periods, keeping them warm and inflating RSS\@.
+By deferring these tasks during idle periods (an
+\tcode{idle-mode} configuration flag) and caching two
+object-metadata fields in the header to avoid dereferencing value
+data on \tcode{DEL} (7~files, 105~lines changed), we reduce Redis's
+baseline RSS from \ablRedisBaselineServeRss\ to
+\ablRedisPatchedBaselineServeRss\,MiB---a \redisPatchBaselineRedPct\%
+reduction \emph{without any compression}---and make the remaining
+cold data consistently compressible by \sys
 (\S\ref{sec:eval:apps}).
+
+\paragraph{Limitations}
+Our Redis workloads use \tcode{redis-benchmark} with a
+fill-cool-serve pattern rather than a standard benchmark like
+YCSB\@.
 
 This paper makes two contributions:
 

@@ -217,7 +217,7 @@ all operations return to normal.
 Table~\ref{tab:redis_patched} compares stock and patched Redis.
 The patches lower the \emph{baseline} RSS from
 \ablRedisBaselineServeRss\,MiB to \ablRedisPatchedBaselineServeRss\,MiB
-(a \ablRedisPatchedBaselineRssRedInt\% reduction even without \sys),
+(a \redisPatchBaselineRedPct\% reduction even without \sys),
 because idle-mode prevents background tasks from inflating RSS\@.
 With \sys, patched Redis achieves \ablRedisPatchedDefaultRssRedInt\%
 RSS reduction (\ablRedisPatchedBaselineServeRss\,MiB to

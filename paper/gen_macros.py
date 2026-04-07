@@ -247,6 +247,22 @@ def main():
             reduction = (bl_rss - fs_rss) / bl_rss * 100
             defcmd(f"co{app_m}FullSmashReduction", fmt_pct(reduction, 0))
 
+    # ── Cross-app comparisons (stock vs patched Redis) ─────────────────
+    lines.append("")
+    lines.append("% ── Cross-app: stock vs patched Redis ──")
+
+    stock_redis_bl = safe_get(ablation, "redis", "B0", "median", "steady_rss_mb")
+    patched_redis_bl = safe_get(ablation, "redis_patched", "B0", "median", "steady_rss_mb")
+    if stock_redis_bl and patched_redis_bl and stock_redis_bl > 0:
+        red = (stock_redis_bl - patched_redis_bl) / stock_redis_bl * 100
+        defcmd("redisPatchBaselineRedPct", fmt_pct(red, 0))
+
+    stock_redis_ext_bl = safe_get(ablation, "redis_ext", "B0", "median", "steady_rss_mb")
+    patched_redis_ext_bl = safe_get(ablation, "redis_ext_patched", "B0", "median", "steady_rss_mb")
+    if stock_redis_ext_bl and patched_redis_ext_bl and stock_redis_ext_bl > 0:
+        red = (stock_redis_ext_bl - patched_redis_ext_bl) / stock_redis_ext_bl * 100
+        defcmd("redisExtPatchBaselineRedPct", fmt_pct(red, 0))
+
     # ── Summary statistics ──────────────────────────────────────────────
     lines.append("")
     lines.append("% ── Summary ranges ──")

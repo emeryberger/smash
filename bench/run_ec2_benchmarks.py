@@ -55,16 +55,21 @@ REGIONS_TO_TRY = ["us-west-2", "us-east-1", "us-east-2", "eu-west-1", "ap-northe
 USER_DATA_SCRIPT = """#!/bin/bash
 set -ex
 
-# Install build dependencies
+# Install build dependencies (retry on transient repo errors)
 # Note: AL2023 uses libzstd-devel not zstd-devel
-dnf install -y \
-    git gcc gcc-c++ cmake ninja-build \
-    autoconf automake libtool \
-    java-17-amazon-corretto-devel \
-    libevent-devel openssl-devel \
-    zlib-devel bzip2-devel lz4-devel snappy-devel libzstd-devel \
-    python3 python3-pip \
-    bc htop || true
+for attempt in 1 2 3; do
+    dnf clean all
+    dnf install -y \
+        git gcc gcc-c++ cmake ninja-build \
+        autoconf automake libtool \
+        java-17-amazon-corretto-devel \
+        libevent-devel openssl-devel \
+        zlib-devel bzip2-devel lz4-devel snappy-devel libzstd-devel \
+        python3 python3-pip \
+        bc htop && break
+    echo "dnf install attempt $attempt failed, retrying..."
+    sleep 5
+done
 
 # Verify critical packages installed
 which cmake gcc g++ git || { echo "CRITICAL: build tools missing"; exit 1; }
@@ -83,72 +88,27 @@ make -j$(nproc)
 make install
 ldconfig
 
+# Install memtier_benchmark
+cd /tmp
+git clone --depth 1 https://github.com/RedisLabs/memtier_benchmark.git
+cd memtier_benchmark
+autoreconf -ivf
+./configure --prefix=/usr/local
+make -j$(nproc)
+make install
+
+# Install YCSB
+cd /home/ec2-user
+curl -sLO https://github.com/brianfrankcooper/YCSB/releases/download/0.17.0/ycsb-0.17.0.tar.gz
+tar xzf ycsb-0.17.0.tar.gz
+mv ycsb-0.17.0 YCSB
+chown -R ec2-user:ec2-user YCSB
+
 # Signal ready
 touch /tmp/setup-complete
 """
 
-REMOTE_BENCHMARK_SCRIPT = """#!/bin/bash
-set -ex
-BENCH_FLAGS="$1"
-
-cd ~/smash
-mkdir -p build && cd build
-
-# Configure with benchmarks
-cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON -DCMAKE_BUILD_TYPE=Release
-
-# Build everything (parallel)
-make -j$(nproc)
-
-# Build benchmark dependencies
-make bench_deps || true
-
-# Create results directory
-RESULTS_DIR=~/smash/ec2_results
-mkdir -p "$RESULTS_DIR"
-
-# Print system info
-echo "=== System Info ===" | tee "$RESULTS_DIR/system_info.txt"
-uname -a | tee -a "$RESULTS_DIR/system_info.txt"
-ldd --version 2>&1 | head -1 | tee -a "$RESULTS_DIR/system_info.txt"
-nproc | tee -a "$RESULTS_DIR/system_info.txt"
-free -h | tee -a "$RESULTS_DIR/system_info.txt"
-
-# Run allocator comparison benchmark
-echo ""
-echo "=== Allocator Comparison ==="
-python3 bench/bench_allocator_compare.py --output "$RESULTS_DIR/allocator_compare" --runs 3 \
-    2>&1 | tee "$RESULTS_DIR/allocator_compare.log" || true
-
-# Run Redis benchmark
-echo ""
-echo "=== Redis Benchmark ==="
-bash bench/bench_redis.sh $BENCH_FLAGS 2>&1 | tee "$RESULTS_DIR/redis.log" || true
-
-# Run Redis multi-allocator comparison
-echo ""
-echo "=== Redis Allocator Comparison ==="
-bash bench/bench_redis_alloc.sh $BENCH_FLAGS 2>&1 | tee "$RESULTS_DIR/redis_alloc.log" || true
-
-# Run Memcached benchmark
-echo ""
-echo "=== Memcached Benchmark ==="
-bash bench/bench_memcached.sh $BENCH_FLAGS 2>&1 | tee "$RESULTS_DIR/memcached.log" || true
-
-# Run RocksDB benchmark
-echo ""
-echo "=== RocksDB Benchmark ==="
-bash bench/bench_rocksdb.sh $BENCH_FLAGS 2>&1 | tee "$RESULTS_DIR/rocksdb.log" || true
-
-# Run algorithm comparison
-echo ""
-echo "=== Algorithm Comparison ==="
-./bench/bench_algo_compare 2>&1 | tee "$RESULTS_DIR/algo_compare.log" || true
-
-echo ""
-echo "=== Benchmarks Complete ==="
-ls -la "$RESULTS_DIR/"
-"""
+REMOTE_BENCHMARK_CMD = "python3 ~/smash/bench/ec2_redis_bench.py"
 
 
 def log(msg: str):
@@ -382,7 +342,7 @@ def wait_for_ssh(host: str, key_path: Path, max_attempts: int = 30) -> bool:
     return False
 
 
-def wait_for_setup(host: str, key_path: Path, max_attempts: int = 60) -> bool:
+def wait_for_setup(host: str, key_path: Path, max_attempts: int = 120) -> bool:
     """Wait for user-data setup to complete."""
     log("Waiting for instance setup (installing dependencies)...")
     for attempt in range(max_attempts):
@@ -407,39 +367,55 @@ def wait_for_setup(host: str, key_path: Path, max_attempts: int = 60) -> bool:
 
 
 def sync_source(host: str, key_path: Path, repo_root: Path):
-    """Sync source code to instance."""
-    log("Syncing source code...")
+    """Sync source code to instance (smash + alloc8 sibling)."""
+    ssh_opts = f"ssh -o StrictHostKeyChecking=no -i {key_path}"
+    rsync_excludes = ["--exclude=build", "--exclude=.git", "--exclude=*.o", "--exclude=*.a"]
+
+    log("Syncing smash source code...")
     cmd = [
-        "rsync", "-avz",
-        "--exclude=build", "--exclude=.git", "--exclude=*.o", "--exclude=*.a",
-        "-e", f"ssh -o StrictHostKeyChecking=no -i {key_path}",
+        "rsync", "-avz", *rsync_excludes,
+        "-e", ssh_opts,
         f"{repo_root}/", f"ec2-user@{host}:~/smash/"
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         log(f"rsync stderr: {result.stderr}")
-        error("Failed to sync source code")
+        error("Failed to sync smash source code")
+
+    # Sync alloc8 sibling directory (required by CMakeLists.txt)
+    alloc8_dir = repo_root.parent / "alloc8"
+    if alloc8_dir.exists():
+        log("Syncing alloc8 source code...")
+        cmd = [
+            "rsync", "-avz", *rsync_excludes,
+            "-e", ssh_opts,
+            f"{alloc8_dir}/", f"ec2-user@{host}:~/alloc8/"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"rsync stderr: {result.stderr}")
+            error("Failed to sync alloc8 source code")
+    else:
+        log(f"Warning: alloc8 not found at {alloc8_dir}")
 
 
 def run_benchmarks(host: str, key_path: Path, quick: bool):
-    """Run benchmarks on the instance."""
+    """Run benchmarks on the instance via the Python benchmark runner."""
     log("Running benchmarks (this will take a while)...")
-    flags = "--quick" if quick else ""
+    remote_cmd = REMOTE_BENCHMARK_CMD
+    if quick:
+        remote_cmd += " --quick"
 
     cmd = [
         "ssh", "-o", "StrictHostKeyChecking=no",
         "-i", str(key_path), f"ec2-user@{host}",
-        f"bash -s {flags}"
+        remote_cmd,
     ]
 
     # Stream output
     proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    proc.stdin.write(REMOTE_BENCHMARK_SCRIPT)
-    proc.stdin.close()
-
     for line in proc.stdout:
         print(line, end="")
 

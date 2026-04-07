@@ -69,6 +69,35 @@ class Slab {
         }
     }
 
+    // Decommit pages of an empty span via MADV_DONTNEED/MADV_FREE, releasing
+    // physical memory immediately without waiting for the compressor to
+    // discover, zero, and compress them.  The span stays in the empty list
+    // for reuse; recommitEmptySpan() restores page state on reuse.
+    void decommitEmptySpan(Span* span) {
+        if (release_hook_ && vm_region_) {
+            size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
+            release_hook_(idx, span->page_count, release_ctx_);
+        }
+        size_t bytes = span->page_count * kPageSize;
+        vm::decommitPages(span->base, bytes);
+        if (page_states_ && vm_region_) {
+            size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
+            for (uint32_t p = 0; p < span->page_count; ++p)
+                page_states_->set(idx + p, PageState::EMPTY);
+        }
+    }
+
+    // Restore page state when reusing a decommitted empty span.
+    // Physical pages are zero-filled by the kernel on first access
+    // (MADV_DONTNEED on Linux, MADV_FREE on macOS).
+    void recommitEmptySpan(Span* span) {
+        if (page_states_ && vm_region_) {
+            size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
+            for (uint32_t p = 0; p < span->page_count; ++p)
+                page_states_->set(idx + p, PageState::ACTIVE);
+        }
+    }
+
 public:
     void init(uint8_t sc, PageMap* pm,
               VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
@@ -99,12 +128,14 @@ public:
             return ptr;
         }
 
-        // Try reusing an empty span
+        // Try reusing an empty span (pages were decommitted)
         span = empty_.popFront();
         if (!span) {
             // Allocate a fresh span
             span = allocateNewSpan();
             if (!span) return nullptr;
+        } else {
+            recommitEmptySpan(span);
         }
 
         void* ptr = span->allocate();
@@ -128,8 +159,11 @@ public:
             full_.remove(span);
             partial_.pushFront(span);
         } else if (span->empty()) {
-            // Transition: partial → empty
+            // Transition: partial → empty.  Immediately decommit pages
+            // via MADV_DONTNEED to release physical memory without waiting
+            // for the compressor to zero and compress them.
             partial_.remove(span);
+            decommitEmptySpan(span);
             empty_.pushFront(span);
         }
     }
@@ -147,6 +181,8 @@ public:
                 if (!span) {
                     span = allocateNewSpan();
                     if (!span) break;
+                } else {
+                    recommitEmptySpan(span);
                 }
                 partial_.pushFront(span);
             }
@@ -181,6 +217,7 @@ public:
                 partial_.pushFront(span);
             } else if (span->empty()) {
                 partial_.remove(span);
+                decommitEmptySpan(span);
                 empty_.pushFront(span);
             }
         }

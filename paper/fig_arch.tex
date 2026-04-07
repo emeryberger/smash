@@ -29,11 +29,11 @@
 
   % Fault handler transitions (back to ACTIVE) — signal handler
   \draw[fault] (monitor) edge[bend left=30]
-    node[left, font=\scriptsize, text=black!60] {fault} (active);
+    node[left, font=\scriptsize, text=black!60] {fault (W)} (active);
   \draw[fault] (compressing) edge[bend left=15]
-    node[left, font=\scriptsize, text=black!60] {fault} (active);
+    node[left, font=\scriptsize, text=black!60] {fault (RW)} (active);
   \draw[fault] (compressed) edge[bend right=70]
-    node[right, font=\scriptsize, text=black!60] {fault} (active);
+    node[right, font=\scriptsize, text=black!60] {fault (RW)} (active);
 \end{tikzpicture}
 \caption{\textbf{Page state machine with JIT compression}
   (\S\ref{sec:design:arch}, \S\ref{sec:design:adaptive}).

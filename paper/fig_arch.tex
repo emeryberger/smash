@@ -44,9 +44,9 @@
   % ROI: COMPRESSING → COMPRESSED
   \draw[forward] (compressing) -- node[elbl, below] {ROI} (compressed);
 
-  % free: ACTIVE → EMPTY
+  % free: ACTIVE → EMPTY (only when entire span is empty)
   \draw[forward] (active) edge[bend left=25]
-    node[elbl, above] {free} (empty);
+    node[elbl, above] {\shortstack{span\\[-2pt]empty}} (empty);
 
   % upgrade: self-loop on COMPRESSED
   \draw[forward] (compressed) edge[loop below, looseness=5, min distance=6mm]

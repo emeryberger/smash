@@ -10,36 +10,37 @@ were merged into Table~\ref{tab:apps_summary}.
 \subsection{Application Benchmarks}
 
 \begin{table}[h]
-\caption{\textbf{\sys reduces RSS by 21--86\% with negligible throughput cost}
+\caption{\textbf{\sys reduces RSS by \rssRedMin--\rssRedMax\% with negligible throughput cost}
   (\S\ref{sec:eval:apps}).  Cool-phase RSS reduction.}
 \label{tab:apps}
 \centering\small
-\begin{tabular}{lrrr}
+\begin{tabular}{lrr}
 \toprule
-Application & RSS Reduction & Throughput & Cold p50 \\
+Application & RSS Reduction & Serve RSS (MiB) \\
 \midrule
-Memcached       & \textbf{86.4\%}  & \textbf{0\%}        & --- \\
-RocksDB         & 83.6\%  & +2\%       & \textbf{0.8}\,$\mu$s \\
-SQLite          & 75.5\%  & $-$0.4\%   & 0.9\,$\mu$s \\
-Redis           & 67.8\%  & \textbf{0\%}        & --- \\
-Redis-ext       & 55.1\%  & \textbf{0\%}        & --- \\
+Memcached       & \textbf{\ablMemcachedDefaultRssRed\%}  & \ablMemcachedDefaultServeRss \\
+RocksDB         & \ablRocksdbDefaultRssRed\%  & \ablRocksdbDefaultServeRss \\
+SQLite          & \ablSqliteDefaultRssRed\%  & \ablSqliteDefaultServeRss \\
+DuckDB          & \ablDuckdbDefaultRssRed\%  & \ablDuckdbDefaultServeRss \\
+Redis           & \ablRedisDefaultRssRed\%  & \ablRedisDefaultServeRss \\
+Redis-ext       & \ablRedisExtDefaultRssRed\%  & \ablRedisExtDefaultServeRss \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{table}[h]
 \caption{\textbf{Only \sys reduces RSS below fill level}
-  (\S\ref{sec:eval:apps}).  Serve-phase RSS (MiB) across all five
-  workloads (Linux).}
+  (\S\ref{sec:eval:apps}).  Serve-phase RSS (MiB) across all six
+  workloads.}
 \label{tab:multi_alloc_apps}
 \centering\small
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrrrrr}
 \toprule
-Allocator & SQLite & RocksDB & Redis & Redis-ext & Memcached \\
+Allocator & SQLite & RocksDB & DuckDB & Redis & Redis-ext & Memcached \\
 \midrule
-System  & 613   & 416   & 117  & 117  & 297 \\
-Mesh    & 618   & 309   & 97   & 78   & 298 \\
-\sys    & \textbf{178} & \textbf{122} & \textbf{40} & \textbf{46} & \textbf{79} \\
+System  & \ablSqliteBaselineServeRss   & \ablRocksdbBaselineServeRss   & \ablDuckdbBaselineServeRss & \ablRedisBaselineServeRss  & \ablRedisExtBaselineServeRss  & \ablMemcachedBaselineServeRss \\
+Mesh    & \ablSqliteMeshServeRss   & \ablRocksdbMeshServeRss   & \ablDuckdbMeshServeRss & \ablRedisMeshServeRss   & \ablRedisExtMeshServeRss   & \ablMemcachedMeshServeRss \\
+\sys    & \textbf{\ablSqliteDefaultServeRss} & \textbf{\ablRocksdbDefaultServeRss} & \textbf{\ablDuckdbDefaultServeRss} & \textbf{\ablRedisDefaultServeRss} & \textbf{\ablRedisExtDefaultServeRss} & \textbf{\ablMemcachedDefaultServeRss} \\
 \bottomrule
 \end{tabular}
 \end{table}

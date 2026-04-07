@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Generate all paper figures using matplotlib + seaborn."""
+"""Generate all paper figures using matplotlib + seaborn.
 
+Reads data from paper_results/*.json when available; falls back to
+hardcoded values if the JSON files are missing.
+"""
+
+import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -33,15 +38,39 @@ BASELINE_COLOR = COLORS[7]   # gray
 MESH_COLOR = COLORS[2]       # green
 ACCENT_COLOR = COLORS[3]     # red
 
+# ── Load benchmark results from JSON ──────────────────────────────────
+RESULTS_DIR = os.path.join(os.path.dirname(OUTDIR), '..', 'paper_results')
+
+def _load_json(name):
+    path = os.path.join(RESULTS_DIR, name)
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+ABLATION = _load_json('ablation_results.json')
+COMPRESS_ONLY = _load_json('compress_only_results.json')
+
+def _abl_med(app, config, field):
+    """Get median field from ablation results."""
+    try:
+        return ABLATION[app][config]['median'][field]
+    except (KeyError, TypeError):
+        return None
+
 
 def fig_rss_reduction():
     """Figure 1: RSS reduction across applications (grouped bar chart)."""
-    # Linux results from run_paper_experiments.py (March 2026)
-    # Redis/Redis-ext updated with background tasks disabled (hz=1, activedefrag=no, etc.)
-    # Redis-ext shows negative reduction because DELETE operations cause decompression
-    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis*', 'Redis-ext*']
-    mesh_rss =  [0.0,  0.5, 23.0, 0.0, 0.0]
-    smash_rss = [82.4, 79.5, 69.1, 47.0, -65.0]  # Redis* with bg disabled; Redis-ext* negative
+    app_keys = [('memcached', 'Memcached'), ('rocksdb', 'RocksDB'),
+                ('sqlite', 'SQLite'), ('duckdb', 'DuckDB'),
+                ('redis', 'Redis*'), ('redis_ext', 'Redis-ext*')]
+    apps = [label for _, label in app_keys]
+    if ABLATION:
+        mesh_rss = [_abl_med(k, 'MESH', 'rss_reduction_pct') or 0.0 for k, _ in app_keys]
+        smash_rss = [_abl_med(k, 'B1', 'rss_reduction_pct') or 0.0 for k, _ in app_keys]
+    else:
+        mesh_rss =  [0.0,  0.2, 31.3, 0.0, 0.0, 0.0]
+        smash_rss = [86.4, 83.6, 75.5, 0.6, 67.8, 55.1]
 
     fig, ax = plt.subplots(figsize=(4.5, 2.5))
     x = np.arange(len(apps))
@@ -62,7 +91,7 @@ def fig_rss_reduction():
     ax.set_xticks(x)
     ax.set_xticklabels(apps, rotation=25, ha='right')
     ax.axhline(y=0, color='black', linewidth=0.5, zorder=2)
-    ax.set_ylim(-80, 95)
+    ax.set_ylim(-10, 100)
     ax.legend(loc='upper right', fontsize=8)
     ax.yaxis.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
@@ -201,31 +230,53 @@ def fig_ablation():
         'No compress',
     ]
 
-    # Deltas (pp) from default for each benchmark - Linux results (March 2026)
-    sqlite_delta    = [-0.2,   0.0,   0.0,   0.0,   0.0,   0.0,  -47.8]
-    rocksdb_delta   = [-1.2,  -1.5,   0.0,  -1.1,  -0.3,   0.1,  -79.0]
-    memcached_delta = [-0.4,  -0.2,  -0.4,  -0.1,  -0.6,  -0.4,  -82.4]
-    redis_delta     = [-0.4,  -2.5,   0.0,   0.6,   0.8,  -1.0,   0.4]
+    # Compute deltas from JSON if available
+    abl_cfgs = ['DICT', 'T1a', 'T1c', 'T2a', 'T1e', 'T1f', 'B2']
+    def _compute_deltas(app):
+        if not ABLATION or app not in ABLATION:
+            return [0.0] * len(abl_cfgs)
+        default = _abl_med(app, 'B1', 'rss_reduction_pct') or 0.0
+        return [((_abl_med(app, c, 'rss_reduction_pct') or 0.0) - default) for c in abl_cfgs]
+
+    if ABLATION:
+        sqlite_delta    = _compute_deltas('sqlite')
+        rocksdb_delta   = _compute_deltas('rocksdb')
+        memcached_delta = _compute_deltas('memcached')
+        redis_delta     = _compute_deltas('redis')
+        duckdb_delta    = _compute_deltas('duckdb')
+        redis_ext_delta = _compute_deltas('redis_ext')
+    else:
+        sqlite_delta    = [-2.6,   0.0,   0.0,   0.0,   0.0,   0.1,  -48.7]
+        rocksdb_delta   = [-6.9,  -0.8,  -0.6,   0.5,   0.8,   1.2,  -83.6]
+        memcached_delta = [-3.9,   0.0,   0.0,   0.0,   0.0,   0.1,  -86.4]
+        redis_delta     = [-7.4,  -0.5,  -0.5,  -3.3,  -3.0,  -2.2,  -67.8]
+        duckdb_delta    = [-0.18, -0.01,  0.0,  -0.01,  0.02, -0.07,  -0.58]
+        redis_ext_delta = [-8.0,   1.4,   0.6,   0.7,  -1.9,  -2.7,  -55.1]
 
     fig, ax = plt.subplots(figsize=(7.0, 4.5))
     x = np.arange(len(configs))
-    width = 0.18
+    n_groups = 6
+    width = 0.8 / n_groups
 
-    ax.bar(x - 1.5*width, sqlite_delta, width, label='SQLite',
+    ax.bar(x - 2.5*width, sqlite_delta, width, label='SQLite',
            color=COLORS[0], edgecolor='white', linewidth=0.3, zorder=3)
-    ax.bar(x - 0.5*width, rocksdb_delta, width, label='RocksDB',
+    ax.bar(x - 1.5*width, rocksdb_delta, width, label='RocksDB',
            color=COLORS[1], edgecolor='white', linewidth=0.3, zorder=3)
-    ax.bar(x + 0.5*width, memcached_delta, width, label='Memcached',
+    ax.bar(x - 0.5*width, memcached_delta, width, label='Memcached',
            color=COLORS[3], edgecolor='white', linewidth=0.3, zorder=3)
+    ax.bar(x + 0.5*width, duckdb_delta, width, label='DuckDB',
+           color=COLORS[5], edgecolor='white', linewidth=0.3, zorder=3)
     ax.bar(x + 1.5*width, redis_delta, width, label='Redis',
            color=COLORS[4], edgecolor='white', linewidth=0.3, zorder=3)
+    ax.bar(x + 2.5*width, redis_ext_delta, width, label='Redis-ext',
+           color=COLORS[6], edgecolor='white', linewidth=0.3, zorder=3)
 
     ax.axhline(y=0, color='black', linewidth=0.5, zorder=2)
     ax.set_ylabel('Change in RSS Reduction (pp)\nfrom default', fontsize=16)
     ax.set_xticks(x)
     ax.set_xticklabels(configs, fontsize=14, rotation=30, ha='right')
     ax.tick_params(axis='y', labelsize=14)
-    ax.legend(frameon=True, framealpha=0.9, ncol=4, fontsize=14,
+    ax.legend(frameon=True, framealpha=0.9, ncol=6, fontsize=12,
               loc='lower left')
     ax.yaxis.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
@@ -375,14 +426,24 @@ def fig_dict_overhead():
 
 def fig_auc_comparison():
     """Figure: AUC (Area Under Curve) reduction - total memory pressure over time."""
-    # Linux results from run_paper_experiments.py (March 2026)
-    # Redis/Redis-ext updated with background tasks disabled (hz=1, activedefrag=no, etc.)
-    # Redis-ext shows worse AUC because DELETE operations cause decompression
-    apps = ['Memcached', 'RocksDB', 'SQLite', 'Redis*', 'Redis-ext*']
+    app_keys = [('memcached', 'Memcached'), ('rocksdb', 'RocksDB'),
+                ('sqlite', 'SQLite'), ('duckdb', 'DuckDB'),
+                ('redis', 'Redis*'), ('redis_ext', 'Redis-ext*')]
+    apps = [label for _, label in app_keys]
 
-    # AUC reduction % from baseline (positive = better)
-    mesh_auc_red =  [-0.9, -9.5, -91.2, 0.0, 0.0]
-    smash_auc_red = [71.9, 59.8, 33.9, 34.2, -92.5]  # Redis* improved; Redis-ext* worse
+    def _auc_red(app, config):
+        b0 = _abl_med(app, 'B0', 'auc_mb_sec')
+        tgt = _abl_med(app, config, 'auc_mb_sec')
+        if b0 and tgt and b0 > 0:
+            return (b0 - tgt) / b0 * 100
+        return 0.0
+
+    if ABLATION:
+        mesh_auc_red = [_auc_red(k, 'MESH') for k, _ in app_keys]
+        smash_auc_red = [_auc_red(k, 'B1') for k, _ in app_keys]
+    else:
+        mesh_auc_red =  [-0.3, 26.5, -0.8, 39.7, 17.5, 33.7]
+        smash_auc_red = [73.2, 74.0, 56.9, 41.4, 54.4, 56.6]
 
     fig, ax = plt.subplots(figsize=(4.5, 2.5))
     x = np.arange(len(apps))
@@ -398,7 +459,7 @@ def fig_auc_comparison():
     ax.set_title('Memory Pressure Over Time (AUC)')
     ax.set_xticks(x)
     ax.set_xticklabels(apps, rotation=25, ha='right')
-    ax.set_ylim(-100, 85)
+    ax.set_ylim(-10, 85)
     ax.legend(loc='upper right', fontsize=8)
     ax.yaxis.grid(True, alpha=0.3)
     ax.set_axisbelow(True)

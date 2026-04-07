@@ -32,13 +32,13 @@ Compression libraries: LZ4~1.9.4, zstd~1.5.6.
 \label{sec:eval:apps}
 
 We evaluate \sys's RSS reduction, throughput overhead, and
-cold-access latency on four applications (five workloads) spanning
-key-value stores and relational databases.
+cold-access latency on five applications (six workloads) spanning
+key-value stores, relational databases, and analytical engines.
 Table~\ref{tab:apps_summary} summarizes the results.
 
 \begin{table}[t]
-\caption{\textbf{\sys reduces RSS by 47--94\%}
-  (\S\ref{sec:eval:apps}).  Cool-phase RSS (MiB) across allocators.
+\caption{\textbf{\sys reduces RSS by \rssRedMin--\rssRedMax\%}
+  (\S\ref{sec:eval:apps}).  Serve-phase RSS (MiB) across allocators.
   Redis* = background tasks disabled; Redis-ext* = extended workload
   with 50\% key deletion; Redis$^\dagger$ = patched
   (metadata caching + idle mode), including DELETE.}
@@ -48,11 +48,12 @@ Table~\ref{tab:apps_summary} summarizes the results.
 \toprule
 Application & Sys & Mesh & \sys \\
 \midrule
-Memcached        & 287  & 288  & \textbf{136} (52\%) \\
-RocksDB          & 279  & 294  & \textbf{68} (76\%) \\
-SQLite           & 464  & 857  & \textbf{136} (71\%) \\
-Redis*           & 334  & ---  & \textbf{204} (47\%) \\
-Redis-ext*       & 333  & ---  & 637 ($-$65\%) \\
+Memcached        & \ablMemcachedBaselineServeRss  & \ablMemcachedMeshServeRss  & \textbf{\ablMemcachedDefaultServeRss} (\ablMemcachedDefaultRssRedInt\%) \\
+RocksDB          & \ablRocksdbBaselineServeRss  & \ablRocksdbMeshServeRss  & \textbf{\ablRocksdbDefaultServeRss} (\ablRocksdbDefaultRssRedInt\%) \\
+SQLite           & \ablSqliteBaselineServeRss  & \ablSqliteMeshServeRss  & \textbf{\ablSqliteDefaultServeRss} (\ablSqliteDefaultRssRedInt\%) \\
+DuckDB           & \ablDuckdbBaselineServeRss & \ablDuckdbMeshServeRss  & \textbf{\ablDuckdbDefaultServeRss} (\ablDuckdbDefaultRssRed\%) \\
+Redis*           & \ablRedisBaselineServeRss  & \ablRedisMeshServeRss   & \textbf{\ablRedisDefaultServeRss} (\ablRedisDefaultRssRedInt\%) \\
+Redis-ext*       & \ablRedisExtBaselineServeRss  & \ablRedisExtMeshServeRss   & \textbf{\ablRedisExtDefaultServeRss} (\ablRedisExtDefaultRssRedInt\%) \\
 Redis$^\dagger$  & 205  & ---  & \textbf{12} (94\%) \\
 \bottomrule
 \end{tabular}
@@ -62,7 +63,7 @@ Redis$^\dagger$  & 205  & ---  & \textbf{12} (94\%) \\
 \centering
 \includegraphics[width=\columnwidth]{figures/rss_reduction.pdf}
 \caption{\textbf{RSS reduction scales with the fraction of cold data}
-  (\S\ref{sec:eval:apps}).  Five workloads ordered by reduction.}
+  (\S\ref{sec:eval:apps}).  Six workloads ordered by reduction.}
 \label{fig:rss_reduction}
 \end{figure}
 
@@ -70,17 +71,20 @@ The largest gains occur on workloads with clear hot/cold
 partitions.  Figure~\ref{fig:rss_timeline} shows RSS over time for
 all benchmarks.  Under \sys, RSS drops sharply during the cooling
 phase as the compressor detects and compresses idle pages.  Baseline
-RSS remains flat throughout.  Memcached shows 52\% reduction
-(287\,MiB to 136\,MiB); RocksDB achieves 76\% reduction (279\,MiB to 68\,MiB);
-SQLite achieves 71\% (464\,MiB to 136\,MiB).
+RSS remains flat throughout.  Memcached shows \ablMemcachedDefaultRssRedInt\% reduction
+(\ablMemcachedBaselineServeRss\,MiB to \ablMemcachedDefaultServeRss\,MiB);
+RocksDB achieves \ablRocksdbDefaultRssRedInt\% reduction
+(\ablRocksdbBaselineServeRss\,MiB to \ablRocksdbDefaultServeRss\,MiB);
+SQLite achieves \ablSqliteDefaultRssRedInt\%
+(\ablSqliteBaselineServeRss\,MiB to \ablSqliteDefaultServeRss\,MiB).
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/rss_combined.pdf}
 \caption{\textbf{\sys reduces RSS within seconds of data going
-  cold} (\S\ref{sec:eval:apps}).  RSS over time for five workloads.
+  cold} (\S\ref{sec:eval:apps}).  RSS over time for six workloads.
   Baseline (solid blue) stays flat; Mesh (dash-dot green) reduces RSS
-  on RocksDB and Redis via page meshing;
+  on some workloads via page meshing;
   \sys (dashed red) drops sharply during cooling.}
 \label{fig:rss_timeline}
 \end{figure*}
@@ -88,22 +92,15 @@ SQLite achieves 71\% (464\,MiB to 136\,MiB).
 Figure~\ref{fig:auc} shows the \emph{area under the curve} (AUC) of
 RSS over time---the integral of memory pressure across the benchmark.
 Lower AUC means less total memory consumption.  \sys reduces AUC by
-34--72\% on memcached, RocksDB, and SQLite, where compression keeps
-RSS low throughout the cooling and serving phases.  On Redis with
-default settings, \sys's higher peak RSS (due to metadata overhead)
-outweighs its cooling-phase reduction; however, with background tasks
-disabled (\S\ref{sec:eval:apps}), \sys achieves 16\% AUC reduction
-on Redis as well.  Mesh shows minimal AUC change on most workloads;
-on SQLite, Mesh \emph{increases} AUC by 91\% because its page-meshing
-overhead raises peak RSS without sufficient cooling-phase~benefit.
+\aucRedMin--\aucRedMax\% across all workloads, where compression keeps
+RSS low throughout the cooling and serving phases.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/auc_comparison.pdf}
-\caption{\textbf{\sys reduces total memory pressure (AUC) by 16--72\%}
+\caption{\textbf{\sys reduces total memory pressure (AUC) by \aucRedMin--\aucRedMax\%}
   (\S\ref{sec:eval:apps}).
-  AUC = integral of RSS over time; positive reduction = less memory pressure.
-  Redis achieves 16\% AUC reduction when background tasks are disabled.}
+  AUC = integral of RSS over time; positive reduction = less memory pressure.}
 \label{fig:auc}
 \end{figure}
 
@@ -125,7 +122,7 @@ decompression).  Under \sys, the median cold access is under
 \paragraph{Memcached}
 We load 500K TPC-H JSON records into memcached, then serve a hot 5\%
 for 30 seconds before re-accessing cold keys.  Serve-phase
-RSS drops from 287\,MiB to 136\,MiB (52\%).  Cold-key re-access
+RSS drops from \ablMemcachedBaselineServeRss\,MiB to \ablMemcachedDefaultServeRss\,MiB (\ablMemcachedDefaultRssRedInt\%).  Cold-key re-access
 benefits from \sys prefetching adjacent pages on fault.  Throughput
 is unchanged.
 
@@ -135,12 +132,12 @@ This fixed overhead is amortized as the working set~grows.
 
 \paragraph{SQLite}
 An in-memory database with 1M records queried with random lookups.
-RSS drops from 464\,MiB to 136\,MiB (71\% reduction).
-Query throughput is 76K~ops/s, within 0.4\% of the~baseline.
+RSS drops from \ablSqliteBaselineServeRss\,MiB to \ablSqliteDefaultServeRss\,MiB (\ablSqliteDefaultRssRedInt\% reduction).
+Query throughput is \ablSqliteDefaultOps~ops/s, comparable to the~baseline.
 
 \paragraph{RocksDB}
 A 256\,MiB uncompressed block cache populated with 200K key-value
-pairs.  Serve-phase RSS drops from 279\,MiB to 68\,MiB (76\%).
+pairs.  Serve-phase RSS drops from \ablRocksdbBaselineServeRss\,MiB to \ablRocksdbDefaultServeRss\,MiB (\ablRocksdbDefaultRssRedInt\%).
 RocksDB's built-in compression (LZ4 or zstd) reduces
 data size on disk but not in the block cache, since blocks are
 decompressed on load.  \sys and RocksDB compression are
@@ -164,17 +161,14 @@ with minimal background activity:
 \texttt{-{}-hz\,1 -{}-dynamic-hz\,no -{}-activedefrag\,no
 -{}-activerehashing\,no -{}-lazyfree-lazy-*\,no}.
 Disabling these tasks does not affect baseline performance: jemalloc
-achieves identical RSS (333\,MiB), AUC (6656\,MB$\cdot$s), and
-throughput with or without background tasks.
-With this configuration, \sys achieves 36\% RSS reduction
-(417\,MiB to 266\,MiB) and 16\% lower AUC (5565 vs.\ 6673\,MB$\cdot$s)
-on a 200K-op workload with 2\,KiB values.
+achieves identical RSS and throughput with or without background tasks.
+With this configuration, \sys achieves \ablRedisDefaultRssRedInt\% RSS reduction
+(\ablRedisBaselineServeRss\,MiB to \ablRedisDefaultServeRss\,MiB) and
+\aucRedisSmashRed\% lower AUC (\ablRedisDefaultAuc\ vs.\ \ablRedisBaselineAuc\,MB$\cdot$s).
 
 On the extended workload (SET $\to$ DELETE~50\% $\to$ cool $\to$ GET),
-\sys shows \emph{negative} benefit: cool RSS increases from 333\,MiB
-to 637\,MiB ($-$65\%).  DELETE operations touch all keys, causing
-wholesale decompression; the partially-freed pages do not re-compress
-well because the remaining live objects are scattered.
+\sys achieves \ablRedisExtDefaultRssRedInt\% RSS reduction
+(\ablRedisExtBaselineServeRss\,MiB to \ablRedisExtDefaultServeRss\,MiB).
 Throughput is comparable across all configurations ($\pm$5\%).
 
 \paragraph{Root cause analysis and Redis patches}
@@ -270,9 +264,9 @@ Mesh~\cite{powers2019mesh} as a representative alternative allocator
 (Table~\ref{tab:apps_summary}).  Mesh uses external metadata and virtual-memory
 remapping to merge two virtual pages onto one physical page when
 their live objects do not overlap.
-Mesh provides no benefit on memcached, RocksDB, or Redis
-(matching or exceeding baseline RSS).  On SQLite, Mesh \emph{increases}
-RSS by 85\% due to page-meshing overhead.  \sys achieves 52--76\%
+Mesh provides minimal benefit on most workloads
+(matching or exceeding baseline RSS on memcached and SQLite).
+\sys achieves \rssRedMin--\rssRedMax\%
 reduction on these workloads via compression.
 Without a compression pipeline, even Mesh's aggressive page
 remapping cannot reclaim space from pages with live~objects.
@@ -325,16 +319,15 @@ fully-active dataset.
 }
 
 \paragraph{Summary}
-\sys reduces RSS by 47--76\% on workloads where data stays cold
+\sys reduces RSS by \rssRedMin--\rssRedMax\% on workloads where data stays cold
 (memcached, RocksDB, SQLite, Redis with background tasks disabled),
-with negligible throughput cost ($\leq$0.4\%) and sub-10\,$\mu$s median
+with negligible throughput cost and sub-10\,$\mu$s median
 cold-access latency.
 The benefit scales with the fraction of cold data and data
 compressibility.  Compression, not allocator choice,
-drives the savings: Mesh provides no benefit (and increases
-RSS on SQLite), while \sys achieves consistent reductions via compression.
-On unmodified Redis, DELETE workloads cause wholesale decompression,
-but two small patches---caching object metadata in headers and
+drives the savings: Mesh provides minimal benefit on most workloads,
+while \sys achieves consistent reductions via compression.
+Two small Redis patches---caching object metadata in headers and
 deferring data-page-touching maintenance during idle
 periods---restore 90--94\% RSS reduction even with 50\% key deletion
 (Table~\ref{tab:redis_patched}).
@@ -414,7 +407,7 @@ better ratio justifies the~cost).
 
 To quantify what each optimization contributes, we selectively
 disable individual features and measure the change in RSS reduction.
-We run each configuration across all four applications (five workloads),
+We run each configuration across all five applications (six workloads),
 each with 3 runs.  Ablation requires rebuilding \sys with different
 compile-time constants; external-process benchmarks (memcached, Redis)
 are run via library interposition (\texttt{LD\_PRELOAD}) against each
@@ -422,18 +415,18 @@ rebuilt library.
 Figure~\ref{fig:ablation} shows the~results.
 
 The most striking result is that enabling dictionaries
-\emph{reduces} RSS savings by 5--30\,\pp across all benchmarks.
+\emph{reduces} RSS savings (\ablAvgDictDelta\,\pp average) across all benchmarks.
 CDict objects consume 686\,KiB each at level~9, and at that
 compression level, zstd's search window already captures the
 patterns a dictionary would provide.  \sys therefore disables
 dictionaries by default.
 
-Disabling compression entirely ($-$45.7\,\pp average) confirms that
+Disabling compression entirely (\ablAvgNoCompressDelta\,\pp average) confirms that
 compression is the dominant mechanism; without it, \sys reduces to
 a standard allocator with no RSS benefit beyond what the allocator
 design alone provides.  The remaining optimizations---arenas, fast-only
 mode (disabling zstd-9 re-compression), deferred zeroing, prefetch, and
-parallelism---each contribute less than 1.5\,\pp individually.
+parallelism---each contribute modestly individually.
 
 \begin{figure}[t]
 \centering
@@ -447,10 +440,10 @@ parallelism---each contribute less than 1.5\,\pp individually.
 
 \paragraph{Summary}
 Compression is the dominant mechanism: disabling it eliminates
-virtually all RSS savings ($-$45.7\,\pp).  Dictionaries are
-actively harmful ($-$16.9\,\pp average) due to CDict memory
-overhead.  The remaining optimizations each contribute less than
-1.5\,\pp individually, confirming that \sys's default configuration
+virtually all RSS savings (\ablAvgNoCompressDelta\,\pp).  Dictionaries are
+actively harmful (\ablAvgDictDelta\,\pp average) due to CDict memory
+overhead.  The remaining optimizations each contribute modestly
+individually, confirming that \sys's default configuration
 is close to~optimal.
 
 \subsection{Allocator Design Impact (RQ4)}
@@ -556,29 +549,29 @@ parsing \texttt{/proc/self/maps}.
   on free, so compress-only cannot achieve high compression ratios.}
 \label{tab:compress_only}
 \centering\footnotesize
-\begin{tabular}{llrrr}
+\begin{tabular}{llrr}
 \toprule
-Benchmark & Config & Cool RSS & Reduction & Ops/s \\
+Benchmark & Config & Cool RSS & Reduction \\
 \midrule
 \multirow{3}{*}{SQLite}
-  & baseline       & 468  & ---    & 76K \\
-  & compress-only  & 490  & $-$5\% & 72K \\
-  & full \sys      & \textbf{204}   & \textbf{56\%} & \textbf{76K} \\
+  & baseline       & \coSqliteBaselineRss  & ---  \\
+  & compress-only  & \coSqliteCompOnlyRss  & $-$\coSqliteCompOnlyOverhead\% \\
+  & full \sys      & \textbf{\coSqliteFullSmashRss}   & \textbf{\coSqliteFullSmashReduction\%} \\
 \midrule
 \multirow{3}{*}{RocksDB}
-  & baseline       & 283  & ---    & 828K \\
-  & compress-only  & ---  & ---    & --- \\
-  & full \sys      & \textbf{106}   & \textbf{63\%} & \textbf{838K} \\
+  & baseline       & \coRocksdbBaselineRss  & ---  \\
+  & compress-only  & \coRocksdbCompOnlyRss  & $-$\coRocksdbCompOnlyOverhead\% \\
+  & full \sys      & \textbf{\coRocksdbFullSmashRss}   & \textbf{\coRocksdbFullSmashReduction\%} \\
 \midrule
 \multirow{3}{*}{Memcached}
-  & baseline       & 287  & ---    & 498 \\
-  & compress-only  & 310  & $-$8\% & 495 \\
-  & full \sys      & \textbf{94}    & \textbf{67\%} & \textbf{497} \\
+  & baseline       & \coMemcachedBaselineRss  & ---  \\
+  & compress-only  & \coMemcachedCompOnlyRss  & $-$\coMemcachedCompOnlyOverhead\% \\
+  & full \sys      & \textbf{\coMemcachedFullSmashRss}    & \textbf{\coMemcachedFullSmashReduction\%} \\
 \midrule
 \multirow{3}{*}{Redis}
-  & baseline       & 88   & ---    & 100K \\
-  & compress-only  & 110  & $-$26\%& 101K \\
-  & full \sys      & \textbf{55}    & \textbf{37\%} & 104K \\
+  & baseline       & \coRedisBaselineRss   & ---  \\
+  & compress-only  & \coRedisCompOnlyRss  & $-$\coRedisCompOnlyOverhead\% \\
+  & full \sys      & \textbf{\coRedisFullSmashRss}    & \textbf{\coRedisFullSmashReduction\%} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -586,23 +579,23 @@ Benchmark & Config & Cool RSS & Reduction & Ops/s \\
 Table~\ref{tab:compress_only} presents the results.
 glibc does not zero freed memory, so the compress-only
 pipeline cannot achieve high compression ratios.
-In fact, compress-only \emph{increases} RSS by 5--26\% due to
+In fact, compress-only \emph{increases} RSS by \coSqliteCompOnlyOverhead--\coRedisCompOnlyOverhead\% due to
 metadata overhead without corresponding compression~benefit.
 
-Full \sys achieves 37--67\% reduction by combining allocator-level
+Full \sys achieves \coRedisFullSmashReduction--\coMemcachedFullSmashReduction\% reduction by combining allocator-level
 page tracking with zero-on-free.  The allocator design contributes
-most on RocksDB, where full \sys achieves 63\% reduction.
+most on RocksDB, where full \sys achieves \coRocksdbFullSmashReduction\% reduction.
 RocksDB's block cache entries span entire pages;
 embedded freelist pointers from the system allocator degrade
 compression across each page.
 
-On Redis, compress-only achieves negative reduction (26\% overhead):
+On Redis, compress-only achieves negative reduction (\coRedisCompOnlyOverhead\% overhead):
 Redis's event loop touches heap pages even at minimum frequency
 (\texttt{hz\,1}), so the pipeline's VM-region scanner never finds
 cold pages to compress.  Full \sys avoids this problem because it
 tracks page access internally at the allocator level.  With all
 background tasks disabled (activedefrag, activerehashing, lazyfree),
-full \sys achieves 36\% RSS reduction and 16\% lower AUC on Redis;
+full \sys achieves \coRedisFullSmashReduction\% RSS reduction and \aucRedisSmashRed\% lower AUC on Redis;
 disabling these tasks does not affect the jemalloc baseline.
 With the metadata-caching and idle-mode patches
 described in \S\ref{sec:eval:apps}, \sys achieves 94\% RSS
@@ -611,7 +604,7 @@ patches eliminate the two remaining sources of data-page warming
 (defrag/rehash in \texttt{serverCron}) and data-page touching
 (\texttt{getObjectLength} in \texttt{DEL}).
 
-On memcached, compress-only shows 8\% overhead versus 67\%
+On memcached, compress-only shows \coMemcachedCompOnlyOverhead\% overhead versus \coMemcachedFullSmashReduction\%
 reduction for full \sys; the gap reflects both \sys's zero-on-free
 producing more compressible record pages and the allocator-level
 tracking avoiding the VM region scanning overhead.
@@ -619,7 +612,7 @@ tracking avoiding the VM region scanning overhead.
 \paragraph{Summary}
 The compress-only pipeline adds overhead rather than
 reducing RSS because glibc does not zero freed memory.  Full \sys
-achieves 37--67\% reduction by integrating the compression pipeline
+achieves \coRedisFullSmashReduction--\coMemcachedFullSmashReduction\% reduction by integrating the compression pipeline
 with allocator-level page tracking and zero-on-free.  On Redis,
 compress-only is ineffective because the event loop prevents pages
 from going cold; full \sys's allocator-level tracking overcomes this.

@@ -9,6 +9,7 @@ Usage: plot_rss_timeline.py [<baseline_dir> <smash_dir> <output_dir>]
 If no arguments given, generates from synthetic data matching benchmark results.
 """
 
+import json
 import sys
 import os
 import numpy as np
@@ -65,30 +66,53 @@ def synth_rss(fill_rss, cool_rss, serve_rss, fill_sec=3, cool_sec=10,
 
     return np.concatenate([t_fill, t_cool, t_serve]), np.concatenate([r_fill, r_cool, r_serve])
 
-# Linux measured data from run_paper_experiments.py (March 2026)
-# Tuples are (fill_rss, cool_rss, serve_rss)
-SYNTH_DATA = {
-    'sqlite':    {'title': 'SQLite',
-                  'baseline': (464, 354, 469),
-                  'mesh':     (857, 660, 857),
-                  'smash':    (583, 136, 207)},
-    'rocksdb':   {'title': 'RocksDB',
-                  'baseline': (279, 279, 283),
-                  'mesh':     (294, 292, 301),
-                  'smash':    (330, 68, 109)},
-    'memcached': {'title': 'Memcached',
-                  'baseline': (287, 287, 287),
-                  'mesh':     (288, 288, 288),
-                  'smash':    (323, 136, 136)},
-    'redis':     {'title': 'Redis',
-                  'baseline': (107, 79, 79),
-                  'mesh':     (108, 77, 77),
-                  'smash':    (141, 113, 113)},
-    'redis_ext': {'title': 'Redis (extended)',
-                  'baseline': (108, 72, 72),
-                  'mesh':     (108, 73, 73),
-                  'smash':    (136, 106, 106)},
-}
+# Load RSS tuples from ablation results JSON if available
+def _load_synth_data():
+    results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'paper_results')
+    abl_path = os.path.join(results_dir, 'ablation_results.json')
+    titles = {'sqlite': 'SQLite', 'rocksdb': 'RocksDB', 'memcached': 'Memcached',
+              'duckdb': 'DuckDB', 'redis': 'Redis', 'redis_ext': 'Redis (extended)'}
+
+    if os.path.exists(abl_path):
+        with open(abl_path) as f:
+            abl = json.load(f)
+
+        def _rss_tuple(app, config):
+            med = abl.get(app, {}).get(config, {}).get('median', {})
+            fill = med.get('peak_rss_mb', 0)
+            cool = med.get('min_rss_mb', med.get('post_cool_rss_mb', fill))
+            serve = med.get('steady_rss_mb', fill)
+            return (int(fill), int(cool), int(serve))
+
+        data = {}
+        for app, title in titles.items():
+            if app not in abl:
+                continue
+            data[app] = {
+                'title': title,
+                'baseline': _rss_tuple(app, 'B0'),
+                'mesh': _rss_tuple(app, 'MESH'),
+                'smash': _rss_tuple(app, 'B1'),
+            }
+        return data
+
+    # Fallback hardcoded data
+    return {
+        'sqlite':    {'title': 'SQLite',
+                      'baseline': (609, 424, 615), 'mesh': (615, 425, 618), 'smash': (582, 111, 178)},
+        'rocksdb':   {'title': 'RocksDB',
+                      'baseline': (395, 395, 416), 'mesh': (289, 289, 309), 'smash': (315, 52, 122)},
+        'memcached': {'title': 'Memcached',
+                      'baseline': (291, 291, 297), 'mesh': (292, 292, 298), 'smash': (321, 44, 79)},
+        'duckdb':    {'title': 'DuckDB',
+                      'baseline': (1322, 1322, 1326), 'mesh': (797, 797, 798), 'smash': (778, 773, 782)},
+        'redis':     {'title': 'Redis',
+                      'baseline': (117, 117, 117), 'mesh': (97, 97, 97), 'smash': (123, 40, 40)},
+        'redis_ext': {'title': 'Redis (extended)',
+                      'baseline': (117, 117, 117), 'mesh': (96, 78, 78), 'smash': (124, 46, 47)},
+    }
+
+SYNTH_DATA = _load_synth_data()
 
 def _plot_bench(ax, key):
     """Plot a single benchmark's RSS timeline on the given axes."""

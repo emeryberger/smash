@@ -1,47 +1,79 @@
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}[
-  state/.style={draw, rounded corners, font=\footnotesize\ttfamily,
-                minimum width=1.6cm, minimum height=0.6cm,
-                fill=black!5},
-  every edge/.style={draw, ->, >=stealth, thick},
-  fault/.style={dashed, color=black!60},
-  plbl/.style={circle, draw, inner sep=1pt, font=\scriptsize\bfseries,
-               fill=white, minimum size=0.4cm},
-  node distance=1.1cm and 1.1cm
+  state/.style={draw, rounded corners=3pt, font=\footnotesize\ttfamily,
+                minimum width=1.5cm, minimum height=0.5cm,
+                fill=black!5, thick},
+  forward/.style={draw, ->, >=stealth, semithick},
+  fault/.style={draw, ->, >=stealth, semithick, dashed, color=black!50},
+  phaselbl/.style={fill=white, inner sep=1pt, font=\scriptsize\bfseries,
+                   draw, circle, minimum size=4.5mm},
+  elbl/.style={font=\scriptsize, fill=white, inner sep=0.5pt},
 ]
-  \node[state] (empty)   {EMPTY};
-  \node[state, right=of empty] (active) {ACTIVE};
-  \node[state, right=of active, minimum width=2.0cm] (monitor) {\shortstack{MONITORING}};
-  \node[state, below=of monitor] (compressing) {COMPRESS};
-  \node[state, below=1.4cm of compressing, minimum width=2.4cm] (compressed)
-    {\shortstack{COMPRESSED\\[-2pt]\scriptsize(zstd-1 or zstd-9)}};
+  % Layout: two rows, forward path goes clockwise
+  %
+  %    EMPTY ---alloc--> ACTIVE ---[3]--> MONITORING
+  %                         ^                 |
+  %                     faults             [2]|
+  %                         |                 v
+  %    COMPRESSED <--ROI-- COMPRESSING
+  %
+  \node[state] (empty) {EMPTY};
+  \node[state, right=1.1cm of empty] (active) {ACTIVE};
+  \node[state, right=1.1cm of active, minimum width=1.9cm] (monitor) {MONITORING};
 
-  % Forward transitions (compressor thread) with phase labels
-  \draw (empty) edge node[above, font=\scriptsize] {alloc} (active);
-  \draw (active) edge node[plbl] {3} (monitor);
-  \draw (monitor) edge node[plbl] {2} (compressing);
-  \draw (compressing) edge node[right, font=\scriptsize] {ROI} (compressed);
+  \node[state, below=1.3cm of monitor] (compressing) {COMPRESSING};
+  \node[state, below=1.3cm of empty, minimum width=2.0cm] (compressed)
+    {\shortstack{COMPRESSED\\[-2pt]\scriptsize\rmfamily(zstd-1/zstd-9)}};
 
-  % Phase 1 self-loop on monitor (update cold counts)
-  \draw (monitor) edge[loop above, looseness=5, min distance=8mm]
-    node[plbl, above=0.1cm] {1} (monitor);
+  % ── Forward path (solid) ─────────────────────────────────────
 
-  % Fault handler transitions (back to ACTIVE) — signal handler
-  \draw[fault] (monitor) edge[bend left=30]
-    node[left, font=\scriptsize, text=black!60] {fault (W)} (active);
-  \draw[fault] (compressing) edge[bend left=15]
-    node[left, font=\scriptsize, text=black!60] {fault (RW)} (active);
-  \draw[fault] (compressed) edge[bend right=70]
-    node[right, font=\scriptsize, text=black!60] {fault (RW)} (active);
+  % alloc
+  \draw[forward] (empty) -- node[elbl, above] {alloc} (active);
+
+  % Phase 3: ACTIVE → MONITORING
+  \draw[forward] (active) -- node[phaselbl] {3} (monitor);
+
+  % Phase 1: self-loop on MONITORING
+  \draw[forward] (monitor) edge[loop above, looseness=5, min distance=6mm]
+    node[phaselbl, above=0.05cm] {1} (monitor);
+
+  % Phase 2: MONITORING → COMPRESSING
+  \draw[forward] (monitor) -- node[phaselbl] {2} (compressing);
+
+  % ROI: COMPRESSING → COMPRESSED
+  \draw[forward] (compressing) -- node[elbl, below] {ROI} (compressed);
+
+  % free: ACTIVE → EMPTY
+  \draw[forward] (active) edge[bend left=25]
+    node[elbl, above] {free} (empty);
+
+  % upgrade: self-loop on COMPRESSED
+  \draw[forward] (compressed) edge[loop below, looseness=5, min distance=6mm]
+    node[elbl, below=0.05cm] {upgrade} (compressed);
+
+  % ── Fault paths (dashed, back to ACTIVE) ─────────────────────
+
+  % MONITORING → ACTIVE  (write fault, PROT_READ)
+  \draw[fault] (monitor) edge[bend left=20]
+    node[elbl, below, text=black!50] {fault\,(W)} (active);
+
+  % COMPRESSING → ACTIVE (any fault, PROT_NONE)
+  \draw[fault] (compressing) --
+    node[elbl, right=0.05cm, text=black!50] {fault\,(RW)} (active);
+
+  % COMPRESSED → ACTIVE  (any fault, decompress)
+  \draw[fault] (compressed) --
+    node[elbl, left=0.05cm, text=black!50] {fault\,(RW)} (active);
+
 \end{tikzpicture}
-\caption{\textbf{Page state machine with JIT compression}
-  (\S\ref{sec:design:arch}, \S\ref{sec:design:adaptive}).
-  Circled numbers denote the three phases of each background
-  compressor tick: \textcircled{\small 1}~update cold counts,
-  \textcircled{\small 2}~compress cold pages (algorithm selected
-  by ROI model),
-  \textcircled{\small 3}~monitor remaining active pages.
-  Dashed arrows: signal-handler transitions back to ACTIVE.}
+\caption{\textbf{Page state machine.}
+  Solid arrows: compressor-thread transitions.
+  Circled numbers are the three phases of each tick:
+  \textcircled{\small 1}~update cold counts,
+  \textcircled{\small 2}~compress cold pages (algorithm by ROI),
+  \textcircled{\small 3}~set remaining active pages read-only.
+  Dashed arrows: signal-handler fault transitions back to
+  \textsc{active}.}
 \label{fig:arch}
 \end{figure}

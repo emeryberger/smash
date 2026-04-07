@@ -83,11 +83,12 @@ static void testFaultCycleBasic() {
         bytes[i] = static_cast<uint8_t>(i & 0xFF);
     }
 
-    // Compress the page (2 ticks: cold detection + compression)
+    // Compress the page (3 ticks: monitoring + deep monitoring + compression)
+    compressor.compressTick();
     compressor.compressTick();
     compressor.compressTick();
     CHECK(states.get(page_idx) == PageState::COMPRESSED,
-          "page should be COMPRESSED after 2 ticks, got %d",
+          "page should be COMPRESSED after 3 ticks, got %d",
           static_cast<int>(states.get(page_idx)));
 
     // Now READ the page — this triggers a real SIGSEGV/SIGBUS
@@ -164,7 +165,8 @@ static void testFaultCycleMultipleRounds() {
             bytes[i] = static_cast<uint8_t>((i + round) & 0xFF);
         }
 
-        // Compress
+        // Compress (3 ticks: monitoring + deep monitoring + compression)
+        compressor.compressTick();
         compressor.compressTick();
         compressor.compressTick();
         CHECK(states.get(page_idx) == PageState::COMPRESSED,

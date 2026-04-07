@@ -265,6 +265,11 @@ else()
   endif()
 
   set(GPERFTOOLS_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/gperftools)
+  if(APPLE)
+    set(_TCMALLOC_SHLIB_SUFFIX ".dylib")
+  else()
+    set(_TCMALLOC_SHLIB_SUFFIX ".so")
+  endif()
   ExternalProject_Add(tcmalloc_build
     URL https://github.com/gperftools/gperftools/releases/download/gperftools-2.16/gperftools-2.16.tar.gz
     URL_HASH SHA256=f12624af5c5987f2cc830ee534f754c3c5961eec08004c26a8b80de015cf056f
@@ -277,10 +282,10 @@ else()
     BUILD_COMMAND make -j${_TCMALLOC_NCPU}
     INSTALL_COMMAND make install
     BUILD_BYPRODUCTS
-      ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal.so
+      ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal${_TCMALLOC_SHLIB_SUFFIX}
       ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal.a
   )
-  set(TCMALLOC_LIB_BUILTIN ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal.so)
+  set(TCMALLOC_LIB_BUILTIN ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal${_TCMALLOC_SHLIB_SUFFIX})
   set(TCMALLOC_INCLUDE_BUILTIN ${GPERFTOOLS_PREFIX}/install/include)
 
   smash_add_alloc_bench(bench_alloc_tcmalloc "tcmalloc")
@@ -638,6 +643,10 @@ if(SMASH_BUILD_BENCH_DEPS)
     PREFIX ${BENCH_DEPS_DIR}/rocksdb
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      -DCMAKE_CXX_FLAGS=-Wno-error=nontrivial-memcall
       -DWITH_TESTS=OFF
       -DWITH_BENCHMARK_TOOLS=OFF
       -DWITH_TOOLS=OFF
@@ -667,6 +676,9 @@ if(SMASH_BUILD_BENCH_DEPS)
       > <SOURCE_DIR>/extension/extension_config_local.cmake
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
       -DBUILD_SHELL=ON
       -DBUILD_UNITTESTS=OFF
       -DENABLE_SANITIZER=OFF

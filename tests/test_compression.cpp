@@ -100,16 +100,20 @@ static void testCompressorRoundtrip() {
     // Fill with a repeating pattern (highly compressible)
     memset(page, 0x42, kPageSize);
 
-    // Tick once: cold_count goes to 1, page becomes ACTIVE_MONITORING
+    // Tick 1: cold_count goes to 1, page becomes ACTIVE_MONITORING (PROT_READ)
     compressor.compressTick();
     CHECK(states.get(page_idx) == PageState::ACTIVE_MONITORING,
           "after tick 1: expected ACTIVE_MONITORING, got %d",
           static_cast<int>(states.get(page_idx)));
 
-    // Tick twice: cold_count goes to 2 (>= kColdTicks), page gets compressed
+    // Tick 2: cold_count reaches kColdTicks, two-level monitoring escalates
+    // to PROT_NONE (deep monitoring) to detect reads as well as writes
+    compressor.compressTick();
+
+    // Tick 3: survived deep monitoring, truly cold — compress
     compressor.compressTick();
     CHECK(states.get(page_idx) == PageState::COMPRESSED,
-          "after tick 2: expected COMPRESSED, got %d",
+          "after tick 3: expected COMPRESSED, got %d",
           static_cast<int>(states.get(page_idx)));
 
     // Simulate a fault: decompress the page
@@ -167,7 +171,8 @@ static void testIncompressibleData() {
         bytes[i] = static_cast<uint8_t>(seed >> 16);
     }
 
-    // Tick twice to attempt compression
+    // Tick three times to attempt compression (two-level monitoring requires 3)
+    compressor.compressTick();
     compressor.compressTick();
     compressor.compressTick();
 
@@ -231,10 +236,11 @@ static void testAccessTracking() {
           "after write fault: expected ACTIVE, got %d",
           static_cast<int>(states.get(page_idx)));
 
-    // Now tick three more times — the fault set accessed_=true, so:
+    // Now tick four more times — the fault set accessed_=true, so:
     // Tick 1: accessed_=true → cold_count stays 0, cleared. Phase 3: → ACTIVE_MONITORING
     // Tick 2: accessed_=false → cold_count=1. Phase 2: skip (< kColdTicks)
-    // Tick 3: accessed_=false → cold_count=2. Phase 2: compress!
+    // Tick 3: accessed_=false → cold_count=2 (== kColdTicks). Phase 2: escalate to deep monitoring
+    // Tick 4: accessed_=false → cold_count=3 (> kColdTicks). Phase 2: compress!
     compressor.compressTick();
     CHECK(states.get(page_idx) == PageState::ACTIVE_MONITORING,
           "after tick 1: expected ACTIVE_MONITORING");
@@ -245,9 +251,14 @@ static void testAccessTracking() {
           "after tick 2: should not be COMPRESSED yet");
 
     compressor.compressTick();
-    // cold_count=2, should now be compressed
+    // cold_count=2, deep monitoring escalation — not yet compressed
+    CHECK(states.get(page_idx) != PageState::COMPRESSED,
+          "after tick 3: should not be COMPRESSED yet (deep monitoring)");
+
+    compressor.compressTick();
+    // cold_count=3, survived deep monitoring — should now be compressed
     CHECK(states.get(page_idx) == PageState::COMPRESSED,
-          "after 3 ticks without access: expected COMPRESSED, got %d",
+          "after 4 ticks without access: expected COMPRESSED, got %d",
           static_cast<int>(states.get(page_idx)));
 
     // Decompress and verify
@@ -289,7 +300,8 @@ static void testReleaseCompressedPages() {
     states.set(page_idx, PageState::ACTIVE);
     memset(page, 0x42, kPageSize);
 
-    // Compress it
+    // Compress it (3 ticks: monitoring + deep monitoring + compress)
+    compressor.compressTick();
     compressor.compressTick();
     compressor.compressTick();
     CHECK(states.get(page_idx) == PageState::COMPRESSED,

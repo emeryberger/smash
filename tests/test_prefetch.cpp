@@ -68,7 +68,8 @@ static void testPrefetchAdjacentPages() {
         memset(addr, 0x30 + p, kPageSize);  // Each page has a distinct byte
     }
 
-    // Tick twice to compress all pages
+    // Tick three times to compress all pages (two-level monitoring)
+    compressor.compressTick();
     compressor.compressTick();
     compressor.compressTick();
 
@@ -179,6 +180,7 @@ static void testPrefetchBoundaryClipping() {
         memset(vm.pageAddress(s2_base + p), 0xB0 + p, kPageSize);
     }
 
+    compressor.compressTick();
     compressor.compressTick();
     compressor.compressTick();
 

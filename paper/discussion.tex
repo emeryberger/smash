@@ -96,6 +96,42 @@ benefit when pages are fully
 occupied.  Without a compression
 pipeline, an allocator can only return empty pages to the OS.
 
+\paragraph{Application adaptation: Redis patches}
+\sys is designed to be transparent, but applications that touch
+heap data during idle periods can inadvertently prevent compression.
+Redis illustrates both the problem and the solution.
+
+Without modification, Redis's \tcode{server\-Cron()} traverses key
+data pages every tick for defragmentation, rehashing, and dictionary
+resizing---even when no client commands are executing.  Additionally,
+\tcode{DEL} dereferences value pointers to update bookkeeping
+histograms, triggering wholesale decompression of cold pages.  These
+two behaviors reduce \sys's effectiveness from 94\% RSS reduction
+(with patches) to 68\% (without).
+
+We address both with two small, semantics-preserving patches
+(7~files, 105~lines added, 51~removed).\footnote{%
+\url{https://github.com/plasma-umass/redis-smash}}
+The first patch adds two
+write-through cache fields to the object header so that the delete
+path can read object metadata without dereferencing into value data
+pages.  The second patch adds an \tcode{idle-mode} configuration
+option that defers only the three data-page-traversing maintenance
+operations during idle periods; all other background tasks
+(expiration, client timeouts, replication, persistence) continue
+unchanged.
+
+These patches are not specific to \sys: any system that applies
+\tcode{mprotect}-based page monitoring---including OS-level page
+compressors---would benefit from the same separation of metadata
+access from data-page access.  The general principle is that
+applications should avoid traversing cold data structures for
+bookkeeping purposes; caching derived values in hot headers is a
+straightforward alternative.  We expect similar patterns in other
+long-running servers (e.g., database buffer managers, application
+caches) and anticipate that small, targeted patches can unlock
+transparent compression for a broad class of applications.
+
 \punt{
 \paragraph{Limitations}  Decompression adds 1--10\,$\mu$s per
 fault (Table~\ref{tab:apps}).  Workloads with uniform access

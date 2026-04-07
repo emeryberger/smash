@@ -2594,5 +2594,209 @@
       "peak_rss_mb": 777.78125,
       "post_cool_rss_mb": 773.515625
     }
+  },
+  "redis_patched_baseline": {
+    "runs": [
+      {
+        "peak_rss_mb": 64.0625,
+        "min_rss_mb": 64.0625,
+        "steady_rss_mb": 64.0625,
+        "rss_reduction_pct": 0.0,
+        "rss_timeline": [
+          64.0625,
+          64.0625,
+          64.0625,
+          64.0625,
+          64.0625
+        ],
+        "auc_mb_sec": 320.3125,
+        "ops_per_sec": 55803.57
+      }
+    ],
+    "median": {
+      "rss_timeline": [
+        64.0625,
+        64.0625,
+        64.0625,
+        64.0625,
+        64.0625
+      ],
+      "auc_mb_sec": 320.3125,
+      "ops_per_sec": 55803.57,
+      "peak_rss_mb": 64.0625,
+      "steady_rss_mb": 64.0625,
+      "rss_reduction_pct": 0.0,
+      "min_rss_mb": 64.0625
+    }
+  },
+  "redis_patched_compress_only": {
+    "runs": [
+      {
+        "peak_rss_mb": 90.25,
+        "min_rss_mb": 90.25,
+        "steady_rss_mb": 90.25,
+        "rss_reduction_pct": 0.0,
+        "rss_timeline": [
+          90.25,
+          90.25,
+          90.25,
+          90.25,
+          90.25
+        ],
+        "auc_mb_sec": 451.25,
+        "ops_per_sec": 54585.15
+      }
+    ],
+    "median": {
+      "rss_timeline": [
+        90.25,
+        90.25,
+        90.25,
+        90.25,
+        90.25
+      ],
+      "auc_mb_sec": 451.25,
+      "ops_per_sec": 54585.15,
+      "peak_rss_mb": 90.25,
+      "steady_rss_mb": 90.25,
+      "rss_reduction_pct": 0.0,
+      "min_rss_mb": 90.25
+    }
+  },
+  "redis_patched_full_smash": {
+    "runs": [
+      {
+        "peak_rss_mb": 92.90625,
+        "min_rss_mb": 52.8125,
+        "steady_rss_mb": 53.609375,
+        "rss_reduction_pct": 43.15506222670703,
+        "rss_timeline": [
+          92.0,
+          53.25,
+          52.8125,
+          53.296875,
+          53.609375
+        ],
+        "auc_mb_sec": 304.96875,
+        "ops_per_sec": 55555.56
+      }
+    ],
+    "median": {
+      "rss_timeline": [
+        92.0,
+        53.25,
+        52.8125,
+        53.296875,
+        53.609375
+      ],
+      "auc_mb_sec": 304.96875,
+      "ops_per_sec": 55555.56,
+      "peak_rss_mb": 92.90625,
+      "steady_rss_mb": 53.609375,
+      "rss_reduction_pct": 43.15506222670703,
+      "min_rss_mb": 52.8125
+    }
+  },
+  "redis_ext_patched_baseline": {
+    "runs": [
+      {
+        "peak_rss_mb": 64.578125,
+        "min_rss_mb": 64.578125,
+        "steady_rss_mb": 64.75,
+        "rss_reduction_pct": 0.0,
+        "rss_timeline": [
+          64.75,
+          64.75,
+          64.75,
+          64.75,
+          64.75
+        ],
+        "auc_mb_sec": 323.75,
+        "ops_per_sec": 55493.89
+      }
+    ],
+    "median": {
+      "rss_timeline": [
+        64.75,
+        64.75,
+        64.75,
+        64.75,
+        64.75
+      ],
+      "auc_mb_sec": 323.75,
+      "ops_per_sec": 55493.89,
+      "peak_rss_mb": 64.578125,
+      "steady_rss_mb": 64.75,
+      "rss_reduction_pct": 0.0,
+      "min_rss_mb": 64.578125
+    }
+  },
+  "redis_ext_patched_compress_only": {
+    "runs": [
+      {
+        "peak_rss_mb": 90.15625,
+        "min_rss_mb": 90.15625,
+        "steady_rss_mb": 90.265625,
+        "rss_reduction_pct": 0.0,
+        "rss_timeline": [
+          90.265625,
+          90.265625,
+          90.265625,
+          90.265625,
+          90.265625
+        ],
+        "auc_mb_sec": 451.328125,
+        "ops_per_sec": 55370.98
+      }
+    ],
+    "median": {
+      "rss_timeline": [
+        90.265625,
+        90.265625,
+        90.265625,
+        90.265625,
+        90.265625
+      ],
+      "auc_mb_sec": 451.328125,
+      "ops_per_sec": 55370.98,
+      "peak_rss_mb": 90.15625,
+      "steady_rss_mb": 90.265625,
+      "rss_reduction_pct": 0.0,
+      "min_rss_mb": 90.15625
+    }
+  },
+  "redis_ext_patched_full_smash": {
+    "runs": [
+      {
+        "peak_rss_mb": 93.0625,
+        "min_rss_mb": 52.5625,
+        "steady_rss_mb": 53.53125,
+        "rss_reduction_pct": 43.519140362659506,
+        "rss_timeline": [
+          92.40625,
+          52.5625,
+          52.890625,
+          53.328125,
+          53.53125
+        ],
+        "auc_mb_sec": 304.71875,
+        "ops_per_sec": 56369.79
+      }
+    ],
+    "median": {
+      "rss_timeline": [
+        92.40625,
+        52.5625,
+        52.890625,
+        53.328125,
+        53.53125
+      ],
+      "auc_mb_sec": 304.71875,
+      "ops_per_sec": 56369.79,
+      "peak_rss_mb": 93.0625,
+      "steady_rss_mb": 53.53125,
+      "rss_reduction_pct": 43.519140362659506,
+      "min_rss_mb": 52.5625
+    }
   }
 }

@@ -54,7 +54,7 @@ SQLite           & \ablSqliteBaselineServeRss  & \ablSqliteMeshServeRss  & \text
 DuckDB           & \ablDuckdbBaselineServeRss & \ablDuckdbMeshServeRss  & \textbf{\ablDuckdbDefaultServeRss} (\ablDuckdbDefaultRssRed\%) \\
 Redis*           & \ablRedisBaselineServeRss  & \ablRedisMeshServeRss   & \textbf{\ablRedisDefaultServeRss} (\ablRedisDefaultRssRedInt\%) \\
 Redis-ext*       & \ablRedisExtBaselineServeRss  & \ablRedisExtMeshServeRss   & \textbf{\ablRedisExtDefaultServeRss} (\ablRedisExtDefaultRssRedInt\%) \\
-Redis$^\dagger$  & 205  & ---  & \textbf{12} (94\%) \\
+Redis$^\dagger$  & \ablRedisPatchedBaselineServeRss  & ---  & \textbf{\ablRedisPatchedDefaultServeRss} (\ablRedisPatchedDefaultRssRedInt\%) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -214,34 +214,46 @@ and cluster heartbeats, AOF persistence, and all periodic cleanup
 tasks.  When client commands resume, the idle counter resets and
 all operations return to normal.
 
-Table~\ref{tab:redis_patched} shows the results on a 50K-key
-workload with 2\,KiB values.  With both patches, \sys achieves
-94\% RSS reduction on the standard workload (204\,MiB baseline to
-11.8\,MiB) and, critically, pages \emph{re-compress after DELETE}:
-the final minimum RSS (19.5\,MiB) returns to within 65\% of the
-pre-DELETE minimum, compared to a $6\times$ RSS increase without the
-patches.  Total AUC drops by 84\%.
+Table~\ref{tab:redis_patched} compares stock and patched Redis.
+The patches lower the \emph{baseline} RSS from
+\ablRedisBaselineServeRss\,MiB to \ablRedisPatchedBaselineServeRss\,MiB
+(a \ablRedisPatchedBaselineRssRedInt\% reduction even without \sys),
+because idle-mode prevents background tasks from inflating RSS\@.
+With \sys, patched Redis achieves \ablRedisPatchedDefaultRssRedInt\%
+RSS reduction (\ablRedisPatchedBaselineServeRss\,MiB to
+\ablRedisPatchedDefaultServeRss\,MiB).  While the percentage
+reduction is smaller than stock Redis (\ablRedisDefaultRssRedInt\%),
+this is because the baseline is already lower---the absolute
+minimum RSS values are comparable
+(\ablRedisPatchedDefaultMinRss\,MiB patched vs.\
+\ablRedisDefaultMinRss\,MiB stock).
+
+On the extended workload (with 50\% DELETE), patched Redis achieves
+\ablRedisExtPatchedDefaultRssRedInt\% reduction
+(\ablRedisExtPatchedBaselineServeRss\,MiB to
+\ablRedisExtPatchedDefaultServeRss\,MiB), compared to
+\ablRedisExtDefaultRssRedInt\% for stock Redis.  Critically,
+patched Redis achieves comparable reduction on
+\emph{both} workloads (\ablRedisPatchedDefaultRssRedInt\% standard
+vs.\ \ablRedisExtPatchedDefaultRssRedInt\% extended), whereas stock
+Redis drops from \ablRedisDefaultRssRedInt\% to
+\ablRedisExtDefaultRssRedInt\% after DELETE\@.
 
 \begin{table}[t]
-\caption{\textbf{Patched Redis achieves 90--94\% RSS reduction
-  with \sys} (\S\ref{sec:eval:apps}).  50K keys $\times$ 2\,KiB
-  values, fill $\to$ cool 20\,s $\to$ DELETE 50\% $\to$ cool 20\,s
-  (macOS, single run).}
+\caption{\textbf{Patched Redis lowers the baseline; \sys compresses
+  the remainder}
+  (\S\ref{sec:eval:apps}).  Serve-phase RSS (MiB) for stock vs.\
+  patched Redis (with idle-mode and metadata caching).}
 \label{tab:redis_patched}
 \centering\small
-\begin{tabular}{lrrr}
+\begin{tabular}{lrrrr}
 \toprule
-Metric & Baseline & \sys~V1 & \sys~V2 \\
+ & \multicolumn{2}{c}{Standard} & \multicolumn{2}{c}{Extended (DEL 50\%)} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Config & Baseline & \sys & Baseline & \sys \\
 \midrule
-Fill RSS (MiB)          & 204.5 & 166.6 & 135.6 \\
-Cool min RSS (MiB)      & 204.5 & \textbf{11.8} & 59.5 \\
-Post-DELETE RSS (MiB)   & 204.6 & 123.8 & 160.3 \\
-Final min RSS (MiB)     & 204.6 & \textbf{19.5} & 62.6 \\
-Total AUC (MiB$\cdot$s) & 8182  & \textbf{1291} & 2724 \\
-\midrule
-RSS reduction (cool)    & ---   & \textbf{94\%} & 71\% \\
-RSS reduction (final)   & ---   & \textbf{90\%} & 69\% \\
-AUC reduction           & ---   & \textbf{84\%} & 67\% \\
+Stock Redis   & \ablRedisBaselineServeRss  & \textbf{\ablRedisDefaultServeRss} (\ablRedisDefaultRssRedInt\%) & \ablRedisExtBaselineServeRss  & \textbf{\ablRedisExtDefaultServeRss} (\ablRedisExtDefaultRssRedInt\%) \\
+Patched Redis & \ablRedisPatchedBaselineServeRss & \textbf{\ablRedisPatchedDefaultServeRss} (\ablRedisPatchedDefaultRssRedInt\%) & \ablRedisExtPatchedBaselineServeRss & \textbf{\ablRedisExtPatchedDefaultServeRss} (\ablRedisExtPatchedDefaultRssRedInt\%) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -327,7 +339,8 @@ drives the savings: Mesh provides minimal benefit on most workloads,
 while \sys achieves consistent reductions via compression.
 Two small Redis patches---caching object metadata in headers and
 deferring data-page-touching maintenance during idle
-periods---restore 90--94\% RSS reduction even with 50\% key deletion
+periods---lower the baseline RSS and enable consistent compression
+across both standard and extended workloads
 (Table~\ref{tab:redis_patched}).
 
 \subsection{Algorithm Comparison (RQ2)}
@@ -598,11 +611,12 @@ background tasks disabled (activedefrag, activerehashing, lazyfree),
 full \sys achieves \coRedisFullSmashReduction\% RSS reduction and \aucRedisSmashRed\% lower AUC on Redis;
 disabling these tasks does not affect the jemalloc baseline.
 With the metadata-caching and idle-mode patches
-described in \S\ref{sec:eval:apps}, \sys achieves 94\% RSS
-reduction on Redis---comparable to memcached---because the
-patches eliminate the two remaining sources of data-page warming
-(defrag/rehash in \texttt{serverCron}) and data-page touching
-(\texttt{getObjectLength} in \texttt{DEL}).
+described in \S\ref{sec:eval:apps}, the patched Redis baseline
+is already \ablRedisPatchedBaselineServeRss\,MiB (vs.\
+\ablRedisBaselineServeRss\,MiB stock), and \sys achieves
+\ablRedisPatchedDefaultRssRedInt\% further reduction because the
+patches eliminate data-page warming from background tasks
+and \tcode{DEL}.
 
 On memcached, compress-only shows \coMemcachedCompOnlyOverhead\% overhead versus \coMemcachedFullSmashReduction\%
 reduction for full \sys; the gap reflects both \sys's zero-on-free

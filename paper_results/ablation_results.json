@@ -8736,5 +8736,709 @@
         "post_cool_rss_mb": 779.390625
       }
     }
+  },
+  "redis_patched": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 92.765625,
+          "min_rss_mb": 52.34375,
+          "steady_rss_mb": 53.9375,
+          "rss_reduction_pct": 43.57419572174499,
+          "rss_timeline": [
+            92.546875,
+            72.09375,
+            52.34375,
+            53.984375,
+            53.9375
+          ],
+          "auc_mb_sec": 324.90625,
+          "ops_per_sec": 55803.57
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          92.546875,
+          72.09375,
+          52.34375,
+          53.984375,
+          53.9375
+        ],
+        "auc_mb_sec": 324.90625,
+        "ops_per_sec": 55803.57,
+        "peak_rss_mb": 92.765625,
+        "steady_rss_mb": 53.9375,
+        "rss_reduction_pct": 43.57419572174499,
+        "min_rss_mb": 52.34375
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 64.65625,
+          "min_rss_mb": 64.65625,
+          "steady_rss_mb": 64.65625,
+          "rss_reduction_pct": 0.0,
+          "rss_timeline": [
+            64.65625,
+            64.65625,
+            64.65625,
+            64.65625,
+            64.65625
+          ],
+          "auc_mb_sec": 323.28125,
+          "ops_per_sec": 46728.97
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          64.65625,
+          64.65625,
+          64.65625,
+          64.65625,
+          64.65625
+        ],
+        "auc_mb_sec": 323.28125,
+        "ops_per_sec": 46728.97,
+        "peak_rss_mb": 64.65625,
+        "steady_rss_mb": 64.65625,
+        "rss_reduction_pct": 0.0,
+        "min_rss_mb": 64.65625
+      }
+    },
+    "MESH": {
+      "name": "Mesh",
+      "runs": [
+        {
+          "peak_rss_mb": 56.375,
+          "min_rss_mb": 56.375,
+          "steady_rss_mb": 56.375,
+          "rss_reduction_pct": 0.0,
+          "rss_timeline": [
+            56.375,
+            56.375,
+            56.375,
+            56.375,
+            56.375
+          ],
+          "auc_mb_sec": 281.875,
+          "ops_per_sec": 48638.13
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          56.375,
+          56.375,
+          56.375,
+          56.375,
+          56.375
+        ],
+        "auc_mb_sec": 281.875,
+        "ops_per_sec": 48638.13,
+        "peak_rss_mb": 56.375,
+        "steady_rss_mb": 56.375,
+        "rss_reduction_pct": 0.0,
+        "min_rss_mb": 56.375
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "peak_rss_mb": 92.921875,
+          "min_rss_mb": 70.609375,
+          "steady_rss_mb": 72.265625,
+          "rss_reduction_pct": 24.012106944677992,
+          "rss_timeline": [
+            91.984375,
+            71.625,
+            70.609375,
+            71.78125,
+            72.265625
+          ],
+          "auc_mb_sec": 378.265625,
+          "ops_per_sec": 55432.37
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          91.984375,
+          71.625,
+          70.609375,
+          71.78125,
+          72.265625
+        ],
+        "auc_mb_sec": 378.265625,
+        "ops_per_sec": 55432.37,
+        "peak_rss_mb": 92.921875,
+        "steady_rss_mb": 72.265625,
+        "rss_reduction_pct": 24.012106944677992,
+        "min_rss_mb": 70.609375
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "peak_rss_mb": 92.625,
+          "min_rss_mb": 51.71875,
+          "steady_rss_mb": 53.515625,
+          "rss_reduction_pct": 44.16329284750338,
+          "rss_timeline": [
+            91.84375,
+            51.71875,
+            52.765625,
+            53.25,
+            53.515625
+          ],
+          "auc_mb_sec": 303.09375,
+          "ops_per_sec": 56625.14
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          91.84375,
+          51.71875,
+          52.765625,
+          53.25,
+          53.515625
+        ],
+        "auc_mb_sec": 303.09375,
+        "ops_per_sec": 56625.14,
+        "peak_rss_mb": 92.625,
+        "steady_rss_mb": 53.515625,
+        "rss_reduction_pct": 44.16329284750338,
+        "min_rss_mb": 51.71875
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "peak_rss_mb": 92.828125,
+          "min_rss_mb": 52.671875,
+          "steady_rss_mb": 53.484375,
+          "rss_reduction_pct": 43.258710654771924,
+          "rss_timeline": [
+            91.90625,
+            53.90625,
+            52.671875,
+            53.171875,
+            53.484375
+          ],
+          "auc_mb_sec": 305.140625,
+          "ops_per_sec": 57339.45
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          91.90625,
+          53.90625,
+          52.671875,
+          53.171875,
+          53.484375
+        ],
+        "auc_mb_sec": 305.140625,
+        "ops_per_sec": 57339.45,
+        "peak_rss_mb": 92.828125,
+        "steady_rss_mb": 53.484375,
+        "rss_reduction_pct": 43.258710654771924,
+        "min_rss_mb": 52.671875
+      }
+    },
+    "T2a": {
+      "name": "No zero-deferred",
+      "runs": [
+        {
+          "peak_rss_mb": 92.9375,
+          "min_rss_mb": 51.734375,
+          "steady_rss_mb": 53.609375,
+          "rss_reduction_pct": 44.33422999327505,
+          "rss_timeline": [
+            92.078125,
+            51.734375,
+            52.984375,
+            53.390625,
+            53.609375
+          ],
+          "auc_mb_sec": 303.796875,
+          "ops_per_sec": 56242.97
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          92.078125,
+          51.734375,
+          52.984375,
+          53.390625,
+          53.609375
+        ],
+        "auc_mb_sec": 303.796875,
+        "ops_per_sec": 56242.97,
+        "peak_rss_mb": 92.9375,
+        "steady_rss_mb": 53.609375,
+        "rss_reduction_pct": 44.33422999327505,
+        "min_rss_mb": 51.734375
+      }
+    },
+    "T1e": {
+      "name": "No prefetch",
+      "runs": [
+        {
+          "peak_rss_mb": 92.6875,
+          "min_rss_mb": 52.390625,
+          "steady_rss_mb": 54.078125,
+          "rss_reduction_pct": 43.47606203641268,
+          "rss_timeline": [
+            52.390625,
+            54.171875,
+            53.71875,
+            54.234375,
+            54.078125
+          ],
+          "auc_mb_sec": 268.59375,
+          "ops_per_sec": 50505.05
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          52.390625,
+          54.171875,
+          53.71875,
+          54.234375,
+          54.078125
+        ],
+        "auc_mb_sec": 268.59375,
+        "ops_per_sec": 50505.05,
+        "peak_rss_mb": 92.6875,
+        "steady_rss_mb": 54.078125,
+        "rss_reduction_pct": 43.47606203641268,
+        "min_rss_mb": 52.390625
+      }
+    },
+    "T1f": {
+      "name": "Single worker",
+      "runs": [
+        {
+          "peak_rss_mb": 93.0625,
+          "min_rss_mb": 53.609375,
+          "steady_rss_mb": 53.953125,
+          "rss_reduction_pct": 42.39422431161854,
+          "rss_timeline": [
+            54.359375,
+            56.0625,
+            53.609375,
+            53.8125,
+            53.953125
+          ],
+          "auc_mb_sec": 271.796875,
+          "ops_per_sec": 52798.31
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          54.359375,
+          56.0625,
+          53.609375,
+          53.8125,
+          53.953125
+        ],
+        "auc_mb_sec": 271.796875,
+        "ops_per_sec": 52798.31,
+        "peak_rss_mb": 93.0625,
+        "steady_rss_mb": 53.953125,
+        "rss_reduction_pct": 42.39422431161854,
+        "min_rss_mb": 53.609375
+      }
+    },
+    "B2": {
+      "name": "No compression",
+      "runs": [
+        {
+          "peak_rss_mb": 92.765625,
+          "min_rss_mb": 92.515625,
+          "steady_rss_mb": 92.515625,
+          "rss_reduction_pct": 0.2694963786424087,
+          "rss_timeline": [
+            92.515625,
+            92.515625,
+            92.515625,
+            92.515625,
+            92.515625
+          ],
+          "auc_mb_sec": 462.578125,
+          "ops_per_sec": 54525.63
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          92.515625,
+          92.515625,
+          92.515625,
+          92.515625,
+          92.515625
+        ],
+        "auc_mb_sec": 462.578125,
+        "ops_per_sec": 54525.63,
+        "peak_rss_mb": 92.765625,
+        "steady_rss_mb": 92.515625,
+        "rss_reduction_pct": 0.2694963786424087,
+        "min_rss_mb": 92.515625
+      }
+    }
+  },
+  "redis_ext_patched": {
+    "B1": {
+      "name": "Default",
+      "runs": [
+        {
+          "peak_rss_mb": 92.859375,
+          "min_rss_mb": 51.921875,
+          "steady_rss_mb": 53.59375,
+          "rss_reduction_pct": 44.08547871445398,
+          "rss_timeline": [
+            64.296875,
+            51.921875,
+            53.0,
+            53.390625,
+            53.59375
+          ],
+          "auc_mb_sec": 276.203125,
+          "ops_per_sec": 55187.64
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          64.296875,
+          51.921875,
+          53.0,
+          53.390625,
+          53.59375
+        ],
+        "auc_mb_sec": 276.203125,
+        "ops_per_sec": 55187.64,
+        "peak_rss_mb": 92.859375,
+        "steady_rss_mb": 53.59375,
+        "rss_reduction_pct": 44.08547871445398,
+        "min_rss_mb": 51.921875
+      }
+    },
+    "B0": {
+      "name": "System malloc",
+      "runs": [
+        {
+          "peak_rss_mb": 64.828125,
+          "min_rss_mb": 64.828125,
+          "steady_rss_mb": 65.046875,
+          "rss_reduction_pct": 0.0,
+          "rss_timeline": [
+            65.046875,
+            65.046875,
+            65.046875,
+            65.046875,
+            65.046875
+          ],
+          "auc_mb_sec": 325.234375,
+          "ops_per_sec": 52301.26
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          65.046875,
+          65.046875,
+          65.046875,
+          65.046875,
+          65.046875
+        ],
+        "auc_mb_sec": 325.234375,
+        "ops_per_sec": 52301.26,
+        "peak_rss_mb": 64.828125,
+        "steady_rss_mb": 65.046875,
+        "rss_reduction_pct": 0.0,
+        "min_rss_mb": 64.828125
+      }
+    },
+    "MESH": {
+      "name": "Mesh",
+      "runs": [
+        {
+          "peak_rss_mb": 57.125,
+          "min_rss_mb": 52.03125,
+          "steady_rss_mb": 52.03125,
+          "rss_reduction_pct": 8.916849015317286,
+          "rss_timeline": [
+            52.03125,
+            52.03125,
+            52.03125,
+            52.03125,
+            52.03125
+          ],
+          "auc_mb_sec": 260.15625,
+          "ops_per_sec": 52687.04
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          52.03125,
+          52.03125,
+          52.03125,
+          52.03125,
+          52.03125
+        ],
+        "auc_mb_sec": 260.15625,
+        "ops_per_sec": 52687.04,
+        "peak_rss_mb": 57.125,
+        "steady_rss_mb": 52.03125,
+        "rss_reduction_pct": 8.916849015317286,
+        "min_rss_mb": 52.03125
+      }
+    },
+    "DICT": {
+      "name": "With dicts",
+      "runs": [
+        {
+          "peak_rss_mb": 92.859375,
+          "min_rss_mb": 66.734375,
+          "steady_rss_mb": 69.265625,
+          "rss_reduction_pct": 28.13393908800269,
+          "rss_timeline": [
+            92.203125,
+            66.734375,
+            67.703125,
+            69.03125,
+            69.265625
+          ],
+          "auc_mb_sec": 364.9375,
+          "ops_per_sec": 56947.61
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          92.203125,
+          66.734375,
+          67.703125,
+          69.03125,
+          69.265625
+        ],
+        "auc_mb_sec": 364.9375,
+        "ops_per_sec": 56947.61,
+        "peak_rss_mb": 92.859375,
+        "steady_rss_mb": 69.265625,
+        "rss_reduction_pct": 28.13393908800269,
+        "min_rss_mb": 66.734375
+      }
+    },
+    "T1a": {
+      "name": "No arenas",
+      "runs": [
+        {
+          "peak_rss_mb": 92.640625,
+          "min_rss_mb": 51.59375,
+          "steady_rss_mb": 53.5,
+          "rss_reduction_pct": 44.30764041153652,
+          "rss_timeline": [
+            92.078125,
+            51.59375,
+            53.125,
+            53.296875,
+            53.5
+          ],
+          "auc_mb_sec": 303.59375,
+          "ops_per_sec": 53134.96
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          92.078125,
+          51.59375,
+          53.125,
+          53.296875,
+          53.5
+        ],
+        "auc_mb_sec": 303.59375,
+        "ops_per_sec": 53134.96,
+        "peak_rss_mb": 92.640625,
+        "steady_rss_mb": 53.5,
+        "rss_reduction_pct": 44.30764041153652,
+        "min_rss_mb": 51.59375
+      }
+    },
+    "T1c": {
+      "name": "LZ4 only",
+      "runs": [
+        {
+          "peak_rss_mb": 92.921875,
+          "min_rss_mb": 53.515625,
+          "steady_rss_mb": 54.234375,
+          "rss_reduction_pct": 42.40793677484446,
+          "rss_timeline": [
+            57.859375,
+            59.203125,
+            53.515625,
+            54.359375,
+            54.234375
+          ],
+          "auc_mb_sec": 279.171875,
+          "ops_per_sec": 49115.91
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          57.859375,
+          59.203125,
+          53.515625,
+          54.359375,
+          54.234375
+        ],
+        "auc_mb_sec": 279.171875,
+        "ops_per_sec": 49115.91,
+        "peak_rss_mb": 92.921875,
+        "steady_rss_mb": 54.234375,
+        "rss_reduction_pct": 42.40793677484446,
+        "min_rss_mb": 53.515625
+      }
+    },
+    "T2a": {
+      "name": "No zero-deferred",
+      "runs": [
+        {
+          "peak_rss_mb": 93.0,
+          "min_rss_mb": 52.921875,
+          "steady_rss_mb": 53.859375,
+          "rss_reduction_pct": 43.09475806451613,
+          "rss_timeline": [
+            54.703125,
+            55.09375,
+            52.921875,
+            53.8125,
+            53.859375
+          ],
+          "auc_mb_sec": 270.390625,
+          "ops_per_sec": 52137.64
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          54.703125,
+          55.09375,
+          52.921875,
+          53.8125,
+          53.859375
+        ],
+        "auc_mb_sec": 270.390625,
+        "ops_per_sec": 52137.64,
+        "peak_rss_mb": 93.0,
+        "steady_rss_mb": 53.859375,
+        "rss_reduction_pct": 43.09475806451613,
+        "min_rss_mb": 52.921875
+      }
+    },
+    "T1e": {
+      "name": "No prefetch",
+      "runs": [
+        {
+          "peak_rss_mb": 92.875,
+          "min_rss_mb": 51.828125,
+          "steady_rss_mb": 53.578125,
+          "rss_reduction_pct": 44.19582772543742,
+          "rss_timeline": [
+            80.671875,
+            51.828125,
+            53.25,
+            53.375,
+            53.578125
+          ],
+          "auc_mb_sec": 292.703125,
+          "ops_per_sec": 53937.43
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          80.671875,
+          51.828125,
+          53.25,
+          53.375,
+          53.578125
+        ],
+        "auc_mb_sec": 292.703125,
+        "ops_per_sec": 53937.43,
+        "peak_rss_mb": 92.875,
+        "steady_rss_mb": 53.578125,
+        "rss_reduction_pct": 44.19582772543742,
+        "min_rss_mb": 51.828125
+      }
+    },
+    "T1f": {
+      "name": "Single worker",
+      "runs": [
+        {
+          "peak_rss_mb": 92.09375,
+          "min_rss_mb": 52.625,
+          "steady_rss_mb": 52.921875,
+          "rss_reduction_pct": 42.85714285714286,
+          "rss_timeline": [
+            53.65625,
+            55.09375,
+            52.625,
+            52.984375,
+            52.921875
+          ],
+          "auc_mb_sec": 267.28125,
+          "ops_per_sec": 53418.8
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          53.65625,
+          55.09375,
+          52.625,
+          52.984375,
+          52.921875
+        ],
+        "auc_mb_sec": 267.28125,
+        "ops_per_sec": 53418.8,
+        "peak_rss_mb": 92.09375,
+        "steady_rss_mb": 52.921875,
+        "rss_reduction_pct": 42.85714285714286,
+        "min_rss_mb": 52.625
+      }
+    },
+    "B2": {
+      "name": "No compression",
+      "runs": [
+        {
+          "peak_rss_mb": 93.0,
+          "min_rss_mb": 92.890625,
+          "steady_rss_mb": 92.890625,
+          "rss_reduction_pct": 0.11760752688172449,
+          "rss_timeline": [
+            92.890625,
+            92.890625,
+            92.890625,
+            92.890625,
+            92.890625
+          ],
+          "auc_mb_sec": 464.453125,
+          "ops_per_sec": 51493.3
+        }
+      ],
+      "median": {
+        "rss_timeline": [
+          92.890625,
+          92.890625,
+          92.890625,
+          92.890625,
+          92.890625
+        ],
+        "auc_mb_sec": 464.453125,
+        "ops_per_sec": 51493.3,
+        "peak_rss_mb": 93.0,
+        "steady_rss_mb": 92.890625,
+        "rss_reduction_pct": 0.11760752688172449,
+        "min_rss_mb": 92.890625
+      }
+    }
   }
 }

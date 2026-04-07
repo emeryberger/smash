@@ -58,7 +58,8 @@ ABLATION_CONFIGS = OrderedDict([
             "cmake_flags": {"SMASH_COLD_TICKS": "9999"}, "use_smash": True}),
 ])
 
-APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext"]
+APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext",
+        "redis_patched", "redis_ext_patched"]
 
 IS_DARWIN = platform.system() == "Darwin"
 PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
@@ -599,6 +600,163 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         kill_redis(port)
 
 
+def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
+    """Shared implementation for Redis benchmarks (stock and patched, standard and extended)."""
+    if patched:
+        redis_server = get_binary("redis-server-smash", build_dir)
+        redis_cli = get_binary("redis-cli-smash", build_dir)
+        for cmd in ("redis-server-smash", "redis-cli-smash", "redis-benchmark"):
+            if not check_binary(cmd, build_dir):
+                return None
+    else:
+        redis_server = get_binary("redis-server", build_dir)
+        redis_cli = get_binary("redis-cli", build_dir)
+        for cmd in ("redis-server", "redis-cli", "redis-benchmark"):
+            if not check_binary(cmd, build_dir):
+                return None
+    redis_benchmark = get_binary("redis-benchmark", build_dir)
+
+    label = ("redis_ext_patched" if extended else "redis_patched") if patched \
+        else ("redis_ext" if extended else "redis")
+    # Use different ports to avoid conflicts
+    port = 16399 + (1 if extended else 0) + (2 if patched else 0)
+    num_ops = 50000 if quick else 100000
+    num_clients = 1000 if quick else 5000
+    value_size = 1000
+    keyspace = 100000
+    cool_sec = 5 if quick else 15
+
+    kill_redis(port)
+
+    env = os.environ.copy()
+    if smash_lib:
+        env[PRELOAD_VAR] = str(smash_lib)
+        env["SMASH_VERY_COLD_TICKS"] = "5"
+
+    server_args = [redis_server, "--port", str(port), "--save", "",
+                   "--appendonly", "no", "--daemonize", "no", "--loglevel", "warning",
+                   "--hz", "1", "--dynamic-hz", "no"]
+    if patched:
+        server_args += ["--idle-mode", "yes"]
+
+    proc = subprocess.Popen(
+        server_args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    try:
+        if not wait_for_port(port, timeout=10):
+            print(f"    {label}: failed to start")
+            return None
+
+        # SET phase
+        try:
+            set_result = subprocess.run(
+                [redis_benchmark, "-p", str(port), "-c", str(num_clients),
+                 "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
+                 "-t", "set", "-q"],
+                capture_output=True, text=True, timeout=600
+            )
+            set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
+        except subprocess.TimeoutExpired:
+            print(f"    {label} SET timed out")
+            set_rps = 0
+
+        # Verify fill
+        try:
+            dbsize = subprocess.check_output(
+                [redis_cli, "-p", str(port), "DBSIZE"],
+                text=True, timeout=5
+            ).strip()
+        except Exception:
+            dbsize = "?"
+
+        fill_rss = get_rss_mb(proc.pid)
+        if fill_rss < 10:
+            print(f"    {label}: fill_rss={fill_rss:.1f}MB (too low, DBSIZE={dbsize})")
+            return None
+
+        # DELETE phase (extended workload only)
+        if extended:
+            n = num_ops // 2
+            try:
+                subprocess.run(
+                    [redis_cli, "-p", str(port), "EVAL",
+                     f"local d=0; for i=1,{n} do local k=redis.call('RANDOMKEY'); "
+                     f"if k then redis.call('DEL',k); d=d+1 end end; return d",
+                     "0"],
+                    capture_output=True, text=True, timeout=300
+                )
+            except subprocess.TimeoutExpired:
+                print(f"    {label} DELETE timed out")
+
+        # Cool phase
+        rss_timeline = []
+        min_rss = fill_rss
+        for _ in range(cool_sec):
+            time.sleep(1)
+            r = get_rss_mb(proc.pid)
+            rss_timeline.append(r)
+            if r > 0 and r < min_rss:
+                min_rss = r
+
+        steady_rss = get_rss_mb(proc.pid)
+
+        # GET phase
+        get_rps = 0
+        if set_rps > 0:
+            try:
+                get_result = subprocess.run(
+                    [redis_benchmark, "-p", str(port), "-c", str(num_clients),
+                     "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
+                     "-t", "get", "-q"],
+                    capture_output=True, text=True, timeout=600
+                )
+                get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
+            except subprocess.TimeoutExpired:
+                print(f"    {label} GET timed out")
+
+        if fill_rss <= 0 or min_rss <= 0:
+            print(f"    {label}: invalid RSS measurement")
+            return None
+
+        rss_reduction = (1.0 - min_rss / fill_rss) * 100
+
+        auc = sum(rss_timeline)
+        result = {
+            "peak_rss_mb": fill_rss,
+            "min_rss_mb": min_rss,
+            "steady_rss_mb": steady_rss,
+            "rss_reduction_pct": rss_reduction,
+            "rss_timeline": rss_timeline,
+            "auc_mb_sec": auc,
+        }
+        if set_rps: result["ops_per_sec"] = set_rps
+        return result
+
+    finally:
+        try:
+            subprocess.run([redis_cli, "-p", str(port), "SHUTDOWN", "NOSAVE"],
+                          capture_output=True, timeout=5)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        kill_redis(port)
+
+
+def run_redis_patched_bench(build_dir, smash_lib, quick):
+    """Run patched Redis (redis-smash with idle-mode) standard benchmark."""
+    return _run_redis_bench_impl(build_dir, smash_lib, quick, patched=True, extended=False)
+
+
+def run_redis_ext_patched_bench(build_dir, smash_lib, quick):
+    """Run patched Redis (redis-smash with idle-mode) extended benchmark (with DELETE)."""
+    return _run_redis_bench_impl(build_dir, smash_lib, quick, patched=True, extended=True)
+
+
 def run_memcached_bench(build_dir, smash_lib, quick):
     """Run Memcached benchmark.
 
@@ -1052,7 +1210,9 @@ def get_binary(name, build_dir):
         "memcached": "memcached",
         "duckdb": "duckdb",
         "redis-server": "redis-server-libc",
+        "redis-server-smash": "redis-server-smash",
         "redis-cli": "redis-cli",
+        "redis-cli-smash": "redis-cli-smash",
         "redis-benchmark": "redis-benchmark",
     }
 
@@ -1073,7 +1233,9 @@ def check_binary(name, build_dir):
         "memcached": "memcached",
         "duckdb": "duckdb",
         "redis-server": "redis-server-libc",
+        "redis-server-smash": "redis-server-smash",
         "redis-cli": "redis-cli",
+        "redis-cli-smash": "redis-cli-smash",
         "redis-benchmark": "redis-benchmark",
     }
     built_name = binary_map.get(name, name)
@@ -1134,6 +1296,10 @@ def run_app(app, build_dir, smash_lib, quick):
         return run_redis_bench(build_dir, smash_lib, quick)
     elif app == "redis_ext":
         return run_redis_extended_bench(build_dir, smash_lib, quick)
+    elif app == "redis_patched":
+        return run_redis_patched_bench(build_dir, smash_lib, quick)
+    elif app == "redis_ext_patched":
+        return run_redis_ext_patched_bench(build_dir, smash_lib, quick)
     elif app == "duckdb":
         return run_duckdb_bench(build_dir, smash_lib, quick)
     return None
@@ -1530,6 +1696,10 @@ def main():
             elif app == "redis" and check_binary("redis-server", build_dir):
                 apps.append(app)
             elif app == "redis_ext" and check_binary("redis-server", build_dir):
+                apps.append(app)
+            elif app == "redis_patched" and check_binary("redis-server-smash", build_dir):
+                apps.append(app)
+            elif app == "redis_ext_patched" and check_binary("redis-server-smash", build_dir):
                 apps.append(app)
 
     print(f"Apps: {', '.join(apps)}")

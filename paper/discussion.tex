@@ -105,9 +105,12 @@ Without modification, Redis's \tcode{server\-Cron()} traverses key
 data pages every tick for defragmentation, rehashing, and dictionary
 resizing---even when no client commands are executing.  Additionally,
 \tcode{DEL} dereferences value pointers to update bookkeeping
-histograms, triggering wholesale decompression of cold pages.  These
-two behaviors reduce \sys's effectiveness from 94\% RSS reduction
-(with patches) to 68\% (without).
+histograms, triggering wholesale decompression of cold pages.  These two behaviors keep pages warm even during idle periods.
+The patches lower the baseline RSS itself (from
+\ablRedisBaselineServeRss\,MiB to
+\ablRedisPatchedBaselineServeRss\,MiB) and make the remaining
+data compressible by \sys
+(\ablRedisPatchedDefaultRssRedInt\% reduction).
 
 We address both with two small, semantics-preserving patches
 (7~files, 105~lines added, 51~removed).\footnote{%

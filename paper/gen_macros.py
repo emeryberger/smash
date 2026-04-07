@@ -101,6 +101,8 @@ def main():
         "memcached": "Memcached",
         "redis": "Redis",
         "redis_ext": "RedisExt",
+        "redis_patched": "RedisPatched",
+        "redis_ext_patched": "RedisExtPatched",
         "duckdb": "Duckdb",
     }
 

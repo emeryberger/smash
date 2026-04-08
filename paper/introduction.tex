@@ -55,7 +55,8 @@ each improve page compressibility:
   out-of-band bitmaps rather than in-band freelist pointers.
   Data pages receive no allocator metadata writes, so they can go
   truly cold---unlike conventional allocators where every
-  \tcode{malloc}/\tcode{free} touches the data page.
+  \tcode{malloc}/\tcode{free} touches the data page
+  (\S\ref{sec:design:arch}).
 \end{enumerate}
 
 \noindent

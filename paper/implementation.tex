@@ -1,13 +1,16 @@
 \section{Implementation}
 \label{sec:impl}
 
-\sys is implemented as a single shared library (5,200 lines of
-C++ across headers and one compilation unit) that interposes on
-\texttt{malloc}/\texttt{free} via dyld library interposition on
-macOS and \texttt{LD\_PRELOAD} on Linux.  On macOS, the
-\texttt{\_\_interpose} section redirects cross-dylib GOT entries;
-on Linux, strong symbol definitions in the preloaded library
-override glibc's weak defaults.
+\sys is implemented as a single shared library (5,200 lines of C++
+across headers and one compilation unit) for macOS and Linux. It uses the alloc8
+framework~\cite{berger2025alloc8} to replace all allocation operations
+(e.g., \texttt{malloc}/\texttt{free}) via library interposition
+(\tcode{DYLD\_\allowbreak INSERT\_\allowbreak LIBRARIES} on macOS,
+\tcode{LD\_\allowbreak PRELOAD} on Linux).
+%On macOS, the
+%\texttt{\_\_interpose} section redirects cross-dylib GOT entries;
+%on Linux, strong symbol definitions in the preloaded library
+%override glibc's weak defaults.
 % The Linux version uses an
 % unversioned linker script (no \texttt{GLIBC\_2.x} tags) so that a
 % single binary works across architectures---x86\_64 expects version

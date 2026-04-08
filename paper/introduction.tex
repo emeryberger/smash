@@ -11,70 +11,66 @@ macOS uses WKdm~\cite{wilson1999case,apple2013compressed} for
 inactive pages, and Meta's TMO~\cite{weiner2022tmo} offloads cold
 pages to compressed swap at datacenter scale.
 
-These OS mechanisms are \emph{reactive}---they compress only when
-the system is under memory pressure---and \emph{structure-blind}:
+These OS mechanisms are \emph{reactive}. They compress only when
+the system is under memory pressure. They are also \emph{structure-blind}:
 each page is treated as an opaque 4\,KiB (or 16\,KiB) byte array.
-This matters because conventional allocators produce pages that are
-hostile to compression.  A typical slab page intermixes objects from
-unrelated call sites (a JSON record next to a hash-table node next to
-a connection buffer), embeds freelist pointers that the allocator
-rewrites on every \tcode{malloc} and \tcode{free}, and retains stale
-data in freed slots.  The freelist writes keep pages ``warm'' in the
+Unfortunately, conventional allocators are likely to produce pages that are
+hostile to compression.  A typical page intermixes objects from
+unrelated call sites, which could group wildly different objects (e.g., a JSON record next to a hash-table node next to a connection buffer). Conventional allocators also use object headers to manage freelist pointers; the allocator
+rewrites these on every \tcode{malloc} and \tcode{free}. When objects are freed, their
+slate contents remain intact. The freelist writes thus keep pages ``warm'' in the
 OS's access-tracking sense even when application data is cold, and
-the heterogeneous, stale-laden content compresses poorly.
+their heterogeneous content compresses poorly, and compression effort is wasted on freed objects.
 Our compress-only experiment (\S\ref{sec:eval:pipeline}) confirms
 this: layering a compression pipeline atop the unmodified system
 allocator \emph{increases} RSS by 6--24\% due to metadata overhead
 that is not offset by compression savings, because glibc's pages
 contain too much incompressible noise.
 
-\sys is a drop-in memory allocator designed to make transparent heap
-compression effective.  Its key insight is that the allocator and
-compressor must be \emph{co-designed}: the allocator produces pages
-that are maximally compressible, and the compressor exploits the
-allocator's structural knowledge to compress them efficiently.
-Specifically, \sys contributes three allocator-level techniques that
-each improve page compressibility:
+\sys is a drop-in replacement memory allocator designed to make
+transparent heap compression effective.  Its key insight is that
+\emph{allocation and compression can cooperate to improve
+compressibility}. \sys's allocator produces pages that are maximally
+compressible, and its compressor exploits structural knowledge of the
+heap to compress them efficiently.  \sys incorporates allocator-level
+techniques designed to improve page compressibility:
 
-\begin{enumerate}\setlength{\itemsep}{1pt}\setlength{\parskip}{0pt}
-\item \textbf{Deferred zero-on-free.}  Freed object slots are zeroed
-  at compression time (using non-temporal stores to avoid cache
-  pollution), replacing stale data with long zero runs that zstd
-  compresses to near-zero cost.  This keeps the \tcode{free} path
-  fast while dramatically improving ratios
+First, \sys \textbf{segregates data from heap metadata}. \sys employs
+  out-of-band bitmaps rather than in-band object headers.
+  Unlike conventional allocators where data and heap metadata are intermingled,
+  leading to every
+  \tcode{malloc}/\tcode{free} touching adjacent data pages,
+  \sys{} avoids disrupting the reference behavior of data
+  (\S\ref{sec:design:arch}).
+%\begin{enumerate}\setlength{\itemsep}{1pt}\setlength{\parskip}{0pt}
+%\item
+  % \item
+  Second, \sys \textbf{segregates objects by their size and their call site}.
+  Each \tcode{malloc}
+  hashes its return address to route allocation to one of four
+  arenas, so same-sized objects from the same call site share pages. This grouping
+  yields structurally homogeneous page content (similar field
+  layouts, similar byte patterns) that can further improve compression
+  (\S\ref{sec:design:arenas}).
+  % \item
+% \end{enumerate}
+  Finally, \sys \textbf{lazily zeroes freed objects} at compression time (using non-temporal stores to avoid cache pollution), replacing stale data with runs of zeroes. This approach keeps the \tcode{free} path fast while dramatically improving compression ratios
   (\S\ref{sec:design:zero}).
 
-\item \textbf{Call-site arena segregation.}  Each \tcode{malloc}
-  hashes its return address to route the allocation to one of four
-  arenas, so objects from the same call site share pages.  This
-  produces structurally homogeneous page content---similar field
-  layouts, similar byte patterns---that compresses well
-  (\S\ref{sec:design:arenas}).
-
-\item \textbf{External metadata.}  Free-slot tracking uses
-  out-of-band bitmaps rather than in-band freelist pointers.
-  Data pages receive no allocator metadata writes, so they can go
-  truly cold---unlike conventional allocators where every
-  \tcode{malloc}/\tcode{free} touches the data page
-  (\S\ref{sec:design:arch}).
-\end{enumerate}
-
-\noindent
-On top of this compression-friendly allocator, \sys runs a background
-compressor that applies \emph{JIT compression}: like a JIT compiler
+  % \noindent
+  
+On top of its compression-friendly allocator, \sys incorporates a background
+compressor that applies \textbf{JIT compression}: like a JIT compiler
 that profiles methods to decide which to optimize and at what level,
-\sys uses per-size-class compression statistics and a
+\sys tracks per-size-class compression statistics and employs a
 return-on-investment (ROI) model to decide \emph{whether} to compress
 each cold page and \emph{which} algorithm to use---zstd-1 for
 recently cold pages where fast compression minimizes risk, zstd-9 for
 long-idle pages where the better ratio justifies the higher CPU cost;
 accessed pages are decompressed and reset, analogous to
 deoptimization (\S\ref{sec:design:adaptive}).
-\sys interposes on \tcode{malloc} and \tcode{free} via library
-interposition~\cite{berger2001composing}, requiring no application
-changes.
 
-We evaluate \sys on five applications.  \sys reduces serve-phase
+We evaluate \sys on five real-world, memory intensive applications.  \sys reduces serve-phase
 RSS by \rssRedMin--\rssRedMax\% with negligible throughput impact:
 memcached \ablMemcachedBaselineServeRss$\to$\ablMemcachedDefaultServeRss\,MiB
 (\ablMemcachedDefaultRssRedInt\%),
@@ -99,17 +95,20 @@ from \ablRedisBaselineServeRss\ to
 \emph{without any compression}---and make the remaining cold data
 consistently compressible (\S\ref{sec:eval:apps}).
 
-This paper makes two contributions:
-
-\begin{itemize}
-\item The design and implementation of \sys, a drop-in allocator
+\noindent
+This paper makes the following contributions:
+%
+%\begin{itemize}
+% \item
+  it presents the design and implementation of \sys, a drop-in allocator
   whose allocator-level structure (call-site segregation,
   deferred zero-on-free, external metadata) is co-designed with
-  a JIT compression pipeline to maximize page compressibility
+  a JIT compression pipeline to guide and maximize page compressibility
   (\S\ref{sec:design}--\ref{sec:impl}).
-
-\item An evaluation decomposing the sources of RSS reduction: the
-  compression pipeline, the allocator design, and individual
-  techniques, across five applications and nine allocator substrates
+% \item
+  Its evaluation demonstrates \sys{}'s effectiveness across a range of real-world applications and shows that it substantially reduces RSS over existing memory allocators.
+  %decomposes the sources of RSS reduction: the
+  %compression pipeline, the allocator design, and individual
+  %techniques, across five applications and nine allocator substrates
   (\S\ref{sec:eval}).
-\end{itemize}
+%\end{itemize}

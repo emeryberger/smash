@@ -9,7 +9,7 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 ### Key Features
 
 - **Transparent compression**: No application changes required — works via malloc interposition
-- **Adaptive multi-algorithm**: zstd-1 for recently cold pages, zstd-9 for very cold pages faults
+- **Adaptive multi-algorithm**: zstd-1 for recently cold pages, zstd-9 for very cold pages
 
 ## How It Works
 
@@ -230,7 +230,7 @@ Key tuning constants in `include/smash/config.h`:
 | `kVeryColdTicks` | 60 | Ticks → escalate to zstd/zstd+dict |
 | `kMinCompressRatio` | 0.75 | Only keep compressed if < 75% of original |
 | `kPrefetchWindow` | 2 | Pages prefetched in each direction on fault |
-| `kDictTrainSamples` | 16 | Pages collected before dictionary training |
+| `kDictTrainSamples` | 0 | Pages before dictionary training (disabled by default) |
 | `kNumClasses` | 36 | Size classes (16B to 16KB) |
 
 ## License

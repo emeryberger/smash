@@ -73,36 +73,30 @@ deoptimization (\S\ref{sec:design:adaptive}).
 interposition~\cite{berger2001composing}, requiring no application
 changes.
 
-We evaluate \sys on five applications---databases, caches, and
-analytics engines.  \sys reduces RSS by \rssRedMin--\rssRedMax\%
-depending on the workload's hot/cold partition, with negligible
-throughput impact.  An ablation study across ten configurations
-quantifies each technique's contribution.
+We evaluate \sys on five applications.  \sys reduces serve-phase
+RSS by \rssRedMin--\rssRedMax\% with negligible throughput impact:
+memcached \ablMemcachedBaselineServeRss$\to$\ablMemcachedDefaultServeRss\,MiB
+(\ablMemcachedDefaultRssRedInt\%),
+RocksDB \ablRocksdbBaselineServeRss$\to$\ablRocksdbDefaultServeRss\,MiB
+(\ablRocksdbDefaultRssRedInt\%),
+SQLite \ablSqliteBaselineServeRss$\to$\ablSqliteDefaultServeRss\,MiB
+(\ablSqliteDefaultRssRedInt\%),
+Redis \ablRedisBaselineServeRss$\to$\ablRedisDefaultServeRss\,MiB
+(\ablRedisDefaultRssRedInt\%).
+An ablation study quantifies each technique's contribution;
+no allocator tested (including
+Mesh~\cite{powers2019mesh}) reduces RSS below its fill level
+without compression.
 
-The allocator--compressor co-design is critical.  \sys's compression
-pipeline achieves substantial benefit even atop an unmodified system
-allocator on some workloads, but on others---particularly
-large-object workloads like RocksDB where freelist pointers span
-entire pages---the pipeline alone is ineffective.  Conversely,
-\sys's allocator produces highly compressible pages, but without the
-compression pipeline no RSS reduction occurs (no allocator tested,
-including Mesh~\cite{powers2019mesh}, reduces RSS below its fill
-level without compression).  The two components are synergistic:
-neither alone achieves the full benefit.
-
-In some cases, modest application changes can dramatically improve
-\sys's effectiveness.  Redis's background maintenance tasks
-(defragmentation, incremental rehashing) traverse heap data pages
-even during idle periods, keeping them warm and inflating RSS\@.
-By deferring these tasks during idle periods (an
-\tcode{idle-mode} configuration flag) and caching two
-object-metadata fields in the header to avoid dereferencing value
-data on \tcode{DEL} (7~files, 105~lines changed), we reduce Redis's
-baseline RSS from \ablRedisBaselineServeRss\ to
-\ablRedisPatchedBaselineServeRss\,MiB---a \redisPatchBaselineRedPct\%
-reduction \emph{without any compression}---and make the remaining
-cold data consistently compressible by \sys
-(\S\ref{sec:eval:apps}).
+In some cases, modest application changes can further improve
+\sys's effectiveness.  By deferring Redis's background maintenance
+tasks during idle periods and caching two object-metadata fields
+to avoid dereferencing value data on \tcode{DEL}
+(7~files, 105~lines changed), we reduce Redis's baseline RSS
+from \ablRedisBaselineServeRss\ to
+\ablRedisPatchedBaselineServeRss\,MiB---\redisPatchBaselineRedPct\%
+\emph{without any compression}---and make the remaining cold data
+consistently compressible (\S\ref{sec:eval:apps}).
 
 This paper makes two contributions:
 

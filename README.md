@@ -1,19 +1,15 @@
 # smash
 
-**S**elective **M**emory **A**llocation with **S**mart **H**andling — a compression-aware memory allocator that transparently compresses cold pages to reduce resident set size (RSS).
+**smash** — a compression-aware memory allocator that transparently compresses cold pages to reduce resident set size (RSS).
 
 ## Overview
 
-smash is a drop-in malloc replacement that monitors page access patterns and compresses pages that haven't been touched recently. When compressed pages are accessed again, a signal handler transparently decompresses them before the application sees the data. This reduces physical memory usage for applications with large working sets where significant portions of allocated memory are idle at any given time.
+Smash is a drop-in malloc replacement that monitors page access patterns and compresses pages that haven't been touched recently. When compressed pages are accessed again, a signal handler transparently decompresses them before the application sees the data. Smash reduces physical memory usage for applications with large working sets where significant portions of allocated memory are idle at any given time.
 
 ### Key Features
 
 - **Transparent compression**: No application changes required — works via malloc interposition
-- **Adaptive multi-algorithm**: LZ4 for recently cold pages, zstd for very cold pages, zstd+dictionary for homogeneous size classes
-- **Per-size-class dictionaries**: Automatically trains compression dictionaries from page samples, exploiting structural similarity within size classes
-- **Prefetching**: On fault, decompresses adjacent pages in the same span to reduce future faults
-- **Signal-safe decompression**: All decompression state pre-allocated from a bootstrap allocator — no malloc calls in the fault handler path
-- **Fine-grained locking**: Per-page spinlocks and per-slab locks minimize contention
+- **Adaptive multi-algorithm**: zstd-1 for recently cold pages, zstd-9 for very cold pages faults
 
 ## How It Works
 

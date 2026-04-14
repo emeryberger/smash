@@ -63,6 +63,14 @@ class CompressorThread {
     CompressedFn compressed_fn_ = nullptr;
     void* compressed_ctx_ = nullptr;
 
+    // Decompressed-page hook (COMPRESSED → ACTIVE on fault).  A "re-warm"
+    // is direct evidence the (arena, sc) bucket is hot for this page; the
+    // heap uses it to drive adaptive under-packing.
+    using DecompressedFn = void(*)(size_t page_idx, uint8_t arena_id,
+                                   uint8_t sc, void* ctx);
+    DecompressedFn decompressed_fn_ = nullptr;
+    void* decompressed_ctx_ = nullptr;
+
     // Per-page metadata (allocated from bootstrap, indexed by VmRegion page index)
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
@@ -1002,6 +1010,11 @@ public:
         compressed_ctx_ = ctx;
     }
 
+    void setDecompressedCallback(DecompressedFn fn, void* ctx) {
+        decompressed_fn_ = fn;
+        decompressed_ctx_ = ctx;
+    }
+
     void start() {
         running_.store(true, std::memory_order_release);
 
@@ -1093,6 +1106,17 @@ public:
             states_->set(page_idx, PageState::ACTIVE);
             cold_count_[page_idx] = 0;
             locks_->unlock(page_idx);
+
+            // Adaptive cap: decompression = re-warm evidence.  Notify the
+            // heap so it can bias cap sizing for this (arena, sc) toward
+            // "hot" (no cap / larger cap).
+            if (decompressed_fn_ && page_map_) {
+                Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
+                if (sp && !sp->is_large && sp->size_class < kNumClasses) {
+                    decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
+                                     decompressed_ctx_);
+                }
+            }
 
             // Prefetch adjacent compressed pages
             prefetchAdjacent(page_idx);

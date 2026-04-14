@@ -39,6 +39,8 @@ ALL_ABLATION_VARS = [
     "SMASH_MAX_SLOTS_PER_PAGE", "SMASH_COLD_ARENA_FEEDBACK",
     "SMASH_COLD_ARENA_THRESHOLD", "SMASH_PAGE_LOCAL_BATCH",
     "SMASH_THREAD_ARENA_HASH",
+    "SMASH_ADAPTIVE_CAP", "SMASH_ADAPTIVE_CAP_TARGET_PCT",
+    "SMASH_ADAPTIVE_CAP_MIN", "SMASH_ADAPTIVE_CAP_MIN_SAMPLES",
 ]
 
 # ── Ablation configs matching paper table ────────────────────────────────────
@@ -78,6 +80,11 @@ ABLATION_CONFIGS = OrderedDict([
     # A2-lite: thread identity in arena hash (cheap per-thread separation).
     ("T3e", {"name": "Thread arena hash",
              "cmake_flags": {"SMASH_THREAD_ARENA_HASH": "ON"}, "use_smash": True}),
+    # C1b: adaptive cap driven by (compress, decompress) feedback.  q̂ =
+    # decomp / (comp + decomp); N = floor(log(p_target)/log(1-q̂)) with
+    # a floor of kAdaptiveCapMin.  Hot buckets (q̂ >= 0.30) disable cap.
+    ("T3f", {"name": "Adaptive cap (feedback)",
+             "cmake_flags": {"SMASH_ADAPTIVE_CAP": "ON"}, "use_smash": True}),
 ])
 
 APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext",

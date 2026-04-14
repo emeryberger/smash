@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include "smash/config.h"
 #include "core/bootstrap_alloc.h"
 #include "core/size_classes.h"
@@ -77,6 +78,14 @@ class SmashHeap {
     std::atomic<uint32_t> compress_count_[kNumArenas * kNumClasses]{};
     std::atomic<uint8_t> cold_bias_[kNumArenas * kNumClasses]{};
 
+    // C1b (adaptive cap) feedback.  Per (base_arena, size_class) counter
+    // of re-warm events — a page that was COMPRESSED but got faulted back
+    // to ACTIVE.  q̂ = decomp / (comp + decomp) is the online Pareto
+    // estimator; cached cap values live in adaptive_cap_ so the slab
+    // allocateNewSpan path can read them without recomputing every call.
+    std::atomic<uint32_t> decompress_count_[kNumArenas * kNumClasses]{};
+    std::atomic<uint32_t> adaptive_cap_[kNumArenas * kNumClasses]{};
+
     LargeAlloc large_alloc_;
     PageMap page_map_;
 
@@ -124,19 +133,84 @@ public:
     // threshold is crossed, flips the sticky cold-bias flag so subsequent
     // allocations route to the cold sub-arena.
     void onPageCompressed(uint8_t arena_id, uint8_t sc) {
-        if constexpr (!kColdArenaFeedback) return;
+        if constexpr (!kColdArenaFeedback && !kAdaptiveCap) return;
         if (sc >= kNumClasses) return;
         uint8_t base = arena_id & (kNumArenas - 1);   // strip cold half
         size_t idx = base * kNumClasses + sc;
-        uint32_t prev = compress_count_[idx].fetch_add(1, std::memory_order_relaxed);
-        if (prev + 1 == kColdArenaThreshold) {
-            cold_bias_[idx].store(1, std::memory_order_relaxed);
+        if constexpr (kColdArenaFeedback) {
+            uint32_t prev = compress_count_[idx].fetch_add(1, std::memory_order_relaxed);
+            if (prev + 1 == kColdArenaThreshold) {
+                cold_bias_[idx].store(1, std::memory_order_relaxed);
+            }
+        } else {
+            compress_count_[idx].fetch_add(1, std::memory_order_relaxed);
+        }
+        if constexpr (kAdaptiveCap) {
+            recomputeAdaptiveCap(idx);
         }
     }
 
     static void compressedEventHook(size_t /*page_idx*/, uint8_t arena_id,
                                     uint8_t sc, void* ctx) {
         static_cast<SmashHeap*>(ctx)->onPageCompressed(arena_id, sc);
+    }
+
+    // Called by the compressor when a COMPRESSED page faults back to
+    // ACTIVE.  Updates the decompression counter and recomputes the
+    // cached adaptive cap for this (base_arena, sc).  The cap is the
+    // smallest N with (1 - q̂)^N >= P_target, floored at kAdaptiveCapMin.
+    // Hot buckets (q̂ >= q_max) disable the cap outright — under-packing
+    // a hot bucket costs RSS without winning compressibility.
+    void onPageDecompressed(uint8_t arena_id, uint8_t sc) {
+        if constexpr (!kAdaptiveCap) return;
+        if (sc >= kNumClasses) return;
+        uint8_t base = arena_id & (kNumArenas - 1);
+        size_t idx = base * kNumClasses + sc;
+        decompress_count_[idx].fetch_add(1, std::memory_order_relaxed);
+        recomputeAdaptiveCap(idx);
+    }
+
+    static void decompressedEventHook(size_t /*page_idx*/, uint8_t arena_id,
+                                      uint8_t sc, void* ctx) {
+        static_cast<SmashHeap*>(ctx)->onPageDecompressed(arena_id, sc);
+    }
+
+    // Recompute and cache the adaptive cap for bucket idx.  Called whenever
+    // compress or decompress counters change.  Cheap (one log() call) and
+    // races are benign — worst case we publish a slightly stale cap.
+    void recomputeAdaptiveCap(size_t idx) {
+        uint32_t comp = compress_count_[idx].load(std::memory_order_relaxed);
+        uint32_t dec  = decompress_count_[idx].load(std::memory_order_relaxed);
+        uint32_t total = comp + dec;
+        uint32_t cap;
+        if (total < kAdaptiveCapMinSamples) {
+            cap = 0;   // not enough evidence — don't cap
+        } else {
+            double q = double(dec) / double(total);
+            constexpr double q_max = 0.30;   // above this, under-packing is counterproductive
+            if (q >= q_max) {
+                cap = 0;
+            } else if (q <= 0.0) {
+                // Pure cold — use the minimum floor (aggressive cap)
+                cap = kAdaptiveCapMin;
+            } else {
+                double p = double(kAdaptiveCapTargetPct) / 100.0;
+                double n = std::log(p) / std::log(1.0 - q);
+                uint32_t cap_u = static_cast<uint32_t>(n);  // floor
+                cap = cap_u < kAdaptiveCapMin ? kAdaptiveCapMin : cap_u;
+            }
+        }
+        adaptive_cap_[idx].store(cap, std::memory_order_relaxed);
+    }
+
+    // Slab-facing cap lookup.  Returns the current cached cap for the
+    // (arena, sc) bucket; 0 = no cap.  Called from Slab::allocateNewSpan.
+    static uint32_t adaptiveCapQuery(void* ctx, uint8_t arena, uint8_t sc) {
+        auto* self = static_cast<SmashHeap*>(ctx);
+        if (sc >= kNumClasses) return 0;
+        uint8_t base = arena & (kNumArenas - 1);
+        return self->adaptive_cap_[base * kNumClasses + sc]
+                   .load(std::memory_order_relaxed);
     }
 
 private:
@@ -217,8 +291,11 @@ public:
                              compress_only ? nullptr : &page_map_, &fault_handler_);
             // A3: register the cold-arena feedback hook (no-op when
             // SMASH_COLD_ARENA_FEEDBACK is off — onPageCompressed early-returns).
-            if (!compress_only && kColdArenaFeedback) {
+            if (!compress_only && (kColdArenaFeedback || kAdaptiveCap)) {
                 compressor_.setCompressedCallback(compressedEventHook, this);
+            }
+            if (!compress_only && kAdaptiveCap) {
+                compressor_.setDecompressedCallback(decompressedEventHook, this);
             }
 
             if (!compress_only) {
@@ -235,12 +312,17 @@ public:
                     } else {
                         cap = kMaxSlotsPerPage;
                     }
-                    for (int i = 0; i < kNumClasses; ++i)
+                    for (int i = 0; i < kNumClasses; ++i) {
                         slabs_[a * kNumClasses + i].init(
                             static_cast<uint8_t>(i), &page_map_,
                             &vm_region_, &page_states_,
                             releaseHook, this,
                             static_cast<uint8_t>(a), cap);
+                        if constexpr (kAdaptiveCap) {
+                            slabs_[a * kNumClasses + i].setCapFn(
+                                adaptiveCapQuery, this);
+                        }
+                    }
                 }
             }
             compression_inited_ = true;

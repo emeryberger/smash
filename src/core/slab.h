@@ -25,6 +25,12 @@ class Slab {
     // Per-slab per-page slot cap (0 = no cap).  Set by SmashHeap during init
     // based on cold vs hot sub-arena identity (C1).
     uint32_t max_slots_per_page_ = 0;
+    // Adaptive cap callback.  When set, overrides max_slots_per_page_ per
+    // new-span allocation; lets SmashHeap revise the cap as it accumulates
+    // compression/decompression feedback for this (arena, sc) bucket.
+    using CapFn = uint32_t(*)(void* ctx, uint8_t arena, uint8_t sc);
+    CapFn cap_fn_ = nullptr;
+    void* cap_ctx_ = nullptr;
     Spinlock lock_;
     IntrusiveList<Span> partial_;
     IntrusiveList<Span> full_;
@@ -54,7 +60,9 @@ class Slab {
         }
 
         Span* span = newSpanDescriptor();
-        span->init(mem, info.pages, size_class_, arena_id_, max_slots_per_page_);
+        uint32_t cap = cap_fn_ ? cap_fn_(cap_ctx_, arena_id_, size_class_)
+                               : max_slots_per_page_;
+        span->init(mem, info.pages, size_class_, arena_id_, cap);
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
     }
@@ -254,6 +262,11 @@ public:
         while (Span* span = empty_.popFront()) {
             releaseSpan(span);
         }
+    }
+
+    void setCapFn(CapFn fn, void* ctx) {
+        cap_fn_ = fn;
+        cap_ctx_ = ctx;
     }
 
     void lockSlab() { lock_.lock(); }

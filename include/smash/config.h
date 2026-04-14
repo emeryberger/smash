@@ -65,6 +65,38 @@ inline constexpr uint32_t kMaxSlotsPerPage = 0;
 inline constexpr uint32_t kMaxSlotsPerPage = SMASH_MAX_SLOTS_PER_PAGE;
 #endif
 
+// C1b: Adaptive per-page cap driven by compression/decompression feedback.
+// When on, the heap tracks per-(base_arena, size_class) counters for both
+// successful compression events (cold evidence) and fault decompression
+// events (hot evidence, i.e., the page was re-warmed after being cold).
+// q̂ = decomp / (comp + decomp) is an online Pareto estimator; N is chosen
+// so (1 - q̂)^N >= kAdaptiveCapTargetPct / 100 (i.e., target probability
+// that a freshly allocated page stays uniformly cold for one tick window).
+// Below kAdaptiveCapMinSamples total events the cap is disabled
+// (insufficient evidence).  For hot-dominated buckets (q̂ too high to
+// satisfy the target at any N >= kAdaptiveCapMin), the cap is also
+// disabled — under-packing a hot bucket just balloons RSS.
+#ifdef SMASH_ADAPTIVE_CAP
+inline constexpr bool kAdaptiveCap = true;
+#else
+inline constexpr bool kAdaptiveCap = false;
+#endif
+#ifndef SMASH_ADAPTIVE_CAP_TARGET_PCT
+inline constexpr int kAdaptiveCapTargetPct = 50;   // P(page cold) target
+#else
+inline constexpr int kAdaptiveCapTargetPct = SMASH_ADAPTIVE_CAP_TARGET_PCT;
+#endif
+#ifndef SMASH_ADAPTIVE_CAP_MIN
+inline constexpr uint32_t kAdaptiveCapMin = 4;     // floor on N
+#else
+inline constexpr uint32_t kAdaptiveCapMin = SMASH_ADAPTIVE_CAP_MIN;
+#endif
+#ifndef SMASH_ADAPTIVE_CAP_MIN_SAMPLES
+inline constexpr uint32_t kAdaptiveCapMinSamples = 16;
+#else
+inline constexpr uint32_t kAdaptiveCapMinSamples = SMASH_ADAPTIVE_CAP_MIN_SAMPLES;
+#endif
+
 // A2-lite: Thread identity in the arena hash.  When on, callsiteArena()
 // XORs a per-thread id into the (RA, frame, sc) hash so allocations from
 // different threads are more likely to land in different arenas.  Cheap —

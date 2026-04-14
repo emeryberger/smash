@@ -22,6 +22,9 @@ namespace smash {
 class Slab {
     uint8_t size_class_;
     uint8_t arena_id_ = 0;
+    // Per-slab underfill denominator (1 = no underfill).
+    // Set by SmashHeap during init based on cold vs hot sub-arena identity.
+    int underfill_denom_ = 1;
     Spinlock lock_;
     IntrusiveList<Span> partial_;
     IntrusiveList<Span> full_;
@@ -51,7 +54,7 @@ class Slab {
         }
 
         Span* span = newSpanDescriptor();
-        span->init(mem, info.pages, size_class_, arena_id_);
+        span->init(mem, info.pages, size_class_, arena_id_, underfill_denom_);
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
     }
@@ -103,9 +106,11 @@ public:
               VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
               void (*hook)(size_t, size_t, void*) = nullptr,
               void* hook_ctx = nullptr,
-              uint8_t arena_id = 0) {
+              uint8_t arena_id = 0,
+              int underfill_denom = 1) {
         size_class_ = sc;
         arena_id_ = arena_id;
+        underfill_denom_ = underfill_denom;
         page_map_ = pm;
         vm_region_ = vr;
         page_states_ = ps;
@@ -170,6 +175,12 @@ public:
 
     // Batch allocate: fill an array with up to `count` pointers.
     // Returns actual number allocated.
+    //
+    // When kPageLocalBatch is true, the inner loop stops as soon as the
+    // next allocated object would lie on a different VM page than the
+    // batch's first object.  This keeps each thread-cache refill confined
+    // to one page, so objects allocated in a single burst share a page
+    // and (under Pareto-skew access) tend to cool together.
     size_t allocateBatch(void** out, size_t count) {
         LockGuard guard(lock_);
         size_t allocated = 0;
@@ -187,9 +198,23 @@ public:
                 partial_.pushFront(span);
             }
 
+            uintptr_t first_page = 0;
+            bool first_in_batch = (allocated == 0);
             while (allocated < count) {
                 void* ptr = span->allocate();
                 if (!ptr) break;
+                if (kPageLocalBatch) {
+                    uintptr_t p = reinterpret_cast<uintptr_t>(ptr) & ~(kPageSize - 1);
+                    if (first_in_batch) {
+                        first_page = p;
+                        first_in_batch = false;
+                    } else if (p != first_page) {
+                        // Crossed a page boundary.  Return the object and stop
+                        // — next refill will anchor on a fresh page.
+                        span->deallocate(ptr);
+                        return allocated;
+                    }
+                }
                 out[allocated++] = ptr;
             }
 

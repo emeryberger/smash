@@ -25,6 +25,48 @@ inline constexpr int kNumArenas = 4;  // must be power of 2
 inline constexpr int kNumArenas = SMASH_NUM_ARENAS;
 #endif
 
+// ── Reference-behavior homogeneity knobs (Apr 2026 design memo) ─────────────
+//
+// A3: Cold-bias feedback arenas.  When on, the slab array is doubled to
+// maintain a hot sub-arena (index 0..kNumArenas-1) and a cold sub-arena
+// (index kNumArenas..2*kNumArenas-1) for each (callsite, size class).
+// A per-(base-arena, size-class) flag flips to cold once the compressor
+// records >= kColdArenaThreshold successful compressions for that bucket;
+// subsequent allocations route to the cold sub-arena, where they may be
+// placed under an underfill policy (C1).
+#ifdef SMASH_COLD_ARENA_FEEDBACK
+inline constexpr bool kColdArenaFeedback = true;
+#else
+inline constexpr bool kColdArenaFeedback = false;
+#endif
+#ifndef SMASH_COLD_ARENA_THRESHOLD
+inline constexpr uint32_t kColdArenaThreshold = 8;
+#else
+inline constexpr uint32_t kColdArenaThreshold = SMASH_COLD_ARENA_THRESHOLD;
+#endif
+inline constexpr int kTotalArenas = kColdArenaFeedback ? (kNumArenas * 2) : kNumArenas;
+
+// C1: Deliberate under-packing of cold-biased pages.  When > 1, spans for
+// cold sub-arenas are initialized with object_count / kUnderfillDenom slots;
+// the remaining slots stay zero-filled and compress to near-nothing.  With
+// A3 disabled, the denominator applies to every span (global underfill, for
+// ablation).  Denominator 1 = no underfill (default).
+#ifndef SMASH_UNDERFILL_DENOM
+inline constexpr int kUnderfillDenom = 1;
+#else
+inline constexpr int kUnderfillDenom = SMASH_UNDERFILL_DENOM;
+#endif
+
+// B1: Page-local batch refill.  When on, Slab::allocateBatch stops once
+// the next object would fall on a different page than the batch's first
+// object.  Keeps each thread-cache refill confined to one page, so
+// objects allocated in the same burst share a lifecycle at page grain.
+#ifdef SMASH_PAGE_LOCAL_BATCH
+inline constexpr bool kPageLocalBatch = true;
+#else
+inline constexpr bool kPageLocalBatch = false;
+#endif
+
 // ── Spans ────────────────────────────────────────────────────────────────────
 inline constexpr int kTargetObjectsPerSpan = 64;
 inline constexpr int kMaxSpanPages = 8;

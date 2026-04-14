@@ -37,15 +37,26 @@ struct Span {
     // For thread cache pool recycling
     Span* next_free;
 
-    // Initialize a slab span for the given size class
-    void init(void* base_, uint32_t pages, uint8_t sc, uint8_t arena = 0) {
+    // Initialize a slab span for the given size class.
+    // When underfill_denom > 1, only the first (full_capacity / denom) slots
+    // are made available; the remainder stay zero-filled and compress to
+    // near-zero. Bitmap is still sized to full_capacity so a future
+    // recompute could restore capacity without reallocating.
+    void init(void* base_, uint32_t pages, uint8_t sc, uint8_t arena = 0,
+              int underfill_denom = 1) {
         base = base_;
         page_count = pages;
         size_class = sc;
         is_large = false;
         arena_id = arena;
         object_size = kSizeClasses[sc].size;
-        object_count = static_cast<uint16_t>((pages * kPageSize) / object_size);
+        uint32_t full_capacity = (pages * kPageSize) / object_size;
+        uint32_t effective = full_capacity;
+        if (underfill_denom > 1) {
+            effective = full_capacity / static_cast<uint32_t>(underfill_denom);
+            if (effective == 0) effective = 1;
+        }
+        object_count = static_cast<uint16_t>(effective);
         allocated_count = 0;
         free_hint_word = 0;
         list_prev = nullptr;
@@ -53,16 +64,13 @@ struct Span {
         large_size = 0;
         next_free = nullptr;
 
-        // Allocate bitmap from bootstrap (1 bit per object, in uint64_t words)
+        // Bitmap sized for the effective (possibly underfilled) object count.
         size_t num_words = (object_count + 63) / 64;
         bitmap = static_cast<uint64_t*>(
             BootstrapAlloc::instance().allocate(num_words * sizeof(uint64_t), alignof(uint64_t)));
 
-        // Set all valid object bits to 1 (free)
         if (num_words > 0) {
-            // Set all full words to all-1s
             __builtin_memset(bitmap, 0xFF, num_words * sizeof(uint64_t));
-            // Mask off trailing bits in the last word that don't correspond to objects
             size_t valid_bits = object_count % 64;
             if (valid_bits != 0) {
                 bitmap[num_words - 1] = (1ULL << valid_bits) - 1;

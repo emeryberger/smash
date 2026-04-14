@@ -56,16 +56,17 @@ void ThreadCache::drain(uint8_t sc, Slab* all_slabs, PageMap* page_map) {
     if (to_drain == 0) to_drain = c.count;
     size_t start = c.count - to_drain;
 
-    // Bucket pointers by arena based on their span's arena_id
-    // Max drained per call = ceil(kThreadCacheMaxPerClass/2)
-    void* buckets[kNumArenas][kThreadCacheMaxPerClass];
-    size_t counts[kNumArenas]{};
+    // Bucket pointers by arena based on their span's arena_id.
+    // arena_id may be in [0, kTotalArenas) when cold-arena feedback is on.
+    void* buckets[kTotalArenas][kThreadCacheMaxPerClass];
+    size_t counts[kTotalArenas]{};
     for (size_t i = start; i < c.count; ++i) {
         Span* span = page_map->get(reinterpret_cast<uintptr_t>(c.ptrs[i]));
         uint8_t arena = (span && !span->is_large) ? span->arena_id : 0;
+        if (arena >= kTotalArenas) arena = 0;  // defensive
         buckets[arena][counts[arena]++] = c.ptrs[i];
     }
-    for (int a = 0; a < kNumArenas; ++a) {
+    for (int a = 0; a < kTotalArenas; ++a) {
         if (counts[a] > 0)
             all_slabs[a * kNumClasses + sc].deallocateBatch(buckets[a], counts[a]);
     }
@@ -77,14 +78,15 @@ void ThreadCache::drainAll(Slab* all_slabs, PageMap* page_map) {
         auto& c = caches_[i];
         if (c.count > 0) {
             // Bucket by arena — each bucket may receive up to kThreadCacheMaxPerClass ptrs
-            void* buckets[kNumArenas][kThreadCacheMaxPerClass];
-            size_t counts[kNumArenas]{};
+            void* buckets[kTotalArenas][kThreadCacheMaxPerClass];
+            size_t counts[kTotalArenas]{};
             for (size_t j = 0; j < c.count; ++j) {
                 Span* span = page_map->get(reinterpret_cast<uintptr_t>(c.ptrs[j]));
                 uint8_t arena = (span && !span->is_large) ? span->arena_id : 0;
+                if (arena >= kTotalArenas) arena = 0;
                 buckets[arena][counts[arena]++] = c.ptrs[j];
             }
-            for (int a = 0; a < kNumArenas; ++a) {
+            for (int a = 0; a < kTotalArenas; ++a) {
                 if (counts[a] > 0)
                     all_slabs[a * kNumClasses + i].deallocateBatch(buckets[a], counts[a]);
             }

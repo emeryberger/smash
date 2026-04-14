@@ -55,6 +55,14 @@ class CompressorThread {
     using PreTickFn = void(*)();
     PreTickFn pre_tick_fn_ = nullptr;
 
+    // Optional callback invoked once per successful page compression.
+    // Used by SmashHeap to drive the A3 cold-arena feedback loop:
+    // arena_id and size_class identify the originating slab.
+    using CompressedFn = void(*)(size_t page_idx, uint8_t arena_id,
+                                 uint8_t sc, void* ctx);
+    CompressedFn compressed_fn_ = nullptr;
+    void* compressed_ctx_ = nullptr;
+
     // Per-page metadata (allocated from bootstrap, indexed by VmRegion page index)
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
@@ -587,6 +595,17 @@ class CompressorThread {
 
         states_->set(page_idx, PageState::COMPRESSED);
         locks_->unlock(page_idx);
+
+        // A3 feedback: notify heap that a page from (span->arena_id, sc)
+        // successfully compressed. The hook accumulates evidence that the
+        // originating slab is cold-biased and eventually flips routing.
+        if (compressed_fn_ && page_map_) {
+            Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
+            if (sp && !sp->is_large && sp->size_class < kNumClasses) {
+                compressed_fn_(page_idx, sp->arena_id, sp->size_class,
+                               compressed_ctx_);
+            }
+        }
         return true;
     }
 
@@ -975,6 +994,13 @@ public:
     }
 
     void setPreTickCallback(PreTickFn fn) { pre_tick_fn_ = fn; }
+
+    // A3: feedback hook invoked once per successful page compression
+    // with the originating span's arena_id and size_class.
+    void setCompressedCallback(CompressedFn fn, void* ctx) {
+        compressed_fn_ = fn;
+        compressed_ctx_ = ctx;
+    }
 
     void start() {
         running_.store(true, std::memory_order_release);

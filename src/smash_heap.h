@@ -99,6 +99,13 @@ class SmashHeap {
         uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         uintptr_t sh = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
         uintptr_t h = ra ^ (sh >> 4) ^ static_cast<uintptr_t>(sc);
+        if constexpr (kThreadArenaHash) {
+            // Thread-local monotonic id (A2-lite).  Multiplied by a
+            // large odd constant so the low bits mix well into h.
+            static std::atomic<uint32_t> next_tid{0};
+            thread_local uint32_t tid = next_tid.fetch_add(1, std::memory_order_relaxed);
+            h ^= static_cast<uintptr_t>(tid) * 0x9E3779B97F4A7C15ULL;
+        }
         h ^= h >> 16;
         uint8_t base = static_cast<uint8_t>(h & (kNumArenas - 1));
 #endif

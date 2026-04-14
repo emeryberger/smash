@@ -154,7 +154,7 @@ endforeach()
 foreach(_flag ABLATION_NO_ZERO_EAGER ABLATION_NO_ZERO_DEFERRED
               ABLATION_NO_SKIP_STATS ABLATION_NO_CHUNK_BITMAP
               ABLATION_NO_CALLSITE_ARENA USE_LZ4
-              COLD_ARENA_FEEDBACK PAGE_LOCAL_BATCH)
+              COLD_ARENA_FEEDBACK PAGE_LOCAL_BATCH THREAD_ARENA_HASH)
   if(SMASH_${_flag})
     target_compile_definitions(smash PRIVATE "SMASH_${_flag}=1")
   endif()

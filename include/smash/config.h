@@ -65,6 +65,19 @@ inline constexpr uint32_t kMaxSlotsPerPage = 0;
 inline constexpr uint32_t kMaxSlotsPerPage = SMASH_MAX_SLOTS_PER_PAGE;
 #endif
 
+// A2-lite: Thread identity in the arena hash.  When on, callsiteArena()
+// XORs a per-thread id into the (RA, frame, sc) hash so allocations from
+// different threads are more likely to land in different arenas.  Cheap —
+// uses a TLS-cached monotonic id assigned on first call.  Effectiveness
+// is bounded by kNumArenas: with 4 arenas, ~4 threads saturate the space
+// and the extra term is noise beyond that; consider raising kNumArenas
+// to 8 or 16 for heavier multi-threaded workloads.
+#ifdef SMASH_THREAD_ARENA_HASH
+inline constexpr bool kThreadArenaHash = true;
+#else
+inline constexpr bool kThreadArenaHash = false;
+#endif
+
 // B1: Page-local batch refill.  When on, Slab::allocateBatch stops once
 // the next object would fall on a different page than the batch's first
 // object.  Keeps each thread-cache refill confined to one page, so

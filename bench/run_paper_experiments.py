@@ -38,6 +38,7 @@ ALL_ABLATION_VARS = [
     # T3 series: reference-behavior homogeneity experiments (Apr 2026)
     "SMASH_MAX_SLOTS_PER_PAGE", "SMASH_COLD_ARENA_FEEDBACK",
     "SMASH_COLD_ARENA_THRESHOLD", "SMASH_PAGE_LOCAL_BATCH",
+    "SMASH_THREAD_ARENA_HASH",
 ]
 
 # ── Ablation configs matching paper table ────────────────────────────────────
@@ -74,6 +75,9 @@ ABLATION_CONFIGS = OrderedDict([
              "cmake_flags": {"SMASH_COLD_ARENA_FEEDBACK": "ON",
                              "SMASH_MAX_SLOTS_PER_PAGE": "8",
                              "SMASH_PAGE_LOCAL_BATCH": "ON"}, "use_smash": True}),
+    # A2-lite: thread identity in arena hash (cheap per-thread separation).
+    ("T3e", {"name": "Thread arena hash",
+             "cmake_flags": {"SMASH_THREAD_ARENA_HASH": "ON"}, "use_smash": True}),
 ])
 
 APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext",

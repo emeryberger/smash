@@ -46,15 +46,23 @@ inline constexpr uint32_t kColdArenaThreshold = SMASH_COLD_ARENA_THRESHOLD;
 #endif
 inline constexpr int kTotalArenas = kColdArenaFeedback ? (kNumArenas * 2) : kNumArenas;
 
-// C1: Deliberate under-packing of cold-biased pages.  When > 1, spans for
-// cold sub-arenas are initialized with object_count / kUnderfillDenom slots;
-// the remaining slots stay zero-filled and compress to near-nothing.  With
-// A3 disabled, the denominator applies to every span (global underfill, for
-// ablation).  Denominator 1 = no underfill (default).
-#ifndef SMASH_UNDERFILL_DENOM
-inline constexpr int kUnderfillDenom = 1;
+// C1: Per-page absolute cap on live objects.  The (1-q)^N argument for
+// page-cold probability bounds N (objects per page), not the fraction of
+// the span used.  A fractional denominator is the wrong knob: with
+// denom=4, a 16B size class still puts 256 objects on a page (P(cold)
+// ≈ 0 even for tiny q), while a 4KB size class drops to 1 object/page
+// (huge underfill cost for the same probability bound).
+//
+// kMaxSlotsPerPage caps the number of slots whose start address lies on
+// any single page.  Spans for cold sub-arenas (A3 on) or all spans (A3
+// off) reserve only the first kMaxSlotsPerPage slots per page; the
+// remaining bytes stay zero-filled and compress to near-nothing.
+// 0 = no cap (default).  Cap is silently ignored when object_size >=
+// kPageSize (slot already covers a full page).
+#ifndef SMASH_MAX_SLOTS_PER_PAGE
+inline constexpr uint32_t kMaxSlotsPerPage = 0;
 #else
-inline constexpr int kUnderfillDenom = SMASH_UNDERFILL_DENOM;
+inline constexpr uint32_t kMaxSlotsPerPage = SMASH_MAX_SLOTS_PER_PAGE;
 #endif
 
 // B1: Page-local batch refill.  When on, Slab::allocateBatch stops once

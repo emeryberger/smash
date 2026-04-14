@@ -145,7 +145,7 @@ set_target_properties(smash PROPERTIES
 foreach(_var NUM_ARENAS COLD_TICKS VERY_COLD_TICKS DICT_TRAIN_SAMPLES
             PREFETCH_WINDOW COMPRESSOR_WORKERS COMPRESS_STORE_SHARDS
             LARGE_ALLOC_VM_THRESHOLD
-            UNDERFILL_DENOM COLD_ARENA_THRESHOLD)
+            MAX_SLOTS_PER_PAGE COLD_ARENA_THRESHOLD)
   if(DEFINED SMASH_${_var} AND NOT "${SMASH_${_var}}" STREQUAL "")
     target_compile_definitions(smash PRIVATE "SMASH_${_var}=${SMASH_${_var}}")
   endif()

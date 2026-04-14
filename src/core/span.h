@@ -38,12 +38,19 @@ struct Span {
     Span* next_free;
 
     // Initialize a slab span for the given size class.
-    // When underfill_denom > 1, only the first (full_capacity / denom) slots
-    // are made available; the remainder stay zero-filled and compress to
-    // near-zero. Bitmap is still sized to full_capacity so a future
-    // recompute could restore capacity without reallocating.
+    //
+    // When max_slots_per_page > 0 and object_size < kPageSize, only the first
+    // `cap` slots that start on each page are made available, where
+    // cap = min(max_slots_per_page, slots-starting-on-that-page).  This
+    // bounds per-page live count uniformly across size classes, which is
+    // what the (1-q)^N page-cold probability argument actually requires.
+    // Disallowed slots stay zero-filled and compress to near-zero.
+    //
+    // The bitmap remains sized for the full capacity (1 bit per potential
+    // slot); disallowed slots are simply marked allocated (0) so the
+    // allocator skips them.
     void init(void* base_, uint32_t pages, uint8_t sc, uint8_t arena = 0,
-              int underfill_denom = 1) {
+              uint32_t max_slots_per_page = 0) {
         base = base_;
         page_count = pages;
         size_class = sc;
@@ -51,12 +58,7 @@ struct Span {
         arena_id = arena;
         object_size = kSizeClasses[sc].size;
         uint32_t full_capacity = (pages * kPageSize) / object_size;
-        uint32_t effective = full_capacity;
-        if (underfill_denom > 1) {
-            effective = full_capacity / static_cast<uint32_t>(underfill_denom);
-            if (effective == 0) effective = 1;
-        }
-        object_count = static_cast<uint16_t>(effective);
+
         allocated_count = 0;
         free_hint_word = 0;
         list_prev = nullptr;
@@ -64,18 +66,47 @@ struct Span {
         large_size = 0;
         next_free = nullptr;
 
-        // Bitmap sized for the effective (possibly underfilled) object count.
-        size_t num_words = (object_count + 63) / 64;
+        size_t num_words = (full_capacity + 63) / 64;
         bitmap = static_cast<uint64_t*>(
             BootstrapAlloc::instance().allocate(num_words * sizeof(uint64_t), alignof(uint64_t)));
 
-        if (num_words > 0) {
-            __builtin_memset(bitmap, 0xFF, num_words * sizeof(uint64_t));
-            size_t valid_bits = object_count % 64;
-            if (valid_bits != 0) {
-                bitmap[num_words - 1] = (1ULL << valid_bits) - 1;
+        const bool cap_active = max_slots_per_page > 0 && object_size < kPageSize;
+
+        if (!cap_active) {
+            object_count = static_cast<uint16_t>(full_capacity);
+            if (num_words > 0) {
+                __builtin_memset(bitmap, 0xFF, num_words * sizeof(uint64_t));
+                size_t valid_bits = full_capacity % 64;
+                if (valid_bits != 0) {
+                    bitmap[num_words - 1] = (1ULL << valid_bits) - 1;
+                }
+            }
+            return;
+        }
+
+        // Per-page cap path: build sparse bitmap.
+        if (num_words > 0) __builtin_memset(bitmap, 0, num_words * sizeof(uint64_t));
+        uint32_t live = 0;
+        for (uint32_t p = 0; p < pages; ++p) {
+            // First slot whose start address lies on page p:
+            //   smallest s with s*object_size >= p*kPageSize
+            uint64_t first = (static_cast<uint64_t>(p) * kPageSize + object_size - 1) / object_size;
+            uint64_t next  = (static_cast<uint64_t>(p + 1) * kPageSize + object_size - 1) / object_size;
+            if (next > full_capacity) next = full_capacity;
+            uint64_t avail_on_page = (next > first) ? (next - first) : 0;
+            uint64_t use = avail_on_page < max_slots_per_page ? avail_on_page : max_slots_per_page;
+            for (uint64_t i = 0; i < use; ++i) {
+                uint64_t slot = first + i;
+                bitmap[slot / 64] |= (1ULL << (slot % 64));
+                ++live;
             }
         }
+        if (live == 0) {
+            // Object too big for the cap to be feasible — fall back to one slot.
+            bitmap[0] |= 1ULL;
+            live = 1;
+        }
+        object_count = static_cast<uint16_t>(live);
     }
 
     // Initialize a large allocation span

@@ -36,7 +36,7 @@ ALL_ABLATION_VARS = [
     "SMASH_ABLATION_NO_SKIP_STATS", "SMASH_ABLATION_NO_CHUNK_BITMAP",
     "SMASH_ABLATION_NO_CALLSITE_ARENA",
     # T3 series: reference-behavior homogeneity experiments (Apr 2026)
-    "SMASH_UNDERFILL_DENOM", "SMASH_COLD_ARENA_FEEDBACK",
+    "SMASH_MAX_SLOTS_PER_PAGE", "SMASH_COLD_ARENA_FEEDBACK",
     "SMASH_COLD_ARENA_THRESHOLD", "SMASH_PAGE_LOCAL_BATCH",
 ]
 
@@ -61,16 +61,18 @@ ABLATION_CONFIGS = OrderedDict([
             "cmake_flags": {"SMASH_COLD_TICKS": "9999"}, "use_smash": True}),
     # T3 series: reference-behavior homogeneity (design memo, Apr 2026)
     # Each measures one lever in isolation on top of the B1 default.
-    ("T3a", {"name": "Underfill x4 (global)",
-             "cmake_flags": {"SMASH_UNDERFILL_DENOM": "4"}, "use_smash": True}),
+    # C1 cap target: 8 live objects per page → P(page cold) ≈ (1-q)^8.
+    # At q=0.1 that's 43% (vs ~0.001% for the default 64+ objects/page).
+    ("T3a", {"name": "Cap 8 slots/page (global)",
+             "cmake_flags": {"SMASH_MAX_SLOTS_PER_PAGE": "8"}, "use_smash": True}),
     ("T3b", {"name": "Page-local batch",
              "cmake_flags": {"SMASH_PAGE_LOCAL_BATCH": "ON"}, "use_smash": True}),
-    ("T3c", {"name": "Cold arenas + underfill",
+    ("T3c", {"name": "Cold arenas + cap 8",
              "cmake_flags": {"SMASH_COLD_ARENA_FEEDBACK": "ON",
-                             "SMASH_UNDERFILL_DENOM": "4"}, "use_smash": True}),
+                             "SMASH_MAX_SLOTS_PER_PAGE": "8"}, "use_smash": True}),
     ("T3d", {"name": "All three (B1+T3a+T3b+T3c)",
              "cmake_flags": {"SMASH_COLD_ARENA_FEEDBACK": "ON",
-                             "SMASH_UNDERFILL_DENOM": "4",
+                             "SMASH_MAX_SLOTS_PER_PAGE": "8",
                              "SMASH_PAGE_LOCAL_BATCH": "ON"}, "use_smash": True}),
 ])
 

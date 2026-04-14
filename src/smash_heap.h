@@ -216,24 +216,24 @@ public:
 
             if (!compress_only) {
                 for (int a = 0; a < kTotalArenas; ++a) {
-                    // Hot sub-arenas (a < kNumArenas): no underfill.
+                    // Hot sub-arenas (a < kNumArenas): no per-page cap.
                     // Cold sub-arenas (a >= kNumArenas, only when A3 on):
-                    // apply kUnderfillDenom to produce sparse pages.
-                    // If A3 is off but kUnderfillDenom > 1, underfill
+                    // apply kMaxSlotsPerPage to produce sparse pages.
+                    // If A3 is off but kMaxSlotsPerPage > 0, the cap
                     // applies globally (ablation mode — measure C1 in
                     // isolation without the feedback loop).
-                    int denom = 1;
+                    uint32_t cap = 0;
                     if constexpr (kColdArenaFeedback) {
-                        if (a >= kNumArenas) denom = kUnderfillDenom;
+                        if (a >= kNumArenas) cap = kMaxSlotsPerPage;
                     } else {
-                        denom = kUnderfillDenom;
+                        cap = kMaxSlotsPerPage;
                     }
                     for (int i = 0; i < kNumClasses; ++i)
                         slabs_[a * kNumClasses + i].init(
                             static_cast<uint8_t>(i), &page_map_,
                             &vm_region_, &page_states_,
                             releaseHook, this,
-                            static_cast<uint8_t>(a), denom);
+                            static_cast<uint8_t>(a), cap);
                 }
             }
             compression_inited_ = true;
@@ -244,17 +244,17 @@ public:
             // Fallback: Phase 1 mode (no compression).  No feedback loop
             // possible here, so still respect kUnderfillDenom for ablation.
             for (int a = 0; a < kTotalArenas; ++a) {
-                int denom = 1;
+                uint32_t cap = 0;
                 if constexpr (kColdArenaFeedback) {
-                    if (a >= kNumArenas) denom = kUnderfillDenom;
+                    if (a >= kNumArenas) cap = kMaxSlotsPerPage;
                 } else {
-                    denom = kUnderfillDenom;
+                    cap = kMaxSlotsPerPage;
                 }
                 for (int i = 0; i < kNumClasses; ++i)
                     slabs_[a * kNumClasses + i].init(
                         static_cast<uint8_t>(i), &page_map_,
                         nullptr, nullptr, nullptr, nullptr,
-                        static_cast<uint8_t>(a), denom);
+                        static_cast<uint8_t>(a), cap);
             }
         }
 

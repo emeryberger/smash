@@ -22,9 +22,9 @@ namespace smash {
 class Slab {
     uint8_t size_class_;
     uint8_t arena_id_ = 0;
-    // Per-slab underfill denominator (1 = no underfill).
-    // Set by SmashHeap during init based on cold vs hot sub-arena identity.
-    int underfill_denom_ = 1;
+    // Per-slab per-page slot cap (0 = no cap).  Set by SmashHeap during init
+    // based on cold vs hot sub-arena identity (C1).
+    uint32_t max_slots_per_page_ = 0;
     Spinlock lock_;
     IntrusiveList<Span> partial_;
     IntrusiveList<Span> full_;
@@ -54,7 +54,7 @@ class Slab {
         }
 
         Span* span = newSpanDescriptor();
-        span->init(mem, info.pages, size_class_, arena_id_, underfill_denom_);
+        span->init(mem, info.pages, size_class_, arena_id_, max_slots_per_page_);
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
     }
@@ -107,10 +107,10 @@ public:
               void (*hook)(size_t, size_t, void*) = nullptr,
               void* hook_ctx = nullptr,
               uint8_t arena_id = 0,
-              int underfill_denom = 1) {
+              uint32_t max_slots_per_page = 0) {
         size_class_ = sc;
         arena_id_ = arena_id;
-        underfill_denom_ = underfill_denom;
+        max_slots_per_page_ = max_slots_per_page;
         page_map_ = pm;
         vm_region_ = vr;
         page_states_ = ps;

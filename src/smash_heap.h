@@ -184,19 +184,27 @@ public:
         uint32_t total = comp + dec;
         uint32_t cap;
         if (total < kAdaptiveCapMinSamples) {
-            cap = 0;   // not enough evidence — don't cap
+            // Bootstrap: too little evidence to make a call.
+            cap = 0;
         } else {
-            double q = double(dec) / double(total);
-            constexpr double q_max = 0.30;   // above this, under-packing is counterproductive
+            // Laplace-smoothed estimator: q̂ = (dec + 1) / (total + 2).
+            // Prevents a premature crash-to-floor when compression events
+            // arrive before the first re-warm — an unsmoothed q̂ = 0
+            // collapses N to kAdaptiveCapMin and bakes that into every
+            // subsequent span, devastating workloads (duckdb, redis) whose
+            // access pattern is briefly quiescent before bursting back.
+            // α = 1 is weak enough to let a truly cold bucket relax the
+            // cap as comp count grows: (comp=64, dec=0) → q̂ ≈ 0.015,
+            // N ≈ 46 (effectively uncapped); (comp=16, dec=2) → q̂ ≈ 0.15,
+            // N ≈ 4 (aggressive, justified by observed re-warming).
+            constexpr double q_max = 0.30;
+            double q = double(dec + 1) / double(total + 2);
             if (q >= q_max) {
                 cap = 0;
-            } else if (q <= 0.0) {
-                // Pure cold — use the minimum floor (aggressive cap)
-                cap = kAdaptiveCapMin;
             } else {
                 double p = double(kAdaptiveCapTargetPct) / 100.0;
                 double n = std::log(p) / std::log(1.0 - q);
-                uint32_t cap_u = static_cast<uint32_t>(n);  // floor
+                uint32_t cap_u = static_cast<uint32_t>(n);
                 cap = cap_u < kAdaptiveCapMin ? kAdaptiveCapMin : cap_u;
             }
         }

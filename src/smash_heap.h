@@ -182,43 +182,76 @@ public:
         uint32_t comp = compress_count_[idx].load(std::memory_order_relaxed);
         uint32_t dec  = decompress_count_[idx].load(std::memory_order_relaxed);
         uint32_t total = comp + dec;
-        uint32_t cap;
+        uint32_t cap = 0;
+
+        // Gate 1 — total-evidence floor.  Early in a bucket's life we know
+        // nothing; cap=0 keeps the allocator in its default high-density path.
         if (total < kAdaptiveCapMinSamples) {
-            // Bootstrap: too little evidence to make a call.
-            cap = 0;
-        } else {
-            // Laplace-smoothed estimator: q̂ = (dec + 1) / (total + 2).
-            // Prevents a premature crash-to-floor when compression events
-            // arrive before the first re-warm — an unsmoothed q̂ = 0
-            // collapses N to kAdaptiveCapMin and bakes that into every
-            // subsequent span, devastating workloads (duckdb, redis) whose
-            // access pattern is briefly quiescent before bursting back.
-            // α = 1 is weak enough to let a truly cold bucket relax the
-            // cap as comp count grows: (comp=64, dec=0) → q̂ ≈ 0.015,
-            // N ≈ 46 (effectively uncapped); (comp=16, dec=2) → q̂ ≈ 0.15,
-            // N ≈ 4 (aggressive, justified by observed re-warming).
-            constexpr double q_max = 0.30;
-            double q = double(dec + 1) / double(total + 2);
-            if (q >= q_max) {
-                cap = 0;
-            } else {
-                double p = double(kAdaptiveCapTargetPct) / 100.0;
-                double n = std::log(p) / std::log(1.0 - q);
-                uint32_t cap_u = static_cast<uint32_t>(n);
-                cap = cap_u < kAdaptiveCapMin ? kAdaptiveCapMin : cap_u;
-            }
+            adaptive_cap_[idx].store(0, std::memory_order_relaxed);
+            return;
         }
+
+        // Gate 2 — bilateral-evidence gate.  A stream of compressions with
+        // zero re-warms looks like a "truly cold" bucket under the Pareto
+        // model, but observationally is indistinguishable from "bucket that
+        // hasn't had time to re-warm yet".  Workloads like duckdb and redis
+        // fill-then-idle fall in the second camp; capping them before any
+        // decomp event arrives bakes tiny caps into every span and
+        // catastrophically regresses RSS once queries actually touch the
+        // data.  Require at least one observed re-warm before applying a
+        // cap.  If a bucket is genuinely cold forever, the default path
+        // already wins (pages compress, stay compressed) — no under-packing
+        // is needed.
+        if (dec == 0) {
+            adaptive_cap_[idx].store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        // Gate 3 — hot-bucket rejection.  Under-packing a hot bucket just
+        // balloons RSS.  Laplace smoothing α=1 keeps q̂ bounded away from 0
+        // for thin samples.
+        constexpr double q_max = 0.30;
+        double q = double(dec + 1) / double(total + 2);
+        if (q >= q_max) {
+            adaptive_cap_[idx].store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        double p = double(kAdaptiveCapTargetPct) / 100.0;
+        double n = std::log(p) / std::log(1.0 - q);
+        uint32_t cap_u = static_cast<uint32_t>(n);
+        cap = cap_u < kAdaptiveCapMin ? kAdaptiveCapMin : cap_u;
         adaptive_cap_[idx].store(cap, std::memory_order_relaxed);
     }
 
     // Slab-facing cap lookup.  Returns the current cached cap for the
-    // (arena, sc) bucket; 0 = no cap.  Called from Slab::allocateNewSpan.
+    // (arena, sc) bucket; 0 = no cap.  Called from Slab::allocateNewSpan
+    // and Slab::maybeWiden.
+    //
+    // Clamps the cap against an "underfill floor" equal to
+    // natural_slots_per_page / kAdaptiveCapUnderfillFactor — a cap that
+    // would leave fewer than (natural / factor) slots per page is
+    // rejected.  Without this clamp, a cap of 8 applied to a 64B size
+    // class (natural density = 256 slots/page on a 16K page) forces 32×
+    // VM underfill.  Compression reclaims zero-filled waste, but for
+    // throughput-heavy workloads (duckdb, redis fill) allocations
+    // outpace the compressor and RSS balloons.  The floor keeps the
+    // underfill factor bounded so the Pareto-motivated cap only fires
+    // where the cost is tolerable.
     static uint32_t adaptiveCapQuery(void* ctx, uint8_t arena, uint8_t sc) {
         auto* self = static_cast<SmashHeap*>(ctx);
         if (sc >= kNumClasses) return 0;
         uint8_t base = arena & (kNumArenas - 1);
-        return self->adaptive_cap_[base * kNumClasses + sc]
-                   .load(std::memory_order_relaxed);
+        uint32_t raw = self->adaptive_cap_[base * kNumClasses + sc]
+                           .load(std::memory_order_relaxed);
+        if (raw == 0) return 0;
+        uint32_t osz = kSizeClasses[sc].size;
+        if (osz == 0 || osz >= kPageSize) return raw;
+        uint32_t natural = static_cast<uint32_t>(kPageSize / osz);
+        constexpr uint32_t kUnderfillFactor = 4;
+        uint32_t floor_cap = natural / kUnderfillFactor;
+        if (floor_cap < kAdaptiveCapMin) floor_cap = kAdaptiveCapMin;
+        return raw < floor_cap ? floor_cap : raw;
     }
 
 private:

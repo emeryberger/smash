@@ -60,9 +60,7 @@ class Slab {
         }
 
         Span* span = newSpanDescriptor();
-        uint32_t cap = cap_fn_ ? cap_fn_(cap_ctx_, arena_id_, size_class_)
-                               : max_slots_per_page_;
-        span->init(mem, info.pages, size_class_, arena_id_, cap);
+        span->init(mem, info.pages, size_class_, arena_id_, currentCap());
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
     }
@@ -126,6 +124,25 @@ public:
         release_ctx_ = hook_ctx;
     }
 
+    // Current per-page cap for new spans (or for widening existing ones).
+    // Uses cap_fn_ if installed, else the static max_slots_per_page_.
+    uint32_t currentCap() const {
+        return cap_fn_ ? cap_fn_(cap_ctx_, arena_id_, size_class_)
+                       : max_slots_per_page_;
+    }
+
+    // Widen a partial span's bitmap if the bucket's cap has relaxed since
+    // this span was initialized.  Lets a bucket mis-classified as cold
+    // recover once decomp evidence reveals it's actually hot, without
+    // forcing us to discard spans or pre-allocate fresh ones.
+    void maybeWiden(Span* span) {
+        if (!cap_fn_ || span->current_cap_per_page == 0) return;
+        uint32_t cur_cap = currentCap();
+        if (cur_cap == 0 || cur_cap > span->current_cap_per_page) {
+            span->widenCap(cur_cap);
+        }
+    }
+
     // Allocate one object from this size class. Caller must hold no locks.
     void* allocate() {
         LockGuard guard(lock_);
@@ -133,6 +150,7 @@ public:
         // Try partial spans first
         Span* span = partial_.front();
         if (span) {
+            maybeWiden(span);
             void* ptr = span->allocate();
             if (span->full()) {
                 partial_.remove(span);
@@ -205,6 +223,7 @@ public:
                 }
                 partial_.pushFront(span);
             }
+            maybeWiden(span);
 
             uintptr_t first_page = 0;
             bool first_in_batch = (allocated == 0);

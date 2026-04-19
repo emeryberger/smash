@@ -76,6 +76,19 @@ class CompressorThread {
     std::atomic<bool>* accessed_ = nullptr;
     uint8_t* cold_count_ = nullptr;
 
+    // Cohort measurement (kMeasureCohorts).  Points to SmashHeap's CohortPage
+    // array — opaque here to avoid circular include.  Layout matches
+    // SmashHeap::CohortPage: {uint32_t first_tid, uint32_t first_ra,
+    //                          uint8_t mixed_tid, uint8_t mixed_ra}.
+    struct CohortPage {
+        uint32_t first_tid;
+        uint32_t first_ra;
+        uint8_t  mixed_tid;
+        uint8_t  mixed_ra;
+    };
+    CohortPage* cohort_pages_ = nullptr;
+    size_t cohort_pages_len_ = 0;
+
     // ── Chunk bitmap for fast scanning ────────────────────────────────────
     // One bit per page in kChunkSize-page chunks. Rebuilt at tick start.
     // All three phases iterate only set bits via ctzll + mask clear.
@@ -907,7 +920,49 @@ class CompressorThread {
         dispatch(2);  // Phase 2: compression
         dispatch(3);  // Phase 3: monitoring
 
+        if constexpr (kMeasureCohorts) tallyCohorts(committed);
+
         trainDictionaries();
+    }
+
+    void tallyCohorts(size_t committed) {
+        if (!cohort_pages_ || cohort_pages_len_ == 0) return;
+        size_t lim = committed < cohort_pages_len_ ? committed : cohort_pages_len_;
+        size_t active_total = 0, active_mixed_tid = 0, active_mixed_ra = 0;
+        size_t comp_total = 0, comp_mixed_tid = 0, comp_mixed_ra = 0;
+        size_t all_total = 0, all_mixed_tid = 0, all_mixed_ra = 0;
+        for (size_t i = 0; i < lim; ++i) {
+            auto& cp = cohort_pages_[i];
+            if (cp.first_tid == 0) continue;
+            all_total++;
+            if (cp.mixed_tid) all_mixed_tid++;
+            if (cp.mixed_ra) all_mixed_ra++;
+            PageState st = states_->get(i);
+            if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+                active_total++;
+                if (cp.mixed_tid) active_mixed_tid++;
+                if (cp.mixed_ra) active_mixed_ra++;
+            } else if (st == PageState::COMPRESSED) {
+                comp_total++;
+                if (cp.mixed_tid) comp_mixed_tid++;
+                if (cp.mixed_ra) comp_mixed_ra++;
+            }
+        }
+        auto pct = [](size_t n, size_t d) -> double {
+            return d > 0 ? 100.0 * n / d : 0.0;
+        };
+        fprintf(stderr,
+            "[cohort] committed=%zu stamped=%zu  "
+            "all=%zu mixed_tid=%zu(%.1f%%) mixed_ra=%zu(%.1f%%)  "
+            "active=%zu mixed_tid=%zu(%.1f%%) mixed_ra=%zu(%.1f%%)  "
+            "compressed=%zu mixed_tid=%zu(%.1f%%) mixed_ra=%zu(%.1f%%)\n",
+            committed, all_total,
+            all_total, all_mixed_tid, pct(all_mixed_tid, all_total),
+            all_mixed_ra, pct(all_mixed_ra, all_total),
+            active_total, active_mixed_tid, pct(active_mixed_tid, active_total),
+            active_mixed_ra, pct(active_mixed_ra, active_total),
+            comp_total, comp_mixed_tid, pct(comp_mixed_tid, comp_total),
+            comp_mixed_ra, pct(comp_mixed_ra, comp_total));
     }
 
     // ── Thread entry points ───────────────────────────────────────────────
@@ -1013,6 +1068,11 @@ public:
     void setDecompressedCallback(DecompressedFn fn, void* ctx) {
         decompressed_fn_ = fn;
         decompressed_ctx_ = ctx;
+    }
+
+    void setCohortData(void* pages, size_t len) {
+        cohort_pages_ = static_cast<CohortPage*>(pages);
+        cohort_pages_len_ = len;
     }
 
     void start() {

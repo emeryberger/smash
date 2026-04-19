@@ -86,6 +86,19 @@ class SmashHeap {
     std::atomic<uint32_t> decompress_count_[kNumArenas * kNumClasses]{};
     std::atomic<uint32_t> adaptive_cap_[kNumArenas * kNumClasses]{};
 
+    // Cohort measurement arrays (kMeasureCohorts only).  Per-page tracking
+    // of first allocating thread ID and RA hash; a "mixed" flag per axis
+    // flips when a second distinct value is seen.  Bootstrap-allocated once
+    // compression is initialized.
+    struct CohortPage {
+        uint32_t first_tid;
+        uint32_t first_ra;
+        uint8_t  mixed_tid;
+        uint8_t  mixed_ra;
+    };
+    CohortPage* cohort_pages_ = nullptr;
+    size_t cohort_pages_len_ = 0;
+
     LargeAlloc large_alloc_;
     PageMap page_map_;
 
@@ -370,6 +383,14 @@ public:
             g_smash_vm_region = &vm_region_;
             vm::g_page_pins = bootstrapArray<std::atomic<uint8_t>>(
                 vm_region_.totalPages());
+
+            if constexpr (kMeasureCohorts) {
+                cohort_pages_len_ = vm_region_.totalPages();
+                cohort_pages_ = bootstrapArray<CohortPage>(cohort_pages_len_);
+                __builtin_memset(cohort_pages_, 0,
+                                 cohort_pages_len_ * sizeof(CohortPage));
+                compressor_.setCohortData(cohort_pages_, cohort_pages_len_);
+            }
         } else if (!compress_only) {
             // Fallback: Phase 1 mode (no compression).  No feedback loop
             // possible here, so still respect kUnderfillDenom for ablation.
@@ -404,6 +425,23 @@ public:
         return tc;
     }
 
+    void stampCohort(void* ptr, uint32_t ra_hash) {
+        if constexpr (!kMeasureCohorts) return;
+        if (!cohort_pages_) return;
+        uintptr_t pa = reinterpret_cast<uintptr_t>(ptr);
+        if (!vm_region_.contains(pa)) return;
+        size_t idx = vm_region_.pageIndex(pa);
+        if (idx >= cohort_pages_len_) return;
+        auto& cp = cohort_pages_[idx];
+        static std::atomic<uint32_t> next_ctid{1};
+        thread_local uint32_t ctid =
+            next_ctid.fetch_add(1, std::memory_order_relaxed);
+        if (cp.first_tid == 0) cp.first_tid = ctid;
+        else if (cp.first_tid != ctid) cp.mixed_tid = 1;
+        if (cp.first_ra == 0) cp.first_ra = ra_hash;
+        else if (cp.first_ra != ra_hash) cp.mixed_ra = 1;
+    }
+
     void* malloc(size_t size) {
         if (isCompressOnlyMode()) {
             // During early init, g_system_alloc may not be resolved yet
@@ -418,8 +456,16 @@ public:
         if (sc < kNumClasses) {
             ThreadCache* tc = getOrCreateThreadCache();
             void* ptr = tc->allocate(sc);
-            if (ptr) return ptr;
-            return tc->refill(sc, &slab(callsiteArena(sc), sc));
+            if (!ptr) ptr = tc->refill(sc, &slab(callsiteArena(sc), sc));
+            if constexpr (kMeasureCohorts) {
+                if (ptr) {
+                    uintptr_t ra = reinterpret_cast<uintptr_t>(
+                        __builtin_return_address(0));
+                    uint32_t ra32 = static_cast<uint32_t>(ra ^ (ra >> 32));
+                    stampCohort(ptr, ra32);
+                }
+            }
+            return ptr;
         }
         return large_alloc_.allocate(size, kMinAlignment);
     }
@@ -538,5 +584,8 @@ public:
         ThreadCache*& tc = currentThreadCache();
         if (tc) { tc->drainAll(slabs_, &page_map_); returnThreadCache(tc); tc = nullptr; }
     }
+
+    CohortPage* cohortPages() const { return cohort_pages_; }
+    size_t cohortPagesLen() const { return cohort_pages_len_; }
 };
 } // namespace smash

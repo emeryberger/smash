@@ -120,6 +120,14 @@ inline constexpr bool kPageLocalBatch = true;
 inline constexpr bool kPageLocalBatch = false;
 #endif
 
+// Cohort measurement: track per-page thread/call-site mixing and print
+// a summary each compressor tick.  Measurement only — no behavioral change.
+#ifdef SMASH_MEASURE_COHORTS
+inline constexpr bool kMeasureCohorts = true;
+#else
+inline constexpr bool kMeasureCohorts = false;
+#endif
+
 // ── Spans ────────────────────────────────────────────────────────────────────
 inline constexpr int kTargetObjectsPerSpan = 64;
 inline constexpr int kMaxSpanPages = 8;

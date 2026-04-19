@@ -49,15 +49,22 @@ and pipeline decomposition (\S\ref{sec:eval:pipeline}) together
 suggest a hierarchy of importance for compression-friendly allocator
 design:
 
-The dominant factor is \emph{having a compression pipeline at all}:
-the compress-only variant achieves 32--61\% RSS reduction with an
-unmodified system allocator, and no allocator design choice can
-substitute for a pipeline that monitors access patterns, compresses
-cold pages, and decompresses on demand.  Among page-content
+The dominant factor is \emph{allocator ownership}: the compress-only
+pipeline achieves zero RSS reduction atop system malloc, jemalloc, or
+mimalloc on memcached and Redis, because third-party allocators' internal
+page management prevents the pipeline from identifying cold pages.
+The compression pipeline is necessary but not sufficient---it must be
+integrated with the allocator to control page protection and track
+access patterns.  Among page-content
 optimizations, \emph{zero-on-free} contributes most, improving
 compression ratios by 1.5--2$\times$ for every allocator tested
 (DieHarder zeros for security; \sys zeros for compression; the effect
-on page content is the same).  \emph{External metadata}---storing
+on page content is the same).  However, \sys-noopt (one arena, no
+zeroing) matches full \sys on both memcached and SQLite, indicating
+that deferred zeroing at compression time captures the same benefit
+as eager zeroing---the compressor zeros freed slots in its scratch
+buffer before compressing regardless of the ablation flag.
+\emph{External metadata}---storing
 freelists and bitmaps outside data pages---has a modest effect and is
 dominated by zeroing.  \emph{Arena segregation} helps on
 heterogeneous workloads but provides little benefit
@@ -71,30 +78,28 @@ compressibility on par with system malloc.
 
 These findings generalize beyond \sys: any system that compresses
 heap pages (including OS-level compressors) would benefit from
-allocators that zero freed slots and produce sequential layouts.
+integrated allocator--compressor designs that control page protection
+and zero freed slots.
 
 \paragraph{Synergy between pipeline and allocator}
 The compress-only experiment (\S\ref{sec:eval:pipeline}) shows
-that \sys's compression pipeline achieves substantial benefit
-even atop an allocator that was not designed for compression.  On
-small-object workloads (SQLite), compress-only matches
-or exceeds full \sys.  The allocator design contributes
-substantially on large-object workloads (RocksDB: +25\pp)
-where freelist pollution spans entire pages, and \sys's integrated
-design avoids the hash-map-based page tracking overhead that costs
-compress-only 7--18\% throughput.  The pipeline could also be
-deployed as a standalone library,
-though the integrated design avoids the overhead of external page
-tracking and provides additional benefit for large allocations.
+that \sys's compression pipeline \emph{requires} allocator-level
+integration to be effective.  Layering the pipeline atop any of
+three production allocators (system malloc, jemalloc~5.3.0,
+mimalloc~3.3.0) increases RSS by 6--13\% due to metadata overhead
+without achieving any compression on memcached or Redis.  The
+allocator design contributes substantially on large-object workloads
+(RocksDB: \coRocksdbFullSmashReductionMac\% reduction) where
+freelist pollution spans entire pages.
 
-The multi-allocator comparison (\S\ref{sec:eval:apps})
+The multi-allocator comparison (\S\ref{sec:eval:allocator})
 reinforces this point: across seven alternative allocators
 (mimalloc, jemalloc, tcmalloc, Hoard, Mesh, DieHard, DieHarder),
 none reduces RSS below its fill level.  Mesh's virtual-memory
 remapping can help on workloads with sparse pages but provides no
 benefit when pages are fully
-occupied.  Without a compression
-pipeline, an allocator can only return empty pages to the OS.
+occupied.  Without an integrated allocator--compressor,
+an allocator can only return empty pages to the OS.
 
 \paragraph{Application adaptation: Redis patches}
 \sys is designed to be transparent, but applications that touch
@@ -107,8 +112,8 @@ resizing---even when no client commands are executing.  Additionally,
 \tcode{DEL} dereferences value pointers to update bookkeeping
 histograms, triggering wholesale decompression of cold pages.  These two behaviors keep pages warm even during idle periods.
 The patches lower the baseline RSS itself (from
-\ablRedisBaselineServeRss\,MiB to
-\ablRedisPatchedBaselineServeRss\,MiB) and make the remaining
+\ablRedisBaselineServeRssMac\,MiB to
+\ablRedisPatchedBaselineServeRssMac\,MiB) and make the remaining
 data compressible by \sys
 (\ablRedisPatchedDefaultRssRedInt\% reduction).
 

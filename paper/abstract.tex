@@ -12,8 +12,8 @@ compression}, using a return-on-investment model to select between
 fast zstd-1 and high-ratio zstd-9 based on the expected CPU cost and
 RSS savings for pages from each group. It zeroes any freed slots just
 before compression, further increasing compressibility. Across
-five real-world, memory-intensive applications (memcached, RocksDB,
-SQLite, DuckDB, and Redis), \sys reduces resident set size (RSS) by
+four real-world, memory-intensive applications (memcached, RocksDB,
+SQLite, and Redis), \sys reduces resident set size (RSS) by
 \rssRedMin--\rssRedMax\% with negligible throughput impact.
 %We show that \sys's compression
 %pipeline and allocator design are synergistic: its pipeline achieves

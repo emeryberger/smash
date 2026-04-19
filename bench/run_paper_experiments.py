@@ -41,6 +41,7 @@ ALL_ABLATION_VARS = [
     "SMASH_THREAD_ARENA_HASH",
     "SMASH_ADAPTIVE_CAP", "SMASH_ADAPTIVE_CAP_TARGET_PCT",
     "SMASH_ADAPTIVE_CAP_MIN", "SMASH_ADAPTIVE_CAP_MIN_SAMPLES",
+    "SMASH_MEASURE_COHORTS",
 ]
 
 # ── Ablation configs matching paper table ────────────────────────────────────
@@ -85,6 +86,13 @@ ABLATION_CONFIGS = OrderedDict([
     # a floor of kAdaptiveCapMin.  Hot buckets (q̂ >= 0.30) disable cap.
     ("T3f", {"name": "Adaptive cap (feedback)",
              "cmake_flags": {"SMASH_ADAPTIVE_CAP": "ON"}, "use_smash": True}),
+    # T4 series: isolation experiments (PLAN4.md, Apr 2026).
+    # T4b: widen kNumArenas from 4 -> 16 to reduce call-site collisions on a
+    # shared partial span.  Tests M2a (the cheapest isolation lever) on top
+    # of the T3f adaptive cap.
+    ("T4b", {"name": "Adaptive cap + 16 arenas",
+             "cmake_flags": {"SMASH_ADAPTIVE_CAP": "ON",
+                             "SMASH_NUM_ARENAS": "16"}, "use_smash": True}),
 ])
 
 APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext",
@@ -196,9 +204,14 @@ def wait_for_timewait_drain(port, timeout=60):
     return False
 
 
-def kill_redis(port):
+def kill_redis(port, build_dir=None):
     """Forcefully kill any Redis on the given port and wait for it to die."""
-    subprocess.run(["redis-cli", "-p", str(port), "SHUTDOWN", "NOSAVE"],
+    cli = "redis-cli"
+    if build_dir:
+        cli_path = get_binary("redis-cli", build_dir) or get_binary("redis-cli-smash", build_dir)
+        if cli_path:
+            cli = cli_path
+    subprocess.run([cli, "-p", str(port), "SHUTDOWN", "NOSAVE"],
                    capture_output=True, timeout=5)
     if not wait_for_port_closed(port, timeout=5):
         # Force kill any process on this port
@@ -349,12 +362,12 @@ def run_redis_bench(build_dir, smash_lib, quick):
 
     port = 16399
     num_ops = 50000 if quick else 100000
-    num_clients = 1000 if quick else 5000
+    num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
     value_size = 1000
     keyspace = 100000
     cool_sec = 5 if quick else 15
 
-    kill_redis(port)
+    kill_redis(port, build_dir)
 
     env = os.environ.copy()
     if smash_lib:
@@ -454,7 +467,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
-        kill_redis(port)
+        kill_redis(port, build_dir)
 
 
 def _parse_redis_benchmark_rps(output, cmd_name):
@@ -478,12 +491,12 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
 
     port = 16400  # different port from run_redis_bench to avoid conflicts
     num_ops = 50000 if quick else 100000
-    num_clients = 1000 if quick else 5000
+    num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
     value_size = 1000
     keyspace = 100000
     cool_sec = 5 if quick else 15
 
-    kill_redis(port)
+    kill_redis(port, build_dir)
 
     env = os.environ.copy()
     if smash_lib:
@@ -626,7 +639,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
-        kill_redis(port)
+        kill_redis(port, build_dir)
 
 
 def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
@@ -650,12 +663,12 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
     # Use different ports to avoid conflicts
     port = 16399 + (1 if extended else 0) + (2 if patched else 0)
     num_ops = 50000 if quick else 100000
-    num_clients = 1000 if quick else 5000
+    num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
     value_size = 1000
     keyspace = 100000
     cool_sec = 5 if quick else 15
 
-    kill_redis(port)
+    kill_redis(port, build_dir)
 
     env = os.environ.copy()
     if smash_lib:
@@ -700,8 +713,14 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
             dbsize = "?"
 
         fill_rss = get_rss_mb(proc.pid)
-        if fill_rss < 10:
-            print(f"    {label}: fill_rss={fill_rss:.1f}MB (too low, DBSIZE={dbsize})")
+        # Parse DBSIZE (format: "(integer) N")
+        num_keys = 0
+        try:
+            num_keys = int(dbsize.split(":")[-1].strip().rstrip("\r"))
+        except (ValueError, IndexError):
+            pass
+        if fill_rss < 10 or num_keys < keyspace // 4:
+            print(f"    {label}: fill_rss={fill_rss:.1f}MB keys={num_keys} (underfill, DBSIZE={dbsize})")
             return None
 
         # DELETE phase (extended workload only)
@@ -773,7 +792,7 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
-        kill_redis(port)
+        kill_redis(port, build_dir)
 
 
 def run_redis_patched_bench(build_dir, smash_lib, quick):
@@ -1365,9 +1384,9 @@ def run_ablation(build_dir, source_dir, apps, quick, output_dir, runs=1):
             last_flags = flags
 
         for app in apps:
-            # Check if already done
-            if app in all_results and cid in all_results.get(app, {}):
-                print(f"  {app}: cached")
+            existing = all_results.get(app, {}).get(cid)
+            if existing and len(existing.get("runs", [])) >= runs:
+                print(f"  {app}: cached ({len(existing['runs'])} runs)")
                 continue
 
             if cfg["use_smash"]:
@@ -1452,8 +1471,9 @@ def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1):
 
         for config_name, lib in configs:
             key = f"{app}_{config_name}"
-            if key in all_results:
-                print(f"  {config_name}: cached")
+            existing = all_results.get(key)
+            if existing and len(existing.get("runs", [])) >= runs:
+                print(f"  {config_name}: cached ({len(existing['runs'])} runs)")
                 continue
 
             run_results = []
@@ -1522,8 +1542,9 @@ def run_duckdb_compression_experiment(build_dir, source_dir, quick, output_dir, 
 
     t0 = time.time()
     for config_name, lib, no_compress in configs:
-        if config_name in all_results:
-            print(f"  {config_name}: cached")
+        existing = all_results.get(config_name)
+        if existing and len(existing.get("runs", [])) >= runs:
+            print(f"  {config_name}: cached ({len(existing['runs'])} runs)")
             continue
 
         run_results = []
@@ -1703,8 +1724,9 @@ def main():
 
     build_dir = Path(args.build_dir).resolve()
     source_dir = Path(__file__).resolve().parent.parent
-    output_dir = source_dir / "paper_results"
-    output_dir.mkdir(exist_ok=True)
+    plat_subdir = "macos" if IS_DARWIN else "linux"
+    output_dir = source_dir / "paper_results" / plat_subdir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine available apps
     if args.apps:

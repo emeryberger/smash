@@ -21,7 +21,6 @@ Application & RSS Reduction & Serve RSS (MiB) \\
 Memcached       & \textbf{\ablMemcachedDefaultRssRed\%}  & \ablMemcachedDefaultServeRss \\
 RocksDB         & \ablRocksdbDefaultRssRed\%  & \ablRocksdbDefaultServeRss \\
 SQLite          & \ablSqliteDefaultRssRed\%  & \ablSqliteDefaultServeRss \\
-DuckDB          & \ablDuckdbDefaultRssRed\%  & \ablDuckdbDefaultServeRss \\
 Redis           & \ablRedisDefaultRssRed\%  & \ablRedisDefaultServeRss \\
 Redis-ext       & \ablRedisExtDefaultRssRed\%  & \ablRedisExtDefaultServeRss \\
 \bottomrule
@@ -30,17 +29,17 @@ Redis-ext       & \ablRedisExtDefaultRssRed\%  & \ablRedisExtDefaultServeRss \\
 
 \begin{table}[h]
 \caption{\textbf{Only \sys reduces RSS below fill level}
-  (\S\ref{sec:eval:apps}).  Serve-phase RSS (MiB) across all six
+  (\S\ref{sec:eval:apps}).  Serve-phase RSS (MiB) across all five
   workloads.}
 \label{tab:multi_alloc_apps}
 \centering\scriptsize
 \begin{tabular}{lrrrrrr}
 \toprule
-Allocator & SQLite & RocksDB & DuckDB & Redis & Redis-ext & Memcached \\
+Allocator & SQLite & RocksDB & Redis & Redis-ext & Memcached \\
 \midrule
-System  & \ablSqliteBaselineServeRss   & \ablRocksdbBaselineServeRss   & \ablDuckdbBaselineServeRss & \ablRedisBaselineServeRss  & \ablRedisExtBaselineServeRss  & \ablMemcachedBaselineServeRss \\
-Mesh    & \ablSqliteMeshServeRss   & \ablRocksdbMeshServeRss   & \ablDuckdbMeshServeRss & \ablRedisMeshServeRss   & \ablRedisExtMeshServeRss   & \ablMemcachedMeshServeRss \\
-\sys    & \textbf{\ablSqliteDefaultServeRss} & \textbf{\ablRocksdbDefaultServeRss} & \textbf{\ablDuckdbDefaultServeRss} & \textbf{\ablRedisDefaultServeRss} & \textbf{\ablRedisExtDefaultServeRss} & \textbf{\ablMemcachedDefaultServeRss} \\
+System  & \ablSqliteBaselineServeRss   & \ablRocksdbBaselineServeRss   & \ablRedisBaselineServeRss  & \ablRedisExtBaselineServeRss  & \ablMemcachedBaselineServeRss \\
+Mesh    & \ablSqliteMeshServeRss   & \ablRocksdbMeshServeRss   & \ablRedisMeshServeRss   & \ablRedisExtMeshServeRss   & \ablMemcachedMeshServeRss \\
+\sys    & \textbf{\ablSqliteDefaultServeRss} & \textbf{\ablRocksdbDefaultServeRss} & \textbf{\ablRedisDefaultServeRss} & \textbf{\ablRedisExtDefaultServeRss} & \textbf{\ablMemcachedDefaultServeRss} \\
 \bottomrule
 \end{tabular}
 \end{table}

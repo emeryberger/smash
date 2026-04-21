@@ -293,3 +293,112 @@ with private compression state, and stores compressed data in an
 uses 32 pre-allocated fault slots acquired via compare-and-swap,
 supporting 32~concurrent page faults with no shared mutable~state.
 
+\subsection{Fragmentation Under Compression}
+\label{sec:design:fragmentation}
+
+Classical worst-case fragmentation bounds assume that every allocated
+page costs a full page of physical memory regardless of its
+occupancy.  Robson~\cite{robson1977worst} showed that for any online
+allocator handling objects of sizes $s_1 < s_2 < \cdots < s_k$, an
+adversary can construct a request sequence forcing memory usage
+$M = \Omega(n \cdot \log(s_k / s_1))$, where $n$ is the number of
+simultaneously live objects.  The adversary exploits the fact that a
+page with a single live object costs the same physical memory as a
+fully occupied page.
+
+Compression breaks this assumption.  In \sys, a cold page with
+occupancy~$\alpha$ (fraction of slots containing live objects) has
+physical cost approximately
+\[
+  C(\alpha) \;\approx\; \alpha \cdot P / r_d \;+\; (1-\alpha) \cdot P / r_0,
+\]
+where $P$ is the page size, $r_d$ is the compression ratio on live
+data, and $r_0 \gg r_d$ is the compression ratio on zero-filled freed
+slots.  Because deferred zero-on-free fills every freed slot with
+zeros before compression (\S\ref{sec:design:zero}), $r_0$ is
+typically $100\times$ or higher, making the second term negligible.
+The physical cost of a cold page is therefore determined by its
+occupancy, not its nominal size.
+
+Crucially, this result does \emph{not} require live data to be
+compressible.  Even when $r_d = 1$ (completely incompressible data),
+the physical cost of a page with occupancy~$\alpha$ is still only
+$\alpha \cdot P$, because the $(1-\alpha)$ fraction of zeroed freed
+slots compresses away.  The fragmentation benefit comes entirely from
+eliminating the dead space on partially-filled pages---the same dead
+space that Robson's adversary exploits.
+
+This inverts the classical fragmentation picture.  Robson's adversary
+creates maximum waste by producing many pages with low occupancy
+across different size classes---exactly the allocation pattern that
+\emph{maximizes} compression savings.  Low-occupancy pages are
+dominated by zero-filled freed slots, which compress to near-nothing.
+The adversary's ``fragmented'' heap compresses \emph{better} than a
+well-packed one.
+
+More precisely, let $V$ denote the virtual footprint (total allocated
+pages), $W$ the working set (pages touched in the current tick
+window), $f = (V - W)/V$ the cold fraction, and $\bar{\alpha}$ the
+mean occupancy of cold pages.  Then even with $r_d = 1$:
+\[
+  \text{RSS}_{\sys} \;\leq\; W \cdot P \;+\; f \cdot V \cdot \bar{\alpha} \cdot P \;+\; M_{\text{meta}}
+\]
+where $M_{\text{meta}} = O(V)$ covers per-page state and compression
+metadata.  The product $f \cdot V \cdot \bar{\alpha} \cdot P$ is
+bounded by the total live data $L = \sum_i |o_i|$, since each live
+object occupies at most one slot.  So:
+\[
+  \text{RSS}_{\sys} \;\leq\; W \cdot P \;+\; L \;+\; M_{\text{meta}}.
+\]
+Compare to the classical bound $\text{RSS} = V \cdot P$, where
+$V \cdot P$ can be $\Omega(L \cdot \log(s_k/s_1))$.
+Even without compressible data, \sys reduces the fragmentation
+overhead from $O(L \cdot \log(s_k/s_1))$ to $O(L)$---eliminating the
+logarithmic Robson factor entirely.  When live data is also
+compressible ($r_d > 1$), the bound tightens further to $L / r_d$.
+
+Two conditions are required.
+(1)~The cold fraction must satisfy $f > 1/\log(s_k/s_1)$.
+For the bound to improve on classical RSS, we need
+$L < f \cdot V \cdot P$;
+under Robson's adversary $V \cdot P = \Theta(L \log(s_k/s_1))$,
+which yields $f > 1/\log(s_k/s_1)$.  For typical size-class ranges
+(16\,B to 16\,KiB), this threshold is ${\sim}10\%$.  Empirically,
+cold fractions of 19--62\% of RSS are observed in
+production~\cite{weiner2022tmo}, well above this threshold---and
+the threshold \emph{decreases} under worse fragmentation, since a
+wider size-class range increases the denominator.
+(2)~Freed slots are zeroed: \sys's deferred zeroing guarantees this
+by construction (\S\ref{sec:design:zero}).
+When both hold, \sys's physical fragmentation is bounded
+independently of the adversary's allocation pattern.
+Compressible live data ($r_d > 1$) provides additional savings
+beyond the fragmentation bound, tightening the cold-data term from
+$L$ to $L/r_d$.
+
+\paragraph{Role of page size}
+The bound $\text{RSS}_{\sys} \leq W \cdot P + L + M_{\text{meta}}$
+is parametric in $P$.
+On Linux x86-64 ($P = 4$\,KiB) a page holds $P/s$ objects for size
+class~$s$; on macOS ARM64 ($P = 16$\,KiB) the same class packs
+$4\times$ as many.
+Larger $P$ has two opposing effects.
+First, more objects per page means more zero-filled freed slots
+per cold page, improving the ratio $r_0$ and reducing the physical
+cost of low-occupancy pages.
+Second, a page with more objects is \emph{less likely} to be
+uniformly cold: with $n = P/s$ independently accessed objects, each
+hot with probability~$q$, the probability the page is fully cold is
+$(1-q)^n$, which decreases with~$n$.
+The cold-fraction threshold $f > 1/\log(s_k/s_1)$ is independent
+of~$P$---it depends only on the size-class range---so the
+fragmentation bound holds on both platforms.
+However, the absolute working-set term $W \cdot P$ is $4\times$
+larger per warm page on macOS, which limits the maximum achievable
+RSS reduction when the working set is large relative to cold data.
+% Transparent huge pages (2\,MiB) amplify both effects: each huge
+% page contains hundreds of objects, yielding excellent compression
+% when cold, but even a single hot object pins 2\,MiB of physical
+% memory.  \sys currently operates at the base page granularity;
+% extending to huge pages is future work.
+

@@ -58,9 +58,8 @@
   \draw[fault] (monitor) edge[bend left=20]
     node[elbl, below, text=black!50] {fault\,(W)} (active);
 
-  % COMPRESSING → ACTIVE (any fault, PROT_NONE)
-  \draw[fault] (compressing) --
-    node[elbl, right=0.05cm, text=black!50] {fault\,(RW)} (active);
+  % COMPRESSING → ACTIVE: unreachable (compressor holds per-page lock
+  % throughout COMPRESSING; verified via TLA+ model checking).
 
   % COMPRESSED → ACTIVE  (any fault, decompress)
   \draw[fault] (compressed) --

@@ -102,6 +102,32 @@ exploiting object liveness and structure for higher ratios.  The two
 are complementary: \sys could compress locally before TMO offloads
 remaining cold~pages.
 
+\paragraph{Database-internal compression}
+White-box compression~\cite{ghita2020whitebox} represents logical
+columns as learned functions over physical columns---e.g., expressing
+one column as a linear transform of another---so that the query engine
+can push predicates into the compressed domain and prune columns
+before decompression.  BtrBlocks~\cite{kuschewski2023btrblocks}
+extends this idea into a practical system, cascading lightweight
+schemes (dictionary, RLE, pseudodecimal, FOR+bitpacking) selected per
+block by a fast heuristic; FSST~\cite{boncz2020fsst} learns a
+symbol table for high-throughput string compression.  These approaches
+achieve substantially higher compression ratios than generic codecs
+but require tight integration with a columnar storage engine and full
+knowledge of data schemas and types.
+%
+\sys operates at the opposite end of this spectrum: it treats every
+heap page as an opaque byte array, with no schema, no type
+information, and no application cooperation.  That a fully black-box
+approach can nonetheless recover 49--83\% RSS reductions on
+real applications is, we believe, surprising---and is enabled by
+the allocator-level structure that \sys exploits (call-site arena
+routing, deferred zero-on-free, and page-granularity access
+monitoring) rather than data-level semantics.  The two approaches are
+complementary: a database could use white-box compression for its
+columnar store while \sys compresses cold metadata, query-plan
+structures, and other heap-resident data outside the storage engine.
+
 \paragraph{Compressed caches and memory}
 LCP~\cite{pekhimenko2012linearly} and BDI~\cite{pekhimenko2012linearly}
 compress cache lines at the hardware level.  Linearly compressed

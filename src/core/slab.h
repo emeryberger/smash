@@ -22,6 +22,15 @@ namespace smash {
 class Slab {
     uint8_t size_class_;
     uint8_t arena_id_ = 0;
+    // Per-slab per-page slot cap (0 = no cap).  Set by SmashHeap during init
+    // based on cold vs hot sub-arena identity (C1).
+    uint32_t max_slots_per_page_ = 0;
+    // Adaptive cap callback.  When set, overrides max_slots_per_page_ per
+    // new-span allocation; lets SmashHeap revise the cap as it accumulates
+    // compression/decompression feedback for this (arena, sc) bucket.
+    using CapFn = uint32_t(*)(void* ctx, uint8_t arena, uint8_t sc);
+    CapFn cap_fn_ = nullptr;
+    void* cap_ctx_ = nullptr;
     Spinlock lock_;
     IntrusiveList<Span> partial_;
     IntrusiveList<Span> full_;
@@ -51,7 +60,7 @@ class Slab {
         }
 
         Span* span = newSpanDescriptor();
-        span->init(mem, info.pages, size_class_, arena_id_);
+        span->init(mem, info.pages, size_class_, arena_id_, currentCap());
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
     }
@@ -103,14 +112,35 @@ public:
               VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
               void (*hook)(size_t, size_t, void*) = nullptr,
               void* hook_ctx = nullptr,
-              uint8_t arena_id = 0) {
+              uint8_t arena_id = 0,
+              uint32_t max_slots_per_page = 0) {
         size_class_ = sc;
         arena_id_ = arena_id;
+        max_slots_per_page_ = max_slots_per_page;
         page_map_ = pm;
         vm_region_ = vr;
         page_states_ = ps;
         release_hook_ = hook;
         release_ctx_ = hook_ctx;
+    }
+
+    // Current per-page cap for new spans (or for widening existing ones).
+    // Uses cap_fn_ if installed, else the static max_slots_per_page_.
+    uint32_t currentCap() const {
+        return cap_fn_ ? cap_fn_(cap_ctx_, arena_id_, size_class_)
+                       : max_slots_per_page_;
+    }
+
+    // Widen a partial span's bitmap if the bucket's cap has relaxed since
+    // this span was initialized.  Lets a bucket mis-classified as cold
+    // recover once decomp evidence reveals it's actually hot, without
+    // forcing us to discard spans or pre-allocate fresh ones.
+    void maybeWiden(Span* span) {
+        if (!cap_fn_ || span->current_cap_per_page == 0) return;
+        uint32_t cur_cap = currentCap();
+        if (cur_cap == 0 || cur_cap > span->current_cap_per_page) {
+            span->widenCap(cur_cap);
+        }
     }
 
     // Allocate one object from this size class. Caller must hold no locks.
@@ -120,6 +150,7 @@ public:
         // Try partial spans first
         Span* span = partial_.front();
         if (span) {
+            maybeWiden(span);
             void* ptr = span->allocate();
             if (span->full()) {
                 partial_.remove(span);
@@ -170,6 +201,12 @@ public:
 
     // Batch allocate: fill an array with up to `count` pointers.
     // Returns actual number allocated.
+    //
+    // When kPageLocalBatch is true, the inner loop stops as soon as the
+    // next allocated object would lie on a different VM page than the
+    // batch's first object.  This keeps each thread-cache refill confined
+    // to one page, so objects allocated in a single burst share a page
+    // and (under Pareto-skew access) tend to cool together.
     size_t allocateBatch(void** out, size_t count) {
         LockGuard guard(lock_);
         size_t allocated = 0;
@@ -186,10 +223,25 @@ public:
                 }
                 partial_.pushFront(span);
             }
+            maybeWiden(span);
 
+            uintptr_t first_page = 0;
+            bool first_in_batch = (allocated == 0);
             while (allocated < count) {
                 void* ptr = span->allocate();
                 if (!ptr) break;
+                if (kPageLocalBatch) {
+                    uintptr_t p = reinterpret_cast<uintptr_t>(ptr) & ~(kPageSize - 1);
+                    if (first_in_batch) {
+                        first_page = p;
+                        first_in_batch = false;
+                    } else if (p != first_page) {
+                        // Crossed a page boundary.  Return the object and stop
+                        // — next refill will anchor on a fresh page.
+                        span->deallocate(ptr);
+                        return allocated;
+                    }
+                }
                 out[allocated++] = ptr;
             }
 
@@ -229,6 +281,11 @@ public:
         while (Span* span = empty_.popFront()) {
             releaseSpan(span);
         }
+    }
+
+    void setCapFn(CapFn fn, void* ctx) {
+        cap_fn_ = fn;
+        cap_ctx_ = ctx;
     }
 
     void lockSlab() { lock_.lock(); }

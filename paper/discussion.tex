@@ -89,7 +89,7 @@ three production allocators (system malloc, jemalloc~5.3.0,
 mimalloc~3.3.0) increases RSS by 6--13\% due to metadata overhead
 without achieving any compression on memcached or Redis.  The
 allocator design contributes substantially on large-object workloads
-(RocksDB: \coRocksdbFullSmashReductionMac\% reduction) where
+(RocksDB: \coRocksdbFullSmashReduction\% reduction) where
 freelist pollution spans entire pages.
 
 The multi-allocator comparison (\S\ref{sec:eval:allocator})
@@ -112,8 +112,8 @@ resizing---even when no client commands are executing.  Additionally,
 \tcode{DEL} dereferences value pointers to update bookkeeping
 histograms, triggering wholesale decompression of cold pages.  These two behaviors keep pages warm even during idle periods.
 The patches lower the baseline RSS itself (from
-\ablRedisBaselineServeRssMac\,MiB to
-\ablRedisPatchedBaselineServeRssMac\,MiB) and make the remaining
+\ablRedisBaselineServeRss\,MiB to
+\ablRedisPatchedBaselineServeRss\,MiB) and make the remaining
 data compressible by \sys
 (\ablRedisPatchedDefaultRssRedInt\% reduction).
 

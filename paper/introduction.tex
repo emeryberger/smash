@@ -74,12 +74,12 @@ We evaluate \sys on four real-world, memory intensive applications.  \sys reduce
 RSS by \rssRedMin--\rssRedMax\% with negligible throughput impact:
 memcached \ablMemcachedBaselineServeRss$\to$\ablMemcachedDefaultServeRss\,MiB
 (\ablMemcachedDefaultRssRedInt\%),
-RocksDB \ablRocksdbBaselineServeRssMac$\to$\ablRocksdbDefaultServeRssMac\,MiB
-(\ablRocksdbDefaultRssRedIntMac\%),
+RocksDB \ablRocksdbBaselineServeRss$\to$\ablRocksdbDefaultServeRss\,MiB
+(\ablRocksdbDefaultRssRedInt\%),
 SQLite \ablSqliteBaselineServeRss$\to$\ablSqliteDefaultServeRss\,MiB
 (\ablSqliteDefaultRssRedInt\%),
-Redis \ablRedisBaselineServeRssMac$\to$\ablRedisDefaultServeRssMac\,MiB
-(\ablRedisDefaultRssRedIntMac\%).
+Redis \ablRedisBaselineServeRss$\to$\ablRedisDefaultServeRss\,MiB
+(\ablRedisDefaultRssRedInt\%).
 An ablation study quantifies each technique's contribution;
 no allocator tested (including
 Mesh~\cite{powers2019mesh}) reduces RSS below its fill level
@@ -90,8 +90,8 @@ In some cases, modest application changes can further improve
 tasks during idle periods and caching two object-metadata fields
 to avoid dereferencing value data on \tcode{DEL}
 (7~files, 105~lines changed), we reduce Redis's baseline RSS
-from \ablRedisBaselineServeRssMac\ to
-\ablRedisPatchedBaselineServeRssMac\,MiB---\redisPatchBaselineRedPctMac\%
+from \ablRedisBaselineServeRss\ to
+\ablRedisPatchedBaselineServeRss\,MiB---\redisPatchBaselineRedPct\%
 \emph{without any compression}---and make the remaining cold data
 consistently compressible (\S\ref{sec:eval:apps}).
 

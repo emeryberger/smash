@@ -90,10 +90,6 @@ blobs in a region are freed).
   \State $\mathit{buf} \gets$ copy page into worker scratch buffer
   \State zero freed slots in $\mathit{buf}$ (non-temporal stores)
   \State \Call{mprotect}{$p$, \textsc{prot\_none}}
-  \If{$\mathit{state}[p] \neq$ \textsc{compressing}}
-    $\triangleright$ \textit{preempted by fault}
-    \State \Call{Unlock}{$p$};\; \Return
-  \EndIf
   \State $R \gets \Call{AvgRatio}{\mathit{sc}}$
   \Comment{from sliding window}
   \If{$\Call{ROI}{\mathit{cold}[p], R} < \textsc{Threshold}$}
@@ -133,13 +129,13 @@ handler receives the faulting address, looks up the page index in the
 VM region, acquires the per-page lock, and takes action based on page
 state.  For a \textsc{compressed} page, the handler recommits the
 physical page, decompresses the stored data, releases the compressed
-blob, and transitions to \textsc{active}.  For a \textsc{compressing}
-page, the handler recommits the page (the compressor has a copy in its
-scratch buffer) and transitions to \textsc{active}; the compressor
-detects the state change and abandons the compression.  For an
+blob, and transitions to \textsc{active}.  For an
 \textsc{active\_monitoring} page (a write to a read-only monitored
 page), the handler restores read-write permission and transitions to
-\textsc{active}.  Finally, a fault on an \textsc{active} page
+\textsc{active}.  The handler never observes the \textsc{compressing}
+state: the compressor holds the per-page lock throughout compression,
+so the handler blocks until the page reaches \textsc{compressed} or
+returns to \textsc{active} (\S\ref{sec:impl:formal}).  Finally, a fault on an \textsc{active} page
 indicates a race where Phase~3's batched \texttt{mprotect} overwrote a
 per-page permission restoration from a concurrent fault handler; the
 handler restores write~permission.
@@ -157,10 +153,6 @@ handler restores write~permission.
       \State release compressed blob;\; \Call{ReleaseFaultSlot}{$\mathit{slot}$}
       \State $\mathit{state}[p] \gets$ \textsc{active};\; $\mathit{cold}[p] \gets 0$
       \State \Call{PrefetchAdjacent}{$p$}
-  \ElsIf{$\mathit{state}[p] =$ \textsc{compressing}}
-      \State \Call{Recommit}{$p$}
-      $\triangleright$ \textit{compressor detects \& aborts}
-      \State $\mathit{state}[p] \gets$ \textsc{active}
   \ElsIf{$\mathit{state}[p] =$ \textsc{active\_monitoring}}
       \State \Call{mprotect}{$p$, \textsc{prot\_read|write}}
       \State $\mathit{state}[p] \gets$ \textsc{active}
@@ -299,3 +291,57 @@ All syscall wrappers require explicit default visibility
 annotations, since the library is compiled with hidden visibility
 by default; without this, the dynamic linker cannot see the
 wrapper symbols for~interposition.
+
+\subsection{Formal Verification}
+\label{sec:impl:formal}
+
+The page state machine coordinates a background compressor thread
+and concurrent application threads through shared mutable state
+(page states, protection bits, per-page locks) with no global lock.
+Reasoning about the resulting interleavings informally is
+error-prone: subtle races arise from the gap between multi-step
+operations (lock, set state, mprotect, compress, unlock) and the
+single-step transitions shown in the state diagram.
+
+We model the core protocol in PlusCal~\cite{lamport:pluscal}, a
+high-level algorithm language that compiles to
+TLA\textsuperscript{+}~\cite{lamport:tla}.  The model captures two
+application threads that non-deterministically access pages (faulting
+when protection is insufficient) and a three-phase compressor that
+scans, compresses, and monitors pages.  Per-page locks, protection
+bits, cold counts, and blob/physical-page ownership are all explicit
+state variables.  The TLC model checker exhaustively explores
+all interleavings.
+
+\paragraph{Safety invariants}  Two invariants are checked in every
+reachable state: (1)~\emph{BlobIntegrity}---a page is in
+\textsc{compressed} state if and only if a compressed blob exists and
+the physical page has been decommitted; and
+(2)~\emph{ProtectionConsistency}---page protection matches page
+state (e.g., \textsc{compressed} implies \texttt{PROT\_NONE}).
+
+\paragraph{Liveness properties}  Under strong fairness, TLC verifies
+two liveness properties: (1)~every faulted thread eventually resumes,
+and (2)~every sufficiently cold monitored page is eventually
+compressed or re-accessed.
+
+\paragraph{Bugs found and confirmed}  Model checking revealed that
+Phase~3's original state update---a plain store of
+\textsc{active\_monitoring}---was unsafe: between checking a page's
+state and writing the new state, a concurrent fault handler could
+transition the page to \textsc{active}, and the store would silently
+overwrite it.  The fix, now in the implementation, is a compare-and-swap
+that abandons the transition if the page is no longer \textsc{active}.
+The model also proved that the fault handler can never observe a page
+in \textsc{compressing} state, because the compressor holds the
+per-page lock for the entire duration of compression; the fault
+handler blocks on the lock and sees only \textsc{compressed} or
+\textsc{active}.  We confirmed both findings with runtime assertions
+(\texttt{\_\_builtin\_trap}) across the full benchmark suite (576~runs,
+zero crashes).
+
+\paragraph{Verification scale}  With 3~pages, 2~threads, and a
+cold threshold of~2, TLC explores 4.5~million distinct states
+and verifies all safety invariants and liveness properties in
+42~minutes.  The PlusCal source and TLC configuration are included
+in the repository (\texttt{paper/SmashCore.tla}).

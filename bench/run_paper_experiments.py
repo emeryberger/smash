@@ -93,6 +93,29 @@ ABLATION_CONFIGS = OrderedDict([
     ("T4b", {"name": "Adaptive cap + 16 arenas",
              "cmake_flags": {"SMASH_ADAPTIVE_CAP": "ON",
                              "SMASH_NUM_ARENAS": "16"}, "use_smash": True}),
+    # Combination experiments: explore pairwise/triple combos of winners
+    ("T5a", {"name": "ThreadHash + PageLocal",
+             "cmake_flags": {"SMASH_THREAD_ARENA_HASH": "ON",
+                             "SMASH_PAGE_LOCAL_BATCH": "ON"}, "use_smash": True}),
+    ("T5b", {"name": "ThreadHash + ColdArena",
+             "cmake_flags": {"SMASH_THREAD_ARENA_HASH": "ON",
+                             "SMASH_COLD_ARENA_FEEDBACK": "ON"}, "use_smash": True}),
+    ("T5c", {"name": "ThreadHash + PageLocal + ColdArena",
+             "cmake_flags": {"SMASH_THREAD_ARENA_HASH": "ON",
+                             "SMASH_PAGE_LOCAL_BATCH": "ON",
+                             "SMASH_COLD_ARENA_FEEDBACK": "ON"}, "use_smash": True}),
+    ("T5d", {"name": "ThreadHash + 16 arenas",
+             "cmake_flags": {"SMASH_THREAD_ARENA_HASH": "ON",
+                             "SMASH_NUM_ARENAS": "16"}, "use_smash": True}),
+    ("T5e", {"name": "ThreadHash + PageLocal + 16 arenas",
+             "cmake_flags": {"SMASH_THREAD_ARENA_HASH": "ON",
+                             "SMASH_PAGE_LOCAL_BATCH": "ON",
+                             "SMASH_NUM_ARENAS": "16"}, "use_smash": True}),
+    ("T5f", {"name": "PageLocal + ColdArena",
+             "cmake_flags": {"SMASH_PAGE_LOCAL_BATCH": "ON",
+                             "SMASH_COLD_ARENA_FEEDBACK": "ON"}, "use_smash": True}),
+    ("T5g", {"name": "ColdArena only (no cap)",
+             "cmake_flags": {"SMASH_COLD_ARENA_FEEDBACK": "ON"}, "use_smash": True}),
 ])
 
 APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext",
@@ -1717,6 +1740,8 @@ def main():
     parser.add_argument("--duckdb-compression-only", action="store_true",
                         help="Run only the DuckDB compression comparison experiment")
     parser.add_argument("--build-dir", default=".", help="Build directory (default: .)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Output directory for results (default: paper_results/<platform>)")
     parser.add_argument("--runs", type=int, default=1, help="Runs per config (default: 1)")
     parser.add_argument("--apps", default=None,
                         help="Comma-separated app list (default: all available)")
@@ -1724,8 +1749,11 @@ def main():
 
     build_dir = Path(args.build_dir).resolve()
     source_dir = Path(__file__).resolve().parent.parent
-    plat_subdir = "macos" if IS_DARWIN else "linux"
-    output_dir = source_dir / "paper_results" / plat_subdir
+    if args.output_dir:
+        output_dir = Path(args.output_dir).resolve()
+    else:
+        plat_subdir = "macos" if IS_DARWIN else "linux"
+        output_dir = source_dir / "paper_results" / plat_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine available apps

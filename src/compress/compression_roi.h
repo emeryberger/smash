@@ -101,7 +101,7 @@ struct AlgoProfile {
 struct ROIConfig {
     uint32_t roi_threshold = kRoiThresholdDefault;
     double min_compress_ratio = kMinCompressRatio;
-    uint32_t cold_ticks_floor = kColdTicks;
+    uint32_t cold_ticks_floor = kColdTicksDefault;
     uint32_t very_cold_ticks = kVeryColdTicks;
 
     AlgoProfile profiles[4];
@@ -126,8 +126,20 @@ struct ROIConfig {
         min_compress_ratio = roiEnvDouble("SMASH_MIN_COMPRESS_RATIO",
                                           kMinCompressRatio);
 
+        // SMASH_COLD_TIMEOUT_SEC is the primary time-space tradeoff dial.
+        // It sets the idle time (in seconds) before a page is compressed.
+        // SMASH_COLD_TICKS is the lower-level override (in tick counts).
+        const char* timeout_env = std::getenv("SMASH_COLD_TIMEOUT_SEC");
         const char* ct_env = std::getenv("SMASH_COLD_TICKS");
-        if (ct_env) {
+        if (timeout_env) {
+            double sec = std::atof(timeout_env);
+            if (sec > 0) {
+                cold_ticks_floor = static_cast<uint32_t>(
+                    sec * 1000.0 / kCompressIntervalMs + 0.5);
+                if (cold_ticks_floor < 1) cold_ticks_floor = 1;
+                cold_ticks_overridden = true;
+            }
+        } else if (ct_env) {
             cold_ticks_floor = static_cast<uint32_t>(std::atoi(ct_env));
             cold_ticks_overridden = true;
         }

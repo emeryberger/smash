@@ -67,6 +67,18 @@ GLIBC_2.2.5 {
     xxthread_cleanup;
     xxthread_created_flag;
 
+    # alloc8 getcwd hooks (function pointers set by Smash constructor)
+    xx_getcwd_prepare_hook;
+    xx_getcwd_finish_hook;
+
+    # Buffered I/O wrappers (glibc internal __read bypasses our read wrapper)
+    fread;
+    fgets;
+    fgetc;
+    getc;
+    fwrite;
+    fflush;
+
     # Smash syscall wrappers for kernel buffer access
     read;
     write;
@@ -80,6 +92,18 @@ GLIBC_2.2.5 {
     sendto;
     recvmsg;
     sendmsg;
+    poll;
+    ppoll;
+    select;
+    pselect;
+    accept;
+    accept4;
+    recvmmsg;
+    sendmmsg;
+    getsockopt;
+    getsockname;
+    getpeername;
+    getrandom;
     epoll_wait;
     epoll_pwait;
 

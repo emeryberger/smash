@@ -155,11 +155,29 @@ inline constexpr int kRoiThresholdDefault = 1024;
 // ── Compression (Phase 3+) ───────────────────────────────────────────────────
 inline constexpr int kCompressIntervalMs = 1000;
 #ifndef SMASH_COLD_TICKS
-inline constexpr int kColdTicks = 2;
+inline constexpr int kColdTicksDefault = 2;
 #else
-inline constexpr int kColdTicks = SMASH_COLD_TICKS;
+inline constexpr int kColdTicksDefault = SMASH_COLD_TICKS;
 #endif
 inline constexpr double kMinCompressRatio = 0.75;
+
+// Runtime cold timeout: SMASH_COLD_TIMEOUT_SEC overrides kColdTicks.
+// This is the primary time-space tradeoff dial.  Lower values compress
+// sooner (more space savings, more decompression faults on re-access).
+// Higher values are conservative (less savings, fewer faults).
+// Default: kColdTicksDefault * kCompressIntervalMs / 1000.
+inline int getColdTicks() {
+    static int ticks = []() {
+        const char* env = getenv("SMASH_COLD_TIMEOUT_SEC");
+        if (env) {
+            double sec = atof(env);
+            if (sec > 0)
+                return static_cast<int>(sec * 1000.0 / kCompressIntervalMs + 0.5);
+        }
+        return kColdTicksDefault;
+    }();
+    return ticks;
+}
 
 // ── Adaptive compression (Phase 5+) ─────────────────────────────────────────
 #ifndef SMASH_VERY_COLD_TICKS
@@ -194,9 +212,14 @@ inline constexpr int kMaxDictClasses = 8;        // cap total dict memory overhe
 
 // ── Compressor parallelism ───────────────────────────────────────────────────
 #ifndef SMASH_COMPRESSOR_WORKERS
-inline constexpr int kCompressorWorkers = 2;         // parallel compression workers
+inline constexpr int kCompressorWorkers = 2;         // initial compression workers
 #else
 inline constexpr int kCompressorWorkers = SMASH_COMPRESSOR_WORKERS;
+#endif
+#ifndef SMASH_MAX_COMPRESSOR_WORKERS
+inline constexpr int kMaxCompressorWorkers = 8;      // max workers (pre-allocated pool)
+#else
+inline constexpr int kMaxCompressorWorkers = SMASH_MAX_COMPRESSOR_WORKERS;
 #endif
 #ifndef SMASH_COMPRESS_STORE_SHARDS
 inline constexpr int kCompressStoreShards = 8;       // CompressStore lock shards

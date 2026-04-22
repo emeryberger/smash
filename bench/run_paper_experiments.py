@@ -119,7 +119,7 @@ ABLATION_CONFIGS = OrderedDict([
 ])
 
 APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext",
-        "redis_patched", "redis_ext_patched"]
+        "redis_patched", "redis_ext_patched", "pandas"]
 
 IS_DARWIN = platform.system() == "Darwin"
 PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
@@ -384,11 +384,11 @@ def run_redis_bench(build_dir, smash_lib, quick):
             return None
 
     port = 16399
-    num_ops = 50000 if quick else 100000
+    num_ops = 50000 if quick else 200000
     num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
-    value_size = 1000
-    keyspace = 100000
-    cool_sec = 5 if quick else 15
+    value_size = 1000 if quick else 2000
+    keyspace = 100000 if quick else 200000
+    cool_sec = 5 if quick else 20
 
     kill_redis(port, build_dir)
 
@@ -415,7 +415,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
                 [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                  "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                  "-t", "set", "-q"],
-                capture_output=True, text=True, timeout=600
+                capture_output=True, text=True, timeout=1200
             )
             set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
         except subprocess.TimeoutExpired:
@@ -458,7 +458,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
                     [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                      "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                      "-t", "get", "-q"],
-                    capture_output=True, text=True, timeout=600
+                    capture_output=True, text=True, timeout=1200
                 )
                 get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
             except subprocess.TimeoutExpired:
@@ -513,11 +513,11 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
             return None
 
     port = 16400  # different port from run_redis_bench to avoid conflicts
-    num_ops = 50000 if quick else 100000
+    num_ops = 50000 if quick else 200000
     num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
-    value_size = 1000
-    keyspace = 100000
-    cool_sec = 5 if quick else 15
+    value_size = 1000 if quick else 2000
+    keyspace = 100000 if quick else 200000
+    cool_sec = 5 if quick else 20
 
     kill_redis(port, build_dir)
 
@@ -544,7 +544,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
                 [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                  "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                  "-t", "set", "-q"],
-                capture_output=True, text=True, timeout=600
+                capture_output=True, text=True, timeout=1200
             )
             set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
         except subprocess.TimeoutExpired:
@@ -629,7 +629,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
                     [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                      "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                      "-t", "get", "-q"],
-                    capture_output=True, text=True, timeout=600
+                    capture_output=True, text=True, timeout=1200
                 )
                 get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
             except subprocess.TimeoutExpired:
@@ -685,11 +685,11 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
         else ("redis_ext" if extended else "redis")
     # Use different ports to avoid conflicts
     port = 16399 + (1 if extended else 0) + (2 if patched else 0)
-    num_ops = 50000 if quick else 100000
+    num_ops = 50000 if quick else 200000
     num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
-    value_size = 1000
-    keyspace = 100000
-    cool_sec = 5 if quick else 15
+    value_size = 1000 if quick else 2000
+    keyspace = 100000 if quick else 200000
+    cool_sec = 5 if quick else 20
 
     kill_redis(port, build_dir)
 
@@ -719,7 +719,7 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
                 [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                  "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                  "-t", "set", "-q"],
-                capture_output=True, text=True, timeout=600
+                capture_output=True, text=True, timeout=1200
             )
             set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
         except subprocess.TimeoutExpired:
@@ -780,7 +780,7 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
                     [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                      "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                      "-t", "get", "-q"],
-                    capture_output=True, text=True, timeout=600
+                    capture_output=True, text=True, timeout=1200
                 )
                 get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
             except subprocess.TimeoutExpired:
@@ -1353,6 +1353,70 @@ def run_shell_benchmark(script, smash_lib, quick, name):
         return None
 
 
+# ── Pandas cold-columns benchmark ────────────────────────────────────────────
+
+def run_pandas_bench(build_dir, smash_lib, quick):
+    """Run Python+pandas cold-columns benchmark as a subprocess.
+
+    Creates a large DataFrame with many columns, works a subset ("hot"),
+    lets the rest go cold, then measures RSS reduction and decompression cost.
+
+    bench_pandas.py launches its own inner subprocess with LD_PRELOAD, so we
+    DON'T set LD_PRELOAD here — we pass --smash-lib instead.
+    """
+    script = build_dir.parent / "bench" / "bench_pandas.py"
+    if not script.exists():
+        print(f"    pandas script not found: {script}")
+        return None
+
+    # Check pandas is available
+    try:
+        subprocess.check_call(
+            [sys.executable, "-c", "import pandas, numpy"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        print("    pandas/numpy not installed, skipping")
+        return None
+
+    args = [sys.executable, str(script), "--runs", "1"]
+    if quick:
+        args.append("--quick")
+    else:
+        args.extend(["--rows", "2000000", "--cool-sec", "60"])
+    if smash_lib:
+        args.extend(["--smash-lib", str(smash_lib)])
+
+    try:
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        # bench_pandas.py runs the actual work in an inner subprocess.
+        # We can't sample RSS of the inner process from here, so rely on
+        # the internal METRIC lines from the benchmark.
+        stdout, stderr = proc.communicate(timeout=600)
+
+        if proc.returncode != 0:
+            print(f"    pandas error: exit code {proc.returncode}")
+            if stderr:
+                print(f"    stderr: {stderr[:300]}")
+            return None
+
+        metrics = parse_metrics(stdout)
+
+        if "rss_reduction_pct" not in metrics:
+            peak = metrics.get("peak_rss_mb", 0)
+            min_rss = metrics.get("min_rss_mb", peak)
+            if peak > 0 and min_rss > 0:
+                metrics["rss_reduction_pct"] = (1 - min_rss / peak) * 100
+
+        return metrics
+    except Exception as e:
+        print(f"    pandas error: {e}")
+        return None
+
+
 # ── App runner dispatch ──────────────────────────────────────────────────────
 
 def run_app(app, build_dir, smash_lib, quick):
@@ -1373,6 +1437,8 @@ def run_app(app, build_dir, smash_lib, quick):
         return run_redis_ext_patched_bench(build_dir, smash_lib, quick)
     elif app == "duckdb":
         return run_duckdb_bench(build_dir, smash_lib, quick)
+    elif app == "pandas":
+        return run_pandas_bench(build_dir, smash_lib, quick)
     return None
 
 

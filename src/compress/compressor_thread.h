@@ -5,7 +5,7 @@
 // based on cold duration, per-size-class dictionary training, prefetching
 // of adjacent pages on fault, and batch decommit.
 //
-// Parallelism: kCompressorWorkers threads process disjoint page ranges.
+// Parallelism: adaptive worker pool (Little's Law) processes disjoint page ranges.
 // Chunk bitmap skips EMPTY pages. Per-fault-slot DCtx avoids decompress races.
 // Sharded CompressStore eliminates single lock bottleneck.
 #pragma once
@@ -203,7 +203,7 @@ class CompressorThread {
         }
     };
 
-    CompressWorker workers_[kCompressorWorkers];
+    CompressWorker workers_[kMaxCompressorWorkers];
 
     // ── Dictionary training (coordinator thread) ──────────────────────────
     struct DictTrainState {
@@ -224,7 +224,8 @@ class CompressorThread {
 
     // ── Thread management ─────────────────────────────────────────────────
     pthread_t coord_thread_{};
-    pthread_t helper_threads_[kCompressorWorkers > 1 ? kCompressorWorkers - 1 : 1]{};
+    static constexpr int kMaxHelpers = kMaxCompressorWorkers > 1 ? kMaxCompressorWorkers - 1 : 1;
+    pthread_t helper_threads_[kMaxHelpers]{};
     std::atomic<bool> running_{false};
     bool stdio_pinned_ = false;
 
@@ -232,7 +233,36 @@ class CompressorThread {
     // Helpers compare against their last-seen gen to detect new work.
     std::atomic<uint64_t> work_gen_{0};
     int current_phase_ = 0;  // 1=access, 2=compress, 3=monitor
-    std::atomic<uint64_t> helper_done_gen_[kCompressorWorkers > 1 ? kCompressorWorkers - 1 : 1]{};
+    std::atomic<uint64_t> helper_done_gen_[kMaxHelpers]{};
+
+    // ── Adaptive worker scaling (Little's Law) ─────────────────────────
+    //
+    // By Little's Law, the average number of items in a stable queueing
+    // system is L = λ · W, where λ is the arrival rate and W is the mean
+    // service time.  For the compression queue:
+    //
+    //   λ  = pages becoming eligible for compression per tick
+    //   μ  = pages one worker compresses per tick  (service rate = 1/W)
+    //
+    // To keep the queue drained (L → 0), total service rate must meet
+    // arrival rate: N · μ ≥ λ.  Solving for the minimum worker count:
+    //
+    //   N_needed = ⌈λ / μ⌉
+    //
+    // Both λ and μ are measured each tick and smoothed with EMAs.
+    // Workers are pre-allocated up to kMaxCompressorWorkers; helper threads
+    // are lazily created on first scale-up and parked when not needed.
+    int active_workers_{kCompressorWorkers};  // current active count (runtime)
+    int helpers_created_ = 0;  // how many helper threads have been pthread_create'd
+
+    // Per-worker counters for the current tick (reset each tick)
+    std::atomic<uint32_t> worker_pages_eligible_[kMaxCompressorWorkers]{};
+    std::atomic<uint32_t> worker_pages_compressed_[kMaxCompressorWorkers]{};
+
+    // Exponential moving averages (fixed-point: multiply by 256 to avoid float)
+    // EMA update: ema = ema + (sample - ema) / 4   (α = 1/4, ~4-tick response)
+    uint32_t lambda_ema_ = 0;  // pages eligible per tick (× 256)
+    uint32_t mu_ema_ = 256;    // pages compressed per worker per tick (× 256, init=1 to avoid /0)
 
     // ── Helper methods ────────────────────────────────────────────────────
 
@@ -395,16 +425,14 @@ class CompressorThread {
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
                 if (cold_count_[i] == floor && st == PageState::ACTIVE_MONITORING) {
-                    // First tick at cold threshold: escalate to PROT_NONE to
-                    // detect reads as well as writes.  Don't compress yet.
                     escalateToDeepMonitoring(i);
                 } else if (cold_count_[i] > floor) {
-                    // Survived deep monitoring (or was ACTIVE at floor, meaning
-                    // a write just happened and was caught).  Truly cold — compress.
-                    compressPage(i, workers_[worker_id]);
+                    // Page is eligible for compression — count it
+                    worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
+                    if (compressPage(i, workers_[worker_id])) {
+                        worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
-                // cold_count == floor && st == ACTIVE: page was written between
-                // Phase 1 and Phase 2; skip — Phase 1 will reset cold next tick.
             } else if (st == PageState::COMPRESSED &&
                        cold_count_[i] >= upgrade_ticks) {
                 upgradePage(i, workers_[worker_id]);
@@ -862,8 +890,8 @@ class CompressorThread {
     void dispatch(int phase) {
         // If helpers are not running (e.g., compressTick() called directly
         // in tests), fall back to single-threaded execution.
-        bool helpers_active = running_.load(std::memory_order_relaxed) &&
-                              kCompressorWorkers > 1;
+        int nw = active_workers_;
+        bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
         if (helpers_active) {
             current_phase_ = phase;
             work_gen_.fetch_add(1, std::memory_order_release);
@@ -871,9 +899,9 @@ class CompressorThread {
             // Coordinator does worker 0's range
             executePhase(phase, 0);
 
-            // Wait for all helpers
+            // Wait for active helpers only (helpers with id >= nw-1 are parked)
             uint64_t target = work_gen_.load(std::memory_order_relaxed);
-            for (int i = 0; i < kCompressorWorkers - 1; ++i) {
+            for (int i = 0; i < nw - 1; ++i) {
                 while (helper_done_gen_[i].load(std::memory_order_acquire) < target) {
                     // spin
                 }
@@ -909,15 +937,21 @@ class CompressorThread {
         // Rebuild chunk bitmap
         rebuildChunkBitmap(committed);
 
-        // Partition page range across workers.
+        // Reset per-worker tick counters
+        int nw = active_workers_;
+        for (int w = 0; w < nw; ++w) {
+            worker_pages_eligible_[w].store(0, std::memory_order_relaxed);
+            worker_pages_compressed_[w].store(0, std::memory_order_relaxed);
+        }
+
+        // Partition page range across active workers.
         // If helpers are not running, worker 0 gets the entire range.
-        bool helpers_active = running_.load(std::memory_order_relaxed) &&
-                              kCompressorWorkers > 1;
+        bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
         if (helpers_active) {
-            size_t per_worker = committed / kCompressorWorkers;
-            for (int w = 0; w < kCompressorWorkers; ++w) {
+            size_t per_worker = committed / nw;
+            for (int w = 0; w < nw; ++w) {
                 workers_[w].range_start = w * per_worker;
-                workers_[w].range_end = (w == kCompressorWorkers - 1)
+                workers_[w].range_end = (w == nw - 1)
                     ? committed : (w + 1) * per_worker;
             }
         } else {
@@ -930,9 +964,68 @@ class CompressorThread {
         dispatch(2);  // Phase 2: compression
         dispatch(3);  // Phase 3: monitoring
 
+        // ── Adaptive worker scaling ──────────────────────────────────────
+        // Measure this tick's workload and throughput, update EMAs, and
+        // compute the number of workers needed for next tick.
+        adaptWorkerCount(nw);
+
         if constexpr (kMeasureCohorts) tallyCohorts(committed);
 
         trainDictionaries();
+    }
+
+    // Adapt active worker count using Little's Law (see class comment above).
+    // Measures λ (cold arrival rate) and μ (per-worker service rate) each
+    // tick, smooths with EMA (α = 1/4), and sets N = ⌈λ_ema / μ_ema⌉.
+    void adaptWorkerCount(int nw) {
+        // Sum per-worker counters
+        uint32_t total_eligible = 0;
+        uint32_t total_compressed = 0;
+        for (int w = 0; w < nw; ++w) {
+            total_eligible += worker_pages_eligible_[w].load(std::memory_order_relaxed);
+            total_compressed += worker_pages_compressed_[w].load(std::memory_order_relaxed);
+        }
+
+        // Per-worker throughput (avoid division by zero)
+        uint32_t mu_sample = nw > 0 ? (total_compressed + nw - 1) / nw : 0;
+
+        // Update EMAs: ema += (sample - ema) / 4  (in fixed-point ×256)
+        uint32_t lambda_sample_fp = total_eligible << 8;
+        uint32_t mu_sample_fp = mu_sample << 8;
+
+        lambda_ema_ += (static_cast<int32_t>(lambda_sample_fp) - static_cast<int32_t>(lambda_ema_)) / 4;
+        // Only update μ when we have compression work (avoid decaying μ to 0
+        // during idle periods, which would cause spurious scale-up)
+        if (total_compressed > 0) {
+            mu_ema_ += (static_cast<int32_t>(mu_sample_fp) - static_cast<int32_t>(mu_ema_)) / 4;
+            if (mu_ema_ == 0) mu_ema_ = 1;  // floor to prevent division by zero
+        }
+
+        // N_needed = ⌈λ / μ⌉ (both in same fixed-point scale, so they cancel)
+        int n_needed;
+        if (lambda_ema_ == 0) {
+            n_needed = 1;  // no work → 1 worker is enough
+        } else {
+            n_needed = static_cast<int>((lambda_ema_ + mu_ema_ - 1) / mu_ema_);
+        }
+
+        // Clamp to valid range
+        if (n_needed < 1) n_needed = 1;
+        if (n_needed > kMaxCompressorWorkers) n_needed = kMaxCompressorWorkers;
+
+        // Ensure helper threads exist for the new count
+        // (lazily create threads on first scale-up, never destroy them)
+        while (helpers_created_ < n_needed - 1) {
+            int helper_id = helpers_created_;
+            auto* ha = static_cast<HelperArg*>(
+                BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
+            ha->self = this;
+            ha->id = helper_id;
+            pthread_create(&helper_threads_[helper_id], nullptr, helperEntry, ha);
+            helpers_created_++;
+        }
+
+        active_workers_ = n_needed;
     }
 
     void tallyCohorts(size_t committed) {
@@ -1007,7 +1100,11 @@ class CompressorThread {
             }
             last_gen = gen;
 
-            self->executePhase(self->current_phase_, worker_id);
+            // Only execute if this worker is active; otherwise just ACK
+            // so the coordinator's dispatch() doesn't block on parked helpers.
+            if (worker_id < self->active_workers_) {
+                self->executePhase(self->current_phase_, worker_id);
+            }
             self->helper_done_gen_[helper_id].store(gen, std::memory_order_release);
         }
         return nullptr;
@@ -1046,7 +1143,9 @@ public:
             nullptr
         };
 
-        for (int w = 0; w < kCompressorWorkers; ++w) {
+        // Pre-allocate state for all possible workers (adaptive scaling may
+        // activate up to kMaxCompressorWorkers at runtime).
+        for (int w = 0; w < kMaxCompressorWorkers; ++w) {
             auto& worker = workers_[w];
             worker.page_buf = BootstrapAlloc::instance().allocate(kPageSize, kPageSize);
             worker.compress_buf = BootstrapAlloc::instance().allocate(max_comp, 16);
@@ -1088,16 +1187,16 @@ public:
     void start() {
         running_.store(true, std::memory_order_release);
 
-        // Start helper threads
-        if constexpr (kCompressorWorkers > 1) {
-            for (int i = 0; i < kCompressorWorkers - 1; ++i) {
-                auto* ha = static_cast<HelperArg*>(
-                    BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
-                ha->self = this;
-                ha->id = i;
-                pthread_create(&helper_threads_[i], nullptr, helperEntry, ha);
-            }
+        // Start initial helper threads (adaptive scaling may create more later)
+        int initial_helpers = kCompressorWorkers > 1 ? kCompressorWorkers - 1 : 0;
+        for (int i = 0; i < initial_helpers; ++i) {
+            auto* ha = static_cast<HelperArg*>(
+                BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
+            ha->self = this;
+            ha->id = i;
+            pthread_create(&helper_threads_[i], nullptr, helperEntry, ha);
         }
+        helpers_created_ = initial_helpers;
 
         // Start coordinator thread
         pthread_create(&coord_thread_, nullptr, coordEntry, this);
@@ -1107,10 +1206,8 @@ public:
         if (!running_.load(std::memory_order_relaxed)) return;
         running_.store(false, std::memory_order_release);
         pthread_join(coord_thread_, nullptr);
-        if constexpr (kCompressorWorkers > 1) {
-            for (int i = 0; i < kCompressorWorkers - 1; ++i)
-                pthread_join(helper_threads_[i], nullptr);
-        }
+        for (int i = 0; i < helpers_created_; ++i)
+            pthread_join(helper_threads_[i], nullptr);
     }
 
     // Manually trigger one compression tick (for testing/manual control)

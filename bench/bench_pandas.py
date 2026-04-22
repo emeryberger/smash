@@ -28,7 +28,7 @@ from pathlib import Path
 
 
 def get_rss_mb():
-    """Get RSS of the current process in MiB."""
+    """Get current RSS of this process in MiB (Linux + macOS)."""
     try:
         with open(f"/proc/{os.getpid()}/status") as f:
             for line in f:
@@ -36,15 +36,12 @@ def get_rss_mb():
                     return int(line.split()[1]) / 1024.0
     except (FileNotFoundError, PermissionError):
         pass
-    # Fallback: resource module
+    # macOS/fallback: ps -o rss= gives current RSS in KiB
     try:
-        import resource
-        # ru_maxrss is in KiB on Linux, bytes on macOS
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        rss_kb = usage.ru_maxrss
-        if sys.platform == "darwin":
-            rss_kb //= 1024
-        return rss_kb / 1024.0
+        out = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
+        )
+        return float(out.strip()) / 1024.0
     except Exception:
         return 0.0
 
@@ -77,13 +74,25 @@ import os
 import sys
 
 def get_rss_mb():
+    """Get current process RSS in MiB (Linux + macOS)."""
+    # Linux: /proc/self/status
     try:
         with open(f"/proc/{os.getpid()}/status") as f:
             for line in f:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) / 1024.0
+    except (FileNotFoundError, PermissionError):
+        pass
+    # macOS/fallback: ps -o rss= gives current RSS in KiB
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
+        )
+        return float(out.strip()) / 1024.0
     except Exception:
-        return 0.0
+        pass
+    return 0.0
 
 # Parameters from environment
 num_rows = int(os.environ.get("BENCH_ROWS", "2000000"))
@@ -236,7 +245,10 @@ def run_pandas_benchmark(smash_lib=None, num_rows=2_000_000, num_cols=100,
     env["BENCH_DATA_TYPE"] = data_type
 
     if smash_lib:
-        env["LD_PRELOAD"] = str(smash_lib)
+        if sys.platform == "darwin":
+            env["DYLD_INSERT_LIBRARIES"] = str(smash_lib)
+        else:
+            env["LD_PRELOAD"] = str(smash_lib)
         env["SMASH_VERY_COLD_TICKS"] = "5"
 
     config_name = "smash" if smash_lib else "baseline"
@@ -346,12 +358,13 @@ def main():
     else:
         cool_sec = 30
 
-    # Find libsmash.so
+    # Find libsmash
     build_dir = Path(".").resolve()
+    lib_suffix = ".dylib" if sys.platform == "darwin" else ".so"
     if args.smash_lib:
         smash_lib = Path(args.smash_lib).resolve()
     else:
-        smash_lib = build_dir / "libsmash.so"
+        smash_lib = build_dir / f"libsmash{lib_suffix}"
         if not smash_lib.exists():
             print(f"WARNING: {smash_lib} not found, will only run baseline")
             smash_lib = None

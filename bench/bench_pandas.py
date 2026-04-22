@@ -27,25 +27,6 @@ import time
 from pathlib import Path
 
 
-def get_rss_mb():
-    """Get current RSS of this process in MiB (Linux + macOS)."""
-    try:
-        with open(f"/proc/{os.getpid()}/status") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024.0
-    except (FileNotFoundError, PermissionError):
-        pass
-    # macOS/fallback: ps -o rss= gives current RSS in KiB
-    try:
-        out = subprocess.check_output(
-            ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
-        )
-        return float(out.strip()) / 1024.0
-    except Exception:
-        return 0.0
-
-
 def get_rss_mb_external(pid):
     """Get RSS from outside the process (for LD_PRELOAD wrapper)."""
     try:
@@ -72,27 +53,66 @@ import pandas as pd
 import time
 import os
 import sys
+import ctypes
+import ctypes.util
 
-def get_rss_mb():
-    """Get current process RSS in MiB (Linux + macOS)."""
-    # Linux: /proc/self/status
-    try:
-        with open(f"/proc/{os.getpid()}/status") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024.0
-    except (FileNotFoundError, PermissionError):
-        pass
-    # macOS/fallback: ps -o rss= gives current RSS in KiB
-    try:
-        import subprocess as _sp
-        out = _sp.check_output(
-            ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
+def _make_mach_rss_reader():
+    """Build a fast RSS reader using mach task_info (macOS only)."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c"))
+
+    MACH_TASK_BASIC_INFO = 20
+    MACH_TASK_BASIC_INFO_COUNT = 12  # 12 natural_t fields
+
+    class MachTaskBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("suspend_count", ctypes.c_int32),
+            ("virtual_size", ctypes.c_uint64),
+            ("resident_size", ctypes.c_uint64),
+            ("user_time_sec", ctypes.c_uint32),
+            ("user_time_usec", ctypes.c_uint32),
+            ("system_time_sec", ctypes.c_uint32),
+            ("system_time_usec", ctypes.c_uint32),
+            ("policy", ctypes.c_int32),
+        ]
+
+    task_self = libc.mach_task_self
+    task_self.restype = ctypes.c_uint32
+    task_info = libc.task_info
+    task_info.restype = ctypes.c_int32
+
+    def read_rss_mb():
+        info = MachTaskBasicInfo()
+        count = ctypes.c_uint32(MACH_TASK_BASIC_INFO_COUNT)
+        ret = task_info(
+            task_self(),
+            MACH_TASK_BASIC_INFO,
+            ctypes.byref(info),
+            ctypes.byref(count),
         )
-        return float(out.strip()) / 1024.0
-    except Exception:
-        pass
-    return 0.0
+        if ret == 0:
+            return info.resident_size / (1024 * 1024)
+        return 0.0
+
+    return read_rss_mb
+
+def _make_proc_rss_reader():
+    """Build a fast RSS reader using /proc/self/status (Linux)."""
+    def read_rss_mb():
+        try:
+            with open(f"/proc/{os.getpid()}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024.0
+        except Exception:
+            pass
+        return 0.0
+    return read_rss_mb
+
+# Pick the right reader for this platform — no subprocess overhead
+if sys.platform == "darwin":
+    get_rss_mb = _make_mach_rss_reader()
+else:
+    get_rss_mb = _make_proc_rss_reader()
 
 # Parameters from environment
 num_rows = int(os.environ.get("BENCH_ROWS", "2000000"))
@@ -318,7 +338,7 @@ def main():
     parser.add_argument("--quick", action="store_true",
                         help="Smaller dataset, shorter cool-down")
     parser.add_argument("--smash-lib", default=None,
-                        help="Path to libsmash.so")
+                        help="Path to libsmash.so/.dylib")
     parser.add_argument("--rows", type=int, default=None,
                         help="Number of rows (default: 2M full, 500K quick)")
     parser.add_argument("--cols", type=int, default=100,
@@ -330,7 +350,8 @@ def main():
     parser.add_argument("--cool-sec", type=int, default=None,
                         help="Cooldown seconds (default: 15 quick, 30 full)")
     parser.add_argument("--runs", type=int, default=1)
-    parser.add_argument("--output-dir", default="paper_results")
+    parser.add_argument("--output-dir", default=None,
+                        help="Save JSON results to this directory")
     args = parser.parse_args()
 
     # Check pandas is installed
@@ -368,9 +389,6 @@ def main():
         if not smash_lib.exists():
             print(f"WARNING: {smash_lib} not found, will only run baseline")
             smash_lib = None
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = {}
     configs = [
@@ -447,11 +465,14 @@ def main():
         if base_cold > 0:
             print(f"  Cold access overhead: {((smash_cold/base_cold)-1)*100:+.1f}%")
 
-    # Save results
-    out_file = output_dir / "pandas_results.json"
-    with open(out_file, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\n  Results saved to {out_file}")
+    # Save results only if --output-dir was explicitly given
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_file = output_dir / "pandas_results.json"
+        with open(out_file, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\n  Results saved to {out_file}")
 
 
 if __name__ == "__main__":

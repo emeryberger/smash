@@ -120,12 +120,23 @@ class CompressorThread {
         fault_slots_[slot].used.store(false, std::memory_order_release);
     }
 
-    // ── Per-size-class sliding window stats ───────────────────────────────
+    // ── Per-bucket sliding window stats ───────────────────────────────────
+    // A bucket is (arena_id, size_class) per worker.  Each bucket tracks
+    // observed compression ratio AND observed compression time per profile
+    // (fast/deep), so the ROI model can compute cost/benefit from data the
+    // workload has actually produced rather than from synthetic calibration
+    // of zeros/random pages that may not resemble real allocator output.
     struct SizeClassStats {
         static constexpr int kWindow = 64;
+        static constexpr int kTiers = 2;   // 0 = fast tier, 1 = deep tier
+        // Ratio sliding window (0-255, mapping to 0-100% bytes saved).
         uint8_t ratios[kWindow]{};
         uint8_t head = 0, count = 0;
         uint16_t sum = 0;
+        // Observed compression time EMA per tier, in microseconds × 16
+        // (fixed-point to retain sub-microsecond precision without floats).
+        uint32_t cost_ema_x16[kTiers]{};
+        uint8_t  cost_count[kTiers]{};
 
         void record(size_t comp_size, size_t orig_size) {
             uint8_t r = 0;
@@ -141,6 +152,27 @@ class CompressorThread {
             head = static_cast<uint8_t>((head + 1) % kWindow);
         }
 
+        // Record compression time observed for a page compressed with the
+        // given tier (0 = fast, 1 = deep).  EMA with α = 1/4.
+        void recordCost(int tier, uint32_t elapsed_us) {
+            if (tier < 0 || tier >= kTiers) return;
+            uint32_t sample_x16 = elapsed_us * 16;
+            if (cost_count[tier] == 0)
+                cost_ema_x16[tier] = sample_x16;
+            else
+                cost_ema_x16[tier] += (static_cast<int32_t>(sample_x16) -
+                    static_cast<int32_t>(cost_ema_x16[tier])) / 4;
+            if (cost_count[tier] < 64) cost_count[tier]++;
+        }
+
+        // Observed compression microseconds for the given tier.  Returns 0
+        // when fewer than 8 samples exist; callers should fall back to the
+        // profile's calibrated throughput in that case.
+        uint32_t observedCostUs(int tier) const {
+            if (tier < 0 || tier >= kTiers) return 0;
+            return cost_count[tier] >= 8
+                ? (cost_ema_x16[tier] + 8) / 16 : 0;
+        }
     };
 
     // ── Per-worker compression state ──────────────────────────────────────
@@ -537,8 +569,17 @@ class CompressorThread {
             return false;
         }
 
+        // Pass the bucket's observed per-tier compression costs into the
+        // ROI model so it uses real workload data instead of synthetic
+        // calibration when available.
+        uint32_t observed_costs_us[2] = {0, 0};
+        if (have_span && sc < kNumClasses) {
+            observed_costs_us[0] = worker.sc_stats[stats_idx].observedCostUs(0);
+            observed_costs_us[1] = worker.sc_stats[stats_idx].observedCostUs(1);
+        }
         const AlgoProfile* profile = CompressionROI::selectProfile(
-            cold_count_[page_idx], stats_count, stats_sum);
+            cold_count_[page_idx], stats_count, stats_sum,
+            observed_costs_us);
         if (!profile) {
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
@@ -590,6 +631,7 @@ class CompressorThread {
 
         size_t max_comp = CompressEngine::maxCompressedSizeAny(kPageSize);
         size_t comp_size = 0;
+        auto comp_t0 = std::chrono::steady_clock::now();
 
         // Try-both experiment (opt-in): when dict is selected, also try plain
         // ZSTD and keep the smaller result. Doubles compression CPU for
@@ -645,16 +687,26 @@ class CompressorThread {
             (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio))) {
             algo = CompressAlgo::ZSTD;
             zstd_level = kZstdDeepLevel;
+            is_fast_tier = false;
             comp_size = worker.compress(worker.page_buf, worker.compress_buf,
                                         kPageSize, max_comp, algo, sc,
                                         zstd_level, engine_);
         }
 
+        auto comp_t1 = std::chrono::steady_clock::now();
+        uint32_t comp_elapsed_us = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                comp_t1 - comp_t0).count());
+
         if (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio)) {
-            // Not worth compressing; record poor ratio and restore page
-            if (have_span && sc < kNumClasses)
+            // Not worth compressing; record poor ratio and cost for the
+            // tier we actually ran, then restore the page.
+            if (have_span && sc < kNumClasses) {
                 worker.sc_stats[stats_idx].record(
                     comp_size ? comp_size : kPageSize, kPageSize);
+                int tier = is_fast_tier ? 0 : 1;
+                worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
+            }
             vm::protectPages(page_addr, kPageSize, true, true);
             __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
             states_->set(page_idx, PageState::ACTIVE);
@@ -673,9 +725,13 @@ class CompressorThread {
             return false;
         }
 
-        // Record successful compression ratio in the per-(arena, sc) bucket.
-        if (have_span && sc < kNumClasses)
+        // Record successful compression ratio and observed cost in the
+        // per-(arena, sc) bucket so future ROI decisions use real data.
+        if (have_span && sc < kNumClasses) {
             worker.sc_stats[stats_idx].record(comp_size, kPageSize);
+            int tier = is_fast_tier ? 0 : 1;
+            worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
+        }
 
         // Record compressed page info (with algo in top 2 bits)
         compressed_[page_idx].set(stored, comp_size, alloc_size, algo);

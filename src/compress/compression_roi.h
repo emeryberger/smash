@@ -67,12 +67,18 @@ struct AlgoProfile {
     // ROI = benefit / cost (byte-seconds of RSS saved per microsecond of CPU).
     //
     // benefit = kPageSize * (effective_ratio/255) * cold_count   [byte-seconds]
-    // cost    = kPageSize/comp_tp + kPageSize/decomp_tp          [microseconds]
+    // cost    = comp_us + decomp_us                              [microseconds]
     //
-    // Since both cost terms increase with R (worse ratio -> slower throughput)
-    // and benefit decreases with R, ROI is steeply ratio-sensitive.
-    uint32_t computeROI(uint8_t cold_count, uint16_t ratio_255) const {
-        // Scale ratio for algorithms that achieve better ratios than LZ4
+    // If `observed_comp_us > 0`, the caller has real timing data for a page
+    // from the target (arena, size-class) bucket; use it in place of the
+    // calibrated compression-throughput estimate.  Decompression cost is
+    // still estimated from the calibrated profile because decompression
+    // happens at fault time in the signal handler, where we cannot cheaply
+    // attribute timing back to a bucket.
+    uint32_t computeROI(uint8_t cold_count, uint16_t ratio_255,
+                        uint32_t observed_comp_us = 0) const {
+        // Scale ratio for algorithms that achieve better ratios than the
+        // fast-tier baseline.
         uint16_t effective_ratio = ratio_255;
         if (ratio_scale_num != ratio_scale_den && ratio_scale_den > 0) {
             uint32_t scaled = static_cast<uint32_t>(ratio_255) *
@@ -84,11 +90,18 @@ struct AlgoProfile {
                            effective_ratio * cold_count / 255;
         if (benefit == 0) return 0;
 
-        // Use x256 scaling for sub-microsecond precision
-        uint32_t comp_tp = compThroughput(effective_ratio);
+        // Cost: use observed microseconds when available, else derive from
+        // calibrated throughput.  Both terms in x256 fixed point.
         uint32_t decomp_tp = decompThroughput(effective_ratio);
-        uint32_t cost_x256 =
-            static_cast<uint32_t>(kPageSize) * 256 / comp_tp +
+        uint32_t comp_cost_x256;
+        if (observed_comp_us > 0) {
+            comp_cost_x256 = observed_comp_us * 256;
+        } else {
+            uint32_t comp_tp = compThroughput(effective_ratio);
+            comp_cost_x256 =
+                static_cast<uint32_t>(kPageSize) * 256 / comp_tp;
+        }
+        uint32_t cost_x256 = comp_cost_x256 +
             static_cast<uint32_t>(kPageSize) * 256 / decomp_tp;
         if (cost_x256 == 0) return UINT32_MAX;
 
@@ -562,9 +575,15 @@ inline bool shouldCompress(uint8_t cold_count,
 // When enough samples are available, picks the profile with the highest
 // ROI above the per-profile cold-tick threshold.  Otherwise falls back
 // to the fast tier (profile 0).
+//
+// `observed_costs_us[i]`, if > 0, overrides profile[i]'s calibrated
+// compression-throughput estimate with the real observed time (μs per
+// page) from the workload's actual (arena, size-class) bucket.  Callers
+// who do not have per-bucket timing can pass nullptr.
 inline const AlgoProfile* selectProfile(uint8_t cold_count,
                                          uint8_t stats_count,
-                                         uint16_t stats_sum) {
+                                         uint16_t stats_sum,
+                                         const uint32_t* observed_costs_us = nullptr) {
     auto& cfg = ROIConfig::instance();
     if (cfg.num_profiles == 0) return nullptr;
 
@@ -579,7 +598,8 @@ inline const AlgoProfile* selectProfile(uint8_t cold_count,
     for (int i = 0; i < cfg.num_profiles; ++i) {
         const auto& p = cfg.profiles[i];
         if (cold_count < p.min_cold_ticks) continue;
-        uint32_t roi = p.computeROI(cold_count, base_ratio);
+        uint32_t observed = observed_costs_us ? observed_costs_us[i] : 0;
+        uint32_t roi = p.computeROI(cold_count, base_ratio, observed);
         if (roi > best_roi) {
             best_roi = roi;
             best = &p;

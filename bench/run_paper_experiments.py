@@ -53,7 +53,7 @@ ABLATION_CONFIGS = OrderedDict([
               "cmake_flags": {"SMASH_DICT_TRAIN_SAMPLES": "16"}, "use_smash": True}),
     ("T1a", {"name": "No arenas",
              "cmake_flags": {"SMASH_NUM_ARENAS": "1"}, "use_smash": True}),
-    ("T1c", {"name": "LZ4 only",
+    ("T1c", {"name": "Fast tier only",
              "cmake_flags": {"SMASH_VERY_COLD_TICKS": "9999"}, "use_smash": True}),
     ("T2a", {"name": "No zero-deferred",
              "cmake_flags": {"SMASH_ABLATION_NO_ZERO_DEFERRED": "ON"}, "use_smash": True}),

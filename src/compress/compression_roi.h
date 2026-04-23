@@ -41,12 +41,13 @@ inline double roiEnvDouble(const char* name, double default_val) {
 
 struct AlgoProfile {
     CompressAlgo algo = CompressAlgo::NONE;
+    uint8_t  zstd_level = 0;      // zstd compression level (ignored if algo != ZSTD/ZSTD_DICT)
     uint16_t comp_mbs_hi = 0;     // compress throughput (MB/s) at high compressibility
     uint16_t comp_mbs_lo = 0;     // compress throughput (MB/s) at low compressibility
     uint16_t decomp_mbs_hi = 0;   // decompress throughput at high compressibility
     uint16_t decomp_mbs_lo = 0;   // decompress throughput at low compressibility
     uint8_t  min_cold_ticks = 0;  // minimum cold ticks before considering this algo
-    uint8_t  ratio_scale_num = 1; // expected ratio vs LZ4 baseline (num/den)
+    uint8_t  ratio_scale_num = 1; // expected ratio vs fast-tier baseline (num/den)
     uint8_t  ratio_scale_den = 1;
 
     // Linear interpolation: better compression ratio -> higher throughput.
@@ -188,14 +189,18 @@ struct ROIConfig {
     }
 
 private:
-    // Calibration data (stored for file save)
+    // Calibration data (stored for file save).
+    //
+    // "fast" = the fast-tier algorithm actually run at compression time
+    //   (LZ4 when kUseLz4FastTier, else zstd-1).
+    // "deep" = zstd at kZstdDeepLevel (always).
     struct CalData {
-        uint16_t lz4_comp_hi = 3900, lz4_comp_lo = 500;
-        uint16_t lz4_decomp_hi = 25000, lz4_decomp_lo = 3000;
-        uint16_t zstd_comp_hi = 700, zstd_comp_lo = 45;
-        uint16_t zstd_decomp_hi = 3800, zstd_decomp_lo = 1100;
-        double lz4_ratio_zeros = 0.016, lz4_ratio_random = 1.0;
-        double zstd_ratio_zeros = 0.010, zstd_ratio_random = 1.0;
+        uint16_t fast_comp_hi = 2000, fast_comp_lo = 100;     // zstd-1 defaults
+        uint16_t fast_decomp_hi = 4400, fast_decomp_lo = 1600;
+        uint16_t deep_comp_hi = 700, deep_comp_lo = 45;
+        uint16_t deep_decomp_hi = 3800, deep_decomp_lo = 1100;
+        double fast_ratio_zeros = 0.011, fast_ratio_random = 1.0;
+        double deep_ratio_zeros = 0.010, deep_ratio_random = 1.0;
     } cal_;
 
     void useDefaults() {
@@ -205,37 +210,52 @@ private:
     void buildProfiles() {
         num_profiles = 0;
 
-        // LZ4 profile
-        profiles[num_profiles++] = AlgoProfile{
-            CompressAlgo::LZ4,
-            cal_.lz4_comp_hi, cal_.lz4_comp_lo,
-            cal_.lz4_decomp_hi, cal_.lz4_decomp_lo,
-            static_cast<uint8_t>(
-                cold_ticks_floor > 255 ? 255 : cold_ticks_floor),
-            1, 1
-        };
+        // Fast-tier profile.  algo and zstd_level match what compressPage()
+        // will actually invoke; calibration data reflects that same algo.
+        AlgoProfile fast{};
+        if constexpr (kUseLz4FastTier) {
+            fast.algo = CompressAlgo::LZ4;
+            fast.zstd_level = 0;
+        } else {
+            fast.algo = CompressAlgo::ZSTD;
+            fast.zstd_level = kZstdFastLevel;
+        }
+        fast.comp_mbs_hi   = cal_.fast_comp_hi;
+        fast.comp_mbs_lo   = cal_.fast_comp_lo;
+        fast.decomp_mbs_hi = cal_.fast_decomp_hi;
+        fast.decomp_mbs_lo = cal_.fast_decomp_lo;
+        fast.min_cold_ticks = static_cast<uint8_t>(
+            cold_ticks_floor > 255 ? 255 : cold_ticks_floor);
+        fast.ratio_scale_num = 1;
+        fast.ratio_scale_den = 1;
+        profiles[num_profiles++] = fast;
 
-        // ZSTD profile — compute ratio scale from calibration data
+        // Deep-tier profile (zstd at kZstdDeepLevel).
+        // Scale the observed fast-tier ratio to estimate deep-tier ratio.
         uint8_t scale_num = 1, scale_den = 1;
-        if (cal_.lz4_ratio_zeros > 0.001 && cal_.zstd_ratio_zeros > 0.001) {
-            double lz4_sav = 1.0 - cal_.lz4_ratio_zeros;
-            double zstd_sav = 1.0 - cal_.zstd_ratio_zeros;
-            if (lz4_sav > 0.01) {
-                double scale = zstd_sav / lz4_sav;
+        if (cal_.fast_ratio_zeros > 0.001 && cal_.deep_ratio_zeros > 0.001) {
+            double fast_sav = 1.0 - cal_.fast_ratio_zeros;
+            double deep_sav = 1.0 - cal_.deep_ratio_zeros;
+            if (fast_sav > 0.01) {
+                double scale = deep_sav / fast_sav;
                 if      (scale >= 1.5)  { scale_num = 3;  scale_den = 2; }
                 else if (scale >= 1.3)  { scale_num = 4;  scale_den = 3; }
                 else if (scale >= 1.1)  { scale_num = 11; scale_den = 10; }
             }
         }
 
-        profiles[num_profiles++] = AlgoProfile{
-            CompressAlgo::ZSTD,
-            cal_.zstd_comp_hi, cal_.zstd_comp_lo,
-            cal_.zstd_decomp_hi, cal_.zstd_decomp_lo,
-            static_cast<uint8_t>(
-                very_cold_ticks > 255 ? 255 : very_cold_ticks),
-            scale_num, scale_den
-        };
+        AlgoProfile deep{};
+        deep.algo = CompressAlgo::ZSTD;
+        deep.zstd_level = kZstdDeepLevel;
+        deep.comp_mbs_hi   = cal_.deep_comp_hi;
+        deep.comp_mbs_lo   = cal_.deep_comp_lo;
+        deep.decomp_mbs_hi = cal_.deep_decomp_hi;
+        deep.decomp_mbs_lo = cal_.deep_decomp_lo;
+        deep.min_cold_ticks = static_cast<uint8_t>(
+            very_cold_ticks > 255 ? 255 : very_cold_ticks);
+        deep.ratio_scale_num = scale_num;
+        deep.ratio_scale_den = scale_den;
+        profiles[num_profiles++] = deep;
     }
 
     void calibrate(CompressEngine* engine) {
@@ -321,7 +341,7 @@ private:
                     last_comp_size};
         };
 
-        auto benchZSTD = [&](void* page) -> TimingResult {
+        auto benchZstdAtLevel = [&](void* page, int level) -> TimingResult {
             double comp_times[kCalIters], decomp_times[kCalIters];
             size_t last_comp_size = 0;
 
@@ -329,7 +349,7 @@ private:
                 auto t0 = Clock::now();
                 size_t csz = ZSTD_compressCCtx(
                     zstd_cctx, comp_buf, max_comp,
-                    page, kPageSize, kZstdDeepLevel);
+                    page, kPageSize, level);
                 auto t1 = Clock::now();
                 comp_times[iter] = std::chrono::duration<double, std::micro>(
                     t1 - t0).count();
@@ -359,57 +379,63 @@ private:
                 std::min(mbs, 60000.0));
         };
 
-        // Benchmark LZ4
-        auto lz4_zeros  = benchLZ4(zeros_page);
-        auto lz4_random = benchLZ4(random_page);
-        cal_.lz4_comp_hi   = toMBps(lz4_zeros.comp_us);
-        cal_.lz4_comp_lo   = toMBps(lz4_random.comp_us);
-        cal_.lz4_decomp_hi = toMBps(lz4_zeros.decomp_us);
-        cal_.lz4_decomp_lo = toMBps(lz4_random.decomp_us);
-        cal_.lz4_ratio_zeros  = lz4_zeros.comp_size > 0
-            ? static_cast<double>(lz4_zeros.comp_size) / kPageSize : 1.0;
-        cal_.lz4_ratio_random = lz4_random.comp_size > 0
-            ? static_cast<double>(lz4_random.comp_size) / kPageSize : 1.0;
+        // Benchmark the fast tier (LZ4 or zstd-1 depending on build config).
+        TimingResult fast_zeros, fast_random;
+        if constexpr (kUseLz4FastTier) {
+            fast_zeros  = benchLZ4(zeros_page);
+            fast_random = benchLZ4(random_page);
+        } else {
+            fast_zeros  = benchZstdAtLevel(zeros_page, kZstdFastLevel);
+            fast_random = benchZstdAtLevel(random_page, kZstdFastLevel);
+        }
+        cal_.fast_comp_hi   = toMBps(fast_zeros.comp_us);
+        cal_.fast_comp_lo   = toMBps(fast_random.comp_us);
+        cal_.fast_decomp_hi = toMBps(fast_zeros.decomp_us);
+        cal_.fast_decomp_lo = toMBps(fast_random.decomp_us);
+        cal_.fast_ratio_zeros  = fast_zeros.comp_size > 0
+            ? static_cast<double>(fast_zeros.comp_size) / kPageSize : 1.0;
+        cal_.fast_ratio_random = fast_random.comp_size > 0
+            ? static_cast<double>(fast_random.comp_size) / kPageSize : 1.0;
 
-        // Benchmark ZSTD
-        auto zstd_zeros  = benchZSTD(zeros_page);
-        auto zstd_random = benchZSTD(random_page);
-        cal_.zstd_comp_hi   = toMBps(zstd_zeros.comp_us);
-        cal_.zstd_comp_lo   = toMBps(zstd_random.comp_us);
-        cal_.zstd_decomp_hi = toMBps(zstd_zeros.decomp_us);
-        cal_.zstd_decomp_lo = toMBps(zstd_random.decomp_us);
-        cal_.zstd_ratio_zeros  = zstd_zeros.comp_size > 0
-            ? static_cast<double>(zstd_zeros.comp_size) / kPageSize : 1.0;
-        cal_.zstd_ratio_random = zstd_random.comp_size > 0
-            ? static_cast<double>(zstd_random.comp_size) / kPageSize : 1.0;
+        // Benchmark the deep tier (zstd at kZstdDeepLevel).
+        auto deep_zeros  = benchZstdAtLevel(zeros_page, kZstdDeepLevel);
+        auto deep_random = benchZstdAtLevel(random_page, kZstdDeepLevel);
+        cal_.deep_comp_hi   = toMBps(deep_zeros.comp_us);
+        cal_.deep_comp_lo   = toMBps(deep_random.comp_us);
+        cal_.deep_decomp_hi = toMBps(deep_zeros.decomp_us);
+        cal_.deep_decomp_lo = toMBps(deep_random.decomp_us);
+        cal_.deep_ratio_zeros  = deep_zeros.comp_size > 0
+            ? static_cast<double>(deep_zeros.comp_size) / kPageSize : 1.0;
+        cal_.deep_ratio_random = deep_random.comp_size > 0
+            ? static_cast<double>(deep_random.comp_size) / kPageSize : 1.0;
 
         buildProfiles();
     }
 
     void applyEnvOverrides() {
-        for (int i = 0; i < num_profiles; ++i) {
-            auto& p = profiles[i];
-            if (p.algo == CompressAlgo::LZ4) {
-                const char* v;
-                if ((v = std::getenv("SMASH_LZ4_COMP_MBS_HI")))
-                    p.comp_mbs_hi = static_cast<uint16_t>(std::atoi(v));
-                if ((v = std::getenv("SMASH_LZ4_COMP_MBS_LO")))
-                    p.comp_mbs_lo = static_cast<uint16_t>(std::atoi(v));
-                if ((v = std::getenv("SMASH_LZ4_DECOMP_MBS_HI")))
-                    p.decomp_mbs_hi = static_cast<uint16_t>(std::atoi(v));
-                if ((v = std::getenv("SMASH_LZ4_DECOMP_MBS_LO")))
-                    p.decomp_mbs_lo = static_cast<uint16_t>(std::atoi(v));
-            } else if (p.algo == CompressAlgo::ZSTD) {
-                const char* v;
-                if ((v = std::getenv("SMASH_ZSTD_COMP_MBS_HI")))
-                    p.comp_mbs_hi = static_cast<uint16_t>(std::atoi(v));
-                if ((v = std::getenv("SMASH_ZSTD_COMP_MBS_LO")))
-                    p.comp_mbs_lo = static_cast<uint16_t>(std::atoi(v));
-                if ((v = std::getenv("SMASH_ZSTD_DECOMP_MBS_HI")))
-                    p.decomp_mbs_hi = static_cast<uint16_t>(std::atoi(v));
-                if ((v = std::getenv("SMASH_ZSTD_DECOMP_MBS_LO")))
-                    p.decomp_mbs_lo = static_cast<uint16_t>(std::atoi(v));
-            }
+        // profiles[0] is the fast tier, profiles[1] is the deep tier.
+        const char* v;
+        if (num_profiles >= 1) {
+            auto& p = profiles[0];
+            if ((v = std::getenv("SMASH_FAST_COMP_MBS_HI")))
+                p.comp_mbs_hi = static_cast<uint16_t>(std::atoi(v));
+            if ((v = std::getenv("SMASH_FAST_COMP_MBS_LO")))
+                p.comp_mbs_lo = static_cast<uint16_t>(std::atoi(v));
+            if ((v = std::getenv("SMASH_FAST_DECOMP_MBS_HI")))
+                p.decomp_mbs_hi = static_cast<uint16_t>(std::atoi(v));
+            if ((v = std::getenv("SMASH_FAST_DECOMP_MBS_LO")))
+                p.decomp_mbs_lo = static_cast<uint16_t>(std::atoi(v));
+        }
+        if (num_profiles >= 2) {
+            auto& p = profiles[1];
+            if ((v = std::getenv("SMASH_DEEP_COMP_MBS_HI")))
+                p.comp_mbs_hi = static_cast<uint16_t>(std::atoi(v));
+            if ((v = std::getenv("SMASH_DEEP_COMP_MBS_LO")))
+                p.comp_mbs_lo = static_cast<uint16_t>(std::atoi(v));
+            if ((v = std::getenv("SMASH_DEEP_DECOMP_MBS_HI")))
+                p.decomp_mbs_hi = static_cast<uint16_t>(std::atoi(v));
+            if ((v = std::getenv("SMASH_DEEP_DECOMP_MBS_LO")))
+                p.decomp_mbs_lo = static_cast<uint16_t>(std::atoi(v));
         }
     }
 
@@ -444,31 +470,31 @@ private:
 
         int v;
         double d;
-        if ((v = extractUint("\"lz4_comp_mbs_hi\""))   >= 0)
-            cal_.lz4_comp_hi   = static_cast<uint16_t>(v);
-        if ((v = extractUint("\"lz4_comp_mbs_lo\""))   >= 0)
-            cal_.lz4_comp_lo   = static_cast<uint16_t>(v);
-        if ((v = extractUint("\"lz4_decomp_mbs_hi\"")) >= 0)
-            cal_.lz4_decomp_hi = static_cast<uint16_t>(v);
-        if ((v = extractUint("\"lz4_decomp_mbs_lo\"")) >= 0)
-            cal_.lz4_decomp_lo = static_cast<uint16_t>(v);
-        if ((v = extractUint("\"zstd_comp_mbs_hi\""))  >= 0)
-            cal_.zstd_comp_hi  = static_cast<uint16_t>(v);
-        if ((v = extractUint("\"zstd_comp_mbs_lo\""))  >= 0)
-            cal_.zstd_comp_lo  = static_cast<uint16_t>(v);
-        if ((v = extractUint("\"zstd_decomp_mbs_hi\""))>= 0)
-            cal_.zstd_decomp_hi= static_cast<uint16_t>(v);
-        if ((v = extractUint("\"zstd_decomp_mbs_lo\""))>= 0)
-            cal_.zstd_decomp_lo= static_cast<uint16_t>(v);
+        if ((v = extractUint("\"fast_comp_mbs_hi\""))   >= 0)
+            cal_.fast_comp_hi   = static_cast<uint16_t>(v);
+        if ((v = extractUint("\"fast_comp_mbs_lo\""))   >= 0)
+            cal_.fast_comp_lo   = static_cast<uint16_t>(v);
+        if ((v = extractUint("\"fast_decomp_mbs_hi\"")) >= 0)
+            cal_.fast_decomp_hi = static_cast<uint16_t>(v);
+        if ((v = extractUint("\"fast_decomp_mbs_lo\"")) >= 0)
+            cal_.fast_decomp_lo = static_cast<uint16_t>(v);
+        if ((v = extractUint("\"deep_comp_mbs_hi\""))  >= 0)
+            cal_.deep_comp_hi  = static_cast<uint16_t>(v);
+        if ((v = extractUint("\"deep_comp_mbs_lo\""))  >= 0)
+            cal_.deep_comp_lo  = static_cast<uint16_t>(v);
+        if ((v = extractUint("\"deep_decomp_mbs_hi\""))>= 0)
+            cal_.deep_decomp_hi= static_cast<uint16_t>(v);
+        if ((v = extractUint("\"deep_decomp_mbs_lo\""))>= 0)
+            cal_.deep_decomp_lo= static_cast<uint16_t>(v);
 
-        if ((d = extractDouble("\"lz4_ratio_zeros\""))  >= 0)
-            cal_.lz4_ratio_zeros  = d;
-        if ((d = extractDouble("\"lz4_ratio_random\"")) >= 0)
-            cal_.lz4_ratio_random = d;
-        if ((d = extractDouble("\"zstd_ratio_zeros\"")) >= 0)
-            cal_.zstd_ratio_zeros = d;
-        if ((d = extractDouble("\"zstd_ratio_random\""))>= 0)
-            cal_.zstd_ratio_random= d;
+        if ((d = extractDouble("\"fast_ratio_zeros\""))  >= 0)
+            cal_.fast_ratio_zeros  = d;
+        if ((d = extractDouble("\"fast_ratio_random\"")) >= 0)
+            cal_.fast_ratio_random = d;
+        if ((d = extractDouble("\"deep_ratio_zeros\"")) >= 0)
+            cal_.deep_ratio_zeros = d;
+        if ((d = extractDouble("\"deep_ratio_random\""))>= 0)
+            cal_.deep_ratio_random= d;
 
         buildProfiles();
         return true;
@@ -481,18 +507,18 @@ private:
         std::fprintf(f, "{\n");
         std::fprintf(f, "  \"page_size\": %zu,\n",
                      static_cast<size_t>(kPageSize));
-        std::fprintf(f, "  \"lz4_comp_mbs_hi\": %u,\n", cal_.lz4_comp_hi);
-        std::fprintf(f, "  \"lz4_comp_mbs_lo\": %u,\n", cal_.lz4_comp_lo);
-        std::fprintf(f, "  \"lz4_decomp_mbs_hi\": %u,\n", cal_.lz4_decomp_hi);
-        std::fprintf(f, "  \"lz4_decomp_mbs_lo\": %u,\n", cal_.lz4_decomp_lo);
-        std::fprintf(f, "  \"lz4_ratio_zeros\": %.6f,\n", cal_.lz4_ratio_zeros);
-        std::fprintf(f, "  \"lz4_ratio_random\": %.6f,\n",cal_.lz4_ratio_random);
-        std::fprintf(f, "  \"zstd_comp_mbs_hi\": %u,\n", cal_.zstd_comp_hi);
-        std::fprintf(f, "  \"zstd_comp_mbs_lo\": %u,\n", cal_.zstd_comp_lo);
-        std::fprintf(f, "  \"zstd_decomp_mbs_hi\": %u,\n",cal_.zstd_decomp_hi);
-        std::fprintf(f, "  \"zstd_decomp_mbs_lo\": %u,\n",cal_.zstd_decomp_lo);
-        std::fprintf(f, "  \"zstd_ratio_zeros\": %.6f,\n",cal_.zstd_ratio_zeros);
-        std::fprintf(f, "  \"zstd_ratio_random\": %.6f\n",cal_.zstd_ratio_random);
+        std::fprintf(f, "  \"fast_comp_mbs_hi\": %u,\n", cal_.fast_comp_hi);
+        std::fprintf(f, "  \"fast_comp_mbs_lo\": %u,\n", cal_.fast_comp_lo);
+        std::fprintf(f, "  \"fast_decomp_mbs_hi\": %u,\n", cal_.fast_decomp_hi);
+        std::fprintf(f, "  \"fast_decomp_mbs_lo\": %u,\n", cal_.fast_decomp_lo);
+        std::fprintf(f, "  \"fast_ratio_zeros\": %.6f,\n", cal_.fast_ratio_zeros);
+        std::fprintf(f, "  \"fast_ratio_random\": %.6f,\n",cal_.fast_ratio_random);
+        std::fprintf(f, "  \"deep_comp_mbs_hi\": %u,\n", cal_.deep_comp_hi);
+        std::fprintf(f, "  \"deep_comp_mbs_lo\": %u,\n", cal_.deep_comp_lo);
+        std::fprintf(f, "  \"deep_decomp_mbs_hi\": %u,\n",cal_.deep_decomp_hi);
+        std::fprintf(f, "  \"deep_decomp_mbs_lo\": %u,\n",cal_.deep_decomp_lo);
+        std::fprintf(f, "  \"deep_ratio_zeros\": %.6f,\n",cal_.deep_ratio_zeros);
+        std::fprintf(f, "  \"deep_ratio_random\": %.6f\n",cal_.deep_ratio_random);
         std::fprintf(f, "}\n");
         std::fclose(f);
     }
@@ -529,42 +555,52 @@ inline bool shouldCompress(uint8_t cold_count,
     return roi >= cfg.roi_threshold;
 }
 
-// Select the best compression algorithm for this page.
-inline CompressAlgo selectAlgorithm(uint8_t cold_count,
-                                     uint8_t stats_count, uint16_t stats_sum,
-                                     CompressEngine* engine, uint8_t sc) {
+// Select the best profile for this page.  Returns a pointer into the
+// ROIConfig's profiles array; caller reads profile->algo and
+// profile->zstd_level to drive compressPage().
+//
+// When enough samples are available, picks the profile with the highest
+// ROI above the per-profile cold-tick threshold.  Otherwise falls back
+// to the fast tier (profile 0).
+inline const AlgoProfile* selectProfile(uint8_t cold_count,
+                                         uint8_t stats_count,
+                                         uint16_t stats_sum) {
     auto& cfg = ROIConfig::instance();
+    if (cfg.num_profiles == 0) return nullptr;
 
-    // Not enough data for comparison — default to LZ4 or dict
-    if (cfg.num_profiles <= 1 || stats_count < 8) {
-        if (engine && engine->hasDictionary(sc) &&
-            cold_count >= cfg.very_cold_ticks)
-            return CompressAlgo::ZSTD_DICT;
-        return CompressAlgo::LZ4;
+    if (cfg.num_profiles == 1 || stats_count < 8) {
+        return &cfg.profiles[0];
     }
 
     uint16_t base_ratio = stats_sum / stats_count;
 
-    // Evaluate all profiles, pick highest ROI
-    CompressAlgo best_algo = CompressAlgo::LZ4;
+    const AlgoProfile* best = &cfg.profiles[0];
     uint32_t best_roi = 0;
-
     for (int i = 0; i < cfg.num_profiles; ++i) {
         const auto& p = cfg.profiles[i];
         if (cold_count < p.min_cold_ticks) continue;
         uint32_t roi = p.computeROI(cold_count, base_ratio);
         if (roi > best_roi) {
             best_roi = roi;
-            best_algo = p.algo;
+            best = &p;
         }
     }
+    return best;
+}
 
-    // If zstd won and we have a dict, prefer ZSTD_DICT
-    if (best_algo == CompressAlgo::ZSTD &&
+// Back-compat wrapper: return just the algorithm.  When the winning
+// profile is ZSTD and a trained dictionary exists for this size class,
+// switch to ZSTD_DICT (dict is applied at the deep level only).
+inline CompressAlgo selectAlgorithm(uint8_t cold_count,
+                                     uint8_t stats_count, uint16_t stats_sum,
+                                     CompressEngine* engine, uint8_t sc) {
+    const AlgoProfile* p = selectProfile(cold_count, stats_count, stats_sum);
+    if (!p) return CompressAlgo::NONE;
+    CompressAlgo algo = p->algo;
+    if (algo == CompressAlgo::ZSTD && p->zstd_level == kZstdDeepLevel &&
         engine && engine->hasDictionary(sc))
-        best_algo = CompressAlgo::ZSTD_DICT;
-
-    return best_algo;
+        algo = CompressAlgo::ZSTD_DICT;
+    return algo;
 }
 
 } // namespace CompressionROI

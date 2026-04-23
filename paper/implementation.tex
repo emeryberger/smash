@@ -21,10 +21,14 @@ framework~\cite{berger2025alloc8} to replace all allocation operations
 \subsection{Parallel Compressor}
 \label{sec:impl:parallel}
 
-The compressor uses a coordinator-worker model with
-two parallel workers (configurable).  The coordinator thread wakes
-every second, partitions the committed page range across workers,
-and dispatches all three phases.
+The compressor uses a coordinator-worker model.  The coordinator
+thread wakes every second, partitions the committed page range
+across the currently active workers, and dispatches all three
+phases.  The active worker count is set adaptively each tick using
+Little's Law (\S\ref{sec:impl:little}); workers are pre-allocated
+up to \tcode{kMaxCompressorWorkers} (default~8) with helper threads
+lazily created on first scale-up and parked when
+idle.
 
 \paragraph{Chunk bitmap}  Rather than scanning all committed
 pages linearly, the compressor maintains a bitmap with one bit per
@@ -42,24 +46,54 @@ sharded compressed data~store.
 \paragraph{Sharded CompressStore}  Compressed page data is stored
 in a pool with 8~independent shards, each with its own spinlock
 and bump allocator.  Allocations are exact-size with 16-byte
-alignment---no power-of-two rounding---so a 500-byte compressed
-blob consumes exactly 512~bytes (rounded to alignment), not
-1\,KiB.  Pages are assigned to shards by index modulo~8.
-Each shard's backing regions (16\,MiB each) track live bytes;
-when a region's live bytes drop to zero, its data pages are
-decommitted (\tcode{MADV\_\allowbreak FREE} on macOS, \tcode{MADV\_\allowbreak DONTNEED}
-on Linux), releasing physical memory while preserving the virtual
-mapping.  With two workers and eight shards, lock contention is
-near~zero.
+alignment rather than power-of-two rounding, so a 500-byte
+compressed blob consumes exactly 512~bytes (rounded to alignment)
+rather than 1\,KiB.  Pages are assigned to shards by index
+modulo~8.  Each shard's backing regions (16\,MiB each) track live
+bytes; when a region's live bytes drop to zero, its data pages are
+decommitted (\tcode{MADV\_\allowbreak FREE\_\allowbreak REUSABLE} on
+macOS, \tcode{MADV\_\allowbreak DONTNEED} on Linux), releasing
+physical memory while preserving the virtual mapping.  With up to
+eight workers and eight shards, lock contention is near~zero.
 
-\paragraph{In-place upgrade}  When a page compressed with
-zstd-1 reaches the deep-compression threshold, Phase~2 attempts
-zstd-9 re-compression.  If the result is smaller, the compressor
-overwrites the existing blob in place---the new data always fits
-within the original allocation since it is strictly smaller.  This
-avoids a release-then-store cycle that would fragment the bump
-allocator's regions (released space cannot be reclaimed until all
-blobs in a region are freed).
+\paragraph{Adaptive worker scaling via Little's Law}
+\label{sec:impl:little}
+The right number of workers depends on the workload.  An idle
+program needs one; a bulk-allocation phase may need several.
+With too few workers, the compression queue grows faster than it
+drains and cold pages stay uncompressed.  With too many, idle
+helpers consume CPU and scheduler bandwidth for no gain.
+\sys sizes the worker pool each tick by treating the compressor
+as a simple queueing system and applying Little's Law.
+
+Let $\lambda$ be the rate at which pages become eligible for
+compression (cold-count reaches the threshold and the ROI model
+accepts) and $\mu$ be the rate at which a single worker compresses
+pages.  For a stable queue with expected length $L$ and expected
+wait $W$, $L = \lambda W$; equivalently, to keep the queue drained
+($L \to 0$), the aggregate service rate across $N$ workers must
+match arrival, $N \mu \geq \lambda$.  \sys uses the tight~bound,
+\[
+  N_{\mathit{needed}} \;=\; \left\lceil \lambda / \mu \right\rceil,
+\]
+clamped to $[1, \tcode{kMaxCompressorWorkers}]$.  Both quantities
+are measured in pages per tick; units cancel, so
+$N_{\mathit{needed}}$ depends only on the arrival-to-service ratio
+and not on the tick length.  Each worker maintains two atomic
+counters per tick (pages eligible, pages compressed), which the
+coordinator sums after dispatch.  Per-worker throughput $\mu$ is
+the tick's $\mathit{total\_compressed} / N$.  Both $\lambda$ and
+$\mu$ are smoothed with an exponential moving average computed in
+fixed point to avoid floating-point in the compressor:
+$\mathrm{ema} \mathrel{+}= (\mathrm{sample} - \mathrm{ema})/4$.
+The resulting four-tick response is fast enough to track phase
+changes (e.g., load versus serve) and slow enough to avoid
+oscillation on a single noisy tick.  \sys only updates $\mu$ on
+ticks with work, so that idle periods do not decay it to zero and
+cause spurious scale-up when work resumes.  Pre-allocating the
+worker state array and lazily \texttt{pthread\_create}-ing helpers
+avoids allocator reentrancy during a scale-up inside the
+compression~path.
 
 \begin{figure}[t]
 \begin{algorithmic}[1]
@@ -87,14 +121,18 @@ blobs in a region are freed).
 \Statex
 \Function{CompressPage}{$p$}
   \State \Call{Lock}{$p$};\; $\mathit{state}[p] \gets$ \textsc{compressing}
-  \State $\mathit{buf} \gets$ copy page into worker scratch buffer
-  \State zero freed slots in $\mathit{buf}$ (non-temporal stores)
-  \State \Call{mprotect}{$p$, \textsc{prot\_none}}
   \State $R \gets \Call{AvgRatio}{\mathit{sc}}$
   \Comment{from sliding window}
   \If{$\Call{ROI}{\mathit{cold}[p], R} < \textsc{Threshold}$}
-    \State restore page;\; \Call{Unlock}{$p$};\; \Return
+    \State $\mathit{state}[p] \gets$ \textsc{active};\; \Call{Unlock}{$p$};\; \Return
   \EndIf
+  \State \Call{mprotect}{$p$, \textsc{prot\_read}}
+  \Comment{snapshot}
+  \State $\mathit{buf} \gets$ copy page into worker scratch buffer
+  \State zero freed slots in $\mathit{buf}$ (non-temporal stores)
+  \State \Call{Decommit}{$p$}
+  \Comment{before \textsc{prot\_none}}
+  \State \Call{mprotect}{$p$, \textsc{prot\_none}}
   \State $\mathit{algo} \gets \Call{BestAlgo}{\mathit{cold}[p], R}$
   \Comment{highest-ROI algorithm}
   \State $\mathit{blob} \gets \Call{Compress}{\mathit{buf}, \mathit{algo}}$
@@ -104,22 +142,35 @@ blobs in a region are freed).
       \State $\mathit{blob} \gets \Call{Compress}{\mathit{buf},\;\text{zstd-9}}$
     \EndIf
     \If{$|\mathit{blob}| > \textsc{MinRatio} \times \textsc{PageSize}$}
-      \State restore page;\; \Call{Unlock}{$p$};\; \Return
+      \State restore $p$ from $\mathit{buf}$;\; \Call{Unlock}{$p$};\; \Return
     \EndIf
   \EndIf
   \State store $\mathit{blob}$ in sharded \textsc{CompressStore}
-  \State \Call{Decommit}{$p$};\; $\mathit{state}[p] \gets$ \textsc{compressed}
-  \State \Call{Unlock}{$p$}
+  \State $\mathit{state}[p] \gets$ \textsc{compressed};\; \Call{Unlock}{$p$}
 \EndFunction
 \end{algorithmic}
 \caption{\textbf{Background compressor tick}
   (\S\ref{sec:impl:parallel}).  Three phases run in parallel
   across disjoint page ranges.  \textsc{CompressPage} zeros freed
-  slots lazily, uses the ROI model to decide whether to compress
-  and which algorithm to use, and decommits the physical page on
-  success.}
+  slots lazily, decommits the physical page, and then uses the
+  compression result to decide whether to store a compressed blob
+  or restore the page from the scratch buffer.}
 \label{fig:algo:compress}
 \end{figure}
+
+\paragraph{Physical page reclamation}
+Marking a page \texttt{PROT\_NONE} prevents access but does not
+release its physical backing.  \sys releases the backing with
+\texttt{madvise}.  On Linux it calls
+\texttt{madvise(MADV\_\allowbreak DONTNEED)}.
+On macOS it calls
+\texttt{madvise(MADV\_\allowbreak FREE\_\allowbreak REUSABLE)},
+the hint that actually returns frames to the kernel (this is what
+jemalloc and WebKit use).  The macOS hint fails with
+\texttt{EPERM} on \texttt{PROT\_NONE} pages, so \sys issues the
+\texttt{madvise} call while the page is still \texttt{PROT\_READ}
+and then transitions it to \texttt{PROT\_NONE}
+(Figure~\ref{fig:algo:compress}).
 
 \subsection{Fault Handler}
 \label{sec:impl:fault}
@@ -176,7 +227,7 @@ acquires a slot via compare-and-swap, decompresses into the slot's
 buffer, copies the result to the faulting page, and releases the slot.
 If all slots are in use, the handler spin-waits with
 architecture-specific pause instructions (\tcode{pause} on x86, \tcode{yield} on ARM) until
-a slot becomes available---since the thread is already blocked on the
+a slot becomes available.  Since the thread is already blocked on the
 page fault, it cannot proceed without decompressing.  Prefetch, which is
 an optional optimization, instead skips any page for which no slot is
 available.  This design supports high-concurrency workloads (e.g.,
@@ -292,6 +343,47 @@ annotations, since the library is compiled with hidden visibility
 by default; without this, the dynamic linker cannot see the
 wrapper symbols for~interposition.
 
+\subsection{Coexisting with a Host Allocator}
+\label{sec:impl:largeonly}
+
+Some language runtimes ship their own small-object allocator.
+CPython~3.13, for example, builds mimalloc into the interpreter and
+routes Python-level allocations through it unless
+\texttt{PYTHONMALLOC=malloc} is set.  Under full \sys interposition
+the interpreter's small-object path is redirected to \sys regardless
+of what the runtime would prefer, which is both slower and
+unhelpful (the small objects are hot and rarely compress).  \sys
+therefore offers a \emph{large-only} mode, enabled with
+\texttt{SMASH\_\allowbreak LARGE\_\allowbreak ONLY=1}: allocations
+up to \texttt{kMaxSmallSize} (16\,KiB, matching the boundary between
+slab and large-allocation classes) pass through to the host
+allocator, and only requests above that threshold go through \sys's
+slab and compressible VM region.  \texttt{free} and
+\texttt{malloc\_size}/\texttt{malloc\_\allowbreak usable\_\allowbreak size}
+consult the page map first and delegate to the host allocator when
+the pointer is not \sys-managed.
+
+\paragraph{Locating the host allocator on macOS}
+Passthrough requires calling the \emph{unwrapped} system malloc,
+but DYLD interposition is truly global on macOS: once \sys's
+library is loaded, every call site for \texttt{malloc}, including
+\texttt{dlsym(RTLD\_\allowbreak NEXT, \allowbreak"malloc")} and
+even
+\texttt{dlopen("libsystem\_malloc.dylib")+\allowbreak dlsym}, is
+rewritten to point at \sys's wrapper.  To recover the original
+function pointer, \sys scans the Mach-O \texttt{\_\_interpose}
+section at runtime.  Each interpose entry is a
+\texttt{\{replacement,\allowbreak\ original\}} pair; \sys walks the
+section, matches its own wrapper address as the replacement, and
+reads the paired original.  On ARM64e (Apple Silicon) the section
+specified in source as \texttt{\_\_DATA,\_\_interpose} is
+relocated by the linker to \texttt{\_\_AUTH\_CONST,\_\_interpose}
+to accommodate authenticated pointer signing, so \sys scans both
+segments.  Linux has no equivalent issue: symbols resolved with
+\texttt{dlsym(RTLD\_\allowbreak NEXT,~...)} return the next
+definition in the search order, bypassing
+\texttt{LD\_\allowbreak PRELOAD}.
+
 \subsection{Formal Verification}
 \label{sec:impl:formal}
 
@@ -314,11 +406,12 @@ state variables.  The TLC model checker exhaustively explores
 all interleavings.
 
 \paragraph{Safety invariants}  Two invariants are checked in every
-reachable state: (1)~\emph{BlobIntegrity}---a page is in
-\textsc{compressed} state if and only if a compressed blob exists and
-the physical page has been decommitted; and
-(2)~\emph{ProtectionConsistency}---page protection matches page
-state (e.g., \textsc{compressed} implies \texttt{PROT\_NONE}).
+reachable state.  \emph{BlobIntegrity} says that a page is in
+\textsc{compressed} state if and only if a compressed blob exists
+and the physical page has been decommitted.
+\emph{ProtectionConsistency} says that page protection matches
+page state (e.g., \textsc{compressed} implies
+\texttt{PROT\_NONE}).
 
 \paragraph{Liveness properties}  Under strong fairness, TLC verifies
 two liveness properties: (1)~every faulted thread eventually resumes,
@@ -326,11 +419,11 @@ and (2)~every sufficiently cold monitored page is eventually
 compressed or re-accessed.
 
 \paragraph{Bugs found and confirmed}  Model checking revealed that
-Phase~3's original state update---a plain store of
-\textsc{active\_monitoring}---was unsafe: between checking a page's
-state and writing the new state, a concurrent fault handler could
-transition the page to \textsc{active}, and the store would silently
-overwrite it.  The fix, now in the implementation, is a compare-and-swap
+Phase~3's original state update was unsafe.  The original code was
+a plain store of \textsc{active\_monitoring}: between checking a
+page's state and writing the new state, a concurrent fault handler
+could transition the page to \textsc{active}, and the store would
+silently overwrite it.  The fix, now in the implementation, is a compare-and-swap
 that abandons the transition if the page is no longer \textsc{active}.
 The model also proved that the fault handler can never observe a page
 in \textsc{compressing} state, because the compressor holds the

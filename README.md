@@ -76,6 +76,20 @@ DYLD_INSERT_LIBRARIES=./build/libsmash.dylib DYLD_FORCE_FLAT_NAMESPACE=1 ./your_
 LD_PRELOAD=./build/libsmash.so ./your_application
 ```
 
+### Large-Only Mode
+
+For applications with their own small-object allocator (e.g., Python 3.13+ uses mimalloc internally), Smash can manage only large allocations while letting the native allocator handle small objects:
+
+```bash
+# macOS
+SMASH_LARGE_ONLY=1 DYLD_INSERT_LIBRARIES=./build/libsmash.dylib ./your_application
+
+# Linux
+SMASH_LARGE_ONLY=1 LD_PRELOAD=./build/libsmash.so ./your_application
+```
+
+Allocations <= 16KB pass through to the system allocator; larger allocations go through Smash and are eligible for compression. This avoids interfering with language runtimes that have their own optimized small-object allocators.
+
 ### Compress-Only Mode
 
 For applications that use custom allocators (jemalloc, tcmalloc, etc.), Smash can run in compress-only mode where it only monitors and compresses pages without replacing malloc:

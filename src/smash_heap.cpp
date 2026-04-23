@@ -23,12 +23,11 @@ std::atomic<int> smash::g_thread_init_count{0};
 // ── System allocator function pointers for compress-only mode ───────────────
 smash::SystemAllocFns smash::g_system_alloc;
 
-// Early init: resolve system malloc/free before alloc8 interposition
+// Early init: resolve system malloc/free before alloc8 interposition.
+// Needed for compress-only mode and large-only mode (small alloc passthrough).
 __attribute__((constructor(50)))  // Run before alloc8 (priority 100)
 static void smash_resolve_system_alloc() {
-    if (smash::isCompressOnlyMode()) {
-        smash::g_system_alloc.resolve();
-    }
+    smash::g_system_alloc.resolve();
 }
 
 // ── Thread cache methods that depend on Slab ─────────────────────────────────

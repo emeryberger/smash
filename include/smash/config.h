@@ -270,4 +270,17 @@ inline bool isCompressOnlyMode() {
     return getSmashMode() == SmashMode::CompressOnly;
 }
 
+// ── Large-only mode ─────────────────────────────────────────────────────────
+// Set SMASH_LARGE_ONLY=1 to only manage large allocations through Smash.
+// Small allocations (size <= kMaxSmallSize) pass through to the system
+// allocator.  This avoids interfering with language runtimes that use their
+// own small-object allocator (e.g. Python 3.13+ mimalloc).
+inline bool isLargeOnlyMode() {
+    static bool mode = []() {
+        const char* env = getenv("SMASH_LARGE_ONLY");
+        return env && env[0] == '1';
+    }();
+    return mode;
+}
+
 } // namespace smash

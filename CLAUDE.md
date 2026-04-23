@@ -93,13 +93,32 @@ __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 
 `g_page_pins` is a per-page atomic counter. Pages with pin count > 0 are skipped by both Phase 2 (compression) and Phase 3 (monitoring). Used by syscall wrappers to protect kernel buffers during blocking calls.
 
+## Large-Only Mode (`SMASH_LARGE_ONLY=1`)
+
+For applications with their own small-object allocator (e.g., Python 3.13+ uses mimalloc), set `SMASH_LARGE_ONLY=1` to only manage large allocations (> `kMaxSmallSize` = 16KB):
+
+- `malloc(size <= 16KB)` → system malloc passthrough
+- `malloc(size > 16KB)` → Smash's `LargeAlloc` → VmRegion (compressible)
+- `free(ptr)` checks `page_map_`; non-Smash pointers forwarded to system free
+- `getSize(ptr)` falls back to system `malloc_size`/`malloc_usable_size`
+
+### Resolving original system malloc on macOS
+
+On macOS, `dlsym(RTLD_NEXT, "malloc")` returns the interposed wrapper — DYLD interposition is truly global and cannot be bypassed via dlsym (even `dlopen("libsystem_malloc.dylib") + dlsym` returns the wrapper). To get the real system malloc, `SystemAllocFns::findOriginal()` scans the `__interpose` Mach-O section at runtime. On ARM64e (Apple Silicon), this section lives in `__AUTH_CONST` (not `__DATA`) due to pointer authentication. Each entry is `{replacement, original}` — match by replacement address, read the original.
+
+## macOS Page Reclamation
+
+`mprotect(PROT_NONE)` does NOT release physical memory on macOS — the RSS drop visible in `task_info` is a reporting artifact. To actually reclaim physical pages, use `MADV_FREE_REUSABLE` (madvise hint 7), which is what jemalloc and WebKit use. `MADV_FREE_REUSABLE` requires pages to be accessible (PROT_READ or PROT_RW); it fails with EPERM on PROT_NONE pages.
+
+The compressor flow calls `decommitPages()` (MADV_FREE_REUSABLE) **before** `mprotect(PROT_NONE)`, after the page data has been copied to the scratch buffer. On Linux, `MADV_DONTNEED` works regardless of protection.
+
 ## Key Conventions
 
 - Never allocate from the managed heap inside smash internals — use BootstrapAlloc
 - Data pages never contain metadata (bitmap-based free tracking, pointer arrays in thread cache)
 - Fine-grained locking: per-slab spinlocks, per-page spinlocks. No global heap lock. 4 arenas reduce slab lock contention.
 - `PageLockTable::tryLock()` used for prefetch to avoid deadlock
-- Compression deferred until second `threadInit()` call (avoids macOS ObjC runtime crash during early DYLD_INSERT init)
+- Compressor startup: constructor at priority 201 (after alloc8 pthread hooks at 200) calls `xxthread_init()` twice on macOS, once on Linux, ensuring the compressor starts even for non-ObjC programs (e.g., Python) and single-threaded programs
 - Fault handler handles ACTIVE state (not just ACTIVE_MONITORING) to cover the race where Phase 3's batched mprotect overwrites a per-page PROT_RW restoration
 - ThreadCache `drain()`/`drainAll()` bucket pointers by `span->arena_id` before returning to correct arena's slab
 
@@ -295,3 +314,8 @@ Key constants in `include/smash/config.h`:
 - `kCompressStoreShards = 8`: CompressStore lock shards
 - `kChunkSize = 64`: Pages per chunk for scan bitmap
 - `kLargeAllocVmThreshold = 1MB`: Only large allocs above this go in VmRegion
+
+Runtime environment variables:
+- `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc
+- `SMASH_MODE=compress_only`: Compress-only mode — track pages without replacing malloc
+- `SMASH_COLD_TIMEOUT_SEC=N`: Override cold timeout at runtime

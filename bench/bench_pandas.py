@@ -270,9 +270,9 @@ def run_pandas_benchmark(smash_lib=None, num_rows=2_000_000, num_cols=100,
             env["DYLD_INSERT_LIBRARIES"] = str(smash_lib)
         else:
             env["LD_PRELOAD"] = str(smash_lib)
-        # Python 3.13+ uses mimalloc internally; force system malloc so
-        # Smash's interposition captures all allocations.
-        env["PYTHONMALLOC"] = "malloc"
+        # Large-only mode: let Python's internal allocator (mimalloc in 3.13+)
+        # handle small objects; Smash only manages large allocations (NumPy arrays).
+        env["SMASH_LARGE_ONLY"] = "1"
         env["SMASH_VERY_COLD_TICKS"] = "5"
 
     config_name = "smash" if smash_lib else "baseline"

@@ -19,6 +19,10 @@
 #include <cstdint>
 #include <atomic>
 #include <dlfcn.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#endif
 
 namespace smash {
 
@@ -43,6 +47,7 @@ using FreeFn = void(*)(void*);
 using CallocFn = void*(*)(size_t, size_t);
 using ReallocFn = void*(*)(void*, size_t);
 using MemalignFn = int(*)(void**, size_t, size_t);
+using MallocSizeFn = size_t(*)(const void*);
 
 struct SystemAllocFns {
     MallocFn malloc = nullptr;
@@ -50,13 +55,66 @@ struct SystemAllocFns {
     CallocFn calloc = nullptr;
     ReallocFn realloc = nullptr;
     MemalignFn posix_memalign = nullptr;
+    MallocSizeFn malloc_size = nullptr;
+
+    // Find the pre-interposition original of a function by scanning the
+    // __DATA,__interpose section.  Each entry is {replacement, original}.
+    // Returns nullptr if not found.
+#if defined(__APPLE__)
+    static void* findOriginal(void* replacement) {
+        // The interpose section may be in __DATA or __AUTH_CONST (ARM64e).
+        static const char* segments[] = {"__AUTH_CONST", "__DATA"};
+        uint32_t n = _dyld_image_count();
+        for (uint32_t i = 0; i < n; i++) {
+            auto* hdr = reinterpret_cast<const struct mach_header_64*>(
+                _dyld_get_image_header(i));
+            if (!hdr) continue;
+            for (auto* seg : segments) {
+                unsigned long sz = 0;
+                auto* data = getsectiondata(hdr, seg, "__interpose", &sz);
+                if (!data || sz == 0) continue;
+                size_t count = sz / (2 * sizeof(void*));
+                auto* entries = reinterpret_cast<void* const*>(data);
+                for (size_t j = 0; j < count; j++) {
+                    if (entries[j * 2] == replacement)
+                        return entries[j * 2 + 1];
+                }
+            }
+        }
+        return nullptr;
+    }
+#endif
 
     void resolve() {
+#if defined(__APPLE__)
+        // On macOS, dlsym returns the interposed wrapper, not the real system
+        // function.  Read the original from the __DATA,__interpose section.
+        void* h = dlopen("/usr/lib/system/libsystem_malloc.dylib", RTLD_NOLOAD);
+        if (h) {
+            // Get the current (interposed) function addresses, then find
+            // their pre-interposition originals.
+            void* cur_malloc = dlsym(h, "malloc");
+            void* cur_free = dlsym(h, "free");
+            void* cur_calloc = dlsym(h, "calloc");
+            void* cur_realloc = dlsym(h, "realloc");
+            void* cur_memalign = dlsym(h, "posix_memalign");
+            void* cur_msize = dlsym(h, "malloc_size");
+
+            malloc = reinterpret_cast<MallocFn>(findOriginal(cur_malloc));
+            free = reinterpret_cast<FreeFn>(findOriginal(cur_free));
+            calloc = reinterpret_cast<CallocFn>(findOriginal(cur_calloc));
+            realloc = reinterpret_cast<ReallocFn>(findOriginal(cur_realloc));
+            posix_memalign = reinterpret_cast<MemalignFn>(findOriginal(cur_memalign));
+            malloc_size = reinterpret_cast<MallocSizeFn>(findOriginal(cur_msize));
+        }
+#elif defined(__linux__)
         malloc = reinterpret_cast<MallocFn>(dlsym(RTLD_NEXT, "malloc"));
         free = reinterpret_cast<FreeFn>(dlsym(RTLD_NEXT, "free"));
         calloc = reinterpret_cast<CallocFn>(dlsym(RTLD_NEXT, "calloc"));
         realloc = reinterpret_cast<ReallocFn>(dlsym(RTLD_NEXT, "realloc"));
         posix_memalign = reinterpret_cast<MemalignFn>(dlsym(RTLD_NEXT, "posix_memalign"));
+        malloc_size = reinterpret_cast<MallocSizeFn>(dlsym(RTLD_NEXT, "malloc_usable_size"));
+#endif
     }
 };
 
@@ -452,6 +510,12 @@ public:
         }
 
         if (size == 0) size = 1;
+
+        // Large-only mode: small allocations pass through to system malloc
+        if (isLargeOnlyMode() && size <= kMaxSmallSize) {
+            if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
+        }
+
         uint8_t sc = sizeToClass(size);
         if (sc < kNumClasses) {
             ThreadCache* tc = getOrCreateThreadCache();
@@ -480,7 +544,13 @@ public:
         }
 
         Span* span = page_map_.get(reinterpret_cast<uintptr_t>(ptr));
-        if (!span) return;
+        if (!span) {
+            // Not a Smash-managed pointer. In large-only mode, small
+            // allocations were forwarded to system malloc.
+            if (isLargeOnlyMode() && g_system_alloc.free)
+                g_system_alloc.free(ptr);
+            return;
+        }
         if (span->is_large) { large_alloc_.deallocate(span); return; }
         uint8_t sc = span->size_class;
         ThreadCache* tc = getOrCreateThreadCache();
@@ -499,6 +569,13 @@ public:
         }
 
         if (size == 0) size = 1;
+        // Large-only: small aligned allocs go to system allocator
+        if (isLargeOnlyMode() && size <= kMaxSmallSize && g_system_alloc.posix_memalign) {
+            void* ptr = nullptr;
+            if (g_system_alloc.posix_memalign(&ptr, alignment, size) == 0)
+                return ptr;
+            return nullptr;
+        }
         if (alignment <= kMinAlignment) return this->malloc(size);
         return large_alloc_.allocate(size, alignment);
     }
@@ -510,8 +587,11 @@ public:
             trackAllocation(ptr, count * size);
             return ptr;
         }
-        // In full mode, alloc8 handles calloc -> malloc + memset
         size_t total = count * size;
+        // Large-only: small callocs go to system allocator
+        if (isLargeOnlyMode() && total <= kMaxSmallSize && g_system_alloc.calloc) {
+            return g_system_alloc.calloc(count, size);
+        }
         void* ptr = this->malloc(total);
         if (ptr) __builtin_memset(ptr, 0, total);
         return ptr;
@@ -545,7 +625,13 @@ public:
         }
 
         Span* span = page_map_.get(reinterpret_cast<uintptr_t>(ptr));
-        if (!span) return 0;
+        if (!span) {
+            // In large-only mode, query system allocator for size.
+            // alloc8's realloc uses this to size the memcpy.
+            if (isLargeOnlyMode() && g_system_alloc.malloc_size)
+                return g_system_alloc.malloc_size(ptr);
+            return 0;
+        }
         if (span->is_large) return span->large_size;
         return classSize(span->size_class);
     }

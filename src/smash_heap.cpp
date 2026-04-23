@@ -502,14 +502,22 @@ volatile int xxthread_created_flag = 0;
 using SmashRedirect = alloc8::HeapRedirect<smash::SmashHeap>;
 ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);
 
-// ── Linux: start compressor from constructor ─────────────────────────────────
-// On macOS, the ObjC runtime creates threads during early init, which triggers
-// threadInit() via pthread_create interposition. On Linux, no threads are
-// created during LD_PRELOAD init, so single-threaded programs never get
-// threadInit() called. We use a constructor to call it for the main thread.
-#ifdef __linux__
+// ── Start compressor from constructor ─────────────────────────────────────────
+// On macOS, threadInit() requires two calls before starting compression (to
+// avoid crashing the ObjC runtime during early DYLD init — pthread_create in
+// startCompression() triggers task_restartable_ranges_register before ObjC is
+// ready). The alloc8 pthread hooks constructor at priority 200 guarantees that
+// any threads created by the ObjC runtime during early init pass through
+// without calling xxthread_init(). By priority 201, DYLD init is complete and
+// it is safe to start the compressor. We call xxthread_init() twice to satisfy
+// the >= 1 guard, ensuring compression starts even for non-ObjC programs
+// (e.g. Python via DYLD_INSERT_LIBRARIES) and single-threaded programs.
+// On Linux, the same applies: no threads are created during LD_PRELOAD init.
 __attribute__((constructor(201)))  // After alloc8 pthread hooks init (200)
 static void smash_start_main_thread() {
     xxthread_init();
-}
+#ifdef __APPLE__
+    // Second call satisfies the macOS >= 1 guard in threadInit().
+    xxthread_init();
 #endif
+}

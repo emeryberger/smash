@@ -65,14 +65,15 @@ def _make_mach_rss_reader():
 
     class MachTaskBasicInfo(ctypes.Structure):
         _fields_ = [
-            ("suspend_count", ctypes.c_int32),
             ("virtual_size", ctypes.c_uint64),
             ("resident_size", ctypes.c_uint64),
+            ("resident_size_max", ctypes.c_uint64),
             ("user_time_sec", ctypes.c_uint32),
             ("user_time_usec", ctypes.c_uint32),
             ("system_time_sec", ctypes.c_uint32),
             ("system_time_usec", ctypes.c_uint32),
             ("policy", ctypes.c_int32),
+            ("suspend_count", ctypes.c_int32),
         ]
 
     task_self = libc.mach_task_self
@@ -269,6 +270,9 @@ def run_pandas_benchmark(smash_lib=None, num_rows=2_000_000, num_cols=100,
             env["DYLD_INSERT_LIBRARIES"] = str(smash_lib)
         else:
             env["LD_PRELOAD"] = str(smash_lib)
+        # Python 3.13+ uses mimalloc internally; force system malloc so
+        # Smash's interposition captures all allocations.
+        env["PYTHONMALLOC"] = "malloc"
         env["SMASH_VERY_COLD_TICKS"] = "5"
 
     config_name = "smash" if smash_lib else "baseline"

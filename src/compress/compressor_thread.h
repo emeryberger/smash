@@ -527,6 +527,11 @@ class CompressorThread {
         zeroFreeSlots(worker.page_buf, page_idx);
 #endif
 
+        // Release physical backing while page is still accessible.
+        // On macOS, MADV_FREE_REUSABLE requires pages to be readable;
+        // on Linux, MADV_DONTNEED works regardless of protection.
+        vm::decommitPages(page_addr, kPageSize);
+
         // Make page inaccessible
         vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
 
@@ -648,9 +653,6 @@ class CompressorThread {
 
         // Record compressed page info (with algo in top 2 bits)
         compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
-
-        // Decommit physical backing while holding lock
-        vm::decommitPages(page_addr, kPageSize);
 
         states_->set(page_idx, PageState::COMPRESSED);
         locks_->unlock(page_idx);

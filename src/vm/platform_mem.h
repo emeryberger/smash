@@ -56,7 +56,10 @@ inline void decommitPages(void* addr, size_t size) {
 #elif defined(__linux__)
     madvise(addr, size, MADV_DONTNEED);
 #elif defined(__APPLE__)
-    madvise(addr, size, MADV_FREE);
+    // MADV_FREE_REUSABLE tells the kernel to reclaim physical backing immediately.
+    // Must be called while pages are still accessible (PROT_READ or PROT_RW);
+    // fails with EPERM on PROT_NONE pages.
+    madvise(addr, size, MADV_FREE_REUSABLE);
 #endif
 }
 

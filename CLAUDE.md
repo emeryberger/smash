@@ -100,7 +100,7 @@ For applications with their own small-object allocator (e.g., Python 3.13+ uses 
 - `malloc(size <= 16KB)` → system malloc passthrough
 - `malloc(size > 16KB)` → Smash's `LargeAlloc` → VmRegion (compressible)
 - `free(ptr)` checks `page_map_`; non-Smash pointers forwarded to system free
-- `getSize(ptr)` falls back to system `malloc_size`/`malloc_usable_size`
+- `getSize(ptr)` checks `page_map_` first (returns Smash size class or `span->large_size`); falls back to system `malloc_size`/`malloc_usable_size` only for non-Smash pointers
 
 ### Resolving original system malloc on macOS
 

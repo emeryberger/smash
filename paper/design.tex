@@ -112,7 +112,7 @@ and reading the span's \texttt{arena\_id} field.  This prevents arena mixing at 
 \label{sec:design:adaptive}
 
 Just as a JIT compiler uses profiling data to decide which methods to
-optimize and at what level, \sys uses per-size-class compression
+optimize and at what level, \sys uses per-origin compression
 statistics to decide \emph{whether} and \emph{how} to compress each
 cold page.  The decision is driven by a \emph{return-on-investment}
 (ROI) model that weighs the CPU cost of compression against the
@@ -121,12 +121,22 @@ expected RSS savings.
 \paragraph{ROI model}
 For each candidate page, \sys estimates two quantities.  The
 \emph{cost} is the CPU time (in microseconds) to compress and later
-decompress the page, which depends on both the algorithm and the data:
-empirically, highly compressible data is cheaper to process, while
-poorly-compressible data is slower.  \sys models throughput as a
-linear function of the compression ratio, calibrated at startup by
-compressing synthetic test pages (all-zeros and pseudo-random) with
-each algorithm.  The \emph{benefit} is the RSS saved while the page remains
+decompress the page, which depends on both the algorithm and the
+data: empirically, highly compressible data is cheaper to process,
+while poorly-compressible data is slower.  \sys bootstraps this
+estimate from a startup calibration on synthetic pages (all-zeros
+and pseudo-random) per algorithm, then replaces it with
+\emph{per-bucket observed compression time} as real workload
+measurements accumulate.  Each compression records an
+exponentially-weighted moving average of elapsed microseconds in
+the bucket (arena~$\times$ size~class~$\times$ tier); once eight
+samples have been seen, the ROI model uses the observed average
+in place of the calibrated throughput estimate.  This matters
+because calibration uses two extreme data points (all-zeros, all
+random), while real workloads are almost always somewhere in
+between, and the cost distribution differs from one arena to
+another.
+The \emph{benefit} is the RSS saved while the page remains
 compressed: $\mathit{PageSize} \times (1 - R) \times E[T_{\mathit{remain}}]$,
 where $R$ is the compressed-to-original ratio and
 $E[T_{\mathit{remain}}]$ is the expected remaining cold duration.
@@ -192,27 +202,32 @@ count resets to zero, analogous to a JIT deoptimization.  The page
 will be recompressed only if it goes cold~again.
 
 \paragraph{Auto-calibration}
-At startup, \sys benchmarks zstd-1 and zstd-9 on two synthetic pages
-(all-zeros and pseudo-random) to measure per-machine throughput,
-taking the median of 10 iterations per algorithm per page
-($\sim$1\,ms total).  The results populate the throughput profile
-table.  On subsequent runs, calibration results can be cached to a
-JSON file and reloaded, skipping recalibration.  Individual throughput
-values and the ROI threshold can also be overridden via environment
-variables, enabling tuning without recompilation.
+At startup, \sys benchmarks zstd-1 and zstd-9 on two synthetic
+pages (all-zeros and pseudo-random) to measure per-machine
+throughput, taking the median of 10 iterations per algorithm per
+page ($\sim$1\,ms total).  The calibrated numbers serve as the
+initial per-tier cost estimate until per-bucket observations
+accumulate and supersede them.  Calibration results can be cached
+to a JSON file and reloaded on subsequent runs, skipping
+recalibration.  Individual throughput values and the ROI threshold
+can also be overridden via environment variables, enabling tuning
+without recompilation.
 
 \paragraph{Per-origin statistics}
 Different call sites produce pages with very different
 compressibility, and arena routing is what puts those
 different populations onto different pages.  To preserve that
-signal for the ROI model, \sys maintains a 64-entry sliding
-window of compression ratios for each \emph{(arena, size class,
-worker)} bucket.  Aggregating across arenas within a size class
-would wash out exactly the homogeneity that arena routing was
-designed to create.  Each window records the
-compressed-to-original ratio (0--255, mapping to 0--100\%) of
-each attempted compression; the average feeds $R$ in the ROI
-model for future pages from the same origin.  With fewer than
+signal for the ROI model, \sys maintains two per-bucket
+statistics at each \emph{(arena, size class, worker)}:
+a 64-entry sliding window of compression ratios (0--255,
+mapping to 0--100\%), and a per-tier exponentially-weighted
+moving average of observed compression time in microseconds.
+Aggregating across arenas within a size class would wash out
+exactly the homogeneity that arena routing was designed to
+create.  The ratio average feeds $R$ and the cost EMA feeds
+$\mathit{cost}_{\mathit{comp}}$ in the ROI expression above,
+so the model uses \emph{measured} per-origin behavior rather
+than synthetic extrapolation.  With fewer than
 8 samples in a bucket, \sys falls back to optimistic compression
 (compress anything past the cold-tick floor).  The sliding
 window allows recovery: if data patterns change and new pages

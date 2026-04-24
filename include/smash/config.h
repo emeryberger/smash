@@ -25,6 +25,109 @@ inline constexpr int kNumArenas = 4;  // must be power of 2
 inline constexpr int kNumArenas = SMASH_NUM_ARENAS;
 #endif
 
+// ── Reference-behavior homogeneity knobs (Apr 2026 design memo) ─────────────
+//
+// A3: Cold-bias feedback arenas.  When on, the slab array is doubled to
+// maintain a hot sub-arena (index 0..kNumArenas-1) and a cold sub-arena
+// (index kNumArenas..2*kNumArenas-1) for each (callsite, size class).
+// A per-(base-arena, size-class) flag flips to cold once the compressor
+// records >= kColdArenaThreshold successful compressions for that bucket;
+// subsequent allocations route to the cold sub-arena, where they may be
+// placed under an underfill policy (C1).
+#ifdef SMASH_COLD_ARENA_FEEDBACK
+inline constexpr bool kColdArenaFeedback = true;
+#else
+inline constexpr bool kColdArenaFeedback = false;
+#endif
+#ifndef SMASH_COLD_ARENA_THRESHOLD
+inline constexpr uint32_t kColdArenaThreshold = 8;
+#else
+inline constexpr uint32_t kColdArenaThreshold = SMASH_COLD_ARENA_THRESHOLD;
+#endif
+inline constexpr int kTotalArenas = kColdArenaFeedback ? (kNumArenas * 2) : kNumArenas;
+
+// C1: Per-page absolute cap on live objects.  The (1-q)^N argument for
+// page-cold probability bounds N (objects per page), not the fraction of
+// the span used.  A fractional denominator is the wrong knob: with
+// denom=4, a 16B size class still puts 256 objects on a page (P(cold)
+// ≈ 0 even for tiny q), while a 4KB size class drops to 1 object/page
+// (huge underfill cost for the same probability bound).
+//
+// kMaxSlotsPerPage caps the number of slots whose start address lies on
+// any single page.  Spans for cold sub-arenas (A3 on) or all spans (A3
+// off) reserve only the first kMaxSlotsPerPage slots per page; the
+// remaining bytes stay zero-filled and compress to near-nothing.
+// 0 = no cap (default).  Cap is silently ignored when object_size >=
+// kPageSize (slot already covers a full page).
+#ifndef SMASH_MAX_SLOTS_PER_PAGE
+inline constexpr uint32_t kMaxSlotsPerPage = 0;
+#else
+inline constexpr uint32_t kMaxSlotsPerPage = SMASH_MAX_SLOTS_PER_PAGE;
+#endif
+
+// C1b: Adaptive per-page cap driven by compression/decompression feedback.
+// When on, the heap tracks per-(base_arena, size_class) counters for both
+// successful compression events (cold evidence) and fault decompression
+// events (hot evidence, i.e., the page was re-warmed after being cold).
+// q̂ = decomp / (comp + decomp) is an online Pareto estimator; N is chosen
+// so (1 - q̂)^N >= kAdaptiveCapTargetPct / 100 (i.e., target probability
+// that a freshly allocated page stays uniformly cold for one tick window).
+// Below kAdaptiveCapMinSamples total events the cap is disabled
+// (insufficient evidence).  For hot-dominated buckets (q̂ too high to
+// satisfy the target at any N >= kAdaptiveCapMin), the cap is also
+// disabled — under-packing a hot bucket just balloons RSS.
+#ifdef SMASH_ADAPTIVE_CAP
+inline constexpr bool kAdaptiveCap = true;
+#else
+inline constexpr bool kAdaptiveCap = false;
+#endif
+#ifndef SMASH_ADAPTIVE_CAP_TARGET_PCT
+inline constexpr int kAdaptiveCapTargetPct = 50;   // P(page cold) target
+#else
+inline constexpr int kAdaptiveCapTargetPct = SMASH_ADAPTIVE_CAP_TARGET_PCT;
+#endif
+#ifndef SMASH_ADAPTIVE_CAP_MIN
+inline constexpr uint32_t kAdaptiveCapMin = 4;     // floor on N
+#else
+inline constexpr uint32_t kAdaptiveCapMin = SMASH_ADAPTIVE_CAP_MIN;
+#endif
+#ifndef SMASH_ADAPTIVE_CAP_MIN_SAMPLES
+inline constexpr uint32_t kAdaptiveCapMinSamples = 16;
+#else
+inline constexpr uint32_t kAdaptiveCapMinSamples = SMASH_ADAPTIVE_CAP_MIN_SAMPLES;
+#endif
+
+// A2-lite: Thread identity in the arena hash.  When on, callsiteArena()
+// XORs a per-thread id into the (RA, frame, sc) hash so allocations from
+// different threads are more likely to land in different arenas.  Cheap —
+// uses a TLS-cached monotonic id assigned on first call.  Effectiveness
+// is bounded by kNumArenas: with 4 arenas, ~4 threads saturate the space
+// and the extra term is noise beyond that; consider raising kNumArenas
+// to 8 or 16 for heavier multi-threaded workloads.
+#ifdef SMASH_THREAD_ARENA_HASH
+inline constexpr bool kThreadArenaHash = true;
+#else
+inline constexpr bool kThreadArenaHash = false;
+#endif
+
+// B1: Page-local batch refill.  When on, Slab::allocateBatch stops once
+// the next object would fall on a different page than the batch's first
+// object.  Keeps each thread-cache refill confined to one page, so
+// objects allocated in the same burst share a lifecycle at page grain.
+#ifdef SMASH_PAGE_LOCAL_BATCH
+inline constexpr bool kPageLocalBatch = true;
+#else
+inline constexpr bool kPageLocalBatch = false;
+#endif
+
+// Cohort measurement: track per-page thread/call-site mixing and print
+// a summary each compressor tick.  Measurement only — no behavioral change.
+#ifdef SMASH_MEASURE_COHORTS
+inline constexpr bool kMeasureCohorts = true;
+#else
+inline constexpr bool kMeasureCohorts = false;
+#endif
+
 // ── Spans ────────────────────────────────────────────────────────────────────
 inline constexpr int kTargetObjectsPerSpan = 64;
 inline constexpr int kMaxSpanPages = 8;

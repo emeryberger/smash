@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include "smash/config.h"
 #include "core/bootstrap_alloc.h"
 #include "core/size_classes.h"
@@ -62,15 +63,50 @@ struct SystemAllocFns {
 extern SystemAllocFns g_system_alloc;
 
 class SmashHeap {
-    Slab slabs_[kNumArenas * kNumClasses];  // flat 2D: arena * kNumClasses + sc
+    // Slab array sized to kTotalArenas (= kNumArenas when A3 off, 2*kNumArenas
+    // when SMASH_COLD_ARENA_FEEDBACK is on).  Layout:
+    //   arenas [0, kNumArenas)          — hot sub-arenas (default routing)
+    //   arenas [kNumArenas, 2*kNumArenas) — cold sub-arenas (underfilled)
+    Slab slabs_[kTotalArenas * kNumClasses];
+
+    // A3 feedback state (unused/untouched when kColdArenaFeedback is false).
+    // One entry per (base_arena, size_class).  Compressor bumps the counter
+    // after every successful page compression that originated from the
+    // corresponding slab; once it crosses kColdArenaThreshold, the sticky
+    // bias flag flips to 1 and callsiteArena() routes subsequent
+    // allocations to the cold sub-arena for that (arena, sc).
+    std::atomic<uint32_t> compress_count_[kNumArenas * kNumClasses]{};
+    std::atomic<uint8_t> cold_bias_[kNumArenas * kNumClasses]{};
+
+    // C1b (adaptive cap) feedback.  Per (base_arena, size_class) counter
+    // of re-warm events — a page that was COMPRESSED but got faulted back
+    // to ACTIVE.  q̂ = decomp / (comp + decomp) is the online Pareto
+    // estimator; cached cap values live in adaptive_cap_ so the slab
+    // allocateNewSpan path can read them without recomputing every call.
+    std::atomic<uint32_t> decompress_count_[kNumArenas * kNumClasses]{};
+    std::atomic<uint32_t> adaptive_cap_[kNumArenas * kNumClasses]{};
+
+    // Cohort measurement arrays (kMeasureCohorts only).  Per-page tracking
+    // of first allocating thread ID and RA hash; a "mixed" flag per axis
+    // flips when a second distinct value is seen.  Bootstrap-allocated once
+    // compression is initialized.
+    struct CohortPage {
+        uint32_t first_tid;
+        uint32_t first_ra;
+        uint8_t  mixed_tid;
+        uint8_t  mixed_ra;
+    };
+    CohortPage* cohort_pages_ = nullptr;
+    size_t cohort_pages_len_ = 0;
+
     LargeAlloc large_alloc_;
     PageMap page_map_;
 
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
-    static uint8_t callsiteArena(uint8_t sc) {
+    uint8_t callsiteArena(uint8_t sc) {
 #ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
-        return 0;
+        uint8_t base = 0;
 #else
         // LLAMA-style stack hash [Maas et al., ASPLOS 2020]:
         // hash(return_address, stack_height, object_size).
@@ -85,10 +121,153 @@ class SmashHeap {
         uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         uintptr_t sh = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
         uintptr_t h = ra ^ (sh >> 4) ^ static_cast<uintptr_t>(sc);
+        if constexpr (kThreadArenaHash) {
+            // Thread-local monotonic id (A2-lite).  Multiplied by a
+            // large odd constant so the low bits mix well into h.
+            static std::atomic<uint32_t> next_tid{0};
+            thread_local uint32_t tid = next_tid.fetch_add(1, std::memory_order_relaxed);
+            h ^= static_cast<uintptr_t>(tid) * 0x9E3779B97F4A7C15ULL;
+        }
         h ^= h >> 16;
-        return static_cast<uint8_t>(h & (kNumArenas - 1));
+        uint8_t base = static_cast<uint8_t>(h & (kNumArenas - 1));
 #endif
+        if constexpr (kColdArenaFeedback) {
+            // If compressor has flagged this (arena, sc) as cold-biased,
+            // route to the cold sub-arena.
+            if (cold_bias_[base * kNumClasses + sc].load(std::memory_order_relaxed))
+                return static_cast<uint8_t>(base + kNumArenas);
+        }
+        return base;
     }
+
+public:
+    // Called by the compressor after a page transitions to COMPRESSED.
+    // Updates the (base_arena, size_class) compression counter; once the
+    // threshold is crossed, flips the sticky cold-bias flag so subsequent
+    // allocations route to the cold sub-arena.
+    void onPageCompressed(uint8_t arena_id, uint8_t sc) {
+        if constexpr (!kColdArenaFeedback && !kAdaptiveCap) return;
+        if (sc >= kNumClasses) return;
+        uint8_t base = arena_id & (kNumArenas - 1);   // strip cold half
+        size_t idx = base * kNumClasses + sc;
+        if constexpr (kColdArenaFeedback) {
+            uint32_t prev = compress_count_[idx].fetch_add(1, std::memory_order_relaxed);
+            if (prev + 1 == kColdArenaThreshold) {
+                cold_bias_[idx].store(1, std::memory_order_relaxed);
+            }
+        } else {
+            compress_count_[idx].fetch_add(1, std::memory_order_relaxed);
+        }
+        if constexpr (kAdaptiveCap) {
+            recomputeAdaptiveCap(idx);
+        }
+    }
+
+    static void compressedEventHook(size_t /*page_idx*/, uint8_t arena_id,
+                                    uint8_t sc, void* ctx) {
+        static_cast<SmashHeap*>(ctx)->onPageCompressed(arena_id, sc);
+    }
+
+    // Called by the compressor when a COMPRESSED page faults back to
+    // ACTIVE.  Updates the decompression counter and recomputes the
+    // cached adaptive cap for this (base_arena, sc).  The cap is the
+    // smallest N with (1 - q̂)^N >= P_target, floored at kAdaptiveCapMin.
+    // Hot buckets (q̂ >= q_max) disable the cap outright — under-packing
+    // a hot bucket costs RSS without winning compressibility.
+    void onPageDecompressed(uint8_t arena_id, uint8_t sc) {
+        if constexpr (!kAdaptiveCap) return;
+        if (sc >= kNumClasses) return;
+        uint8_t base = arena_id & (kNumArenas - 1);
+        size_t idx = base * kNumClasses + sc;
+        decompress_count_[idx].fetch_add(1, std::memory_order_relaxed);
+        recomputeAdaptiveCap(idx);
+    }
+
+    static void decompressedEventHook(size_t /*page_idx*/, uint8_t arena_id,
+                                      uint8_t sc, void* ctx) {
+        static_cast<SmashHeap*>(ctx)->onPageDecompressed(arena_id, sc);
+    }
+
+    // Recompute and cache the adaptive cap for bucket idx.  Called whenever
+    // compress or decompress counters change.  Cheap (one log() call) and
+    // races are benign — worst case we publish a slightly stale cap.
+    void recomputeAdaptiveCap(size_t idx) {
+        uint32_t comp = compress_count_[idx].load(std::memory_order_relaxed);
+        uint32_t dec  = decompress_count_[idx].load(std::memory_order_relaxed);
+        uint32_t total = comp + dec;
+        uint32_t cap = 0;
+
+        // Gate 1 — total-evidence floor.  Early in a bucket's life we know
+        // nothing; cap=0 keeps the allocator in its default high-density path.
+        if (total < kAdaptiveCapMinSamples) {
+            adaptive_cap_[idx].store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        // Gate 2 — bilateral-evidence gate.  A stream of compressions with
+        // zero re-warms looks like a "truly cold" bucket under the Pareto
+        // model, but observationally is indistinguishable from "bucket that
+        // hasn't had time to re-warm yet".  Workloads like duckdb and redis
+        // fill-then-idle fall in the second camp; capping them before any
+        // decomp event arrives bakes tiny caps into every span and
+        // catastrophically regresses RSS once queries actually touch the
+        // data.  Require at least one observed re-warm before applying a
+        // cap.  If a bucket is genuinely cold forever, the default path
+        // already wins (pages compress, stay compressed) — no under-packing
+        // is needed.
+        if (dec == 0) {
+            adaptive_cap_[idx].store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        // Gate 3 — hot-bucket rejection.  Under-packing a hot bucket just
+        // balloons RSS.  Laplace smoothing α=1 keeps q̂ bounded away from 0
+        // for thin samples.
+        constexpr double q_max = 0.30;
+        double q = double(dec + 1) / double(total + 2);
+        if (q >= q_max) {
+            adaptive_cap_[idx].store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        double p = double(kAdaptiveCapTargetPct) / 100.0;
+        double n = std::log(p) / std::log(1.0 - q);
+        uint32_t cap_u = static_cast<uint32_t>(n);
+        cap = cap_u < kAdaptiveCapMin ? kAdaptiveCapMin : cap_u;
+        adaptive_cap_[idx].store(cap, std::memory_order_relaxed);
+    }
+
+    // Slab-facing cap lookup.  Returns the current cached cap for the
+    // (arena, sc) bucket; 0 = no cap.  Called from Slab::allocateNewSpan
+    // and Slab::maybeWiden.
+    //
+    // Clamps the cap against an "underfill floor" equal to
+    // natural_slots_per_page / kAdaptiveCapUnderfillFactor — a cap that
+    // would leave fewer than (natural / factor) slots per page is
+    // rejected.  Without this clamp, a cap of 8 applied to a 64B size
+    // class (natural density = 256 slots/page on a 16K page) forces 32×
+    // VM underfill.  Compression reclaims zero-filled waste, but for
+    // throughput-heavy workloads (duckdb, redis fill) allocations
+    // outpace the compressor and RSS balloons.  The floor keeps the
+    // underfill factor bounded so the Pareto-motivated cap only fires
+    // where the cost is tolerable.
+    static uint32_t adaptiveCapQuery(void* ctx, uint8_t arena, uint8_t sc) {
+        auto* self = static_cast<SmashHeap*>(ctx);
+        if (sc >= kNumClasses) return 0;
+        uint8_t base = arena & (kNumArenas - 1);
+        uint32_t raw = self->adaptive_cap_[base * kNumClasses + sc]
+                           .load(std::memory_order_relaxed);
+        if (raw == 0) return 0;
+        uint32_t osz = kSizeClasses[sc].size;
+        if (osz == 0 || osz >= kPageSize) return raw;
+        uint32_t natural = static_cast<uint32_t>(kPageSize / osz);
+        constexpr uint32_t kUnderfillFactor = 4;
+        uint32_t floor_cap = natural / kUnderfillFactor;
+        if (floor_cap < kAdaptiveCapMin) floor_cap = kAdaptiveCapMin;
+        return raw < floor_cap ? floor_cap : raw;
+    }
+
+private:
 
     // Phase 2-4: compression infrastructure
     VmRegion vm_region_;
@@ -164,28 +343,70 @@ public:
             compressor_.init(&vm_region_, &page_states_, &page_locks_,
                              &compress_store_, &compress_engine_,
                              compress_only ? nullptr : &page_map_, &fault_handler_);
+            // A3: register the cold-arena feedback hook (no-op when
+            // SMASH_COLD_ARENA_FEEDBACK is off — onPageCompressed early-returns).
+            if (!compress_only && (kColdArenaFeedback || kAdaptiveCap)) {
+                compressor_.setCompressedCallback(compressedEventHook, this);
+            }
+            if (!compress_only && kAdaptiveCap) {
+                compressor_.setDecompressedCallback(decompressedEventHook, this);
+            }
 
             if (!compress_only) {
-                for (int a = 0; a < kNumArenas; ++a)
-                    for (int i = 0; i < kNumClasses; ++i)
+                for (int a = 0; a < kTotalArenas; ++a) {
+                    // Hot sub-arenas (a < kNumArenas): no per-page cap.
+                    // Cold sub-arenas (a >= kNumArenas, only when A3 on):
+                    // apply kMaxSlotsPerPage to produce sparse pages.
+                    // If A3 is off but kMaxSlotsPerPage > 0, the cap
+                    // applies globally (ablation mode — measure C1 in
+                    // isolation without the feedback loop).
+                    uint32_t cap = 0;
+                    if constexpr (kColdArenaFeedback) {
+                        if (a >= kNumArenas) cap = kMaxSlotsPerPage;
+                    } else {
+                        cap = kMaxSlotsPerPage;
+                    }
+                    for (int i = 0; i < kNumClasses; ++i) {
                         slabs_[a * kNumClasses + i].init(
                             static_cast<uint8_t>(i), &page_map_,
                             &vm_region_, &page_states_,
                             releaseHook, this,
-                            static_cast<uint8_t>(a));
+                            static_cast<uint8_t>(a), cap);
+                        if constexpr (kAdaptiveCap) {
+                            slabs_[a * kNumClasses + i].setCapFn(
+                                adaptiveCapQuery, this);
+                        }
+                    }
+                }
             }
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
             vm::g_page_pins = bootstrapArray<std::atomic<uint8_t>>(
                 vm_region_.totalPages());
+
+            if constexpr (kMeasureCohorts) {
+                cohort_pages_len_ = vm_region_.totalPages();
+                cohort_pages_ = bootstrapArray<CohortPage>(cohort_pages_len_);
+                __builtin_memset(cohort_pages_, 0,
+                                 cohort_pages_len_ * sizeof(CohortPage));
+                compressor_.setCohortData(cohort_pages_, cohort_pages_len_);
+            }
         } else if (!compress_only) {
-            // Fallback: Phase 1 mode (no compression)
-            for (int a = 0; a < kNumArenas; ++a)
+            // Fallback: Phase 1 mode (no compression).  No feedback loop
+            // possible here, so still respect kUnderfillDenom for ablation.
+            for (int a = 0; a < kTotalArenas; ++a) {
+                uint32_t cap = 0;
+                if constexpr (kColdArenaFeedback) {
+                    if (a >= kNumArenas) cap = kMaxSlotsPerPage;
+                } else {
+                    cap = kMaxSlotsPerPage;
+                }
                 for (int i = 0; i < kNumClasses; ++i)
                     slabs_[a * kNumClasses + i].init(
                         static_cast<uint8_t>(i), &page_map_,
                         nullptr, nullptr, nullptr, nullptr,
-                        static_cast<uint8_t>(a));
+                        static_cast<uint8_t>(a), cap);
+            }
         }
 
         if (!compress_only) {
@@ -204,6 +425,23 @@ public:
         return tc;
     }
 
+    void stampCohort(void* ptr, uint32_t ra_hash) {
+        if constexpr (!kMeasureCohorts) return;
+        if (!cohort_pages_) return;
+        uintptr_t pa = reinterpret_cast<uintptr_t>(ptr);
+        if (!vm_region_.contains(pa)) return;
+        size_t idx = vm_region_.pageIndex(pa);
+        if (idx >= cohort_pages_len_) return;
+        auto& cp = cohort_pages_[idx];
+        static std::atomic<uint32_t> next_ctid{1};
+        thread_local uint32_t ctid =
+            next_ctid.fetch_add(1, std::memory_order_relaxed);
+        if (cp.first_tid == 0) cp.first_tid = ctid;
+        else if (cp.first_tid != ctid) cp.mixed_tid = 1;
+        if (cp.first_ra == 0) cp.first_ra = ra_hash;
+        else if (cp.first_ra != ra_hash) cp.mixed_ra = 1;
+    }
+
     void* malloc(size_t size) {
         if (isCompressOnlyMode()) {
             // During early init, g_system_alloc may not be resolved yet
@@ -218,8 +456,16 @@ public:
         if (sc < kNumClasses) {
             ThreadCache* tc = getOrCreateThreadCache();
             void* ptr = tc->allocate(sc);
-            if (ptr) return ptr;
-            return tc->refill(sc, &slab(callsiteArena(sc), sc));
+            if (!ptr) ptr = tc->refill(sc, &slab(callsiteArena(sc), sc));
+            if constexpr (kMeasureCohorts) {
+                if (ptr) {
+                    uintptr_t ra = reinterpret_cast<uintptr_t>(
+                        __builtin_return_address(0));
+                    uint32_t ra32 = static_cast<uint32_t>(ra ^ (ra >> 32));
+                    stampCohort(ptr, ra32);
+                }
+            }
+            return ptr;
         }
         return large_alloc_.allocate(size, kMinAlignment);
     }
@@ -306,13 +552,13 @@ public:
 
     void lock() {
         if (isCompressOnlyMode()) return;
-        for (int i = 0; i < kNumArenas * kNumClasses; ++i) slabs_[i].lockSlab();
+        for (int i = 0; i < kTotalArenas * kNumClasses; ++i) slabs_[i].lockSlab();
         large_alloc_.lockAlloc();
     }
     void unlock() {
         if (isCompressOnlyMode()) return;
         large_alloc_.unlockAlloc();
-        for (int i = kNumArenas * kNumClasses - 1; i >= 0; --i) slabs_[i].unlockSlab();
+        for (int i = kTotalArenas * kNumClasses - 1; i >= 0; --i) slabs_[i].unlockSlab();
     }
     void threadInit() {
         if (!isCompressOnlyMode()) {
@@ -338,5 +584,8 @@ public:
         ThreadCache*& tc = currentThreadCache();
         if (tc) { tc->drainAll(slabs_, &page_map_); returnThreadCache(tc); tc = nullptr; }
     }
+
+    CohortPage* cohortPages() const { return cohort_pages_; }
+    size_t cohortPagesLen() const { return cohort_pages_len_; }
 };
 } // namespace smash

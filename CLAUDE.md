@@ -42,7 +42,7 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 - **Header-only internals**: Most code lives in headers under `src/`. Only `smash_heap.cpp` is compiled.
 - **BootstrapAlloc**: All internal metadata allocated from a bump allocator (never calls malloc). Critical for avoiding reentrancy in the fault handler.
 - **Arena-based allocation**: 4 arenas (`kNumArenas`). `callsiteArena()` hashes `__builtin_return_address(1)` to route allocations from the same call site to the same arena. Pages within an arena contain similar data → better compression ratios. `Slab slabs_[kNumArenas * kNumClasses]` flat 2D array.
-- **Zero-on-free**: Objects ≤ `kZeroOnFreeMaxSize` (128B) are zeroed eagerly in `free()`. Larger objects are zeroed by the compressor in `zeroFreeSlots()` using non-temporal stores (`ntZeroMemory`) to avoid cache pollution. This makes partial pages compress well (zero runs → high LZ4 ratios).
+- **Zero-on-free (deferred)**: All zeroing is deferred to the compressor thread's `zeroFreeSlots()` — no zeroing occurs in the `free()` critical path. Uses non-temporal stores (`ntZeroMemory`) to avoid cache pollution. This makes partial pages compress well (zero runs → high compression ratios).
 - **PageState machine**: EMPTY → ACTIVE → ACTIVE_MONITORING → COMPRESSING → COMPRESSED → ACTIVE. CAS transitions ensure safe coordination between compressor thread and fault handler.
 - **CompressEngine**: Supports LZ4, zstd, and zstd+dictionary. Algorithm packed in top 2 bits of `CompressedPageInfo::comp_size`. All zstd contexts pre-allocated via `ZSTD_customMem` routing to BootstrapAlloc.
 - **Parallel compressor**: Coordinator thread + worker threads (`kCompressorWorkers`). Chunk bitmap (`live_chunks_[]`) skips EMPTY pages. Sharded `CompressStore` (8 shards) eliminates lock contention. Per-worker compression contexts (LZ4 state, ZSTD CCtx, scratch buffers, SizeClassStats).
@@ -289,11 +289,9 @@ Key constants in `include/smash/config.h`:
 - `kVeryColdTicks = 60`: Ticks before escalating to zstd/zstd+dict
 - `kMinCompressRatio = 0.75`: Only store if compressed < 75% of original
 - `kPrefetchWindow = 2`: Pages prefetched in each direction on fault
-- `kDictTrainSamples = 16`: Pages collected before training a dictionary
+- `kDictTrainSamples = 0`: Pages before dictionary training (disabled by default; dicts net-negative)
 - `kNumArenas = 4`: Call-site arena count (must be power of 2)
 - `kCompressorWorkers = 2`: Parallel compression worker threads
 - `kCompressStoreShards = 8`: CompressStore lock shards
 - `kChunkSize = 64`: Pages per chunk for scan bitmap
-- `kZeroOnFree = true`: Enable zero-on-free for better compression
-- `kZeroOnFreeMaxSize = 128`: Eager memset threshold (larger objects zeroed by compressor)
 - `kLargeAllocVmThreshold = 1MB`: Only large allocs above this go in VmRegion

@@ -636,6 +636,12 @@ if(SMASH_BUILD_BENCH_DEPS)
   endif()
 
   # ── RocksDB 9.8.4 (static library, no gflags/tools) ───────────────────────
+  # -Wno-error=nontrivial-memcall is Apple Clang-only; GCC doesn't support it
+  set(_ROCKSDB_EXTRA_CXX_FLAGS "")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
+    set(_ROCKSDB_EXTRA_CXX_FLAGS "-Wno-error=nontrivial-memcall")
+  endif()
+
   ExternalProject_Add(rocksdb_build
     GIT_REPOSITORY https://github.com/facebook/rocksdb.git
     GIT_TAG v9.8.4
@@ -646,7 +652,7 @@ if(SMASH_BUILD_BENCH_DEPS)
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
       -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
       -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
-      -DCMAKE_CXX_FLAGS=-Wno-error=nontrivial-memcall
+      -DCMAKE_CXX_FLAGS=${_ROCKSDB_EXTRA_CXX_FLAGS}
       -DWITH_TESTS=OFF
       -DWITH_BENCHMARK_TOOLS=OFF
       -DWITH_TOOLS=OFF

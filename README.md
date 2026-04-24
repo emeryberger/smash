@@ -1,19 +1,15 @@
 # smash
 
-**S**elective **M**emory **A**llocation with **S**mart **H**andling — a compression-aware memory allocator that transparently compresses cold pages to reduce resident set size (RSS).
+**smash** — a compression-aware memory allocator that transparently compresses cold pages to reduce resident set size (RSS).
 
 ## Overview
 
-smash is a drop-in malloc replacement that monitors page access patterns and compresses pages that haven't been touched recently. When compressed pages are accessed again, a signal handler transparently decompresses them before the application sees the data. This reduces physical memory usage for applications with large working sets where significant portions of allocated memory are idle at any given time.
+Smash is a drop-in malloc replacement that monitors page access patterns and compresses pages that haven't been touched recently. When compressed pages are accessed again, a signal handler transparently decompresses them before the application sees the data. Smash reduces physical memory usage for applications with large working sets where significant portions of allocated memory are idle at any given time.
 
 ### Key Features
 
 - **Transparent compression**: No application changes required — works via malloc interposition
-- **Adaptive multi-algorithm**: LZ4 for recently cold pages, zstd for very cold pages, zstd+dictionary for homogeneous size classes
-- **Per-size-class dictionaries**: Automatically trains compression dictionaries from page samples, exploiting structural similarity within size classes
-- **Prefetching**: On fault, decompresses adjacent pages in the same span to reduce future faults
-- **Signal-safe decompression**: All decompression state pre-allocated from a bootstrap allocator — no malloc calls in the fault handler path
-- **Fine-grained locking**: Per-page spinlocks and per-slab locks minimize contention
+- **Adaptive multi-algorithm**: zstd-1 for recently cold pages, zstd-9 for very cold pages
 
 ## How It Works
 
@@ -234,7 +230,7 @@ Key tuning constants in `include/smash/config.h`:
 | `kVeryColdTicks` | 60 | Ticks → escalate to zstd/zstd+dict |
 | `kMinCompressRatio` | 0.75 | Only keep compressed if < 75% of original |
 | `kPrefetchWindow` | 2 | Pages prefetched in each direction on fault |
-| `kDictTrainSamples` | 16 | Pages collected before dictionary training |
+| `kDictTrainSamples` | 0 | Pages before dictionary training (disabled by default) |
 | `kNumClasses` | 36 | Size classes (16B to 16KB) |
 
 ## License

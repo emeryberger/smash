@@ -18,8 +18,8 @@ We structure the evaluation around five questions:
 \subsection{Methodology}
 \label{sec:eval:method}
 
-We evaluate on Linux x86\_64 (Amazon Linux~2, kernel~5.10,
-glibc~2.26, 4\,KiB pages, 64\,GiB RAM, 16 cores).  \sys is loaded
+We evaluate on Linux x86\_64 (Ubuntu~22.04, kernel~6.8,
+glibc~2.35, 4\,KiB pages, 32\,GiB RAM, 8 cores; AWS m5.2xlarge).  \sys is loaded
 via \tcode{LD\_\allowbreak PRELOAD}; RSS is sampled via
 \tcode{/proc/\allowbreak[pid]/\allowbreak statm} at 1\,s intervals.
 Each configuration is run three times; we report the median.
@@ -32,7 +32,7 @@ Compression libraries: LZ4~1.9.4, zstd~1.5.6.
 \label{sec:eval:apps}
 
 We evaluate \sys's RSS reduction, throughput overhead, and
-cold-access latency on five applications (six workloads) spanning
+cold-access latency on four applications (six workloads) spanning
 key-value stores, relational databases, and analytical engines.
 Table~\ref{tab:apps_summary} summarizes the results.
 
@@ -51,7 +51,6 @@ Application & Sys & Mesh & \sys \\
 Memcached        & \ablMemcachedBaselineServeRss  & \ablMemcachedMeshServeRss  & \textbf{\ablMemcachedDefaultServeRss} (\ablMemcachedDefaultRssRedInt\%) \\
 RocksDB          & \ablRocksdbBaselineServeRss  & \ablRocksdbMeshServeRss  & \textbf{\ablRocksdbDefaultServeRss} (\ablRocksdbDefaultRssRedInt\%) \\
 SQLite           & \ablSqliteBaselineServeRss  & \ablSqliteMeshServeRss  & \textbf{\ablSqliteDefaultServeRss} (\ablSqliteDefaultRssRedInt\%) \\
-DuckDB           & \ablDuckdbBaselineServeRss & \ablDuckdbMeshServeRss  & \textbf{\ablDuckdbDefaultServeRss} (\ablDuckdbDefaultRssRed\%) \\
 Redis*           & \ablRedisBaselineServeRss  & \ablRedisMeshServeRss   & \textbf{\ablRedisDefaultServeRss} (\ablRedisDefaultRssRedInt\%) \\
 Redis-ext*       & \ablRedisExtBaselineServeRss  & \ablRedisExtMeshServeRss   & \textbf{\ablRedisExtDefaultServeRss} (\ablRedisExtDefaultRssRedInt\%) \\
 Redis$^\dagger$  & \ablRedisPatchedBaselineServeRss  & ---  & \textbf{\ablRedisPatchedDefaultServeRss} (\ablRedisPatchedDefaultRssRedInt\%) \\
@@ -82,7 +81,7 @@ SQLite achieves \ablSqliteDefaultRssRedInt\%
 \centering
 \includegraphics[width=\textwidth]{figures/rss_combined.pdf}
 \caption{\textbf{\sys reduces RSS within seconds of data going
-  cold} (\S\ref{sec:eval:apps}).  RSS over time for six workloads.
+  cold} (\S\ref{sec:eval:apps}).  RSS over time for all workloads.
   Baseline (solid blue) stays flat; Mesh (dash-dot green) reduces RSS
   on some workloads via page meshing;
   \sys (dashed red) drops sharply during cooling.}
@@ -418,7 +417,7 @@ better ratio justifies the~cost).
 
 To quantify what each optimization contributes, we selectively
 disable individual features and measure the change in RSS reduction.
-We run each configuration across all five applications (six workloads),
+We run each configuration across all four applications (six workloads),
 each with 3 runs.  Ablation requires rebuilding \sys with different
 compile-time constants; external-process benchmarks (memcached, Redis)
 are run via library interposition (\texttt{LD\_PRELOAD}) against each
@@ -539,45 +538,63 @@ compressibility benefit without adding latency to the
 
 Finally, we ask how much of \sys's benefit comes from the
 compression pipeline versus its allocator design choices.
-To decompose these contributions, we build a \emph{compress-only}
+We decompose the contribution via two experiments.
+
+\paragraph{Compress-only across allocator substrates}
+We build a \emph{compress-only}
 library
-that adds \sys's compression pipeline \emph{on top of} the
-unmodified system allocator.  This library interposes
+that adds \sys's compression pipeline \emph{on top of} an
+unmodified allocator.  This library interposes
 \texttt{malloc}/\texttt{free} solely to discover which pages
 belong to the heap; all allocation requests are forwarded to
-system malloc unchanged.  It then applies \sys's page monitoring,
+the underlying allocator unchanged.  It then applies \sys's page monitoring,
 JIT compression (zstd-1$\to$zstd-9 tiering), signal-based
 decompression, and prefetching to those pages.  Because allocation is still performed
-by system malloc, pages contain embedded freelists, objects are
+by the underlying allocator, pages contain embedded freelists, objects are
 not zeroed, and allocations are not segregated by call site.
 On Linux, the compress-only library discovers heap regions by
 parsing \texttt{/proc/self/maps}.
 
+We test compress-only on three allocator substrates: glibc
+system malloc, jemalloc~5.3.0, and mimalloc~3.3.0 (both built
+from source).  We also build \emph{\sys-noopt}, a variant that
+uses \sys's allocator but disables the allocation-design
+optimizations (arenas${}={}$1, no zero-on-free), isolating the
+contribution of owning the allocation from the optimizations
+themselves.
+
 \begin{table}[t]
-\caption{\textbf{Full \sys achieves large RSS reductions; compress-only
-  adds overhead} (\S\ref{sec:eval:pipeline}).  Compress-only
-  uses system malloc + \sys pipeline.  glibc does not zero
-  on free, so compress-only cannot achieve high compression ratios.}
+\caption{\textbf{Replacing the allocator is necessary for compression;
+  optimizations are not.}  Compress-only adds \sys's pipeline atop
+  the given allocator; \sys-noopt uses \sys's allocator with 1~arena
+  and no zero-on-free (\S\ref{sec:eval:pipeline}).}
 \label{tab:compress_only}
 \centering\footnotesize
 \begin{tabular}{llrr}
 \toprule
-Benchmark & Config & Cool RSS & Reduction \\
+Benchmark & Config & Min RSS & Reduction \\
 \midrule
-\multirow{3}{*}{SQLite}
-  & baseline       & \coSqliteBaselineRss  & ---  \\
-  & compress-only  & \coSqliteCompOnlyRss  & $-$\coSqliteCompOnlyOverhead\% \\
-  & full \sys      & \textbf{\coSqliteFullSmashRss}   & \textbf{\coSqliteFullSmashReduction\%} \\
+\multirow{5}{*}{Memcached}
+  & system malloc           & \vaMemcachedBaselineRss  & ---  \\
+  & jemalloc                & \vaMemcachedJemallocRss  & 0\% \\
+  & mimalloc                & \vaMemcachedMimallocRss  & 0\% \\
+  & sys.\ + compress-only   & \vaMemcachedSysCompRss   & $-$\vaMemcachedSysCompOh\% \\
+  & je.\ + compress-only    & \vaMemcachedJeCompRss    & $-$\vaMemcachedJeCompOh\% \\
+  & mi.\ + compress-only    & \vaMemcachedMiCompRss    & $-$\vaMemcachedMiCompOh\% \\
+  & \sys-noopt              & \textbf{\vaMemcachedNooptRss} & \textbf{\vaMemcachedNooptRed\%} \\
+  & full \sys               & \textbf{\vaMemcachedFullRss}   & \textbf{\vaMemcachedFullRed\%} \\
+\midrule
+\multirow{4}{*}{SQLite}
+  & system malloc           & \vaSqliteBaselineRss     & ---  \\
+  & sys.\ + compress-only   & \vaSqliteSysCompRss      & $-$\vaSqliteSysCompOh\% \\
+  & mi.\ + compress-only    & \vaSqliteMiCompRss       & $-$\vaSqliteMiCompOh\% \\
+  & \sys-noopt              & \textbf{\vaSqliteNooptRss} & \textbf{\vaSqliteNooptRed\%} \\
+  & full \sys               & \textbf{\vaSqliteFullRss}  & \textbf{\vaSqliteFullRed\%} \\
 \midrule
 \multirow{3}{*}{RocksDB}
   & baseline       & \coRocksdbBaselineRss  & ---  \\
   & compress-only  & \coRocksdbCompOnlyRss  & $-$\coRocksdbCompOnlyOverhead\% \\
   & full \sys      & \textbf{\coRocksdbFullSmashRss}   & \textbf{\coRocksdbFullSmashReduction\%} \\
-\midrule
-\multirow{3}{*}{Memcached}
-  & baseline       & \coMemcachedBaselineRss  & ---  \\
-  & compress-only  & \coMemcachedCompOnlyRss  & $-$\coMemcachedCompOnlyOverhead\% \\
-  & full \sys      & \textbf{\coMemcachedFullSmashRss}    & \textbf{\coMemcachedFullSmashReduction\%} \\
 \midrule
 \multirow{3}{*}{Redis}
   & baseline       & \coRedisBaselineRss   & ---  \\
@@ -588,27 +605,45 @@ Benchmark & Config & Cool RSS & Reduction \\
 \end{table}
 
 Table~\ref{tab:compress_only} presents the results.
-glibc does not zero freed memory, so the compress-only
-pipeline cannot achieve high compression ratios.
-In fact, compress-only \emph{increases} RSS by \coSqliteCompOnlyOverhead--\coRedisCompOnlyOverhead\% due to
-metadata overhead without corresponding compression~benefit.
+Compress-only is ineffective on \emph{every} allocator substrate:
+it increases RSS by \vaSqliteSysCompOh--\vaMemcachedSysCompOh\%
+due to metadata overhead (VM region, page-state arrays, compression
+contexts) without corresponding compression~benefit.  The result
+is the same whether the underlying allocator is system malloc,
+jemalloc, or mimalloc: pages managed by a third-party allocator are
+never sufficiently cold to compress.
+
+The critical factor is \emph{owning the allocation}.
+\sys-noopt---which uses \sys's allocator but disables arenas and
+zero-on-free---achieves \vaMemcachedNooptRed\% reduction on
+memcached and \vaSqliteNooptRed\% on SQLite, matching full \sys
+within noise.
+The essential property is that \sys's allocator places objects in
+its own VM~region where the compressor has full control over page
+protection and can decompress transparently on fault.
+Third-party allocators use their own VM management (Mach zones on
+macOS, \texttt{mmap} arenas on Linux), and external page scanning
+cannot reliably track access patterns within those regions.
 
 Full \sys achieves
-\coRedisFullSmashReduction--\coMemcachedFullSmashReduction\%
-reduction by combining allocator-level page tracking with
-zero-on-free.  The allocator design contributes most on RocksDB
-(\coRocksdbFullSmashReduction\% reduction).
-RocksDB's block cache entries span entire pages;
+\coRedisPatchedFullSmashReduction--\vaMemcachedFullRed\%
+reduction.  The allocator design contributes most on RocksDB
+(\coRocksdbFullSmashReduction\% reduction),
+where block-cache entries span entire pages and
 embedded freelist pointers from the system allocator degrade
-compression across each page.
+compression.
 
-On Redis, compress-only achieves negative reduction (\coRedisCompOnlyOverhead\% overhead):
-Redis's event loop touches heap pages even at minimum frequency
-(\texttt{hz\,1}), so the pipeline's VM-region scanner never finds
-cold pages to compress.  Full \sys avoids this problem because it
-tracks page access internally at the allocator level.  With all
-background tasks disabled (activedefrag, activerehashing, lazyfree),
-full \sys achieves \coRedisFullSmashReduction\% RSS reduction and \aucRedisSmashRed\% lower AUC on Redis;
+\paragraph{Why compress-only fails on memcached and Redis}
+On memcached, the slab allocator manages items within 1\,MiB
+\texttt{malloc}'d chunks; even with the LRU crawler disabled,
+internal slab bookkeeping keeps pages warm.
+On Redis, the event loop touches heap pages even at minimum
+frequency (\texttt{hz\,1}), preventing the pipeline's VM-region
+scanner from finding cold pages.
+Full \sys avoids both problems because it tracks page access
+internally at the allocator level.  With all background tasks
+disabled, full \sys achieves \coRedisFullSmashReduction\% RSS
+reduction and \aucRedisSmashRed\% lower AUC on Redis;
 disabling these tasks does not affect the jemalloc baseline.
 With the metadata-caching and idle-mode patches
 described in \S\ref{sec:eval:apps}, the patched Redis baseline
@@ -618,18 +653,19 @@ is already \ablRedisPatchedBaselineServeRss\,MiB (vs.\
 patches eliminate data-page warming from background tasks
 and \tcode{DEL}.
 
-On memcached, compress-only shows \coMemcachedCompOnlyOverhead\% overhead versus \coMemcachedFullSmashReduction\%
-reduction for full \sys; the gap reflects both \sys's zero-on-free
-producing more compressible record pages and the allocator-level
-tracking avoiding the VM region scanning overhead.
-
 \paragraph{Summary}
-The compress-only pipeline adds overhead rather than
-reducing RSS because glibc does not zero freed memory.  Full \sys
-achieves \coRedisFullSmashReduction--\coMemcachedFullSmashReduction\% reduction by integrating the compression pipeline
-with allocator-level page tracking and zero-on-free.  On Redis,
-compress-only is ineffective because the event loop prevents pages
-from going cold; full \sys's allocator-level tracking overcomes this.
-The two components are complementary: the pipeline provides the
-compression infrastructure, while the allocator design maximizes
-its effectiveness on structured data.
+The critical value-add is \emph{allocator ownership}, not
+allocation-design optimizations.
+\sys-noopt (one arena, no zeroing) matches full \sys because the
+essential property is placing objects in a region where the
+compressor controls page protection and can zero freed slots at
+compression time.
+Compress-only adds overhead rather than reducing RSS on every
+allocator substrate tested (system malloc, jemalloc~5.3.0,
+mimalloc~3.3.0), because third-party allocators' internal page
+management prevents the compression pipeline from discovering
+cold pages.
+The pipeline and allocator are complementary:
+the pipeline provides the compression infrastructure, while
+allocator ownership provides the page-level control that makes
+compression effective.

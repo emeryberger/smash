@@ -8,16 +8,18 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 
 ### Key Features
 
-- **Transparent compression**: No application changes required — works via malloc interposition
-- **Adaptive multi-algorithm**: zstd-1 for recently cold pages, zstd-9 for very cold pages
+- **Transparent compression**: No application changes required, works via malloc interposition.
+- **ROI-driven algorithm selection**: A return-on-investment model picks zstd-1 (fast tier) or zstd-9 (deep tier) per page at compression time, weighing observed compressibility and observed compression cost against the page's accumulated cold time.
+- **Per-origin learning**: Compression-ratio and compression-cost statistics are kept per `(arena, size class)`, so call-site arena routing translates directly into more accurate ROI decisions.
+- **Adaptive worker pool**: The compressor scales its active worker count each tick using Little's Law (`N = ⌈λ/μ⌉`), so an idle process uses one worker and a bulk-allocation phase uses several.
 
 ## How It Works
 
-1. **Allocation**: smash replaces malloc/free via [alloc8](https://github.com/emeryberger/alloc8) interposition. All slab data pages come from a single large virtual memory reservation (VmRegion).
+1. **Allocation**: smash replaces malloc/free via [alloc8](https://github.com/emeryberger/alloc8) interposition. All slab data pages come from a single large virtual memory reservation (VmRegion). A return-address hash routes calls from the same call site into the same arena, producing structurally homogeneous pages.
 
 2. **Access tracking**: A background compressor thread periodically sets active pages to read-only (`mprotect PROT_READ`). Write faults mark pages as "accessed"; pages without writes across multiple intervals are considered cold.
 
-3. **Compression**: Cold pages are compressed (LZ4, zstd, or zstd+dictionary depending on coldness duration) and their physical backing is released. Compressed data is stored in a separate region.
+3. **Compression**: Cold pages are compressed with zstd-1 or zstd-9, selected by the ROI model based on the page's `(arena, size class)` observed ratio and the per-tier observed compression cost. Physical backing is released (`MADV_FREE_REUSABLE` on macOS, `MADV_DONTNEED` on Linux); compressed data is stored in a separate sharded region.
 
 4. **Decompression**: When the application accesses a compressed page, a SIGSEGV/SIGBUS handler recommits the page, decompresses the data, and resumes execution transparently.
 
@@ -240,12 +242,16 @@ Key tuning constants in `include/smash/config.h`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `kCompressIntervalMs` | 1000 | Compression scan interval (ms) |
-| `kColdTicks` | 2 | Ticks without access → compress with LZ4 |
-| `kVeryColdTicks` | 60 | Ticks → escalate to zstd/zstd+dict |
+| `kColdTicks` | 2 | Ticks without access before fast-tier compression considered |
+| `kVeryColdTicks` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile in the ROI model |
 | `kMinCompressRatio` | 0.75 | Only keep compressed if < 75% of original |
 | `kPrefetchWindow` | 2 | Pages prefetched in each direction on fault |
 | `kDictTrainSamples` | 0 | Pages before dictionary training (disabled by default) |
 | `kNumClasses` | 36 | Size classes (16B to 16KB) |
+| `kNumArenas` | 4 | Call-site arenas (must be a power of 2) |
+| `kCompressorWorkers` | 2 | Initial compressor worker count |
+| `kMaxCompressorWorkers` | 8 | Cap for adaptive worker scaling |
+| `kCompressStoreShards` | 8 | Sharded lock count in CompressStore |
 
 ## License
 

@@ -53,7 +53,7 @@ The dominant factor is \emph{allocator ownership}: the compress-only
 pipeline achieves zero RSS reduction atop system malloc, jemalloc, or
 mimalloc on memcached and Redis, because third-party allocators' internal
 page management prevents the pipeline from identifying cold pages.
-The compression pipeline is necessary but not sufficient---it must be
+The compression pipeline is necessary but not sufficient; it must be
 integrated with the allocator to control page protection and track
 access patterns.  Among page-content
 optimizations, \emph{zero-on-free} contributes most, improving
@@ -62,15 +62,15 @@ compression ratios by 1.5--2$\times$ for every allocator tested
 on page content is the same).  However, \sys-noopt (one arena, no
 zeroing) matches full \sys on both memcached and SQLite, indicating
 that deferred zeroing at compression time captures the same benefit
-as eager zeroing---the compressor zeros freed slots in its scratch
+as eager zeroing: the compressor zeros freed slots in its scratch
 buffer before compressing regardless of the ablation flag.
-\emph{External metadata}---storing
-freelists and bitmaps outside data pages---has a modest effect and is
-dominated by zeroing.  \emph{Arena segregation} helps on
-heterogeneous workloads but provides little benefit
-when data is already structurally uniform.  Finally,
-\emph{allocation layout}---sequential vs.\ randomized---affects
-compression more than metadata placement: system malloc's sequential
+\emph{External metadata}, which stores freelists and bitmaps
+outside data pages, has a modest effect and is dominated by
+zeroing.  \emph{Arena segregation} helps on heterogeneous
+workloads but provides little benefit when data is already
+structurally uniform.  Finally, \emph{allocation layout}
+(sequential versus randomized) affects compression more than
+metadata placement: system malloc's sequential
 layout compresses better than DieHard's randomized layout despite
 embedded freelists.  Mesh confirms this: it shares DieHard's
 external bitmap metadata but uses a conventional layout, achieving
@@ -108,7 +108,7 @@ Redis illustrates both the problem and the solution.
 
 Without modification, Redis's \tcode{server\-Cron()} traverses key
 data pages every tick for defragmentation, rehashing, and dictionary
-resizing---even when no client commands are executing.  Additionally,
+resizing, even when no client commands are executing.  Additionally,
 \tcode{DEL} dereferences value pointers to update bookkeeping
 histograms, triggering wholesale decompression of cold pages.  These two behaviors keep pages warm even during idle periods.
 The patches lower the baseline RSS itself (from
@@ -130,8 +130,8 @@ operations during idle periods; all other background tasks
 unchanged.
 
 These patches are not specific to \sys: any system that applies
-\tcode{mprotect}-based page monitoring---including OS-level page
-compressors---would benefit from the same separation of metadata
+\tcode{mprotect}-based page monitoring (including OS-level page
+compressors) would benefit from the same separation of metadata
 access from data-page access.  The general principle is that
 applications should avoid traversing cold data structures for
 bookkeeping purposes; caching derived values in hot headers is a

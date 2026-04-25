@@ -1,0 +1,45 @@
+=== JSON Processing Benchmark ===
+Records: 50000, Hot: 500 (1%), Cool: 5s, Serve: 10s
+
+Generating JSON with 50000 records...
+Generated 21.0 MB JSON in 0.07s
+Parsed in 0.17s (125.6 MB/s)
+Built index for 50000 records
+Post-parse RSS (DOM only): 136.8 MB
+
+Cooling phase: 5 seconds (no access, waiting for compression)...
+  t= 1s: RSS=136.9 MB
+  t= 2s: RSS=136.9 MB
+  t= 3s: RSS=136.9 MB
+  t= 4s: RSS=136.9 MB
+  t= 5s: RSS=136.9 MB
+Post-cooling RSS: 136.9 MB (-0.0% reduction from peak)
+
+Serve phase: 10 seconds (hot-only, 500 records)...
+  t= 1s: RSS=136.9 MB  accesses=21678408
+  t= 2s: RSS=136.9 MB  accesses=21836344
+  t= 3s: RSS=136.9 MB  accesses=21628908
+  t= 4s: RSS=136.9 MB  accesses=21530611
+  t= 5s: RSS=136.9 MB  accesses=21706172
+  t= 6s: RSS=136.9 MB  accesses=21638103
+  t= 7s: RSS=136.9 MB  accesses=21848515
+  t= 8s: RSS=136.9 MB  accesses=21708397
+  t= 9s: RSS=136.9 MB  accesses=21540999
+  t=10s: RSS=136.9 MB  accesses=21711682
+
+Cold re-access: touching 4950 cold records...
+Cold access p50/p99: 0.7 / 1.2 us
+Post re-access RSS: 136.9 MB
+METRIC json_size_mb 21.0
+METRIC parse_throughput_mbs 125.6
+METRIC peak_rss_mb 136.8
+METRIC post_cool_rss_mb 136.9
+METRIC cool_reduction_pct -0.0
+METRIC steady_rss_mb 136.9
+METRIC min_rss_mb 136.9
+METRIC rss_reduction_pct -0.0
+METRIC total_accesses 216828139
+METRIC accesses_per_sec 21682814
+METRIC cold_p50_us 0.7
+METRIC cold_p99_us 1.2
+METRIC post_reaccess_rss_mb 136.9

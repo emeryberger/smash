@@ -89,7 +89,7 @@ SQLite achieves \ablSqliteDefaultRssRedInt\%
 \end{figure*}
 
 Figure~\ref{fig:auc} shows the \emph{area under the curve} (AUC) of
-RSS over time---the integral of memory pressure across the benchmark.
+RSS over time, the integral of memory pressure across the benchmark.
 Lower AUC means less total memory consumption.  \sys reduces AUC by
 \aucRedMin--\aucRedMax\% across all workloads, where compression keeps
 RSS low throughout the cooling and serving phases.
@@ -171,10 +171,10 @@ Throughput is comparable across all configurations ($\pm$5\%).
 
 \paragraph{Root cause analysis and Redis patches}
 Two specific Redis behaviors prevent effective compression.
-First, \tcode{server\-Cron()}'s background
-operations---active defragmentation, incremental rehashing, and hash
-table resizing---traverse key data pages every cron tick, keeping them
-warm even when no client commands are being processed.  With
+First, \tcode{server\-Cron()}'s background operations (active
+defragmentation, incremental rehashing, and hash table resizing)
+traverse key data pages every cron tick, keeping them warm even
+when no client commands are being processed.  With
 \tcode{-{}-hz\,1} and all configurable background tasks disabled,
 only 0.4\% of pages reach the cold threshold because
 \tcode{server\-Cron} still runs defrag and rehash unconditionally.
@@ -222,7 +222,7 @@ With \sys, patched Redis achieves \ablRedisPatchedDefaultRssRedInt\%
 RSS reduction (\ablRedisPatchedBaselineServeRss\,MiB to
 \ablRedisPatchedDefaultServeRss\,MiB).  While the percentage
 reduction is smaller than stock Redis (\ablRedisDefaultRssRedInt\%),
-this is because the baseline is already lower---the absolute
+this is because the baseline is already lower; the absolute
 minimum RSS values are comparable
 (\ablRedisPatchedDefaultMinRss\,MiB patched vs.\
 \ablRedisDefaultMinRss\,MiB stock).
@@ -259,12 +259,12 @@ Patched Redis & \ablRedisPatchedBaselineServeRss & \textbf{\ablRedisPatchedDefau
 
 The patches illustrate a general principle: applications that
 access heap data structures during idle periods interfere with
-page-level compression.  Separating metadata from data---so that
-bookkeeping operations read cached values in object headers rather
-than dereferencing into data pages---and deferring
-data-page-touching maintenance until the application is active
-are sufficient to make such applications compatible with
-transparent heap compression.
+page-level compression.  Two changes suffice to make such
+applications compatible with transparent heap compression.
+The first is to separate metadata from data, so that bookkeeping
+operations read cached values in object headers rather than
+dereferencing into data pages.  The second is to defer
+data-page-touching maintenance until the application is active.
 
 \paragraph{Comparison across allocators}
 To confirm that compression, not allocator choice, drives the
@@ -286,8 +286,8 @@ Powers et al.~\cite{powers2019mesh} report that Mesh reduces Redis
 RSS by 39\% on a workload designed to induce fragmentation: 700K
 keys with 240-byte values followed by 170K keys with 492-byte
 values, under a 100\,MiB LRU cap.  We replicate this workload
-(Table~\ref{tab:redis_mesh}).  No allocator---including Mesh,
-jemalloc's activedefrag, and \sys---reduces RSS.  All
+(Table~\ref{tab:redis_mesh}).  No allocator (including Mesh,
+jemalloc's activedefrag, and \sys) reduces RSS.  All
 configurations show a $\sim$1.9$\times$ fragmentation ratio.
 
 \begin{table}[t]
@@ -318,8 +318,8 @@ jemalloc handles size-class transitions (240\,B $\to$ 492\,B) with
 far less fragmentation, and Redis itself has improved its internal
 memory management over five major versions.  The result is that LRU
 eviction immediately replaces freed objects with new insertions,
-keeping pages fully occupied---there are no partially-filled pages
-for Mesh to compact and no cold pages for \sys to compress.  The
+keeping pages fully occupied.  There are no partially-filled
+pages for Mesh to compact and no cold pages for \sys to compress.  The
 $\sim$1.9$\times$ ratio reflects fixed per-object metadata overhead
 (SDS headers, dict entries, alignment padding), not reclaimable
 holes.  \sys's own metadata (page-state tracking, bootstrap
@@ -336,9 +336,9 @@ The benefit scales with the fraction of cold data and data
 compressibility.  Compression, not allocator choice,
 drives the savings: Mesh provides minimal benefit on most workloads,
 while \sys achieves consistent reductions via compression.
-Two small Redis patches---caching object metadata in headers and
-deferring data-page-touching maintenance during idle
-periods---lower the baseline RSS and enable consistent compression
+Two small Redis patches (caching object metadata in headers and
+deferring data-page-touching maintenance during idle periods)
+lower the baseline RSS and enable consistent compression
 across both standard and extended workloads
 (Table~\ref{tab:redis_patched}).
 
@@ -406,11 +406,11 @@ lower throughput.  zstd-1's entropy coder gives 1.5--2$\times$ better
 ratios than LZ4 at $\sim$2$\times$ lower throughput; for cold pages
 that remain idle, the better ratio yields higher net~ROI\@.
 These results motivate \sys's ROI-based JIT
-compression: because highly compressible data is also \emph{cheaper}
-to compress (higher throughput), the ROI is doubly favorable---the
-model naturally selects zstd-1 for recently cold pages (where fast
-compression minimizes risk) and zstd-9 for long-idle pages (where the
-better ratio justifies the~cost).
+compression.  Because highly compressible data is also
+\emph{cheaper} to compress (higher throughput), the ROI is doubly
+favorable: the model naturally selects zstd-1 for recently cold
+pages, where fast compression minimizes risk, and zstd-9 for
+long-idle pages, where the better ratio justifies the~cost.
 
 \subsection{Ablation Study (RQ3)}
 \label{sec:eval:ablation}
@@ -431,12 +431,13 @@ compression level, zstd's search window already captures the
 patterns a dictionary would provide.  \sys therefore disables
 dictionaries by default.
 
-Disabling compression entirely (\ablAvgNoCompressDelta\,\pp average) confirms that
-compression is the dominant mechanism; without it, \sys reduces to
-a standard allocator with no RSS benefit beyond what the allocator
-design alone provides.  The remaining optimizations---arenas, fast-only
-mode (disabling zstd-9 re-compression), deferred zeroing, prefetch, and
-parallelism---each contribute modestly individually.
+Disabling compression entirely (\ablAvgNoCompressDelta\,\pp
+average) confirms that compression is the dominant mechanism.
+Without it, \sys reduces to a standard allocator with no RSS
+benefit beyond what the allocator design alone provides.  The
+remaining optimizations (arenas, fast-only mode which restricts
+the ROI model to zstd-1, deferred zeroing, prefetch, and
+parallelism) each contribute modestly individually.
 
 \begin{figure}[t]
 \centering
@@ -462,11 +463,10 @@ is close to~optimal.
 The previous experiments measure \sys end-to-end.  We now ask how
 allocator design alone affects page compressibility, independent of
 any compression pipeline.  For each of nine allocators, we run the
-same application workloads used in RQ1---SQLite (50K rows,
-no frees), memcached-format slab items, and Redis SDS strings
-(100K objects each, 50\% freed in an
-alternating pattern)---and compress the resulting heap pages with
-zstd-9.
+same application workloads used in RQ1 (SQLite (50K rows, no
+frees), memcached-format slab items, and Redis SDS strings, at
+100K objects each with 50\% freed in an alternating pattern) and
+compress the resulting heap pages with zstd-9.
 
 Table~\ref{tab:allocator_features} classifies each allocator by three
 design properties relevant to compression: whether metadata (freelists,
@@ -507,7 +507,7 @@ DieHarder     & \ding{51} & \ding{51} &  \\
   real application heap pages.
   \dag~marks allocators that zero freed memory:
   DieHarder (security zeroing)
-  and Smash (deferred to compression time---not yet applied in
+  and Smash (deferred to compression time, not yet applied in
   this static measurement).}
 \label{fig:allocator_compare}
 \end{figure*}
@@ -614,8 +614,8 @@ jemalloc, or mimalloc: pages managed by a third-party allocator are
 never sufficiently cold to compress.
 
 The critical factor is \emph{owning the allocation}.
-\sys-noopt---which uses \sys's allocator but disables arenas and
-zero-on-free---achieves \vaMemcachedNooptRed\% reduction on
+\sys-noopt (which uses \sys's allocator but disables arenas and
+zero-on-free) achieves \vaMemcachedNooptRed\% reduction on
 memcached and \vaSqliteNooptRed\% on SQLite, matching full \sys
 within noise.
 The essential property is that \sys's allocator places objects in

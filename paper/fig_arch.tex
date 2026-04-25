@@ -48,10 +48,6 @@
   \draw[forward] (active) edge[bend left=25]
     node[elbl, above] {\shortstack{span\\[-2pt]empty}} (empty);
 
-  % upgrade: self-loop on COMPRESSED
-  \draw[forward] (compressed) edge[loop below, looseness=5, min distance=6mm]
-    node[elbl, below=0.05cm] {upgrade} (compressed);
-
   % ── Fault paths (dashed, back to ACTIVE) ─────────────────────
 
   % MONITORING → ACTIVE  (write fault, PROT_READ)

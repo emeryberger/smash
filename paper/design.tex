@@ -60,7 +60,7 @@ First, contiguous active pages are coalesced into runs, so a heap
 with thousands of active pages may require only a handful of
 \texttt{mprotect} calls.  Second, hot pages fault immediately on
 their next write, restoring \texttt{PROT\_RW} within
-$\sim$1\,$\mu$s---no decompression, just a permission change---and
+$\sim$1\,$\mu$s (no decompression, just a permission change) and
 remain writable until the next tick.  Third, only pages tracked in
 the chunk bitmap are visited, making the scan proportional to active
 pages rather than the full VM region.  The net effect is negligible:
@@ -69,9 +69,9 @@ write-intensive workloads (\S\ref{sec:eval:apps}).
 
 When the application accesses a \emph{compressed} page, a page
 fault signal fires.  The fault handler decompresses the page
-(regardless of algorithm), resets its cold count to zero---analogous
-to a JIT deoptimization---and returns, allowing the faulting
-instruction to retry~transparently.
+(regardless of algorithm), resets its cold count to zero
+(analogous to a JIT deoptimization), and returns, allowing the
+faulting instruction to retry~transparently.
 
 \subsection{Call-Site Arena Segregation}
 \label{sec:design:arenas}
@@ -112,7 +112,7 @@ and reading the span's \texttt{arena\_id} field.  This prevents arena mixing at 
 \label{sec:design:adaptive}
 
 Just as a JIT compiler uses profiling data to decide which methods to
-optimize and at what level, \sys uses per-size-class compression
+optimize and at what level, \sys uses per-origin compression
 statistics to decide \emph{whether} and \emph{how} to compress each
 cold page.  The decision is driven by a \emph{return-on-investment}
 (ROI) model that weighs the CPU cost of compression against the
@@ -121,12 +121,22 @@ expected RSS savings.
 \paragraph{ROI model}
 For each candidate page, \sys estimates two quantities.  The
 \emph{cost} is the CPU time (in microseconds) to compress and later
-decompress the page, which depends on both the algorithm and the data:
-empirically, highly compressible data is cheaper to process, while
-poorly-compressible data is slower.  \sys models throughput as a
-linear function of the compression ratio, calibrated at startup by
-compressing synthetic test pages (all-zeros and pseudo-random) with
-each algorithm.  The \emph{benefit} is the RSS saved while the page remains
+decompress the page, which depends on both the algorithm and the
+data: empirically, highly compressible data is cheaper to process,
+while poorly-compressible data is slower.  \sys bootstraps this
+estimate from a startup calibration on synthetic pages (all-zeros
+and pseudo-random) per algorithm, then replaces it with
+\emph{per-bucket observed compression time} as real workload
+measurements accumulate.  Each compression records an
+exponentially-weighted moving average of elapsed microseconds in
+the bucket (arena~$\times$ size~class~$\times$ tier); once eight
+samples have been seen, the ROI model uses the observed average
+in place of the calibrated throughput estimate.  This matters
+because calibration uses two extreme data points (all-zeros, all
+random), while real workloads are almost always somewhere in
+between, and the cost distribution differs from one arena to
+another.
+The \emph{benefit} is the RSS saved while the page remains
 compressed: $\mathit{PageSize} \times (1 - R) \times E[T_{\mathit{remain}}]$,
 where $R$ is the compressed-to-original ratio and
 $E[T_{\mathit{remain}}]$ is the expected remaining cold duration.
@@ -136,9 +146,9 @@ workloads~\cite{maas2020adaptive,amaro2023memory} show that page
 inter-access times are heavy-tailed: most pages are either
 frequently accessed or idle for long periods, with few in between.
 For any distribution whose hazard rate $h(t) = f(t)/\bar{F}(t)$ is
-non-increasing---a property called \emph{Decreasing Failure Rate}
-(DFR), which holds for all heavy-tailed families including
-Pareto, log-normal, and Weibull with shape~$< 1$---the expected
+non-increasing (a property called \emph{Decreasing Failure Rate},
+or DFR, which holds for all heavy-tailed families including
+Pareto, log-normal, and Weibull with shape~$< 1$), the expected
 remaining lifetime given survival to~$N$ satisfies
 $E[T - N \mid T > N] \geq E[T]$ and grows with~$N$.  For the
 Pareto distribution specifically,
@@ -160,13 +170,13 @@ decreases, the ROI is steeply sensitive to the compression
 ratio.  Well-compressing pages (low $R$) have low cost and high
 savings, so they are compressed early; poorly-compressing pages
 (high $R$) have high cost and low savings, so they require a long
-cold duration---or are skipped entirely.
+cold duration, or are skipped entirely.
 
 \paragraph{Algorithm selection}
 \sys uses zstd at two compression levels as a tiered strategy:
 zstd-1 as the fast tier for recently-cold pages and zstd-9 as the
 deep tier for long-idle~pages.  zstd-1 compresses at
-$\sim$0.6--1.4\,GB/s---about 2$\times$ slower than LZ4---but
+$\sim$0.6--1.4\,GB/s (about 2$\times$ slower than LZ4), but
 achieves 1.5--2$\times$ higher compression ratios
 (Table~\ref{tab:algo_compare}), because its entropy coder (FSE)
 captures byte-frequency skew that LZ4's literal-copy format cannot
@@ -188,30 +198,40 @@ configurable ratio gate (default 75\%), \sys falls back to zstd-9,
 which often achieves 30--50\% better compression on the same~data.
 
 If a compressed page is accessed, it is decompressed and its cold
-count resets to zero---analogous to a JIT deoptimization.  The page
+count resets to zero, analogous to a JIT deoptimization.  The page
 will be recompressed only if it goes cold~again.
 
 \paragraph{Auto-calibration}
-At startup, \sys benchmarks zstd-1 and zstd-9 on two synthetic pages
-(all-zeros and pseudo-random) to measure per-machine throughput,
-taking the median of 10 iterations per algorithm per page
-($\sim$1\,ms total).  The results populate the throughput profile
-table.  On subsequent runs, calibration results can be cached to a
-JSON file and reloaded, skipping recalibration.  Individual throughput
-values and the ROI threshold can also be overridden via environment
-variables, enabling tuning without recompilation.
+At startup, \sys benchmarks zstd-1 and zstd-9 on two synthetic
+pages (all-zeros and pseudo-random) to measure per-machine
+throughput, taking the median of 10 iterations per algorithm per
+page ($\sim$1\,ms total).  The calibrated numbers serve as the
+initial per-tier cost estimate until per-bucket observations
+accumulate and supersede them.  Calibration results can be cached
+to a JSON file and reloaded on subsequent runs, skipping
+recalibration.  Individual throughput values and the ROI threshold
+can also be overridden via environment variables, enabling tuning
+without recompilation.
 
-\paragraph{Per-size-class statistics}
-Not all size classes compress well.  \sys maintains a 64-entry sliding
-window of compression ratios for each size class and worker.  The
-window records the compressed-to-original ratio (0--255, mapping to
-0--100\%) of each attempted compression.  These statistics feed the
-ROI model: the average ratio from the sliding window serves as the
-estimate of $R$ for future pages of the same size class.
-With fewer than 8 samples, \sys falls back to optimistic compression
-(compress anything past the cold-tick floor).  The sliding window
-allows recovery: if data patterns change and new pages compress well,
-old poor-ratio samples age~out.
+\paragraph{Per-origin statistics}
+Different call sites produce pages with very different
+compressibility, and arena routing is what puts those
+different populations onto different pages.  To preserve that
+signal for the ROI model, \sys maintains two per-bucket
+statistics at each \emph{(arena, size class, worker)}:
+a 64-entry sliding window of compression ratios (0--255,
+mapping to 0--100\%), and a per-tier exponentially-weighted
+moving average of observed compression time in microseconds.
+Aggregating across arenas within a size class would wash out
+exactly the homogeneity that arena routing was designed to
+create.  The ratio average feeds $R$ and the cost EMA feeds
+$\mathit{cost}_{\mathit{comp}}$ in the ROI expression above,
+so the model uses \emph{measured} per-origin behavior rather
+than synthetic extrapolation.  With fewer than
+8 samples in a bucket, \sys falls back to optimistic compression
+(compress anything past the cold-tick floor).  The sliding
+window allows recovery: if data patterns change and new pages
+compress well, old poor-ratio samples age~out.
 
 \subsection{Lazy Free and Zero-on-Free}
 \label{sec:design:zero}
@@ -320,18 +340,18 @@ typically $100\times$ or higher, making the second term negligible.
 The physical cost of a cold page is therefore determined by its
 occupancy, not its nominal size.
 
-Crucially, this result does \emph{not} require live data to be
-compressible.  Even when $r_d = 1$ (completely incompressible data),
-the physical cost of a page with occupancy~$\alpha$ is still only
+This result does \emph{not} require live data to be compressible.
+Even when $r_d = 1$ (completely incompressible data), the physical
+cost of a page with occupancy~$\alpha$ is still only
 $\alpha \cdot P$, because the $(1-\alpha)$ fraction of zeroed freed
-slots compresses away.  The fragmentation benefit comes entirely from
-eliminating the dead space on partially-filled pages---the same dead
-space that Robson's adversary exploits.
+slots compresses away.  The fragmentation benefit comes entirely
+from eliminating the dead space on partially-filled pages, the
+same dead space that Robson's adversary exploits.
 
-This inverts the classical fragmentation picture.  Robson's adversary
-creates maximum waste by producing many pages with low occupancy
-across different size classes---exactly the allocation pattern that
-\emph{maximizes} compression savings.  Low-occupancy pages are
+This inverts the classical fragmentation picture.  Robson's
+adversary creates maximum waste by producing many pages with low
+occupancy across different size classes, which is exactly the
+allocation pattern that \emph{maximizes} compression savings.  Low-occupancy pages are
 dominated by zero-filled freed slots, which compress to near-nothing.
 The adversary's ``fragmented'' heap compresses \emph{better} than a
 well-packed one.
@@ -353,8 +373,8 @@ object occupies at most one slot.  So:
 Compare to the classical bound $\text{RSS} = V \cdot P$, where
 $V \cdot P$ can be $\Omega(L \cdot \log(s_k/s_1))$.
 Even without compressible data, \sys reduces the fragmentation
-overhead from $O(L \cdot \log(s_k/s_1))$ to $O(L)$---eliminating the
-logarithmic Robson factor entirely.  When live data is also
+overhead from $O(L \cdot \log(s_k/s_1))$ to $O(L)$, eliminating
+the logarithmic Robson factor entirely.  When live data is also
 compressible ($r_d > 1$), the bound tightens further to $L / r_d$.
 
 Two conditions are required.
@@ -365,8 +385,8 @@ under Robson's adversary $V \cdot P = \Theta(L \log(s_k/s_1))$,
 which yields $f > 1/\log(s_k/s_1)$.  For typical size-class ranges
 (16\,B to 16\,KiB), this threshold is ${\sim}10\%$.  Empirically,
 cold fractions of 19--62\% of RSS are observed in
-production~\cite{weiner2022tmo}, well above this threshold---and
-the threshold \emph{decreases} under worse fragmentation, since a
+production~\cite{weiner2022tmo}, well above this threshold.  The
+threshold \emph{decreases} under worse fragmentation, since a
 wider size-class range increases the denominator.
 (2)~Freed slots are zeroed: \sys's deferred zeroing guarantees this
 by construction (\S\ref{sec:design:zero}).
@@ -391,7 +411,7 @@ uniformly cold: with $n = P/s$ independently accessed objects, each
 hot with probability~$q$, the probability the page is fully cold is
 $(1-q)^n$, which decreases with~$n$.
 The cold-fraction threshold $f > 1/\log(s_k/s_1)$ is independent
-of~$P$---it depends only on the size-class range---so the
+of~$P$, since it depends only on the size-class range, so the
 fragmentation bound holds on both platforms.
 However, the absolute working-set term $W \cdot P$ is $4\times$
 larger per warm page on macOS, which limits the maximum achievable

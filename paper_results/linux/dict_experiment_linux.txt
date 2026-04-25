@@ -1,0 +1,163 @@
+=== Dictionary Compression Experiments ===
+Page size: 4096, DictTrainSamples: 0, DeepLevel: 9
+
+========================================
+  Experiment 6: CDict/DDict Memory Overhead
+========================================
+
+  Dict raw size: 32768 bytes
+  CDict at level  1:     78 KB
+METRIC dict_exp6_cdict_L1_kb 78
+  CDict at level  3:    430 KB
+METRIC dict_exp6_cdict_L3_kb 430
+  CDict at level  9:    686 KB
+METRIC dict_exp6_cdict_L9_kb 686
+  CDict at level 15:   1070 KB
+METRIC dict_exp6_cdict_L15_kb 1070
+  DDict: 58 KB
+METRIC dict_exp6_ddict_kb 58
+
+  Per-size-class overhead:
+    Sample buffer: 0 KB
+    Dict buffer:   32 KB
+  With 36 size classes, 36 potentially trained:
+    Sample buffers total: 0 MB
+
+========================================
+  Experiment 1: Try-Both (dict vs plain ZSTD at level 9)
+========================================
+
+DataType     Wins Losses   Ties     AvgDelta   TotalDelta DictBetter
+json          100      0      0       63.4 B       6339 B     100.0%
+METRIC dict_exp1_json_wins 100
+METRIC dict_exp1_json_losses 0
+METRIC dict_exp1_json_avg_delta 63.4
+kv             45     55      0        0.1 B         11 B      45.0%
+METRIC dict_exp1_kv_wins 45
+METRIC dict_exp1_kv_losses 55
+METRIC dict_exp1_kv_avg_delta 0.1
+sqlite        100      0      0       39.6 B       3956 B     100.0%
+METRIC dict_exp1_sqlite_wins 100
+METRIC dict_exp1_sqlite_losses 0
+METRIC dict_exp1_sqlite_avg_delta 39.6
+zeroed         64     29      7        1.9 B        194 B      64.0%
+METRIC dict_exp1_zeroed_wins 64
+METRIC dict_exp1_zeroed_losses 29
+METRIC dict_exp1_zeroed_avg_delta 1.9
+
+========================================
+  Experiment 2: Level Sweep (dict benefit by compression level)
+========================================
+
+DataType    Level    PlainSize     DictSize        Delta   DictBetter
+json            1       1019 B        964 B       55.5 B        5.4%
+METRIC dict_exp2_json_L1_plain 1019
+METRIC dict_exp2_json_L1_dict 964
+json            3       1027 B        964 B       63.4 B        6.2%
+METRIC dict_exp2_json_L3_plain 1027
+METRIC dict_exp2_json_L3_dict 964
+json            9        966 B        964 B        2.3 B        0.2%
+METRIC dict_exp2_json_L9_plain 966
+METRIC dict_exp2_json_L9_dict 964
+json           15        945 B        964 B      -18.6 B       -2.0%
+METRIC dict_exp2_json_L15_plain 945
+METRIC dict_exp2_json_L15_dict 964
+
+kv              1        436 B        441 B       -4.7 B       -1.1%
+METRIC dict_exp2_kv_L1_plain 436
+METRIC dict_exp2_kv_L1_dict 441
+kv              3        441 B        441 B        0.1 B        0.0%
+METRIC dict_exp2_kv_L3_plain 441
+METRIC dict_exp2_kv_L3_dict 441
+kv              9        427 B        441 B      -14.1 B       -3.3%
+METRIC dict_exp2_kv_L9_plain 427
+METRIC dict_exp2_kv_L9_dict 441
+kv             15        414 B        441 B      -27.0 B       -6.5%
+METRIC dict_exp2_kv_L15_plain 414
+METRIC dict_exp2_kv_L15_dict 441
+
+sqlite          1       2305 B       2257 B       48.6 B        2.1%
+METRIC dict_exp2_sqlite_L1_plain 2305
+METRIC dict_exp2_sqlite_L1_dict 2257
+sqlite          3       2296 B       2257 B       39.6 B        1.7%
+METRIC dict_exp2_sqlite_L3_plain 2296
+METRIC dict_exp2_sqlite_L3_dict 2257
+sqlite          9       2262 B       2257 B        5.5 B        0.2%
+METRIC dict_exp2_sqlite_L9_plain 2262
+METRIC dict_exp2_sqlite_L9_dict 2257
+sqlite         15       2236 B       2257 B      -20.8 B       -0.9%
+METRIC dict_exp2_sqlite_L15_plain 2236
+METRIC dict_exp2_sqlite_L15_dict 2257
+
+zeroed          1         65 B         62 B        2.1 B        3.3%
+METRIC dict_exp2_zeroed_L1_plain 65
+METRIC dict_exp2_zeroed_L1_dict 62
+zeroed          3         64 B         62 B        1.9 B        3.0%
+METRIC dict_exp2_zeroed_L3_plain 64
+METRIC dict_exp2_zeroed_L3_dict 62
+zeroed          9         61 B         62 B       -1.1 B       -1.8%
+METRIC dict_exp2_zeroed_L9_plain 61
+METRIC dict_exp2_zeroed_L9_dict 62
+zeroed         15         74 B         62 B       11.6 B       15.7%
+METRIC dict_exp2_zeroed_L15_plain 74
+METRIC dict_exp2_zeroed_L15_dict 62
+
+
+========================================
+  Experiment 3: Grouping Strategy
+========================================
+  homogeneous = train from same data type (simulates per-arena dict)
+  mixed       = train from all data types (simulates per-size-class dict)
+  no-dict     = plain ZSTD baseline
+
+DataType            NoDict     Homogeneous           Mixed     HomoVsMixed
+json                1027 B           964 B          1034 B           -70 B
+METRIC dict_exp3_json_nodict 1027
+METRIC dict_exp3_json_homo 964
+METRIC dict_exp3_json_mixed 1034
+  → homo vs nodict: -6.2%, mixed vs nodict: +0.7%
+kv                   442 B           441 B           542 B          -101 B
+METRIC dict_exp3_kv_nodict 442
+METRIC dict_exp3_kv_homo 441
+METRIC dict_exp3_kv_mixed 542
+  → homo vs nodict: -0.2%, mixed vs nodict: +22.6%
+sqlite              2316 B          2279 B          2348 B           -69 B
+METRIC dict_exp3_sqlite_nodict 2316
+METRIC dict_exp3_sqlite_homo 2279
+METRIC dict_exp3_sqlite_mixed 2348
+  → homo vs nodict: -1.6%, mixed vs nodict: +1.4%
+zeroed                64 B            62 B            64 B            -2 B
+METRIC dict_exp3_zeroed_nodict 64
+METRIC dict_exp3_zeroed_homo 62
+METRIC dict_exp3_zeroed_mixed 64
+  → homo vs nodict: -3.6%, mixed vs nodict: -0.5%
+
+========================================
+  Experiment 5: Sample Count Sweep
+========================================
+
+DataType          4        8       16       32       64  NoDictAvg
+json           965 B     963 B     963 B     954 B     949 B      1025 B
+METRIC dict_exp5_json_n4 965
+METRIC dict_exp5_json_n8 963
+METRIC dict_exp5_json_n16 963
+METRIC dict_exp5_json_n32 954
+METRIC dict_exp5_json_n64 949
+kv             427 B     456 B     441 B     439 B     438 B       442 B
+METRIC dict_exp5_kv_n4 427
+METRIC dict_exp5_kv_n8 456
+METRIC dict_exp5_kv_n16 441
+METRIC dict_exp5_kv_n32 439
+METRIC dict_exp5_kv_n64 438
+sqlite        2268 B    2272 B    2265 B    2265 B    2263 B      2304 B
+METRIC dict_exp5_sqlite_n4 2268
+METRIC dict_exp5_sqlite_n8 2272
+METRIC dict_exp5_sqlite_n16 2265
+METRIC dict_exp5_sqlite_n32 2265
+METRIC dict_exp5_sqlite_n64 2263
+zeroed          60 B      67 B      61 B      61 B      61 B        63 B
+METRIC dict_exp5_zeroed_n4 60
+METRIC dict_exp5_zeroed_n8 67
+METRIC dict_exp5_zeroed_n16 61
+METRIC dict_exp5_zeroed_n32 61
+METRIC dict_exp5_zeroed_n64 61

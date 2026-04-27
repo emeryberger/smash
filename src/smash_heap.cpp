@@ -10,6 +10,7 @@
 #include <sys/uio.h>
 #include <poll.h>
 #include <unistd.h>
+#include <mach/mach.h>
 #endif
 
 // ── Thread init counter for deferred compression start ──────────────────────
@@ -179,6 +180,394 @@ extern "C" int smash_kevent(int kq, const struct kevent* changelist, int nchange
             smash::vm::unpinPages(changelist, nchanges * sizeof(struct kevent), vm);
         if (eventlist && nevents > 0)
             smash::vm::unpinPages(eventlist, nevents * sizeof(struct kevent), vm);
+    }
+    return ret;
+}
+
+// ── kevent64 ─────────────────────────────────────────────────────────────────
+// Firefox's IPC I/O thread uses kevent64 (not kevent) on macOS via
+// message_pump_kqueue.cc. The events_ buffer is a std::vector<kevent64_s>
+// allocated through our malloc, so it lives in our VmRegion and the
+// compressor can mprotect its pages. Without this interposer the kernel
+// returns EFAULT on the page-fault path and Firefox MOZ_CRASHes.
+
+extern "C" int smash_kevent64(int kq,
+                              const struct kevent64_s* changelist, int nchanges,
+                              struct kevent64_s* eventlist, int nevents,
+                              unsigned int flags,
+                              const struct timespec* timeout);
+SMASH_INTERPOSE(smash_kevent64, kevent64);
+
+using kevent64_fn = int(*)(int, const struct kevent64_s*, int,
+                           struct kevent64_s*, int, unsigned int,
+                           const struct timespec*);
+
+extern "C" int smash_kevent64(int kq,
+                              const struct kevent64_s* changelist, int nchanges,
+                              struct kevent64_s* eventlist, int nevents,
+                              unsigned int flags,
+                              const struct timespec* timeout) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm) {
+        if (changelist && nchanges > 0) {
+            smash::vm::pinPages(changelist, nchanges * sizeof(struct kevent64_s), vm);
+            smash::vm::warmPages(changelist, nchanges * sizeof(struct kevent64_s), vm);
+        }
+        if (eventlist && nevents > 0) {
+            smash::vm::pinPages(eventlist, nevents * sizeof(struct kevent64_s), vm);
+            smash::vm::warmPages(eventlist, nevents * sizeof(struct kevent64_s), vm);
+        }
+    }
+    int ret;
+    for (int attempt = 0; ; ++attempt) {
+        ret = reinterpret_cast<kevent64_fn>(smash_interpose_smash_kevent64.original)(
+            kq, changelist, nchanges, eventlist, nevents, flags, timeout);
+        if (ret != -1 || errno != EFAULT || attempt >= 3) break;
+        if (vm) {
+            if (changelist && nchanges > 0)
+                smash::vm::warmPages(changelist, nchanges * sizeof(struct kevent64_s), vm);
+            if (eventlist && nevents > 0)
+                smash::vm::warmPages(eventlist, nevents * sizeof(struct kevent64_s), vm);
+        }
+    }
+    if (vm) {
+        if (changelist && nchanges > 0)
+            smash::vm::unpinPages(changelist, nchanges * sizeof(struct kevent64_s), vm);
+        if (eventlist && nevents > 0)
+            smash::vm::unpinPages(eventlist, nevents * sizeof(struct kevent64_s), vm);
+    }
+    return ret;
+}
+
+// ── mach_msg ─────────────────────────────────────────────────────────────────
+// CoreFoundation's runloop (CFRunLoopServiceMachPort) calls mach_msg with a
+// caller-provided buffer. For receive, the kernel writes the message into the
+// buffer; for send, it reads. If the buffer's pages are smash-managed and the
+// compressor has stripped write access (Phase 3 PROT_READ for monitoring) or
+// read access (Phase 2 PROT_NONE for compression), the kernel returns
+// MACH_RCV_INVALID_DATA / MACH_SEND_INVALID_DATA and CF __builtin_traps via
+// __CFRunLoopServiceMachPort.cold.1. Pin and warm the buffer pages so the
+// compressor leaves them alone for the duration of the call.
+
+using mach_msg_fn = mach_msg_return_t(*)(mach_msg_header_t*, mach_msg_option_t,
+                                         mach_msg_size_t, mach_msg_size_t,
+                                         mach_port_name_t, mach_msg_timeout_t,
+                                         mach_port_name_t);
+
+extern "C" mach_msg_return_t smash_mach_msg(mach_msg_header_t* msg,
+                                            mach_msg_option_t option,
+                                            mach_msg_size_t send_size,
+                                            mach_msg_size_t rcv_size,
+                                            mach_port_name_t rcv_name,
+                                            mach_msg_timeout_t timeout,
+                                            mach_port_name_t notify);
+SMASH_INTERPOSE(smash_mach_msg, mach_msg);
+
+// Up to this many OOL descriptors per message will get their target buffers
+// pinned. CFRunLoop messages typically carry 0–1 OOL descriptors; raising
+// this only matters for unusual senders. The cap keeps the unpin tracker
+// on-stack and bounds worst-case latency.
+static constexpr size_t kSmashMaxOolPins = 16;
+
+struct OolPinTracker {
+    struct Entry { void* addr; size_t size; };
+    Entry entries[kSmashMaxOolPins];
+    size_t count = 0;
+    void add(void* addr, size_t size) {
+        if (count < kSmashMaxOolPins) {
+            entries[count].addr = addr;
+            entries[count].size = size;
+            ++count;
+        }
+    }
+};
+
+// Walk the descriptor body of a complex mach message, pin and warm each
+// OOL descriptor's target buffer, and record it in `tracker` so we can
+// unpin on return.
+//
+// Layout: after mach_msg_header_t comes mach_msg_body_t (a single u32
+// descriptor count) when MACH_MSGH_BITS_COMPLEX is set in msgh_bits.
+// Then `count` descriptors of varying sizes follow. Every descriptor
+// shares the same prefix `mach_msg_type_descriptor_t` (12 bytes on
+// LP64), with the type byte at offset 11. We use that to discriminate
+// before reading the full descriptor struct.
+static void smash_pin_ool_descriptors(mach_msg_header_t* msg,
+                                      smash::VmRegion* vm,
+                                      OolPinTracker& tracker) {
+    if (!msg || !vm) return;
+    if (!(msg->msgh_bits & MACH_MSGH_BITS_COMPLEX)) return;
+
+    auto* body = reinterpret_cast<mach_msg_body_t*>(msg + 1);
+    uint32_t desc_count = body->msgh_descriptor_count;
+    auto* p = reinterpret_cast<uint8_t*>(body + 1);
+    // Don't walk past the message body — guard against a corrupt count.
+    auto* msg_end = reinterpret_cast<uint8_t*>(msg) + msg->msgh_size;
+
+    for (uint32_t i = 0; i < desc_count; ++i) {
+        if (p + 12 > msg_end) return;
+        uint8_t type = p[11];  // type byte: same offset across all variants
+        size_t advance = 0;
+        switch (type) {
+        case MACH_MSG_PORT_DESCRIPTOR:
+            advance = sizeof(mach_msg_port_descriptor_t);
+            break;
+        case MACH_MSG_OOL_DESCRIPTOR:
+        case MACH_MSG_OOL_VOLATILE_DESCRIPTOR: {
+            auto* d = reinterpret_cast<mach_msg_ool_descriptor_t*>(p);
+            if (d->address && d->size > 0) {
+                smash::vm::pinPages(d->address, d->size, vm);
+                smash::vm::warmPages(d->address, d->size, vm);
+                tracker.add(d->address, d->size);
+            }
+            advance = sizeof(mach_msg_ool_descriptor_t);
+            break;
+        }
+        case MACH_MSG_OOL_PORTS_DESCRIPTOR: {
+            auto* d = reinterpret_cast<mach_msg_ool_ports_descriptor_t*>(p);
+            if (d->address && d->count > 0) {
+                size_t bytes = static_cast<size_t>(d->count) *
+                               sizeof(mach_port_t);
+                smash::vm::pinPages(d->address, bytes, vm);
+                smash::vm::warmPages(d->address, bytes, vm);
+                tracker.add(d->address, bytes);
+            }
+            advance = sizeof(mach_msg_ool_ports_descriptor_t);
+            break;
+        }
+        case MACH_MSG_GUARDED_PORT_DESCRIPTOR:
+            advance = sizeof(mach_msg_guarded_port_descriptor_t);
+            break;
+        default:
+            // Unknown descriptor type — bail rather than guess. The
+            // already-pinned descriptors will be unpinned on return.
+            return;
+        }
+        if (p + advance > msg_end) return;
+        p += advance;
+    }
+}
+
+extern "C" mach_msg_return_t smash_mach_msg(mach_msg_header_t* msg,
+                                            mach_msg_option_t option,
+                                            mach_msg_size_t send_size,
+                                            mach_msg_size_t rcv_size,
+                                            mach_port_name_t rcv_name,
+                                            mach_msg_timeout_t timeout,
+                                            mach_port_name_t notify) {
+    auto* vm = smash::g_smash_vm_region;
+    // The buffer holds either send_size (send) or rcv_size (receive); cover
+    // both by using the max so a combined send/receive is also safe.
+    size_t buf_size = send_size > rcv_size ? send_size : rcv_size;
+    if (vm && msg && buf_size > 0) {
+        smash::vm::pinPages(msg, buf_size, vm);
+        smash::vm::warmPages(msg, buf_size, vm);
+    }
+    // Walk descriptor body for OOL targets — the kernel reads/writes
+    // those during message dispatch (mach_msg2_trap), and a compressed
+    // page hit there is unrecoverable (kernel checks protection
+    // synchronously). Only relevant for SEND; on RECEIVE the kernel
+    // writes new descriptor entries and any OOL data is kernel-mapped
+    // into us, not user-side.
+    OolPinTracker ool_tracker;
+    if (vm && msg && (option & MACH_SEND_MSG)) {
+        smash_pin_ool_descriptors(msg, vm, ool_tracker);
+    }
+    mach_msg_return_t ret;
+    for (int attempt = 0; ; ++attempt) {
+        ret = reinterpret_cast<mach_msg_fn>(smash_interpose_smash_mach_msg.original)(
+            msg, option, send_size, rcv_size, rcv_name, timeout, notify);
+        // Retry on the buffer-validity errors specifically; other returns
+        // (timeout, port died, etc.) are not buffer-related.
+        if (ret != MACH_RCV_INVALID_DATA && ret != MACH_SEND_INVALID_DATA)
+            break;
+        if (attempt >= 3) break;
+        if (vm && msg && buf_size > 0)
+            smash::vm::warmPages(msg, buf_size, vm);
+        for (size_t i = 0; i < ool_tracker.count; ++i)
+            smash::vm::warmPages(ool_tracker.entries[i].addr,
+                                  ool_tracker.entries[i].size, vm);
+    }
+    // SMASH_IPC_STICKY_PIN=1: leave the pin counters incremented after the
+    // call, so any page that ever held an IPC buffer is exempt from
+    // compression (via the existing g_page_pins skip in the compressor).
+    // Trades compression coverage for IPC robustness — pages used for
+    // IPC stay readable, so parent↔child mach_msg dispatch never hits
+    // a compressed page. Pin counter is uint8_t; saturates at 255, so
+    // a page hit > 255 times rolls back to compressible. Acceptable
+    // for early-startup IPC (the window where Firefox's flakiness lives).
+    static const bool sticky_pin = []{
+        const char* v = std::getenv("SMASH_IPC_STICKY_PIN");
+        return v && v[0] == '1';
+    }();
+    if (!sticky_pin) {
+        for (size_t i = 0; i < ool_tracker.count; ++i)
+            smash::vm::unpinPages(ool_tracker.entries[i].addr,
+                                   ool_tracker.entries[i].size, vm);
+        if (vm && msg && buf_size > 0)
+            smash::vm::unpinPages(msg, buf_size, vm);
+    }
+    return ret;
+}
+
+// ── mach_msg_overwrite ──────────────────────────────────────────────────────
+// Same hazard as mach_msg, but called by libxpc / libdispatch on a separate
+// path. __DATA_INTERPOSE only catches cross-dylib calls, so libsystem-internal
+// chains (mach_msg → mach_msg_overwrite → mach_msg2_internal → trap) bypass
+// our smash_mach_msg interposer entirely. Adding this interposer catches
+// libxpc/libdispatch direct calls to mach_msg_overwrite. Same buffer-pinning
+// strategy: warm + pin send buffer, walk OOL descriptors on send, warm the
+// separate receive buffer if one was supplied.
+
+using mach_msg_overwrite_fn = mach_msg_return_t(*)(
+    mach_msg_header_t*, mach_msg_option_t,
+    mach_msg_size_t, mach_msg_size_t,
+    mach_port_name_t, mach_msg_timeout_t,
+    mach_port_name_t, mach_msg_header_t*, mach_msg_size_t);
+
+extern "C" mach_msg_return_t smash_mach_msg_overwrite(
+    mach_msg_header_t* msg, mach_msg_option_t option,
+    mach_msg_size_t send_size, mach_msg_size_t rcv_size,
+    mach_port_name_t rcv_name, mach_msg_timeout_t timeout,
+    mach_port_name_t notify, mach_msg_header_t* rcv_msg,
+    mach_msg_size_t rcv_limit);
+SMASH_INTERPOSE(smash_mach_msg_overwrite, mach_msg_overwrite);
+
+extern "C" mach_msg_return_t smash_mach_msg_overwrite(
+    mach_msg_header_t* msg, mach_msg_option_t option,
+    mach_msg_size_t send_size, mach_msg_size_t rcv_size,
+    mach_port_name_t rcv_name, mach_msg_timeout_t timeout,
+    mach_port_name_t notify, mach_msg_header_t* rcv_msg,
+    mach_msg_size_t rcv_limit) {
+    auto* vm = smash::g_smash_vm_region;
+    size_t send_buf_size = send_size;
+    size_t rcv_buf_size = rcv_msg ? rcv_limit : rcv_size;
+    if (vm) {
+        if (msg && send_buf_size > 0) {
+            smash::vm::pinPages(msg, send_buf_size, vm);
+            smash::vm::warmPages(msg, send_buf_size, vm);
+        }
+        if (rcv_msg && rcv_buf_size > 0) {
+            smash::vm::pinPages(rcv_msg, rcv_buf_size, vm);
+            smash::vm::warmPages(rcv_msg, rcv_buf_size, vm);
+        }
+    }
+    OolPinTracker ool_tracker;
+    if (vm && msg && (option & MACH_SEND_MSG)) {
+        smash_pin_ool_descriptors(msg, vm, ool_tracker);
+    }
+    mach_msg_return_t ret;
+    for (int attempt = 0; ; ++attempt) {
+        ret = reinterpret_cast<mach_msg_overwrite_fn>(
+            smash_interpose_smash_mach_msg_overwrite.original)(
+            msg, option, send_size, rcv_size, rcv_name, timeout, notify,
+            rcv_msg, rcv_limit);
+        if (ret != MACH_RCV_INVALID_DATA && ret != MACH_SEND_INVALID_DATA)
+            break;
+        if (attempt >= 3) break;
+        if (vm) {
+            if (msg && send_buf_size > 0)
+                smash::vm::warmPages(msg, send_buf_size, vm);
+            if (rcv_msg && rcv_buf_size > 0)
+                smash::vm::warmPages(rcv_msg, rcv_buf_size, vm);
+            for (size_t i = 0; i < ool_tracker.count; ++i)
+                smash::vm::warmPages(ool_tracker.entries[i].addr,
+                                      ool_tracker.entries[i].size, vm);
+        }
+    }
+    static const bool sticky_pin_ow = []{
+        const char* v = std::getenv("SMASH_IPC_STICKY_PIN");
+        return v && v[0] == '1';
+    }();
+    if (!sticky_pin_ow) {
+        for (size_t i = 0; i < ool_tracker.count; ++i)
+            smash::vm::unpinPages(ool_tracker.entries[i].addr,
+                                   ool_tracker.entries[i].size, vm);
+        if (vm && msg && send_buf_size > 0)
+            smash::vm::unpinPages(msg, send_buf_size, vm);
+        if (vm && rcv_msg && rcv_buf_size > 0)
+            smash::vm::unpinPages(rcv_msg, rcv_buf_size, vm);
+    }
+    return ret;
+}
+
+// ── mach_msg2_internal ───────────────────────────────────────────────────────
+// The internal entry that mach_msg / mach_msg_overwrite / mach_msg2 all
+// route through before invoking the kernel trap. Some libsystem-resident
+// callers (libxpc, libdispatch) reach this via paths we can't see — but
+// any *cross-dylib* call to mach_msg2_internal goes through interposition,
+// so adding this catches the direct callers.
+//
+// Signature is from Apple's libsyscall/mach/mach_msg.c:
+//   mach_msg_return_t mach_msg2_internal(void *data, uint64_t options,
+//       uint64_t msgh_bits_and_send_size,
+//       uint64_t msgh_remote_and_local_port,
+//       uint64_t msgh_voucher_and_id,
+//       uint64_t desc_count_and_rcv_size,
+//       uint64_t rcv_name_and_timeout,
+//       uint32_t priority);
+//
+// Send size is the low 32 bits of msgh_bits_and_send_size; receive size is
+// the low 32 bits of desc_count_and_rcv_size. We pin the buffer over the
+// max of the two so both directions are covered.
+
+// mach_msg2_internal is exported from libsystem_kernel but not declared in
+// any public header. Declare here so we can take its address for the
+// interpose entry.
+extern "C" mach_msg_return_t mach_msg2_internal(
+    void* data, uint64_t options, uint64_t bits_and_send_size,
+    uint64_t remote_and_local_port, uint64_t voucher_and_id,
+    uint64_t desc_count_and_rcv_size, uint64_t rcv_name_and_timeout,
+    uint32_t priority);
+
+using mach_msg2_internal_fn = mach_msg_return_t(*)(
+    void*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint32_t);
+
+extern "C" mach_msg_return_t smash_mach_msg2_internal(
+    void* data, uint64_t options, uint64_t bits_and_send_size,
+    uint64_t remote_and_local_port, uint64_t voucher_and_id,
+    uint64_t desc_count_and_rcv_size, uint64_t rcv_name_and_timeout,
+    uint32_t priority);
+SMASH_INTERPOSE(smash_mach_msg2_internal, mach_msg2_internal);
+
+extern "C" mach_msg_return_t smash_mach_msg2_internal(
+    void* data, uint64_t options, uint64_t bits_and_send_size,
+    uint64_t remote_and_local_port, uint64_t voucher_and_id,
+    uint64_t desc_count_and_rcv_size, uint64_t rcv_name_and_timeout,
+    uint32_t priority) {
+    auto* vm = smash::g_smash_vm_region;
+    uint32_t send_size = static_cast<uint32_t>(bits_and_send_size);
+    uint32_t rcv_size = static_cast<uint32_t>(desc_count_and_rcv_size);
+    size_t buf_size = send_size > rcv_size ? send_size : rcv_size;
+    if (vm && data && buf_size > 0) {
+        smash::vm::pinPages(data, buf_size, vm);
+        smash::vm::warmPages(data, buf_size, vm);
+    }
+    // OOL descriptor walking only makes sense if `data` looks like a
+    // mach_msg_header_t with the COMPLEX bit set; cheap to check.
+    OolPinTracker ool_tracker;
+    if (vm && data && send_size >= sizeof(mach_msg_header_t)) {
+        auto* hdr = static_cast<mach_msg_header_t*>(data);
+        if (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
+            smash_pin_ool_descriptors(hdr, vm, ool_tracker);
+        }
+    }
+    mach_msg_return_t ret = reinterpret_cast<mach_msg2_internal_fn>(
+        smash_interpose_smash_mach_msg2_internal.original)(
+        data, options, bits_and_send_size, remote_and_local_port,
+        voucher_and_id, desc_count_and_rcv_size, rcv_name_and_timeout,
+        priority);
+    static const bool sticky_pin_2i = []{
+        const char* v = std::getenv("SMASH_IPC_STICKY_PIN");
+        return v && v[0] == '1';
+    }();
+    if (!sticky_pin_2i) {
+        for (size_t i = 0; i < ool_tracker.count; ++i)
+            smash::vm::unpinPages(ool_tracker.entries[i].addr,
+                                   ool_tracker.entries[i].size, vm);
+        if (vm && data && buf_size > 0)
+            smash::vm::unpinPages(data, buf_size, vm);
     }
     return ret;
 }

@@ -511,8 +511,10 @@ public:
 
         if (size == 0) size = 1;
 
-        // Large-only mode: small allocations pass through to system malloc
-        if (isLargeOnlyMode() && size <= kMaxSmallSize) {
+        // Large-only mode: allocations <= largeOnlyThreshold() pass through
+        // to system malloc. Default threshold is kMaxSmallSize (16 KB) —
+        // overridable via SMASH_LARGE_ONLY_THRESHOLD env var.
+        if (isLargeOnlyMode() && size <= largeOnlyThreshold()) {
             if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
         }
 
@@ -529,9 +531,15 @@ public:
                     stampCohort(ptr, ra32);
                 }
             }
+            // SMASH_EAGER_ZERO=1: zero the slot synchronously instead of
+            // relying on the compressor's deferred zeroFreeSlots() pass.
+            if (ptr && isEagerZeroMode())
+                __builtin_memset(ptr, 0, classSize(sc));
             return ptr;
         }
-        return large_alloc_.allocate(size, kMinAlignment);
+        void* ptr = large_alloc_.allocate(size, kMinAlignment);
+        if (ptr && isEagerZeroMode()) __builtin_memset(ptr, 0, size);
+        return ptr;
     }
 
     void free(void* ptr) {
@@ -570,7 +578,7 @@ public:
 
         if (size == 0) size = 1;
         // Large-only: small aligned allocs go to system allocator
-        if (isLargeOnlyMode() && size <= kMaxSmallSize && g_system_alloc.posix_memalign) {
+        if (isLargeOnlyMode() && size <= largeOnlyThreshold() && g_system_alloc.posix_memalign) {
             void* ptr = nullptr;
             if (g_system_alloc.posix_memalign(&ptr, alignment, size) == 0)
                 return ptr;
@@ -589,7 +597,7 @@ public:
         }
         size_t total = count * size;
         // Large-only: small callocs go to system allocator
-        if (isLargeOnlyMode() && total <= kMaxSmallSize && g_system_alloc.calloc) {
+        if (isLargeOnlyMode() && total <= largeOnlyThreshold() && g_system_alloc.calloc) {
             return g_system_alloc.calloc(count, size);
         }
         void* ptr = this->malloc(total);

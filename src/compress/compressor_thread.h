@@ -20,6 +20,9 @@
 #include "../core/bootstrap_alloc.h"
 #include "../core/page_map.h"
 #include "../util/spinlock.h"
+
+#include <csignal>
+#include <cstdio>
 #include "../vm/fault_handler.h"
 #include "../vm/syscall_compat.h"
 
@@ -919,6 +922,38 @@ class CompressorThread {
     void tick() {
         if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
+        // SMASH_DEFER_PHASES_MS=NNN: skip Phase 2 (compress) and Phase 3
+        // (monitor PROT_READ) for the first NNN ms after start(). Useful
+        // for workloads that establish IPC channels at startup with
+        // buffers in smash-managed pages — once those buffers are no
+        // longer hot, normal compressor operation resumes. Phase 1
+        // (access tracking bookkeeping) still runs.
+        static const int defer_ms = []{
+            const char* v = std::getenv("SMASH_DEFER_PHASES_MS");
+            return v ? atoi(v) : 0;
+        }();
+        static const auto start_time = std::chrono::steady_clock::now();
+        bool defer_phases = false;
+        if (defer_ms > 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - start_time).count();
+            defer_phases = (elapsed_ms < defer_ms);
+        }
+        // Re-claim SIGUSR2 each tick so Firefox / other runtimes that
+        // also install a SIGUSR2 handler can't permanently displace ours.
+        // Cheap: one sigaction-read + one branch.
+        {
+            struct sigaction current{};
+            sigaction(SIGUSR2, nullptr, &current);
+            if (current.sa_handler != &CompressorThread::sigusr1Handler) {
+                struct sigaction sa{};
+                sa.sa_handler = &CompressorThread::sigusr1Handler;
+                sa.sa_flags = SA_RESTART;
+                sigemptyset(&sa.sa_mask);
+                sigaction(SIGUSR2, &sa, nullptr);
+            }
+        }
 
         // Pin stdio buffers once (they don't move after first use)
         if (!stdio_pinned_) {
@@ -956,8 +991,18 @@ class CompressorThread {
 
         dispatch(1);  // Phase 1: access tracking
 
-        dispatch(2);  // Phase 2: compression
-        dispatch(3);  // Phase 3: monitoring
+        if (!defer_phases) dispatch(2);  // Phase 2: compression
+        // Phase 3 mprotects ACTIVE pages to PROT_READ for write-fault tracking.
+        // This breaks any syscall / Mach trap that writes into a smash-managed
+        // buffer it doesn't know to pin (e.g. mach_msg from CFRunLoop).
+        // SMASH_NO_MONITOR=1 disables Phase 3 at runtime, trading off cold
+        // detection accuracy for compatibility with such codepaths. Looked
+        // up once at startup to keep the tick loop branch-free.
+        static const bool no_monitor = []{
+            const char* v = std::getenv("SMASH_NO_MONITOR");
+            return v && v[0] == '1';
+        }();
+        if (!no_monitor && !defer_phases) dispatch(3);  // Phase 3: monitoring
 
         // ── Adaptive worker scaling ──────────────────────────────────────
         // Measure this tick's workload and throughput, update EMAs, and
@@ -1182,6 +1227,17 @@ public:
     void start() {
         running_.store(true, std::memory_order_release);
 
+        // SIGUSR2 stats dump: walk page-state table, write a one-line summary
+        // to stderr. Lets us observe whether smash is actually compressing
+        // anything during a Firefox run without rebuilding. Use SIGUSR2 (not
+        // SIGUSR1) because Firefox installs a SIGUSR1 handler of its own.
+        s_stats_instance_ = this;
+        struct sigaction sa{};
+        sa.sa_handler = &CompressorThread::sigusr1Handler;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR2, &sa, nullptr);
+
         // Start initial helper threads (adaptive scaling may create more later)
         int initial_helpers = kCompressorWorkers > 1 ? kCompressorWorkers - 1 : 0;
         for (int i = 0; i < initial_helpers; ++i) {
@@ -1195,6 +1251,31 @@ public:
 
         // Start coordinator thread
         pthread_create(&coord_thread_, nullptr, coordEntry, this);
+    }
+
+    static inline CompressorThread* s_stats_instance_ = nullptr;
+
+    static void sigusr1Handler(int) {
+        auto* self = s_stats_instance_;
+        if (!self || !self->states_ || !self->vm_) return;
+        size_t empty = 0, active = 0, monitor = 0, compressing = 0,
+               compressed = 0, total = self->vm_->committedPages();
+        for (size_t i = 0; i < total; ++i) {
+            switch (self->states_->get(i)) {
+            case PageState::EMPTY: ++empty; break;
+            case PageState::ACTIVE: ++active; break;
+            case PageState::ACTIVE_MONITORING: ++monitor; break;
+            case PageState::COMPRESSING: ++compressing; break;
+            case PageState::COMPRESSED: ++compressed; break;
+            }
+        }
+        char buf[256];
+        int n = snprintf(buf, sizeof(buf),
+            "[smash stats] pid=%d committed=%zu  active=%zu  monitor=%zu"
+            "  compressing=%zu  compressed=%zu  empty=%zu\n",
+            (int)getpid(), total, active, monitor, compressing, compressed,
+            empty);
+        if (n > 0) write(2, buf, (size_t)n);
     }
 
     void stop() {

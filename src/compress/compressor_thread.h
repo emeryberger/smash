@@ -1275,7 +1275,10 @@ public:
             "  compressing=%zu  compressed=%zu  empty=%zu\n",
             (int)getpid(), total, active, monitor, compressing, compressed,
             empty);
-        if (n > 0) write(2, buf, (size_t)n);
+        // Cast to void to silence -Wunused-result on glibc (write is
+        // marked __wur there). We're inside a signal handler — there's
+        // no useful recovery if write() short-returns.
+        if (n > 0) (void)!write(2, buf, (size_t)n);
     }
 
     void stop() {

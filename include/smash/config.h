@@ -283,4 +283,38 @@ inline bool isLargeOnlyMode() {
     return mode;
 }
 
+// Threshold for what counts as "small" (passthrough to system) in
+// LARGE_ONLY mode. Defaults to kMaxSmallSize (16 KB). Lower values
+// route a larger fraction of allocations through smash — useful when
+// the workload's byte-volume is dominated by mid-sized allocations
+// (e.g. Firefox's 4 KB–7 KB bucket carries ~20 % of allocation volume
+// while sitting under the default threshold). Must not exceed
+// kMaxSmallSize since smash's slab path tops out there.
+inline size_t largeOnlyThreshold() {
+    static size_t threshold = []() -> size_t {
+        const char* env = getenv("SMASH_LARGE_ONLY_THRESHOLD");
+        if (!env || !*env) return kMaxSmallSize;
+        size_t v = static_cast<size_t>(atoll(env));
+        if (v == 0 || v > kMaxSmallSize) return kMaxSmallSize;
+        return v;
+    }();
+    return threshold;
+}
+
+// ── Eager-zero mode ─────────────────────────────────────────────────────────
+// Set SMASH_EAGER_ZERO=1 to memset newly-allocated buffers to zero on the
+// malloc fast path, instead of relying on the compressor thread's deferred
+// zero-on-free pass. This trades throughput for correctness with callers
+// that assume malloc returns zeroed memory (technically UB, but real-world
+// codebases rely on it). Used to A/B test whether deferred-zero is the
+// source of data-corruption crashes (e.g. ARM64 PAC failures from stale
+// pointer-shaped bytes in reissued slab slots).
+inline bool isEagerZeroMode() {
+    static bool mode = []() {
+        const char* env = getenv("SMASH_EAGER_ZERO");
+        return env && env[0] == '1';
+    }();
+    return mode;
+}
+
 } // namespace smash

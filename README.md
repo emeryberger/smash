@@ -106,6 +106,24 @@ SMASH_MODE=compress_only LD_PRELOAD=./build/libsmash.so ./your_application
 
 This mode tracks all heap pages via `/proc/self/maps` (Linux) or `vm_region` (macOS) and compresses cold regions regardless of which allocator manages them.
 
+### External-Mapping Tracking (`SMASH_TRACK_EXTERNAL=1`)
+
+Standard smash compresses pages within its own `MAP_ANON` arena (where malloc-routed allocations live). Application code that calls `mmap()` / `mach_vm_allocate()` directly bypasses malloc and so escapes the compressor — this is the long pole on Firefox, where SpiderMonkey JS GC arenas, Skia / `mozalloc_aligned` graphics surfaces, and IPC-aligned shared memory all bypass `malloc`.
+
+`SMASH_TRACK_EXTERNAL=1` registers anonymous-writable application-direct mappings with smash so the compressor can see them too:
+
+```bash
+# macOS
+SMASH_TRACK_EXTERNAL=1 DYLD_INSERT_LIBRARIES=./build/libsmash.dylib ./your_application
+
+# Linux
+SMASH_TRACK_EXTERNAL=1 LD_PRELOAD=./build/libsmash.so ./your_application
+```
+
+Filter rules: `mmap` is tracked only with `MAP_ANON | PROT_WRITE` (file-backed and read-only mappings are skipped). On macOS `mach_vm_allocate` and `vm_allocate` are tracked when allocated in the current task. The interposers themselves always install (cost: one branch per `mmap` / `mach_vm` call); only the page registration path is gated by the env var.
+
+This is **opt-in** because the registration path has not yet been validated for stability on Firefox-class workloads — see `smash-benchmarks/FIREFOX_STUDY.md` for context.
+
 ### Optional API
 
 Applications can provide hints for better compression behavior:
@@ -127,7 +145,7 @@ cd build
 ctest --output-on-failure
 ```
 
-12 tests covering:
+14 tests covering:
 
 | Test | What it verifies |
 |------|-----------------|
@@ -143,6 +161,12 @@ ctest --output-on-failure
 | `test_prefetch` | Adjacent page prefetch, span boundary clipping |
 | `test_contention` | 8-thread concurrent alloc/free stress test |
 | `test_fault_cycle` | Real SIGSEGV → decompress → verify data integrity |
+| `test_external_mapping` | `mmap` + `mach_vm_allocate` round-trip through the compressor (under `SMASH_TRACK_EXTERNAL=1`); negative tests confirm file-backed and read-only mappings are not tracked |
+| `test_malloc_compression` | End-to-end compression on the malloc/free path: `SIGUSR2` stats line shows `compressed > 0`, then read-back verifies fault-decompress integrity |
+
+The two end-to-end tests run under `DYLD_INSERT_LIBRARIES` (macOS) / `LD_PRELOAD` (Linux) with a live compressor, so they exercise the full Phase 1 → Phase 2 → fault-decompress cycle, not just unit-level invariants.
+
+Continuous integration: `.github/workflows/ci.yml` builds and runs the full ctest suite on `ubuntu-latest` and `macos-latest` for every push to master and every pull request.
 
 ## Benchmarks
 

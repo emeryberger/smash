@@ -21,7 +21,10 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All 12 tests must pass. The interpose test requires macOS (DYLD_INSERT_LIBRARIES).
+All 14 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Two of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` with a live compressor:
+
+- `test_external_mapping` exercises the `SMASH_TRACK_EXTERNAL=1` registration path. The ctest invocation sets the env var; without it the test would silently no-op (registration path gated).
+- `test_malloc_compression` allocates compressible chunks via the standard `malloc` path, sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2` to itself, captures stderr, parses `compressed=N` from the smash stats line, asserts `N > 0`, then reads every byte back to verify integrity through fault-decompress. Catches regressions in the malloc-side compression path that the interposer-only tests would miss.
 
 ## Project Structure
 
@@ -95,6 +98,33 @@ __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 ### Page pinning (`syscall_compat.h`)
 
 `g_page_pins` is a per-page atomic counter. Pages with pin count > 0 are skipped by both Phase 2 (compression) and Phase 3 (monitoring). Used by syscall wrappers to protect kernel buffers during blocking calls.
+
+### EFAULT retry on syscall TOCTOU (`syscall_compat.h::retryOnEfault`)
+
+Pinning closes most of the race between syscall wrappers and the compressor's per-page mprotect, but a nanosecond-scale TOCTOU window remains: the compressor can read `pin == 0`, the wrapper can bump `pin` to 1, then the compressor proceeds with mprotect anyway. Once the page is `PROT_NONE` / `PROT_READ` the kernel returns EFAULT synchronously and no fault handler can recover. Every buffer-taking I/O wrapper (read/write/pread/pwrite/readv/writev/recv/send/recvfrom/sendto/recvmsg/sendmsg/poll on macOS; the same plus ppoll/select/pselect/accept/accept4/recvmmsg/sendmmsg/getsockopt/getsockname/getpeername/getrandom/epoll_wait/epoll_pwait on Linux) wraps the syscall in `retryOnEfault(syscall, rewarm)` — pin is held across all attempts; on EFAULT the rewarm callback re-warms the buffer and the syscall is retried up to 3×. The mach_msg family does the same against `MACH_SEND/RCV_INVALID_DATA`.
+
+## External-Mapping Tracking (`SMASH_TRACK_EXTERNAL=1`)
+
+Standard smash compresses pages within its own `MAP_ANON` arena. Application code that calls `mmap()` / `mach_vm_allocate()` directly bypasses malloc and so escapes the compressor. The mmap and Mach VM interposers in `smash_heap.cpp` (macOS) and `linux_syscall_wrappers.cpp` (Linux) register such mappings with the VmRegion's external-page hash so the compressor's tick can walk them. **Opt-in**: set `SMASH_TRACK_EXTERNAL=1` to enable the registration path; default off.
+
+### VmRegion full+tracking hybrid (`vm/vm_region.h`)
+
+In full mode VmRegion keeps the contiguous bump-arena (indices `0..contig_pages_-1`) AND a tracking hash for external pages (indices `contig_pages_..contig_pages_+kTrackMaxPages-1`). `total_pages_ = contig_pages_ + kTrackMaxPages` so `PageStateTable` / `PageLockTable` cover both ranges; `committedPages()` returns the high-water across both; `pageAddress(idx)`, `pageIndex(addr)`, and `contains(addr)` route on idx range / address range. The compressor's existing tick / dispatch logic processes external pages without modification — they're just pages with high indices.
+
+Cost: ~1 MB extra bootstrap memory (track hash + reverse map + page-state slots for `kTrackMaxPages = 128 K` external slots).
+
+### Filter rules (deliberately strict)
+
+- `mmap` only registers `MAP_ANON | PROT_WRITE` mappings. File-backed mappings are skipped — compressing them would break `msync` semantics and the OS already evicts them. Read-only mappings are skipped — no dirty bits, no compression value.
+- `mach_vm_allocate` / `vm_allocate` only register when `target == mach_task_self()`. Cross-task allocations belong to children.
+- `BootstrapAlloc`-routed `mmap` calls happen before `g_smash_vm_region` is set, so they're never tracked. Smash's own contiguous reservation uses `PROT_NONE` and is filtered by the writable-only rule.
+- On `munmap` / `mach_vm_deallocate` we mark pages EMPTY before the actual unmap so the compressor stops scanning them. Compressed-buffer leakage on unmap is possible (we don't free the associated compressed bytes); bounded by workload churn.
+
+### Why opt-in
+
+Single-trial Firefox 5-tab Wikipedia at 90 s (full smash + DEFER 30 s + all-procs) showed the registration path possibly regressing stability (33–35 s lifetime vs 61 s with tracking off), but the variance across nominally-identical configs is too high to claim a regression with confidence — FIREFOX_STUDY's "10/10 alive at 60 s" baseline used N=10. Conservative default is off; targets with controlled allocation patterns (e.g. redb-style workloads) can opt in. The interposers themselves still install regardless of the env var, so the runtime cost when off is one branch per `mmap` / `mach_vm` call.
+
+The "compressed=266K pages = 4.2 GB" figure observed under tracking-on on Firefox is misleading: most of those are virtual-address-space artifacts (SpiderMonkey + Skia reserve large `MAP_ANON` ranges that never fault in; the compressor processes zero pages to ~30-byte buffers). A correct Firefox-RSS measurement needs virt-vs-RSS reconciliation in the SIGUSR2 stats handler before claiming any Firefox win.
 
 ## Large-Only Mode (`SMASH_LARGE_ONLY=1`)
 
@@ -322,6 +352,9 @@ Key constants in `include/smash/config.h`:
 Runtime environment variables:
 - `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc
 - `SMASH_MODE=compress_only`: Compress-only mode — track pages without replacing malloc
+- `SMASH_TRACK_EXTERNAL=1`: Register application-direct `mmap` / `mach_vm_allocate` results so the compressor sees them. Opt-in (see "External-Mapping Tracking" above)
+- `SMASH_DEFER_PHASES_MS=N`: Skip Phase 2 (compress) + Phase 3 (monitor) for the first N ms after start. Useful for workloads that establish IPC channels at startup with buffers in smash-managed pages (Firefox sweet spot is 30000)
+- `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
 - `SMASH_COLD_TIMEOUT_SEC=N`: Override cold timeout at runtime
 - `SMASH_VERY_COLD_TICKS=N`: Override deep-tier cold-tick threshold (ROI model). `9999` disables the deep tier entirely (fast tier only).
 - `SMASH_ROI_THRESHOLD=N`: Override ROI cutoff (default 1024)

@@ -582,7 +582,9 @@ SMASH_INTERPOSE(smash_recv, recv);
 extern "C" ssize_t smash_recv(int s, void* buf, size_t len, int flags) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && buf && len) { smash::vm::pinPages(buf, len, vm); smash::vm::warmPages(buf, len, vm); }
-    ssize_t ret = reinterpret_cast<recv_fn>(smash_interpose_smash_recv.original)(s, buf, len, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<recv_fn>(smash_interpose_smash_recv.original)(s, buf, len, flags); },
+        [&] { if (vm && buf && len) smash::vm::warmPages(buf, len, vm); });
     if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
@@ -592,7 +594,9 @@ SMASH_INTERPOSE(smash_send, send);
 extern "C" ssize_t smash_send(int s, const void* buf, size_t len, int flags) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && buf && len) { smash::vm::pinPages(buf, len, vm); smash::vm::warmPages(buf, len, vm); }
-    ssize_t ret = reinterpret_cast<send_fn>(smash_interpose_smash_send.original)(s, buf, len, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<send_fn>(smash_interpose_smash_send.original)(s, buf, len, flags); },
+        [&] { if (vm && buf && len) smash::vm::warmPages(buf, len, vm); });
     if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
@@ -609,8 +613,10 @@ extern "C" ssize_t smash_recvfrom(int s, void* buf, size_t len, int flags,
                                    struct sockaddr* from, socklen_t* fromlen) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && buf && len) { smash::vm::pinPages(buf, len, vm); smash::vm::warmPages(buf, len, vm); }
-    ssize_t ret = reinterpret_cast<recvfrom_fn>(smash_interpose_smash_recvfrom.original)(
-        s, buf, len, flags, from, fromlen);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<recvfrom_fn>(smash_interpose_smash_recvfrom.original)(
+            s, buf, len, flags, from, fromlen); },
+        [&] { if (vm && buf && len) smash::vm::warmPages(buf, len, vm); });
     if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
@@ -622,8 +628,10 @@ extern "C" ssize_t smash_sendto(int s, const void* buf, size_t len, int flags,
                                  const struct sockaddr* to, socklen_t tolen) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && buf && len) { smash::vm::pinPages(buf, len, vm); smash::vm::warmPages(buf, len, vm); }
-    ssize_t ret = reinterpret_cast<sendto_fn>(smash_interpose_smash_sendto.original)(
-        s, buf, len, flags, to, tolen);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<sendto_fn>(smash_interpose_smash_sendto.original)(
+            s, buf, len, flags, to, tolen); },
+        [&] { if (vm && buf && len) smash::vm::warmPages(buf, len, vm); });
     if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
@@ -641,7 +649,12 @@ extern "C" ssize_t smash_recvmsg(int s, struct msghdr* msg, int flags) {
         warmIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         smash::vm::pinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     }
-    ssize_t ret = reinterpret_cast<recvmsg_fn>(smash_interpose_smash_recvmsg.original)(s, msg, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<recvmsg_fn>(smash_interpose_smash_recvmsg.original)(s, msg, flags); },
+        [&] {
+            if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
+                warmIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
+        });
     if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
         smash::vm::unpinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     return ret;
@@ -655,7 +668,12 @@ extern "C" ssize_t smash_sendmsg(int s, const struct msghdr* msg, int flags) {
         warmIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         smash::vm::pinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     }
-    ssize_t ret = reinterpret_cast<sendmsg_fn>(smash_interpose_smash_sendmsg.original)(s, msg, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<sendmsg_fn>(smash_interpose_smash_sendmsg.original)(s, msg, flags); },
+        [&] {
+            if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
+                warmIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
+        });
     if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
         smash::vm::unpinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     return ret;
@@ -669,13 +687,16 @@ extern "C" int smash_poll(struct pollfd* fds, nfds_t nfds, int timeout);
 SMASH_INTERPOSE(smash_poll, poll);
 extern "C" int smash_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     auto* vm = smash::g_smash_vm_region;
+    size_t fds_bytes = nfds * sizeof(struct pollfd);
     if (vm && fds && nfds > 0) {
-        smash::vm::pinPages(fds, nfds * sizeof(struct pollfd), vm);
-        smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
+        smash::vm::pinPages(fds, fds_bytes, vm);
+        smash::vm::warmPages(fds, fds_bytes, vm);
     }
-    int ret = reinterpret_cast<poll_fn>(smash_interpose_smash_poll.original)(fds, nfds, timeout);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<poll_fn>(smash_interpose_smash_poll.original)(fds, nfds, timeout); },
+        [&] { if (vm && fds && nfds > 0) smash::vm::warmPages(fds, fds_bytes, vm); });
     if (vm && fds && nfds > 0)
-        smash::vm::unpinPages(fds, nfds * sizeof(struct pollfd), vm);
+        smash::vm::unpinPages(fds, fds_bytes, vm);
     return ret;
 }
 
@@ -691,7 +712,9 @@ SMASH_INTERPOSE(smash_read, read);
 extern "C" ssize_t smash_read(int fd, void* buf, size_t count) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && buf && count) { smash::vm::pinPages(buf, count, vm); smash::vm::warmPages(buf, count, vm); }
-    ssize_t ret = reinterpret_cast<read_fn>(smash_interpose_smash_read.original)(fd, buf, count);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<read_fn>(smash_interpose_smash_read.original)(fd, buf, count); },
+        [&] { if (vm && buf && count) smash::vm::warmPages(buf, count, vm); });
     if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
@@ -701,7 +724,9 @@ SMASH_INTERPOSE(smash_write, write);
 extern "C" ssize_t smash_write(int fd, const void* buf, size_t count) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && buf && count) { smash::vm::pinPages(buf, count, vm); smash::vm::warmPages(buf, count, vm); }
-    ssize_t ret = reinterpret_cast<write_fn>(smash_interpose_smash_write.original)(fd, buf, count);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<write_fn>(smash_interpose_smash_write.original)(fd, buf, count); },
+        [&] { if (vm && buf && count) smash::vm::warmPages(buf, count, vm); });
     if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
@@ -716,7 +741,9 @@ SMASH_INTERPOSE(smash_pread, pread);
 extern "C" ssize_t smash_pread(int fd, void* buf, size_t count, off_t offset) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && buf && count) { smash::vm::pinPages(buf, count, vm); smash::vm::warmPages(buf, count, vm); }
-    ssize_t ret = reinterpret_cast<pread_fn>(smash_interpose_smash_pread.original)(fd, buf, count, offset);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<pread_fn>(smash_interpose_smash_pread.original)(fd, buf, count, offset); },
+        [&] { if (vm && buf && count) smash::vm::warmPages(buf, count, vm); });
     if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
@@ -726,7 +753,9 @@ SMASH_INTERPOSE(smash_pwrite, pwrite);
 extern "C" ssize_t smash_pwrite(int fd, const void* buf, size_t count, off_t offset) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && buf && count) { smash::vm::pinPages(buf, count, vm); smash::vm::warmPages(buf, count, vm); }
-    ssize_t ret = reinterpret_cast<pwrite_fn>(smash_interpose_smash_pwrite.original)(fd, buf, count, offset);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<pwrite_fn>(smash_interpose_smash_pwrite.original)(fd, buf, count, offset); },
+        [&] { if (vm && buf && count) smash::vm::warmPages(buf, count, vm); });
     if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
@@ -741,7 +770,9 @@ SMASH_INTERPOSE(smash_readv, readv);
 extern "C" ssize_t smash_readv(int fd, const struct iovec* iov, int iovcnt) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && iov && iovcnt > 0) { warmIovec(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
-    ssize_t ret = reinterpret_cast<readv_fn>(smash_interpose_smash_readv.original)(fd, iov, iovcnt);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<readv_fn>(smash_interpose_smash_readv.original)(fd, iov, iovcnt); },
+        [&] { if (vm && iov && iovcnt > 0) warmIovec(iov, iovcnt, vm); });
     if (vm && iov && iovcnt > 0) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
@@ -751,7 +782,9 @@ SMASH_INTERPOSE(smash_writev, writev);
 extern "C" ssize_t smash_writev(int fd, const struct iovec* iov, int iovcnt) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && iov && iovcnt > 0) { warmIovec(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
-    ssize_t ret = reinterpret_cast<writev_fn>(smash_interpose_smash_writev.original)(fd, iov, iovcnt);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return reinterpret_cast<writev_fn>(smash_interpose_smash_writev.original)(fd, iov, iovcnt); },
+        [&] { if (vm && iov && iovcnt > 0) warmIovec(iov, iovcnt, vm); });
     if (vm && iov && iovcnt > 0) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }

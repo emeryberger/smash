@@ -553,11 +553,22 @@ extern "C" mach_msg_return_t smash_mach_msg2_internal(
             smash_pin_ool_descriptors(hdr, vm, ool_tracker);
         }
     }
-    mach_msg_return_t ret = reinterpret_cast<mach_msg2_internal_fn>(
-        smash_interpose_smash_mach_msg2_internal.original)(
-        data, options, bits_and_send_size, remote_and_local_port,
-        voucher_and_id, desc_count_and_rcv_size, rcv_name_and_timeout,
-        priority);
+    mach_msg_return_t ret;
+    for (int attempt = 0; ; ++attempt) {
+        ret = reinterpret_cast<mach_msg2_internal_fn>(
+            smash_interpose_smash_mach_msg2_internal.original)(
+            data, options, bits_and_send_size, remote_and_local_port,
+            voucher_and_id, desc_count_and_rcv_size, rcv_name_and_timeout,
+            priority);
+        if (ret != MACH_RCV_INVALID_DATA && ret != MACH_SEND_INVALID_DATA)
+            break;
+        if (attempt >= 3) break;
+        if (vm && data && buf_size > 0)
+            smash::vm::warmPages(data, buf_size, vm);
+        for (size_t i = 0; i < ool_tracker.count; ++i)
+            smash::vm::warmPages(ool_tracker.entries[i].addr,
+                                  ool_tracker.entries[i].size, vm);
+    }
     static const bool sticky_pin_2i = []{
         const char* v = std::getenv("SMASH_IPC_STICKY_PIN");
         return v && v[0] == '1';

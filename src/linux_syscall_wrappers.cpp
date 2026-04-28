@@ -90,7 +90,9 @@ SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, count, vm);
     if (in_heap) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
-    ssize_t ret = real_read(fd, buf, count);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_read(fd, buf, count); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, count, vm); });
     if (in_heap) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
@@ -102,7 +104,9 @@ SMASH_VISIBLE ssize_t write(int fd, const void* buf, size_t count) {
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, count, vm);
     if (in_heap) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
-    ssize_t ret = real_write(fd, buf, count);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_write(fd, buf, count); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, count, vm); });
     if (in_heap) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
@@ -114,7 +118,9 @@ SMASH_VISIBLE ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, count, vm);
     if (in_heap) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
-    ssize_t ret = real_pread(fd, buf, count, offset);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_pread(fd, buf, count, offset); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, count, vm); });
     if (in_heap) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
@@ -126,7 +132,9 @@ SMASH_VISIBLE ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, count, vm);
     if (in_heap) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
-    ssize_t ret = real_pwrite(fd, buf, count, offset);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_pwrite(fd, buf, count, offset); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, count, vm); });
     if (in_heap) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
@@ -138,7 +146,9 @@ SMASH_VISIBLE ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = iovecInHeap(iov, iovcnt, vm);
     if (in_heap) { warmIovecLinux(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
-    ssize_t ret = real_readv(fd, iov, iovcnt);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_readv(fd, iov, iovcnt); },
+        [&] { if (in_heap) warmIovecLinux(iov, iovcnt, vm); });
     if (in_heap) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
@@ -150,7 +160,9 @@ SMASH_VISIBLE ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = iovecInHeap(iov, iovcnt, vm);
     if (in_heap) { warmIovecLinux(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
-    ssize_t ret = real_writev(fd, iov, iovcnt);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_writev(fd, iov, iovcnt); },
+        [&] { if (in_heap) warmIovecLinux(iov, iovcnt, vm); });
     if (in_heap) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
@@ -162,7 +174,9 @@ SMASH_VISIBLE ssize_t recv(int s, void* buf, size_t len, int flags) {
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, len, vm);
     if (in_heap) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
-    ssize_t ret = real_recv(s, buf, len, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_recv(s, buf, len, flags); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, len, vm); });
     if (in_heap) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
@@ -174,7 +188,9 @@ SMASH_VISIBLE ssize_t send(int s, const void* buf, size_t len, int flags) {
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, len, vm);
     if (in_heap) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
-    ssize_t ret = real_send(s, buf, len, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_send(s, buf, len, flags); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, len, vm); });
     if (in_heap) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
@@ -187,7 +203,9 @@ SMASH_VISIBLE ssize_t recvfrom(int s, void* buf, size_t len, int flags,
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, len, vm);
     if (in_heap) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
-    ssize_t ret = real_recvfrom(s, buf, len, flags, from, fromlen);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_recvfrom(s, buf, len, flags, from, fromlen); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, len, vm); });
     if (in_heap) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
@@ -200,7 +218,9 @@ SMASH_VISIBLE ssize_t sendto(int s, const void* buf, size_t len, int flags,
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, len, vm);
     if (in_heap) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
-    ssize_t ret = real_sendto(s, buf, len, flags, to, tolen);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_sendto(s, buf, len, flags, to, tolen); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, len, vm); });
     if (in_heap) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
@@ -215,7 +235,9 @@ SMASH_VISIBLE ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
         warmIovecLinux(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         smash::vm::pinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     }
-    ssize_t ret = real_recvmsg(s, msg, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_recvmsg(s, msg, flags); },
+        [&] { if (in_heap) warmIovecLinux(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm); });
     if (in_heap)
         smash::vm::unpinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     return ret;
@@ -231,7 +253,9 @@ SMASH_VISIBLE ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
         warmIovecLinux(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         smash::vm::pinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     }
-    ssize_t ret = real_sendmsg(s, msg, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_sendmsg(s, msg, flags); },
+        [&] { if (in_heap) warmIovecLinux(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm); });
     if (in_heap)
         smash::vm::unpinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
     return ret;
@@ -248,7 +272,9 @@ SMASH_VISIBLE int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     size_t size = static_cast<size_t>(nfds) * sizeof(struct pollfd);
     bool in_heap = bufferInHeap(fds, size, vm);
     if (in_heap) { smash::vm::warmPages(fds, size, vm); smash::vm::pinPages(fds, size, vm); }
-    int ret = real_poll(fds, nfds, timeout);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_poll(fds, nfds, timeout); },
+        [&] { if (in_heap) smash::vm::warmPages(fds, size, vm); });
     if (in_heap) smash::vm::unpinPages(fds, size, vm);
     return ret;
 }
@@ -262,7 +288,9 @@ SMASH_VISIBLE int ppoll(struct pollfd* fds, nfds_t nfds,
     size_t size = static_cast<size_t>(nfds) * sizeof(struct pollfd);
     bool in_heap = bufferInHeap(fds, size, vm);
     if (in_heap) { smash::vm::warmPages(fds, size, vm); smash::vm::pinPages(fds, size, vm); }
-    int ret = real_ppoll(fds, nfds, tmo_p, sigmask);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_ppoll(fds, nfds, tmo_p, sigmask); },
+        [&] { if (in_heap) smash::vm::warmPages(fds, size, vm); });
     if (in_heap) smash::vm::unpinPages(fds, size, vm);
     return ret;
 }
@@ -285,7 +313,13 @@ SMASH_VISIBLE int select(int nfds, fd_set* readfds, fd_set* writefds,
     if (pin_r) { smash::vm::warmPages(readfds, set_size, vm); smash::vm::pinPages(readfds, set_size, vm); }
     if (pin_w) { smash::vm::warmPages(writefds, set_size, vm); smash::vm::pinPages(writefds, set_size, vm); }
     if (pin_e) { smash::vm::warmPages(exceptfds, set_size, vm); smash::vm::pinPages(exceptfds, set_size, vm); }
-    int ret = real_select(nfds, readfds, writefds, exceptfds, timeout);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_select(nfds, readfds, writefds, exceptfds, timeout); },
+        [&] {
+            if (pin_r) smash::vm::warmPages(readfds, set_size, vm);
+            if (pin_w) smash::vm::warmPages(writefds, set_size, vm);
+            if (pin_e) smash::vm::warmPages(exceptfds, set_size, vm);
+        });
     if (pin_r) smash::vm::unpinPages(readfds, set_size, vm);
     if (pin_w) smash::vm::unpinPages(writefds, set_size, vm);
     if (pin_e) smash::vm::unpinPages(exceptfds, set_size, vm);
@@ -306,7 +340,13 @@ SMASH_VISIBLE int pselect(int nfds, fd_set* readfds, fd_set* writefds,
     if (pin_r) { smash::vm::warmPages(readfds, set_size, vm); smash::vm::pinPages(readfds, set_size, vm); }
     if (pin_w) { smash::vm::warmPages(writefds, set_size, vm); smash::vm::pinPages(writefds, set_size, vm); }
     if (pin_e) { smash::vm::warmPages(exceptfds, set_size, vm); smash::vm::pinPages(exceptfds, set_size, vm); }
-    int ret = real_pselect(nfds, readfds, writefds, exceptfds, timeout, sigmask);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_pselect(nfds, readfds, writefds, exceptfds, timeout, sigmask); },
+        [&] {
+            if (pin_r) smash::vm::warmPages(readfds, set_size, vm);
+            if (pin_w) smash::vm::warmPages(writefds, set_size, vm);
+            if (pin_e) smash::vm::warmPages(exceptfds, set_size, vm);
+        });
     if (pin_r) smash::vm::unpinPages(readfds, set_size, vm);
     if (pin_w) smash::vm::unpinPages(writefds, set_size, vm);
     if (pin_e) smash::vm::unpinPages(exceptfds, set_size, vm);
@@ -323,7 +363,9 @@ SMASH_VISIBLE int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) 
     size_t addr_size = (addr && addrlen) ? static_cast<size_t>(*addrlen) : 0;
     bool in_heap = addr_size && bufferInHeap(addr, addr_size, vm);
     if (in_heap) { smash::vm::warmPages(addr, addr_size, vm); smash::vm::pinPages(addr, addr_size, vm); }
-    int ret = real_accept(sockfd, addr, addrlen);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_accept(sockfd, addr, addrlen); },
+        [&] { if (in_heap) smash::vm::warmPages(addr, addr_size, vm); });
     if (in_heap) smash::vm::unpinPages(addr, addr_size, vm);
     return ret;
 }
@@ -336,7 +378,9 @@ SMASH_VISIBLE int accept4(int sockfd, struct sockaddr* addr, socklen_t* addrlen,
     size_t addr_size = (addr && addrlen) ? static_cast<size_t>(*addrlen) : 0;
     bool in_heap = addr_size && bufferInHeap(addr, addr_size, vm);
     if (in_heap) { smash::vm::warmPages(addr, addr_size, vm); smash::vm::pinPages(addr, addr_size, vm); }
-    int ret = real_accept4(sockfd, addr, addrlen, flags);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_accept4(sockfd, addr, addrlen, flags); },
+        [&] { if (in_heap) smash::vm::warmPages(addr, addr_size, vm); });
     if (in_heap) smash::vm::unpinPages(addr, addr_size, vm);
     return ret;
 }
@@ -357,7 +401,15 @@ SMASH_VISIBLE int recvmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
             smash::vm::pinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         }
     }
-    int ret = real_recvmmsg(sockfd, msgvec, vlen, flags, timeout);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_recvmmsg(sockfd, msgvec, vlen, flags, timeout); },
+        [&] {
+            for (unsigned i = 0; i < vlen; ++i) {
+                struct msghdr* msg = &msgvec[i].msg_hdr;
+                if (msg->msg_iov && msg->msg_iovlen > 0)
+                    warmIovecLinux(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
+            }
+        });
     for (unsigned i = 0; i < vlen; ++i) {
         struct msghdr* msg = &msgvec[i].msg_hdr;
         if (msg->msg_iov && msg->msg_iovlen > 0)
@@ -379,7 +431,15 @@ SMASH_VISIBLE int sendmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
             smash::vm::pinIovec(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         }
     }
-    int ret = real_sendmmsg(sockfd, msgvec, vlen, flags);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_sendmmsg(sockfd, msgvec, vlen, flags); },
+        [&] {
+            for (unsigned i = 0; i < vlen; ++i) {
+                struct msghdr* msg = &msgvec[i].msg_hdr;
+                if (msg->msg_iov && msg->msg_iovlen > 0)
+                    warmIovecLinux(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
+            }
+        });
     for (unsigned i = 0; i < vlen; ++i) {
         struct msghdr* msg = &msgvec[i].msg_hdr;
         if (msg->msg_iov && msg->msg_iovlen > 0)
@@ -400,7 +460,9 @@ SMASH_VISIBLE int getsockopt(int sockfd, int level, int optname,
     size_t val_size = (optval && optlen) ? static_cast<size_t>(*optlen) : 0;
     bool in_heap = val_size && bufferInHeap(optval, val_size, vm);
     if (in_heap) { smash::vm::warmPages(optval, val_size, vm); smash::vm::pinPages(optval, val_size, vm); }
-    int ret = real_getsockopt(sockfd, level, optname, optval, optlen);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_getsockopt(sockfd, level, optname, optval, optlen); },
+        [&] { if (in_heap) smash::vm::warmPages(optval, val_size, vm); });
     if (in_heap) smash::vm::unpinPages(optval, val_size, vm);
     return ret;
 }
@@ -413,7 +475,9 @@ SMASH_VISIBLE int getsockname(int sockfd, struct sockaddr* addr, socklen_t* addr
     size_t addr_size = (addr && addrlen) ? static_cast<size_t>(*addrlen) : 0;
     bool in_heap = addr_size && bufferInHeap(addr, addr_size, vm);
     if (in_heap) { smash::vm::warmPages(addr, addr_size, vm); smash::vm::pinPages(addr, addr_size, vm); }
-    int ret = real_getsockname(sockfd, addr, addrlen);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_getsockname(sockfd, addr, addrlen); },
+        [&] { if (in_heap) smash::vm::warmPages(addr, addr_size, vm); });
     if (in_heap) smash::vm::unpinPages(addr, addr_size, vm);
     return ret;
 }
@@ -426,7 +490,9 @@ SMASH_VISIBLE int getpeername(int sockfd, struct sockaddr* addr, socklen_t* addr
     size_t addr_size = (addr && addrlen) ? static_cast<size_t>(*addrlen) : 0;
     bool in_heap = addr_size && bufferInHeap(addr, addr_size, vm);
     if (in_heap) { smash::vm::warmPages(addr, addr_size, vm); smash::vm::pinPages(addr, addr_size, vm); }
-    int ret = real_getpeername(sockfd, addr, addrlen);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_getpeername(sockfd, addr, addrlen); },
+        [&] { if (in_heap) smash::vm::warmPages(addr, addr_size, vm); });
     if (in_heap) smash::vm::unpinPages(addr, addr_size, vm);
     return ret;
 }
@@ -441,7 +507,9 @@ SMASH_VISIBLE ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = bufferInHeap(buf, buflen, vm);
     if (in_heap) { smash::vm::warmPages(buf, buflen, vm); smash::vm::pinPages(buf, buflen, vm); }
-    ssize_t ret = real_getrandom(buf, buflen, flags);
+    ssize_t ret = smash::vm::retryOnEfault(
+        [&] { return real_getrandom(buf, buflen, flags); },
+        [&] { if (in_heap) smash::vm::warmPages(buf, buflen, vm); });
     if (in_heap) smash::vm::unpinPages(buf, buflen, vm);
     return ret;
 }
@@ -594,7 +662,9 @@ SMASH_VISIBLE int epoll_wait(int epfd, struct epoll_event* events, int maxevents
     size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
     bool in_heap = bufferInHeap(events, size, vm);
     if (in_heap) { smash::vm::warmPages(events, size, vm); smash::vm::pinPages(events, size, vm); }
-    int ret = real_epoll_wait(epfd, events, maxevents, timeout);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_epoll_wait(epfd, events, maxevents, timeout); },
+        [&] { if (in_heap) smash::vm::warmPages(events, size, vm); });
     if (in_heap) smash::vm::unpinPages(events, size, vm);
     return ret;
 }
@@ -607,7 +677,9 @@ SMASH_VISIBLE int epoll_pwait(int epfd, struct epoll_event* events, int maxevent
     size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
     bool in_heap = bufferInHeap(events, size, vm);
     if (in_heap) { smash::vm::warmPages(events, size, vm); smash::vm::pinPages(events, size, vm); }
-    int ret = real_epoll_pwait(epfd, events, maxevents, timeout, sigmask);
+    int ret = smash::vm::retryOnEfault(
+        [&] { return real_epoll_pwait(epfd, events, maxevents, timeout, sigmask); },
+        [&] { if (in_heap) smash::vm::warmPages(events, size, vm); });
     if (in_heap) smash::vm::unpinPages(events, size, vm);
     return ret;
 }

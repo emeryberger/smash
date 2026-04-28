@@ -515,12 +515,19 @@ SMASH_VISIBLE ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
 }
 
 // ── getcwd buffer hooks ─────────────────────────────────────────────────────
-// alloc8's gnu_wrapper.cpp defines getcwd() and calls through function pointer
-// hooks xx_getcwd_prepare_hook / xx_getcwd_finish_hook.  We set these pointers
-// to warm+pin the buffer so the kernel can write into it.
+// Function-pointer hook surface intended for alloc8's getcwd wrapper to
+// call into smash so we can warm+pin the destination buffer before the
+// kernel writes into it. alloc8's current Linux gnu_wrapper.cpp does not
+// yet call through these — getcwd buffers therefore aren't pinned in
+// today's build — but we still need the storage defined here so that
+// libsmash.so's LD_PRELOAD load doesn't fail with
+//   undefined symbol: xx_getcwd_finish_hook
+// when no other module in the process provides it. install_getcwd_hooks
+// (below) populates the pointers; an alloc8 update can later wire the
+// call sites without touching libsmash.so.
 using xx_getcwd_hook_fn = void(*)(void*, size_t);
-extern xx_getcwd_hook_fn xx_getcwd_prepare_hook;
-extern xx_getcwd_hook_fn xx_getcwd_finish_hook;
+xx_getcwd_hook_fn xx_getcwd_prepare_hook = nullptr;
+xx_getcwd_hook_fn xx_getcwd_finish_hook  = nullptr;
 
 static void smash_getcwd_prepare(void* buf, size_t size) {
     auto* vm = smash::g_smash_vm_region;

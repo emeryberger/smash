@@ -97,3 +97,71 @@ add_test(
     "DYLD_FORCE_FLAT_NAMESPACE=1"
     $<TARGET_FILE:interpose_test>
 )
+
+# External-mapping test: exercises the mmap / Mach VM interposers under
+# a live compressor. Same DYLD/LD_PRELOAD pattern as test_interpose;
+# requires SMASH_LARGE_ONLY=0 + a short SMASH_COLD_TIMEOUT_SEC so the
+# compressor processes pages within the test's 3 s sleep.
+add_executable(external_mapping_test external_mapping_test.cpp)
+set_target_properties(external_mapping_test PROPERTIES
+  CXX_STANDARD 20
+)
+if(APPLE)
+  add_test(
+    NAME test_external_mapping
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "DYLD_FORCE_FLAT_NAMESPACE=1"
+      "MallocNanoZone=0"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_TRACK_EXTERNAL=1"
+      $<TARGET_FILE:external_mapping_test>
+  )
+else()
+  add_test(
+    NAME test_external_mapping
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_TRACK_EXTERNAL=1"
+      $<TARGET_FILE:external_mapping_test>
+  )
+endif()
+set_tests_properties(test_external_mapping PROPERTIES TIMEOUT 60)
+
+# Malloc/free compression test: verifies that smash's main allocator
+# path (not just the new mmap interposers) actually compresses cold
+# pages. Allocates compressible chunks, sleeps, reads SIGUSR2 stats,
+# asserts compressed > 0.
+add_executable(malloc_compression_test malloc_compression_test.cpp)
+set_target_properties(malloc_compression_test PROPERTIES
+  CXX_STANDARD 20
+)
+if(APPLE)
+  add_test(
+    NAME test_malloc_compression
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "DYLD_FORCE_FLAT_NAMESPACE=1"
+      "MallocNanoZone=0"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      $<TARGET_FILE:malloc_compression_test>
+  )
+else()
+  add_test(
+    NAME test_malloc_compression
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      $<TARGET_FILE:malloc_compression_test>
+  )
+endif()
+set_tests_properties(test_malloc_compression PROPERTIES TIMEOUT 60)

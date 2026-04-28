@@ -515,12 +515,19 @@ SMASH_VISIBLE ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
 }
 
 // ── getcwd buffer hooks ─────────────────────────────────────────────────────
-// alloc8's gnu_wrapper.cpp defines getcwd() and calls through function pointer
-// hooks xx_getcwd_prepare_hook / xx_getcwd_finish_hook.  We set these pointers
-// to warm+pin the buffer so the kernel can write into it.
+// Function-pointer hook surface intended for alloc8's getcwd wrapper to
+// call into smash so we can warm+pin the destination buffer before the
+// kernel writes into it. alloc8's current Linux gnu_wrapper.cpp does not
+// yet call through these — getcwd buffers therefore aren't pinned in
+// today's build — but we still need the storage defined here so that
+// libsmash.so's LD_PRELOAD load doesn't fail with
+//   undefined symbol: xx_getcwd_finish_hook
+// when no other module in the process provides it. install_getcwd_hooks
+// (below) populates the pointers; an alloc8 update can later wire the
+// call sites without touching libsmash.so.
 using xx_getcwd_hook_fn = void(*)(void*, size_t);
-extern xx_getcwd_hook_fn xx_getcwd_prepare_hook;
-extern xx_getcwd_hook_fn xx_getcwd_finish_hook;
+xx_getcwd_hook_fn xx_getcwd_prepare_hook = nullptr;
+xx_getcwd_hook_fn xx_getcwd_finish_hook  = nullptr;
 
 static void smash_getcwd_prepare(void* buf, size_t size) {
     auto* vm = smash::g_smash_vm_region;
@@ -694,6 +701,84 @@ SMASH_VISIBLE int epoll_wait_232(int epfd, struct epoll_event* events, int maxev
 
 SMASH_VISIBLE int epoll_pwait_232(int epfd, struct epoll_event* events, int maxevents, int timeout, const sigset_t* sigmask) {
     return epoll_pwait(epfd, events, maxevents, timeout, sigmask);
+}
+
+// ── External-mapping interposers (mmap / munmap) ────────────────────────────
+//
+// Application-direct mmap calls (e.g., SpiderMonkey GC arenas, jemalloc
+// internal slabs in projects that bundle it) bypass smash's malloc and so
+// escape compression. Track MAP_ANONYMOUS + PROT_WRITE mappings via
+// VmRegion's external-page hash so the compressor's tick can see them.
+// File-backed and read-only mappings are explicitly skipped (the former
+// would break msync semantics under compression; the latter never need it).
+//
+// External tracking is OFF by default; set SMASH_TRACK_EXTERNAL=1 to
+// enable. Same opt-in polarity as the macOS path — see smash_heap.cpp
+// for the rationale (Firefox-on-macOS regression with the registration
+// path active).
+
+namespace {
+
+inline bool externalTrackingEnabledLinux() {
+    static const bool enabled = []{
+        const char* v = std::getenv("SMASH_TRACK_EXTERNAL");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+inline void registerLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {
+    if (!vm || !base || !len) return;
+    if (!externalTrackingEnabledLinux()) return;
+    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
+    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
+               & ~(uintptr_t{smash::kPageSize} - 1);
+    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
+        size_t idx = vm->trackExternalPage(p);
+        if (idx == 0) continue;
+        if (smash::g_smash_page_states_for_external)
+            smash::g_smash_page_states_for_external->set(idx, smash::PageState::ACTIVE);
+    }
+}
+
+inline void deregisterLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {
+    if (!vm || !base || !len) return;
+    if (!externalTrackingEnabledLinux()) return;
+    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
+    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
+               & ~(uintptr_t{smash::kPageSize} - 1);
+    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
+        size_t idx = vm->pageIndex(p);
+        if (idx == 0) continue;
+        if (smash::g_smash_page_states_for_external)
+            smash::g_smash_page_states_for_external->set(idx, smash::PageState::EMPTY);
+        vm->untrackExternalPage(p);
+    }
+}
+
+}  // namespace
+
+SMASH_VISIBLE void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    using fn_t = void*(*)(void*, size_t, int, int, int, off_t);
+    SMASH_LAZY_RESOLVE(fn_t, mmap);
+    if (!real_mmap) return MAP_FAILED;
+    void* ret = real_mmap(addr, len, prot, flags, fd, offset);
+    if (ret == MAP_FAILED) return ret;
+    bool anon = (flags & MAP_ANONYMOUS) != 0;
+    bool writable = (prot & PROT_WRITE) != 0;
+    if (!anon || !writable || len == 0) return ret;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm) registerLinuxExternalRange(vm, ret, len);
+    return ret;
+}
+
+SMASH_VISIBLE int munmap(void* addr, size_t len) {
+    using fn_t = int(*)(void*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, munmap);
+    if (!real_munmap) return -1;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len) deregisterLinuxExternalRange(vm, addr, len);
+    return real_munmap(addr, len);
 }
 
 } // extern "C"

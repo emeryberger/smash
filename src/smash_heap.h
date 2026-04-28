@@ -35,6 +35,12 @@ extern std::atomic<int> g_thread_init_count;
 // Set after SmashHeap construction when compression is enabled.
 extern VmRegion* g_smash_vm_region;
 
+// Global pointer to the PageStateTable, used by the mmap / Mach VM
+// interposers to mark newly-tracked external pages as ACTIVE (or EMPTY
+// on unmap). Set when compression is initialized; nullptr otherwise.
+// Same lifetime contract as g_smash_vm_region.
+extern PageStateTable* g_smash_page_states_for_external;
+
 inline ThreadCache*& currentThreadCache() {
     static thread_local ThreadCache* cache = nullptr;
     return cache;
@@ -439,6 +445,7 @@ public:
             }
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
+            g_smash_page_states_for_external = &page_states_;
             vm::g_page_pins = bootstrapArray<std::atomic<uint8_t>>(
                 vm_region_.totalPages());
 

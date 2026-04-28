@@ -1,7 +1,0 @@
-Usage: bench_heap_compress --app <name> [options]
-  Apps: sqlite, rocksdb, memcached, redis, duckdb
-  --rows N       (sqlite, default 500000)
-  --keys N       (rocksdb, default 200000)
-  --value-size N (rocksdb, default 256)
-  --total-mb N   (memcached/redis/duckdb heap fill, default 200)
-  --alloc-size N (memcached/redis/duckdb object size, default 256)

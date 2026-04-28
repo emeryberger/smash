@@ -712,16 +712,19 @@ SMASH_VISIBLE int epoll_pwait_232(int epfd, struct epoll_event* events, int maxe
 // File-backed and read-only mappings are explicitly skipped (the former
 // would break msync semantics under compression; the latter never need it).
 //
-// SMASH_NO_EXTERNAL_TRACKING=1 disables registration entirely.
+// External tracking is OFF by default; set SMASH_TRACK_EXTERNAL=1 to
+// enable. Same opt-in polarity as the macOS path — see smash_heap.cpp
+// for the rationale (Firefox-on-macOS regression with the registration
+// path active).
 
 namespace {
 
 inline bool externalTrackingEnabledLinux() {
-    static const bool disabled = []{
-        const char* v = std::getenv("SMASH_NO_EXTERNAL_TRACKING");
+    static const bool enabled = []{
+        const char* v = std::getenv("SMASH_TRACK_EXTERNAL");
         return v && v[0] == '1';
     }();
-    return !disabled;
+    return enabled;
 }
 
 inline void registerLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {

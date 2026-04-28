@@ -950,17 +950,22 @@ extern "C" int smash_fflush(FILE* stream) {
 // possible (we don't free associated compressed buffers) but bounded
 // by the workload's churn rate.
 //
-// SMASH_NO_EXTERNAL_TRACKING=1 disables the registration path entirely
-// — useful as a kill switch if a target trips on the new code.
+// External tracking is OFF by default. Set SMASH_TRACK_EXTERNAL=1 to
+// enable. Firefox 5-tab Wikipedia at 90 s crashes ~25 s earlier with
+// tracking on (35 s vs 60 s pre-port baseline) — the cause hasn't been
+// root-caused yet. Targets that don't have Firefox's allocation patterns
+// (e.g., a one-shot redb workload) are safe to opt in. The interposers
+// themselves still install (cost: one branch per mmap / mach_vm call);
+// only the page registration path is gated.
 
 namespace {
 
 inline bool externalTrackingEnabled() {
-    static const bool disabled = []{
-        const char* v = std::getenv("SMASH_NO_EXTERNAL_TRACKING");
+    static const bool enabled = []{
+        const char* v = std::getenv("SMASH_TRACK_EXTERNAL");
         return v && v[0] == '1';
     }();
-    return !disabled;
+    return enabled;
 }
 
 // Register every page in [base, base+len) with the VmRegion's external

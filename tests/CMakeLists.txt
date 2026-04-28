@@ -116,6 +116,7 @@ if(APPLE)
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
       "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_TRACK_EXTERNAL=1"
       $<TARGET_FILE:external_mapping_test>
   )
 else()
@@ -126,6 +127,7 @@ else()
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
       "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_TRACK_EXTERNAL=1"
       $<TARGET_FILE:external_mapping_test>
   )
 endif()

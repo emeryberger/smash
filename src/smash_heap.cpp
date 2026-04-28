@@ -8,9 +8,11 @@
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/mman.h>
 #include <poll.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 
 // ── Thread init counter for deferred compression start ──────────────────────
@@ -100,6 +102,11 @@ void ThreadCache::drainAll(Slab* all_slabs, PageMap* page_map) {
 // ── Global VmRegion pointer for syscall wrappers ─────────────────────────────
 
 smash::VmRegion* smash::g_smash_vm_region = nullptr;
+
+// Set when compression is initialized; nullptr in pass-through builds where
+// SmashHeap never wires up page_states_. The mmap / Mach VM interposers
+// gate every state mutation on this being non-null.
+smash::PageStateTable* smash::g_smash_page_states_for_external = nullptr;
 
 // ── Syscall interposition for kernel buffer compatibility ────────────────────
 //
@@ -918,6 +925,190 @@ extern "C" int smash_fflush(FILE* stream) {
     int ret = reinterpret_cast<fflush_fn>(smash_interpose_smash_fflush.original)(stream);
     if (vm) unpinFileBuffer(stream, vm);
     return ret;
+}
+
+// ── External-mapping interposers ────────────────────────────────────────────
+//
+// Standard smash's main allocator hands out memory from a single big
+// MAP_ANON reservation that smash itself owns; the compressor compresses
+// pages within that reservation. Application code that calls mmap() /
+// vm_allocate() *directly* (SpiderMonkey JS GC arenas, Skia surfaces via
+// mozalloc_aligned, etc.) bypasses the malloc path entirely and so escapes
+// the compressor.
+//
+// The interposers below register such mappings via VmRegion's external-
+// page hash so the compressor's tick can see them. Strict filters apply:
+//
+//   • mmap     — only MAP_ANON | PROT_WRITE. File-backed mappings would
+//                break msync semantics under compression and the OS
+//                already evicts them; non-writable mappings won't dirty.
+//   • mach_vm_allocate — anonymous by design; tracked when caller-
+//                requested protection includes VM_PROT_WRITE.
+//
+// munmap / vm_deallocate counterparts mark the pages EMPTY so the
+// compressor stops scanning them. Compressed-page leakage on unmap is
+// possible (we don't free associated compressed buffers) but bounded
+// by the workload's churn rate.
+//
+// SMASH_NO_EXTERNAL_TRACKING=1 disables the registration path entirely
+// — useful as a kill switch if a target trips on the new code.
+
+namespace {
+
+inline bool externalTrackingEnabled() {
+    static const bool disabled = []{
+        const char* v = std::getenv("SMASH_NO_EXTERNAL_TRACKING");
+        return v && v[0] == '1';
+    }();
+    return !disabled;
+}
+
+// Register every page in [base, base+len) with the VmRegion's external
+// tracker and set its initial PageState to ACTIVE.
+inline void registerExternalRange(smash::VmRegion* vm, void* base, size_t len) {
+    if (!vm || !base || !len) return;
+    if (!externalTrackingEnabled()) return;
+    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
+    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
+               & ~(uintptr_t{smash::kPageSize} - 1);
+    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
+        size_t idx = vm->trackExternalPage(p);
+        if (idx == 0) continue;  // table full or page in contiguous arena
+        smash::g_smash_page_states_for_external
+            ? smash::g_smash_page_states_for_external->set(idx, smash::PageState::ACTIVE)
+            : (void)0;
+    }
+}
+
+inline void deregisterExternalRange(smash::VmRegion* vm, void* base, size_t len) {
+    if (!vm || !base || !len) return;
+    if (!externalTrackingEnabled()) return;
+    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
+    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
+               & ~(uintptr_t{smash::kPageSize} - 1);
+    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
+        size_t idx = vm->pageIndex(p);
+        if (idx == 0) continue;
+        if (smash::g_smash_page_states_for_external)
+            smash::g_smash_page_states_for_external->set(idx, smash::PageState::EMPTY);
+        vm->untrackExternalPage(p);
+    }
+}
+
+}  // namespace
+
+// ── mmap / munmap ───────────────────────────────────────────────────────────
+
+using mmap_fn = void*(*)(void*, size_t, int, int, int, off_t);
+using munmap_fn = int(*)(void*, size_t);
+
+extern "C" void* smash_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset);
+SMASH_INTERPOSE(smash_mmap, mmap);
+extern "C" void* smash_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    void* ret = reinterpret_cast<mmap_fn>(smash_interpose_smash_mmap.original)(
+        addr, len, prot, flags, fd, offset);
+    if (ret == MAP_FAILED) return ret;
+    // Filter to anonymous, writable, non-zero-length mappings. File-backed
+    // (fd != -1 or !MAP_ANON) and read-only mappings are ineligible.
+    bool anon = (flags & MAP_ANON) != 0;
+    bool writable = (prot & PROT_WRITE) != 0;
+    if (!anon || !writable || len == 0) return ret;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm) registerExternalRange(vm, ret, len);
+    return ret;
+}
+
+extern "C" int smash_munmap(void* addr, size_t len);
+SMASH_INTERPOSE(smash_munmap, munmap);
+extern "C" int smash_munmap(void* addr, size_t len) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len) deregisterExternalRange(vm, addr, len);
+    return reinterpret_cast<munmap_fn>(smash_interpose_smash_munmap.original)(addr, len);
+}
+
+// ── mach_vm_allocate / mach_vm_deallocate ────────────────────────────────────
+//
+// SpiderMonkey on macOS uses mach_vm_allocate (not POSIX mmap) for its GC
+// arenas. CoreGraphics/IOSurface paths also reach the kernel via Mach VM.
+// mach_vm_allocate is anonymous-by-design (file-backed mappings go through
+// mach_vm_map with a memory object); tracking is unconditional within Mach
+// VM, gated only on the requested protection including write.
+//
+// Note: a few mach_vm_allocate callers immediately mach_vm_protect down to
+// PROT_NONE. Tracking those is harmless — the compressor will see them as
+// EMPTY-equivalent (no write-fault → no dirty bit → no compress).
+
+using mach_vm_allocate_fn = kern_return_t(*)(vm_map_t, mach_vm_address_t*,
+                                              mach_vm_size_t, int);
+using mach_vm_deallocate_fn = kern_return_t(*)(vm_map_t, mach_vm_address_t,
+                                                mach_vm_size_t);
+using vm_allocate_fn = kern_return_t(*)(vm_map_t, vm_address_t*, vm_size_t, int);
+using vm_deallocate_fn = kern_return_t(*)(vm_map_t, vm_address_t, vm_size_t);
+
+extern "C" kern_return_t smash_mach_vm_allocate(vm_map_t target,
+                                                 mach_vm_address_t* address,
+                                                 mach_vm_size_t size, int flags);
+SMASH_INTERPOSE(smash_mach_vm_allocate, mach_vm_allocate);
+extern "C" kern_return_t smash_mach_vm_allocate(vm_map_t target,
+                                                 mach_vm_address_t* address,
+                                                 mach_vm_size_t size, int flags) {
+    kern_return_t kr = reinterpret_cast<mach_vm_allocate_fn>(
+        smash_interpose_smash_mach_vm_allocate.original)(target, address, size, flags);
+    if (kr != KERN_SUCCESS || !address || size == 0) return kr;
+    // Only track allocations in our own task — cross-task allocations
+    // belong to a child process and we can't compress remote pages.
+    if (target != mach_task_self()) return kr;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm) registerExternalRange(vm, reinterpret_cast<void*>(*address),
+                                   static_cast<size_t>(size));
+    return kr;
+}
+
+extern "C" kern_return_t smash_mach_vm_deallocate(vm_map_t target,
+                                                   mach_vm_address_t address,
+                                                   mach_vm_size_t size);
+SMASH_INTERPOSE(smash_mach_vm_deallocate, mach_vm_deallocate);
+extern "C" kern_return_t smash_mach_vm_deallocate(vm_map_t target,
+                                                   mach_vm_address_t address,
+                                                   mach_vm_size_t size) {
+    if (target == mach_task_self() && address && size) {
+        auto* vm = smash::g_smash_vm_region;
+        if (vm)
+            deregisterExternalRange(vm, reinterpret_cast<void*>(address),
+                                     static_cast<size_t>(size));
+    }
+    return reinterpret_cast<mach_vm_deallocate_fn>(
+        smash_interpose_smash_mach_vm_deallocate.original)(target, address, size);
+}
+
+extern "C" kern_return_t smash_vm_allocate(vm_map_t target, vm_address_t* address,
+                                            vm_size_t size, int flags);
+SMASH_INTERPOSE(smash_vm_allocate, vm_allocate);
+extern "C" kern_return_t smash_vm_allocate(vm_map_t target, vm_address_t* address,
+                                            vm_size_t size, int flags) {
+    kern_return_t kr = reinterpret_cast<vm_allocate_fn>(
+        smash_interpose_smash_vm_allocate.original)(target, address, size, flags);
+    if (kr != KERN_SUCCESS || !address || size == 0) return kr;
+    if (target != mach_task_self()) return kr;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm) registerExternalRange(vm, reinterpret_cast<void*>(*address),
+                                   static_cast<size_t>(size));
+    return kr;
+}
+
+extern "C" kern_return_t smash_vm_deallocate(vm_map_t target, vm_address_t address,
+                                              vm_size_t size);
+SMASH_INTERPOSE(smash_vm_deallocate, vm_deallocate);
+extern "C" kern_return_t smash_vm_deallocate(vm_map_t target, vm_address_t address,
+                                              vm_size_t size) {
+    if (target == mach_task_self() && address && size) {
+        auto* vm = smash::g_smash_vm_region;
+        if (vm)
+            deregisterExternalRange(vm, reinterpret_cast<void*>(address),
+                                     static_cast<size_t>(size));
+    }
+    return reinterpret_cast<vm_deallocate_fn>(
+        smash_interpose_smash_vm_deallocate.original)(target, address, size);
 }
 
 #endif // __APPLE__

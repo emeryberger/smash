@@ -315,6 +315,10 @@ public:
 
     char* base() const { return base_; }
     size_t totalPages() const { return total_pages_; }
+    // Contiguous-arena page count. In full mode, this is the bump-arena
+    // capacity (total_pages_ minus the external-page tail). In tracking
+    // mode the contiguous arena is unused, so the value is 0.
+    size_t contigPages() const { return contig_pages_; }
     size_t committedPages() const {
         size_t bump = next_page_.load(std::memory_order_relaxed);
         if (tracking_mode_) return bump;

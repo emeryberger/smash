@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout smash
+        uses: actions/checkout@v4
+        with:
+          path: smash
+
+      # smash's CMake expects ALLOC8_DIR=$smash/../alloc8 (a sibling dir).
+      - name: Checkout alloc8 (sibling dir)
+        uses: actions/checkout@v4
+        with:
+          repository: emeryberger/alloc8
+          path: alloc8
+
+      - name: Configure
+        working-directory: smash
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSMASH_BUILD_TESTS=ON
+
+      - name: Build
+        working-directory: smash
+        run: cmake --build build -j
+
+      # The external_mapping_test exercises the new mmap / Mach VM
+      # interposers under a live compressor — that's the regression
+      # surface this PR introduces. Other tests cover the existing
+      # invariants.
+      - name: Run tests
+        working-directory: smash
+        run: ctest --test-dir build --output-on-failure --timeout 120

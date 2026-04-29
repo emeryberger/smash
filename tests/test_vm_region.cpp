@@ -21,7 +21,10 @@ static void testBasicAlloc() {
     VmRegion vm;
     bool ok = vm.init(64 * kPageSize);
     CHECK(ok, "VmRegion init failed");
-    CHECK(vm.totalPages() == 64, "expected 64 total pages, got %zu", vm.totalPages());
+    // contigPages() is the bump-arena capacity — the original "total"
+    // before VmRegion grew an external-page tail for application-direct
+    // mmap / Mach VM tracking. totalPages() now also includes that tail.
+    CHECK(vm.contigPages() == 64, "expected 64 contig pages, got %zu", vm.contigPages());
     CHECK(vm.committedPages() == 0, "expected 0 committed pages initially");
 
     // Allocate 4 pages

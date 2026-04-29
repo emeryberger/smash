@@ -8,16 +8,18 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 
 ### Key Features
 
-- **Transparent compression**: No application changes required — works via malloc interposition
-- **Adaptive multi-algorithm**: zstd-1 for recently cold pages, zstd-9 for very cold pages
+- **Transparent compression**: No application changes required, works via malloc interposition.
+- **ROI-driven algorithm selection**: A return-on-investment model picks zstd-1 (fast tier) or zstd-9 (deep tier) per page at compression time, weighing observed compressibility and observed compression cost against the page's accumulated cold time.
+- **Per-origin learning**: Compression-ratio and compression-cost statistics are kept per `(arena, size class)`, so call-site arena routing translates directly into more accurate ROI decisions.
+- **Adaptive worker pool**: The compressor scales its active worker count each tick using Little's Law (`N = ⌈λ/μ⌉`), so an idle process uses one worker and a bulk-allocation phase uses several.
 
 ## How It Works
 
-1. **Allocation**: smash replaces malloc/free via [alloc8](https://github.com/emeryberger/alloc8) interposition. All slab data pages come from a single large virtual memory reservation (VmRegion).
+1. **Allocation**: smash replaces malloc/free via [alloc8](https://github.com/emeryberger/alloc8) interposition. All slab data pages come from a single large virtual memory reservation (VmRegion). A return-address hash routes calls from the same call site into the same arena, producing structurally homogeneous pages.
 
 2. **Access tracking**: A background compressor thread periodically sets active pages to read-only (`mprotect PROT_READ`). Write faults mark pages as "accessed"; pages without writes across multiple intervals are considered cold.
 
-3. **Compression**: Cold pages are compressed (LZ4, zstd, or zstd+dictionary depending on coldness duration) and their physical backing is released. Compressed data is stored in a separate region.
+3. **Compression**: Cold pages are compressed with zstd-1 or zstd-9, selected by the ROI model based on the page's `(arena, size class)` observed ratio and the per-tier observed compression cost. Physical backing is released (`MADV_FREE_REUSABLE` on macOS, `MADV_DONTNEED` on Linux); compressed data is stored in a separate sharded region.
 
 4. **Decompression**: When the application accesses a compressed page, a SIGSEGV/SIGBUS handler recommits the page, decompresses the data, and resumes execution transparently.
 
@@ -45,6 +47,24 @@ This produces `libsmash.dylib` (macOS) or `libsmash.so` (Linux).
 cmake .. -DSMASH_BUILD_BENCH=ON
 make -j$(nproc)
 ```
+
+`SMASH_BUILD_BENCH=ON` enables three groups of benchmark targets, each with its own toggle:
+
+| Option | Default | What it gates |
+|--------|---------|---------------|
+| `SMASH_BUILD_BENCH_DEPS` | `ON` | Build Redis, memcached, DuckDB, RocksDB from source via `make bench_deps`. See "Build with benchmark dependencies" below. Set `OFF` to skip — the rest of the benchmark targets still build. |
+| `SMASH_BUILD_BENCH_ALLOCATORS` | `ON` | Build the allocator-comparison benches (mimalloc, jemalloc, tcmalloc, hoard, mesh, diehard, dieharder) and the `bench_allocator_compare.py` runner. Pulls in tcmalloc / mimalloc via FetchContent + ExternalProject_Add, which adds significant build time and several optional `find_library` probes. Set `OFF` for fast smash-only builds (e.g. CI regression runs). |
+
+To build only the smash-internal benches (`bench_rss`, `bench_sqlite`, `bench_throughput`, `bench_compression`, `bench_algo_compare`, etc.) without external services or competing allocators:
+
+```bash
+cmake .. -DSMASH_BUILD_BENCH=ON \
+         -DSMASH_BUILD_BENCH_DEPS=OFF \
+         -DSMASH_BUILD_BENCH_ALLOCATORS=OFF
+make -j$(nproc)
+```
+
+This is what the CI regression-spotting workflow uses (see `.github/workflows/ci.yml`).
 
 ### Build with benchmark dependencies (Redis, memcached, DuckDB, RocksDB)
 
@@ -76,6 +96,20 @@ DYLD_INSERT_LIBRARIES=./build/libsmash.dylib DYLD_FORCE_FLAT_NAMESPACE=1 ./your_
 LD_PRELOAD=./build/libsmash.so ./your_application
 ```
 
+### Large-Only Mode
+
+For applications with their own small-object allocator (e.g., Python 3.13+ uses mimalloc internally), Smash can manage only large allocations while letting the native allocator handle small objects:
+
+```bash
+# macOS
+SMASH_LARGE_ONLY=1 DYLD_INSERT_LIBRARIES=./build/libsmash.dylib ./your_application
+
+# Linux
+SMASH_LARGE_ONLY=1 LD_PRELOAD=./build/libsmash.so ./your_application
+```
+
+Allocations <= 16KB pass through to the system allocator; larger allocations go through Smash and are eligible for compression. This avoids interfering with language runtimes that have their own optimized small-object allocators.
+
 ### Compress-Only Mode
 
 For applications that use custom allocators (jemalloc, tcmalloc, etc.), Smash can run in compress-only mode where it only monitors and compresses pages without replacing malloc:
@@ -89,6 +123,24 @@ SMASH_MODE=compress_only LD_PRELOAD=./build/libsmash.so ./your_application
 ```
 
 This mode tracks all heap pages via `/proc/self/maps` (Linux) or `vm_region` (macOS) and compresses cold regions regardless of which allocator manages them.
+
+### External-Mapping Tracking (`SMASH_TRACK_EXTERNAL=1`)
+
+Standard smash compresses pages within its own `MAP_ANON` arena (where malloc-routed allocations live). Application code that calls `mmap()` / `mach_vm_allocate()` directly bypasses malloc and so escapes the compressor — this is the long pole on Firefox, where SpiderMonkey JS GC arenas, Skia / `mozalloc_aligned` graphics surfaces, and IPC-aligned shared memory all bypass `malloc`.
+
+`SMASH_TRACK_EXTERNAL=1` registers anonymous-writable application-direct mappings with smash so the compressor can see them too:
+
+```bash
+# macOS
+SMASH_TRACK_EXTERNAL=1 DYLD_INSERT_LIBRARIES=./build/libsmash.dylib ./your_application
+
+# Linux
+SMASH_TRACK_EXTERNAL=1 LD_PRELOAD=./build/libsmash.so ./your_application
+```
+
+Filter rules: `mmap` is tracked only with `MAP_ANON | PROT_WRITE` (file-backed and read-only mappings are skipped). On macOS `mach_vm_allocate` and `vm_allocate` are tracked when allocated in the current task. The interposers themselves always install (cost: one branch per `mmap` / `mach_vm` call); only the page registration path is gated by the env var.
+
+This is **opt-in** because the registration path has not yet been validated for stability on Firefox-class workloads — see `smash-benchmarks/FIREFOX_STUDY.md` for context.
 
 ### Optional API
 
@@ -111,7 +163,7 @@ cd build
 ctest --output-on-failure
 ```
 
-12 tests covering:
+14 tests covering:
 
 | Test | What it verifies |
 |------|-----------------|
@@ -127,6 +179,12 @@ ctest --output-on-failure
 | `test_prefetch` | Adjacent page prefetch, span boundary clipping |
 | `test_contention` | 8-thread concurrent alloc/free stress test |
 | `test_fault_cycle` | Real SIGSEGV → decompress → verify data integrity |
+| `test_external_mapping` | `mmap` + `mach_vm_allocate` round-trip through the compressor (under `SMASH_TRACK_EXTERNAL=1`); negative tests confirm file-backed and read-only mappings are not tracked |
+| `test_malloc_compression` | End-to-end compression on the malloc/free path: `SIGUSR2` stats line shows `compressed > 0`, then read-back verifies fault-decompress integrity |
+
+The two end-to-end tests run under `DYLD_INSERT_LIBRARIES` (macOS) / `LD_PRELOAD` (Linux) with a live compressor, so they exercise the full Phase 1 → Phase 2 → fault-decompress cycle, not just unit-level invariants.
+
+Continuous integration: `.github/workflows/ci.yml` builds and runs the full ctest suite on `ubuntu-latest` and `macos-latest` for every push to master and every pull request.
 
 ## Benchmarks
 
@@ -226,12 +284,16 @@ Key tuning constants in `include/smash/config.h`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `kCompressIntervalMs` | 1000 | Compression scan interval (ms) |
-| `kColdTicks` | 2 | Ticks without access → compress with LZ4 |
-| `kVeryColdTicks` | 60 | Ticks → escalate to zstd/zstd+dict |
+| `kColdTicks` | 2 | Ticks without access before fast-tier compression considered |
+| `kVeryColdTicks` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile in the ROI model |
 | `kMinCompressRatio` | 0.75 | Only keep compressed if < 75% of original |
 | `kPrefetchWindow` | 2 | Pages prefetched in each direction on fault |
 | `kDictTrainSamples` | 0 | Pages before dictionary training (disabled by default) |
 | `kNumClasses` | 36 | Size classes (16B to 16KB) |
+| `kNumArenas` | 4 | Call-site arenas (must be a power of 2) |
+| `kCompressorWorkers` | 2 | Initial compressor worker count |
+| `kMaxCompressorWorkers` | 8 | Cap for adaptive worker scaling |
+| `kCompressStoreShards` | 8 | Sharded lock count in CompressStore |
 
 ## License
 

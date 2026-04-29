@@ -54,7 +54,7 @@ int main() {
 
     fprintf(stdout, "=== RSS Reduction Benchmark ===\n");
     fprintf(stdout, "Page size: %zu, Compress interval: %d ms, Cold ticks: %d\n\n",
-            kPageSize, kCompressIntervalMs, kColdTicks);
+            kPageSize, kCompressIntervalMs, getColdTicks());
 
     size_t initial_rss = getCurrentRSSBytes();
     fprintf(stdout, "Initial RSS: %.1f MB\n", initial_rss / (1024.0 * 1024.0));

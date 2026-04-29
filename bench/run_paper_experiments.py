@@ -12,6 +12,8 @@ Produces paper_results/ with:
 """
 
 import argparse
+import datetime
+import hashlib
 import json
 import os
 import platform
@@ -53,7 +55,7 @@ ABLATION_CONFIGS = OrderedDict([
               "cmake_flags": {"SMASH_DICT_TRAIN_SAMPLES": "16"}, "use_smash": True}),
     ("T1a", {"name": "No arenas",
              "cmake_flags": {"SMASH_NUM_ARENAS": "1"}, "use_smash": True}),
-    ("T1c", {"name": "LZ4 only",
+    ("T1c", {"name": "Fast tier only",
              "cmake_flags": {"SMASH_VERY_COLD_TICKS": "9999"}, "use_smash": True}),
     ("T2a", {"name": "No zero-deferred",
              "cmake_flags": {"SMASH_ABLATION_NO_ZERO_DEFERRED": "ON"}, "use_smash": True}),
@@ -119,7 +121,7 @@ ABLATION_CONFIGS = OrderedDict([
 ])
 
 APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext",
-        "redis_patched", "redis_ext_patched"]
+        "redis_patched", "redis_ext_patched", "pandas"]
 
 IS_DARWIN = platform.system() == "Darwin"
 PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
@@ -127,10 +129,203 @@ LIB_SUFFIX = ".dylib" if IS_DARWIN else ".so"
 MESH_LIB = "/usr/local/lib/libmesh.dylib" if IS_DARWIN else "/usr/lib/libmesh.so"
 
 
+# ── Provenance ───────────────────────────────────────────────────────────────
+#
+# Every results JSON records (a) who we are (host, OS, CPU, RAM, page size)
+# and (b) what code produced each data point (git commit, uncommitted diff
+# indicator, source tree hash, cmake flags).  This exists because a previous
+# session had apparently-comparable JSON files that were actually taken
+# under different Redis/bench conditions, and we spent time debugging a
+# phantom regression.  Never again.
+
+_SYSTEM_INFO_CACHE = None
+
+def collect_system_info():
+    """Capture host/OS/CPU/memory/tool-version info that won't change
+    between runs within a session."""
+    global _SYSTEM_INFO_CACHE
+    if _SYSTEM_INFO_CACHE is not None:
+        return _SYSTEM_INFO_CACHE
+
+    def run(cmd):
+        try:
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT,
+                                          timeout=5)
+            return out.strip()
+        except Exception:
+            return None
+
+    info = {
+        "timestamp_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "python": platform.python_version(),
+        "page_size_bytes": os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else None,
+    }
+
+    if IS_DARWIN:
+        info["cpu"] = run(["sysctl", "-n", "machdep.cpu.brand_string"])
+        info["cpu_cores"] = run(["sysctl", "-n", "hw.ncpu"])
+        mem_raw = run(["sysctl", "-n", "hw.memsize"])
+        if mem_raw:
+            try:
+                info["mem_gib"] = round(int(mem_raw) / (1024 ** 3), 1)
+            except Exception:
+                pass
+    else:
+        cpuinfo = run(["grep", "-m1", "model name", "/proc/cpuinfo"])
+        if cpuinfo and ":" in cpuinfo:
+            info["cpu"] = cpuinfo.split(":", 1)[1].strip()
+        cores = run(["grep", "-c", "^processor", "/proc/cpuinfo"])
+        if cores:
+            info["cpu_cores"] = cores
+        mem_kb = run(["grep", "MemTotal", "/proc/meminfo"])
+        if mem_kb:
+            try:
+                kb = int(mem_kb.split()[1])
+                info["mem_gib"] = round(kb / (1024 ** 2), 1)
+            except Exception:
+                pass
+
+    # Tool versions: record whatever is on PATH so we know what we linked
+    # against.  Redis/memcached binaries in the build tree override system
+    # ones; the get_binary helper picks those where available.
+    for tool in ["cmake", "gcc", "g++", "clang", "clang++"]:
+        v = run([tool, "--version"])
+        if v:
+            info[f"{tool}_version"] = v.splitlines()[0]
+    info["redis_server_version"] = run(["redis-server", "--version"]) or None
+    info["memcached_version"] = run(["memcached", "--version"]) or None
+
+    _SYSTEM_INFO_CACHE = info
+    return info
+
+
+def _file_hash(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+    except Exception:
+        return None
+
+
+def collect_source_hash(source_dir):
+    """Hash the Smash source tree (src/, include/, CMakeLists.txt).
+    Stable across unrelated filesystem operations; detects uncommitted
+    changes that a git commit hash alone would miss."""
+    source_dir = Path(source_dir)
+    files = []
+    for sub in ("src", "include"):
+        p = source_dir / sub
+        if p.exists():
+            files.extend(sorted(p.rglob("*.h")))
+            files.extend(sorted(p.rglob("*.cpp")))
+    top_cmake = source_dir / "CMakeLists.txt"
+    if top_cmake.exists():
+        files.append(top_cmake)
+
+    combined = hashlib.sha256()
+    for f in files:
+        rel = f.relative_to(source_dir).as_posix()
+        fh = _file_hash(f)
+        if fh is None:
+            continue
+        combined.update(rel.encode("utf-8"))
+        combined.update(fh.encode("ascii"))
+    return combined.hexdigest()[:16]
+
+
+def collect_git_info(source_dir):
+    """Git HEAD hash + whether the tree has uncommitted changes."""
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", str(source_dir), "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5
+        ).strip()
+    except Exception:
+        return {"git_head": None, "git_dirty": None}
+    dirty = False
+    try:
+        st = subprocess.check_output(
+            ["git", "-C", str(source_dir), "status", "--porcelain"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        dirty = bool(st.strip())
+    except Exception:
+        dirty = None
+    return {"git_head": head, "git_dirty": dirty}
+
+
+def collect_smash_env():
+    """Snapshot every SMASH_* environment variable at the point of call.
+    Individual bench functions may set additional SMASH_* variables inside
+    their own env copies; this captures the baseline visible to the runner."""
+    return {k: v for k, v in os.environ.items() if k.startswith("SMASH_")}
+
+
+def build_provenance(source_dir, cmake_flags, lib_path):
+    """Per-build provenance.  Call after each rebuild; the result is stamped
+    into every result entry produced with that build."""
+    p = {
+        "cmake_flags": dict(cmake_flags) if cmake_flags else {},
+        "smash_env": collect_smash_env(),
+        "source_hash": collect_source_hash(source_dir),
+        "libsmash_sha256": _file_hash(lib_path) if lib_path and Path(lib_path).exists() else None,
+        "libsmash_mtime": (
+            datetime.datetime.utcfromtimestamp(
+                Path(lib_path).stat().st_mtime).isoformat(timespec="seconds") + "Z"
+            if lib_path and Path(lib_path).exists() else None
+        ),
+    }
+    p.update(collect_git_info(source_dir))
+    return p
+
+
+# Per-app bench parameters as actually used by the run_* functions below.
+# Change these in lockstep with the code or the measurements become lies.
+# Included in every results JSON so callers know *what* was measured.
+BENCH_PARAMS = {
+    "sqlite": {
+        "quick": {"rows": None, "note": "passes --quick to bench_sqlite"},
+        "full":  {"rows": None, "note": "default bench_sqlite args"},
+    },
+    "rocksdb": {
+        "quick": {"keys": 200000, "value_size": 256, "cool_sec": 5, "serve_sec": 10},
+        "full":  {"keys": 200000, "value_size": 256, "cool_sec": 5, "serve_sec": 10},
+    },
+    "redis": {
+        "quick": {"port": 16399, "num_ops": 50000, "num_clients": 1000,
+                  "value_size": 1000, "keyspace": 100000, "cool_sec": 5},
+        "full":  {"port": 16399, "num_ops": 200000,
+                  "num_clients_linux": 50, "num_clients_darwin": 5000,
+                  "value_size": 2000, "keyspace": 200000, "cool_sec": 20,
+                  "server_flags": ["--hz", "1", "--dynamic-hz", "no",
+                                   "--save", "", "--appendonly", "no"]},
+    },
+    "redis_ext": {"full": {"port": 16400, "note": "extended: SET + DELETE 50% + GET"}},
+    "redis_patched":     {"full": {"uses": "redis-smash patched binary"}},
+    "redis_ext_patched": {"full": {"uses": "redis-smash patched binary, ext workload"}},
+    "memcached": {
+        "full": {"num_items": 200000, "value_size": 1024, "cool_sec": 20},
+    },
+    "duckdb": {
+        "full": {"note": "TPC-H queries, see run_duckdb_bench"},
+    },
+    "pandas": {
+        "full": {"note": "see bench/bench_pandas.py"},
+    },
+}
+
+
 # ── Build helpers ────────────────────────────────────────────────────────────
 
 def rebuild(build_dir, cmake_flags, source_dir):
-    """Reconfigure and rebuild libsmash with given flags."""
+    """Reconfigure and rebuild libsmash with given flags.  Returns the
+    per-build provenance record on success, or None on failure."""
     # Preserve compiler settings from the original build to avoid C++20 issues
     cache_file = Path(build_dir) / "CMakeCache.txt"
     compiler_flags = []
@@ -151,7 +346,7 @@ def rebuild(build_dir, cmake_flags, source_dir):
     r = subprocess.run(cmd, cwd=build_dir, capture_output=True, text=True)
     if r.returncode != 0:
         print(f"    CMAKE FAILED: {r.stderr[-300:]}")
-        return False
+        return None
 
     # Build only the targets needed for experiments (avoid broken bench targets)
     targets = ["smash", "smash_noopt", "smash_compress_only",
@@ -160,8 +355,10 @@ def rebuild(build_dir, cmake_flags, source_dir):
                        capture_output=True, text=True)
     if r.returncode != 0:
         print(f"    MAKE FAILED: {r.stderr[-300:]}")
-        return False
-    return True
+        return None
+
+    lib_path = Path(build_dir) / f"libsmash{LIB_SUFFIX}"
+    return build_provenance(source_dir, cmake_flags, lib_path)
 
 
 # ── RSS measurement ──────────────────────────────────────────────────────────
@@ -384,11 +581,11 @@ def run_redis_bench(build_dir, smash_lib, quick):
             return None
 
     port = 16399
-    num_ops = 50000 if quick else 100000
+    num_ops = 50000 if quick else 200000
     num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
-    value_size = 1000
-    keyspace = 100000
-    cool_sec = 5 if quick else 15
+    value_size = 1000 if quick else 2000
+    keyspace = 100000 if quick else 200000
+    cool_sec = 5 if quick else 20
 
     kill_redis(port, build_dir)
 
@@ -415,7 +612,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
                 [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                  "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                  "-t", "set", "-q"],
-                capture_output=True, text=True, timeout=600
+                capture_output=True, text=True, timeout=1200
             )
             set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
         except subprocess.TimeoutExpired:
@@ -458,7 +655,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
                     [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                      "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                      "-t", "get", "-q"],
-                    capture_output=True, text=True, timeout=600
+                    capture_output=True, text=True, timeout=1200
                 )
                 get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
             except subprocess.TimeoutExpired:
@@ -513,11 +710,11 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
             return None
 
     port = 16400  # different port from run_redis_bench to avoid conflicts
-    num_ops = 50000 if quick else 100000
+    num_ops = 50000 if quick else 200000
     num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
-    value_size = 1000
-    keyspace = 100000
-    cool_sec = 5 if quick else 15
+    value_size = 1000 if quick else 2000
+    keyspace = 100000 if quick else 200000
+    cool_sec = 5 if quick else 20
 
     kill_redis(port, build_dir)
 
@@ -544,7 +741,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
                 [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                  "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                  "-t", "set", "-q"],
-                capture_output=True, text=True, timeout=600
+                capture_output=True, text=True, timeout=1200
             )
             set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
         except subprocess.TimeoutExpired:
@@ -629,7 +826,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
                     [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                      "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                      "-t", "get", "-q"],
-                    capture_output=True, text=True, timeout=600
+                    capture_output=True, text=True, timeout=1200
                 )
                 get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
             except subprocess.TimeoutExpired:
@@ -685,11 +882,11 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
         else ("redis_ext" if extended else "redis")
     # Use different ports to avoid conflicts
     port = 16399 + (1 if extended else 0) + (2 if patched else 0)
-    num_ops = 50000 if quick else 100000
+    num_ops = 50000 if quick else 200000
     num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
-    value_size = 1000
-    keyspace = 100000
-    cool_sec = 5 if quick else 15
+    value_size = 1000 if quick else 2000
+    keyspace = 100000 if quick else 200000
+    cool_sec = 5 if quick else 20
 
     kill_redis(port, build_dir)
 
@@ -719,7 +916,7 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
                 [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                  "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                  "-t", "set", "-q"],
-                capture_output=True, text=True, timeout=600
+                capture_output=True, text=True, timeout=1200
             )
             set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
         except subprocess.TimeoutExpired:
@@ -780,7 +977,7 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
                     [redis_benchmark, "-p", str(port), "-c", str(num_clients),
                      "-n", str(num_ops), "-d", str(value_size), "-r", str(keyspace),
                      "-t", "get", "-q"],
-                    capture_output=True, text=True, timeout=600
+                    capture_output=True, text=True, timeout=1200
                 )
                 get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
             except subprocess.TimeoutExpired:
@@ -1353,6 +1550,70 @@ def run_shell_benchmark(script, smash_lib, quick, name):
         return None
 
 
+# ── Pandas cold-columns benchmark ────────────────────────────────────────────
+
+def run_pandas_bench(build_dir, smash_lib, quick):
+    """Run Python+pandas cold-columns benchmark as a subprocess.
+
+    Creates a large DataFrame with many columns, works a subset ("hot"),
+    lets the rest go cold, then measures RSS reduction and decompression cost.
+
+    bench_pandas.py launches its own inner subprocess with LD_PRELOAD, so we
+    DON'T set LD_PRELOAD here — we pass --smash-lib instead.
+    """
+    script = build_dir.parent / "bench" / "bench_pandas.py"
+    if not script.exists():
+        print(f"    pandas script not found: {script}")
+        return None
+
+    # Check pandas is available
+    try:
+        subprocess.check_call(
+            [sys.executable, "-c", "import pandas, numpy"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        print("    pandas/numpy not installed, skipping")
+        return None
+
+    args = [sys.executable, str(script), "--runs", "1"]
+    if quick:
+        args.append("--quick")
+    else:
+        args.extend(["--rows", "2000000", "--cool-sec", "60"])
+    if smash_lib:
+        args.extend(["--smash-lib", str(smash_lib)])
+
+    try:
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        # bench_pandas.py runs the actual work in an inner subprocess.
+        # We can't sample RSS of the inner process from here, so rely on
+        # the internal METRIC lines from the benchmark.
+        stdout, stderr = proc.communicate(timeout=600)
+
+        if proc.returncode != 0:
+            print(f"    pandas error: exit code {proc.returncode}")
+            if stderr:
+                print(f"    stderr: {stderr[:300]}")
+            return None
+
+        metrics = parse_metrics(stdout)
+
+        if "rss_reduction_pct" not in metrics:
+            peak = metrics.get("peak_rss_mb", 0)
+            min_rss = metrics.get("min_rss_mb", peak)
+            if peak > 0 and min_rss > 0:
+                metrics["rss_reduction_pct"] = (1 - min_rss / peak) * 100
+
+        return metrics
+    except Exception as e:
+        print(f"    pandas error: {e}")
+        return None
+
+
 # ── App runner dispatch ──────────────────────────────────────────────────────
 
 def run_app(app, build_dir, smash_lib, quick):
@@ -1373,6 +1634,8 @@ def run_app(app, build_dir, smash_lib, quick):
         return run_redis_ext_patched_bench(build_dir, smash_lib, quick)
     elif app == "duckdb":
         return run_duckdb_bench(build_dir, smash_lib, quick)
+    elif app == "pandas":
+        return run_pandas_bench(build_dir, smash_lib, quick)
     return None
 
 
@@ -1384,12 +1647,31 @@ def run_ablation(build_dir, source_dir, apps, quick, output_dir, runs=1):
 
     smash_lib = build_dir / f"libsmash{LIB_SUFFIX}"
 
-    # Load existing results
+    # Load existing results.  Preserve any existing provenance/system-info
+    # at the top level; we extend, not overwrite, so partial re-runs keep
+    # the original host record while newly-stamped entries carry the
+    # current build.
     all_results = {}
     if results_path.exists():
         all_results = json.loads(results_path.read_text())
 
+    # Ensure top-level provenance.  If the file already has one, keep it
+    # (entries embedded earlier were stamped under it), but always append
+    # the current session so we can see when this was re-opened.
+    sessions = all_results.setdefault("_sessions", [])
+    sessions.append({
+        "timestamp_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "runs_requested": runs,
+        "quick": quick,
+        "apps": list(apps),
+        "system_info": collect_system_info(),
+        "smash_env_at_start": collect_smash_env(),
+        "bench_params": BENCH_PARAMS,
+    })
+    results_path.write_text(json.dumps(all_results, indent=2))
+
     last_flags = None
+    current_provenance = None
     total = len(ABLATION_CONFIGS)
     t0 = time.time()
 
@@ -1401,7 +1683,8 @@ def run_ablation(build_dir, source_dir, apps, quick, output_dir, runs=1):
         flags = cfg["cmake_flags"]
         if flags != last_flags and cfg["use_smash"]:
             print(f"  Rebuilding libsmash...")
-            if not rebuild(build_dir, flags, source_dir):
+            current_provenance = rebuild(build_dir, flags, source_dir)
+            if current_provenance is None:
                 print(f"  SKIPPING {cid}: build failed")
                 continue
             last_flags = flags
@@ -1450,6 +1733,7 @@ def run_ablation(build_dir, source_dir, apps, quick, output_dir, runs=1):
                     "name": cfg["name"],
                     "runs": run_results,
                     "median": med,
+                    "provenance": current_provenance,
                 }
 
         # Save incrementally
@@ -1473,12 +1757,27 @@ def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1):
         print(f"ERROR: {co_lib} not found. Build with -DSMASH_BUILD_BENCH=ON")
         return {}
 
-    # Ensure default build for full smash
-    rebuild(build_dir, {}, source_dir)
+    # Ensure default build for full smash and capture provenance.
+    current_provenance = rebuild(build_dir, {}, source_dir)
+    if current_provenance is None:
+        print("ERROR: rebuild failed")
+        return {}
 
     all_results = {}
     if results_path.exists():
         all_results = json.loads(results_path.read_text())
+
+    sessions = all_results.setdefault("_sessions", [])
+    sessions.append({
+        "timestamp_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "runs_requested": runs,
+        "quick": quick,
+        "apps": list(apps),
+        "system_info": collect_system_info(),
+        "smash_env_at_start": collect_smash_env(),
+        "bench_params": BENCH_PARAMS,
+    })
+    results_path.write_text(json.dumps(all_results, indent=2))
 
     configs = [
         ("baseline", None),
@@ -1524,6 +1823,7 @@ def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1):
                 all_results[key] = {
                     "runs": run_results,
                     "median": _median_metrics(run_results),
+                    "provenance": current_provenance,
                 }
 
         results_path.write_text(json.dumps(all_results, indent=2))

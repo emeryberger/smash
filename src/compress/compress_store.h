@@ -5,10 +5,10 @@
 // Sharded by page index to reduce lock contention across compressor workers.
 //
 // Region reclamation: each region tracks live bytes.  When live_bytes drops
-// to zero the region's data pages are decommitted (MADV_FREE on macOS,
-// MADV_DONTNEED on Linux), releasing physical memory back to the OS while
-// keeping the virtual mapping.  If the region is reused, the OS zero-fills
-// on access and the bump allocator is reset.
+// to zero the region's data pages are decommitted (MADV_FREE_REUSABLE on
+// macOS, MADV_DONTNEED on Linux), releasing physical memory back to the OS
+// while keeping the virtual mapping.  If the region is reused, the OS
+// zero-fills on access and the bump allocator is reset.
 #pragma once
 
 #include "smash/config.h"

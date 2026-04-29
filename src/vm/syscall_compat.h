@@ -14,6 +14,7 @@
 #include "smash/config.h"
 #include "vm_region.h"
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <sys/uio.h>
@@ -76,6 +77,30 @@ inline void unpinIovec(const struct iovec* iov, int iovcnt, VmRegion* vm) {
         if (iov[i].iov_base && iov[i].iov_len)
             unpinPages(iov[i].iov_base, iov[i].iov_len, vm);
     }
+}
+
+// Retry a syscall on EFAULT after re-warming buffer pages.
+//
+// Closes the nanosecond-scale TOCTOU window between pinPages() in the
+// caller and the compressor's per-page mprotect (compressor_thread.h
+// phase3Range / escalateToDeepMonitoring): the kernel can synchronously
+// touch a page right after we pin but before our pin-bump is observed,
+// returning EFAULT instead of delivering a fault we could decompress.
+//
+// Caller holds the pin across all attempts. `rewarm` re-touches buffer
+// pages so the user-space fault handler can restore PROT_READ|PROT_WRITE
+// before we re-issue the syscall.
+template <typename Syscall, typename Rewarm>
+inline auto retryOnEfault(Syscall syscall, Rewarm rewarm)
+    -> decltype(syscall()) {
+    auto ret = syscall();
+    for (int attempt = 0;
+         ret == -1 && errno == EFAULT && attempt < 3;
+         ++attempt) {
+        rewarm();
+        ret = syscall();
+    }
+    return ret;
 }
 
 } // namespace smash::vm

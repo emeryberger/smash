@@ -21,7 +21,12 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All 12 tests must pass. The interpose test requires macOS (DYLD_INSERT_LIBRARIES).
+All 14 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Two of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` with a live compressor:
+
+- `test_external_mapping` exercises the `SMASH_TRACK_EXTERNAL=1` registration path. The ctest invocation sets the env var; without it the test would silently no-op (registration path gated).
+- `test_malloc_compression` allocates compressible chunks via the standard `malloc` path, sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2` to itself, captures stderr, parses `compressed=N` from the smash stats line, asserts `N > 0`, then reads every byte back to verify integrity through fault-decompress. Catches regressions in the malloc-side compression path that the interposer-only tests would miss.
+
+After ctest, CI also runs `bench/run_quick_ci.py` which drives `bench_rss` (in-process: 64 MiB compressible alloc → ≥30 % peak-RSS reduction at t=10 s) and `bench_sqlite --quick` under the preloaded libsmash (≥5 % cooling-phase RSS reduction). Local baselines are ~46 % and ~13 % respectively, so the thresholds are well below noise; a real regression in the compressor or the malloc-interposed path will trip them. Configured with `-DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=OFF -DSMASH_BUILD_BENCH_ALLOCATORS=OFF` so the CI build skips Redis/memcached/RocksDB/tcmalloc/jemalloc/hoard/mesh/etc. — only the smash-internal benches are needed.
 
 ## Project Structure
 
@@ -45,9 +50,12 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 - **Zero-on-free (deferred)**: All zeroing is deferred to the compressor thread's `zeroFreeSlots()` — no zeroing occurs in the `free()` critical path. Uses non-temporal stores (`ntZeroMemory`) to avoid cache pollution. This makes partial pages compress well (zero runs → high compression ratios).
 - **PageState machine**: EMPTY → ACTIVE → ACTIVE_MONITORING → COMPRESSING → COMPRESSED → ACTIVE. CAS transitions ensure safe coordination between compressor thread and fault handler.
 - **CompressEngine**: Supports LZ4, zstd, and zstd+dictionary. Algorithm packed in top 2 bits of `CompressedPageInfo::comp_size`. All zstd contexts pre-allocated via `ZSTD_customMem` routing to BootstrapAlloc.
-- **Parallel compressor**: Coordinator thread + worker threads (`kCompressorWorkers`). Chunk bitmap (`live_chunks_[]`) skips EMPTY pages. Sharded `CompressStore` (8 shards) eliminates lock contention. Per-worker compression contexts (LZ4 state, ZSTD CCtx, scratch buffers, SizeClassStats).
+- **Algorithm tiering (single-shot, ROI-driven)**: ROI model picks fast tier (zstd-1 by default; LZ4 if `SMASH_USE_LZ4`) or deep tier (zstd-9) per page **at initial compression time**. There is no later upgrade path; once a page is compressed, the chosen blob stays as-is until the page is decompressed by access. `AlgoProfile` carries `algo + zstd_level` so the calibrated profile reflects what's actually run; calibration in `compression_roi.h::calibrate()` benchmarks the actual fast-tier algorithm.
+- **Adaptive per-bucket cost**: `SizeClassStats` tracks observed compression microseconds per tier (EMA, fixed-point). After 8 samples per (bucket, tier), the ROI model substitutes observed cost for the calibrated estimate via `selectProfile(..., observed_costs_us)`.
+- **Parallel compressor**: Coordinator thread + worker threads. Chunk bitmap (`live_chunks_[]`) skips EMPTY pages. Sharded `CompressStore` (8 shards) eliminates lock contention. Per-worker compression contexts (LZ4 state, ZSTD CCtx, scratch buffers, SizeClassStats).
+- **Adaptive worker count via Little's Law**: each tick the compressor sets active workers to `N = ⌈λ/μ⌉` where `λ` is pages-eligible/tick and `μ` is per-worker pages-compressed/tick (both EMA-smoothed). Workers pre-allocated up to `kMaxCompressorWorkers`; helpers lazily `pthread_create`'d on first scale-up.
 - **Per-fault-slot DCtx**: Each of 32 fault slots has its own `ZSTD_DCtx*`, fixing data race between concurrent decompressions from app threads and prefetch.
-- **Sliding-window stats**: `SizeClassStats` is a 64-entry ring buffer tracking compression ratios (0-255). Size classes can recover after data patterns change.
+- **Per-origin sliding-window stats**: `SizeClassStats` keyed by `(arena, size_class, worker)` — `sc_stats[kNumArenas * kNumClasses]` per worker, indexed via `statsIndex(arena, sc)`. Each bucket holds a 64-entry ratio window (0–255) plus per-tier compression-time EMAs. Aggregating across arenas would wash out the homogeneity arena routing produces.
 - **Signal handler path**: No malloc allowed. Decompression uses pre-allocated per-slot contexts only.
 
 ## Syscall & Buffered I/O Compatibility
@@ -93,13 +101,59 @@ __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 
 `g_page_pins` is a per-page atomic counter. Pages with pin count > 0 are skipped by both Phase 2 (compression) and Phase 3 (monitoring). Used by syscall wrappers to protect kernel buffers during blocking calls.
 
+### EFAULT retry on syscall TOCTOU (`syscall_compat.h::retryOnEfault`)
+
+Pinning closes most of the race between syscall wrappers and the compressor's per-page mprotect, but a nanosecond-scale TOCTOU window remains: the compressor can read `pin == 0`, the wrapper can bump `pin` to 1, then the compressor proceeds with mprotect anyway. Once the page is `PROT_NONE` / `PROT_READ` the kernel returns EFAULT synchronously and no fault handler can recover. Every buffer-taking I/O wrapper (read/write/pread/pwrite/readv/writev/recv/send/recvfrom/sendto/recvmsg/sendmsg/poll on macOS; the same plus ppoll/select/pselect/accept/accept4/recvmmsg/sendmmsg/getsockopt/getsockname/getpeername/getrandom/epoll_wait/epoll_pwait on Linux) wraps the syscall in `retryOnEfault(syscall, rewarm)` — pin is held across all attempts; on EFAULT the rewarm callback re-warms the buffer and the syscall is retried up to 3×. The mach_msg family does the same against `MACH_SEND/RCV_INVALID_DATA`.
+
+## External-Mapping Tracking (`SMASH_TRACK_EXTERNAL=1`)
+
+Standard smash compresses pages within its own `MAP_ANON` arena. Application code that calls `mmap()` / `mach_vm_allocate()` directly bypasses malloc and so escapes the compressor. The mmap and Mach VM interposers in `smash_heap.cpp` (macOS) and `linux_syscall_wrappers.cpp` (Linux) register such mappings with the VmRegion's external-page hash so the compressor's tick can walk them. **Opt-in**: set `SMASH_TRACK_EXTERNAL=1` to enable the registration path; default off.
+
+### VmRegion full+tracking hybrid (`vm/vm_region.h`)
+
+In full mode VmRegion keeps the contiguous bump-arena (indices `0..contig_pages_-1`) AND a tracking hash for external pages (indices `contig_pages_..contig_pages_+kTrackMaxPages-1`). `total_pages_ = contig_pages_ + kTrackMaxPages` so `PageStateTable` / `PageLockTable` cover both ranges; `committedPages()` returns the high-water across both; `pageAddress(idx)`, `pageIndex(addr)`, and `contains(addr)` route on idx range / address range. The compressor's existing tick / dispatch logic processes external pages without modification — they're just pages with high indices.
+
+Cost: ~1 MB extra bootstrap memory (track hash + reverse map + page-state slots for `kTrackMaxPages = 128 K` external slots).
+
+### Filter rules (deliberately strict)
+
+- `mmap` only registers `MAP_ANON | PROT_WRITE` mappings. File-backed mappings are skipped — compressing them would break `msync` semantics and the OS already evicts them. Read-only mappings are skipped — no dirty bits, no compression value.
+- `mach_vm_allocate` / `vm_allocate` only register when `target == mach_task_self()`. Cross-task allocations belong to children.
+- `BootstrapAlloc`-routed `mmap` calls happen before `g_smash_vm_region` is set, so they're never tracked. Smash's own contiguous reservation uses `PROT_NONE` and is filtered by the writable-only rule.
+- On `munmap` / `mach_vm_deallocate` we mark pages EMPTY before the actual unmap so the compressor stops scanning them. Compressed-buffer leakage on unmap is possible (we don't free the associated compressed bytes); bounded by workload churn.
+
+### Why opt-in
+
+Single-trial Firefox 5-tab Wikipedia at 90 s (full smash + DEFER 30 s + all-procs) showed the registration path possibly regressing stability (33–35 s lifetime vs 61 s with tracking off), but the variance across nominally-identical configs is too high to claim a regression with confidence — FIREFOX_STUDY's "10/10 alive at 60 s" baseline used N=10. Conservative default is off; targets with controlled allocation patterns (e.g. redb-style workloads) can opt in. The interposers themselves still install regardless of the env var, so the runtime cost when off is one branch per `mmap` / `mach_vm` call.
+
+The "compressed=266K pages = 4.2 GB" figure observed under tracking-on on Firefox is misleading: most of those are virtual-address-space artifacts (SpiderMonkey + Skia reserve large `MAP_ANON` ranges that never fault in; the compressor processes zero pages to ~30-byte buffers). A correct Firefox-RSS measurement needs virt-vs-RSS reconciliation in the SIGUSR2 stats handler before claiming any Firefox win.
+
+## Large-Only Mode (`SMASH_LARGE_ONLY=1`)
+
+For applications with their own small-object allocator (e.g., Python 3.13+ uses mimalloc), set `SMASH_LARGE_ONLY=1` to only manage large allocations (> `kMaxSmallSize` = 16KB):
+
+- `malloc(size <= 16KB)` → system malloc passthrough
+- `malloc(size > 16KB)` → Smash's `LargeAlloc` → VmRegion (compressible)
+- `free(ptr)` checks `page_map_`; non-Smash pointers forwarded to system free
+- `getSize(ptr)` checks `page_map_` first (returns Smash size class or `span->large_size`); falls back to system `malloc_size`/`malloc_usable_size` only for non-Smash pointers
+
+### Resolving original system malloc on macOS
+
+On macOS, `dlsym(RTLD_NEXT, "malloc")` returns the interposed wrapper — DYLD interposition is truly global and cannot be bypassed via dlsym (even `dlopen("libsystem_malloc.dylib") + dlsym` returns the wrapper). To get the real system malloc, `SystemAllocFns::findOriginal()` scans the `__interpose` Mach-O section at runtime. On ARM64e (Apple Silicon), this section lives in `__AUTH_CONST` (not `__DATA`) due to pointer authentication. Each entry is `{replacement, original}` — match by replacement address, read the original.
+
+## macOS Page Reclamation
+
+`mprotect(PROT_NONE)` does NOT release physical memory on macOS — the RSS drop visible in `task_info` is a reporting artifact. To actually reclaim physical pages, use `MADV_FREE_REUSABLE` (madvise hint 7), which is what jemalloc and WebKit use. `MADV_FREE_REUSABLE` requires pages to be accessible (PROT_READ or PROT_RW); it fails with EPERM on PROT_NONE pages.
+
+The compressor flow calls `decommitPages()` (MADV_FREE_REUSABLE) **before** `mprotect(PROT_NONE)`, after the page data has been copied to the scratch buffer. On Linux, `MADV_DONTNEED` works regardless of protection.
+
 ## Key Conventions
 
 - Never allocate from the managed heap inside smash internals — use BootstrapAlloc
 - Data pages never contain metadata (bitmap-based free tracking, pointer arrays in thread cache)
 - Fine-grained locking: per-slab spinlocks, per-page spinlocks. No global heap lock. 4 arenas reduce slab lock contention.
 - `PageLockTable::tryLock()` used for prefetch to avoid deadlock
-- Compression deferred until second `threadInit()` call (avoids macOS ObjC runtime crash during early DYLD_INSERT init)
+- Compressor startup: constructor at priority 201 (after alloc8 pthread hooks at 200) calls `xxthread_init()` twice on macOS, once on Linux, ensuring the compressor starts even for non-ObjC programs (e.g., Python) and single-threaded programs
 - Fault handler handles ACTIVE state (not just ACTIVE_MONITORING) to cover the race where Phase 3's batched mprotect overwrites a per-page PROT_RW restoration
 - ThreadCache `drain()`/`drainAll()` bucket pointers by `span->arena_id` before returning to correct arena's slab
 
@@ -124,6 +178,15 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 brew install memcached redis rocksdb duckdb
 # Allocator compare also needs: mimalloc, jemalloc, tcmalloc, hoard (built via FetchContent/find_library)
 ```
+
+`SMASH_BUILD_BENCH=ON` is the master switch. Two sub-flags gate heavy chunks of the bench tree, both default `ON`:
+
+| Flag | Gates |
+|------|-------|
+| `SMASH_BUILD_BENCH_DEPS` | The `bench_deps` target (Redis, memcached, DuckDB, RocksDB built from source via ExternalProject_Add). |
+| `SMASH_BUILD_BENCH_ALLOCATORS` | The allocator-comparison block — mimalloc + jemalloc + tcmalloc + hoard + mesh + diehard + dieharder targets, plus `bench_allocator_compare.py.in`. Pulls in tcmalloc via Bazel (when `bazel`/`bazelisk` is on PATH and glibc ≥ 2.35) which uses `bench/tcmalloc_patch_build.cmake` to inject a `cc_binary(libtcmalloc_preload.so)` rule into the upstream `//tcmalloc:BUILD` file. |
+
+Paper experiments need both `=ON`. CI regression runs (`.github/workflows/ci.yml`) set both `=OFF` because the quick benches (`bench_rss`, `bench_sqlite`) don't need any of those allocators or external services, and skipping the heavy paths cuts CI build time from ~10 min to ~3 min.
 
 ### Unified Experiment Runner (ablation + compress-only)
 
@@ -151,7 +214,7 @@ python3 ../bench/run_paper_experiments.py --apps sqlite,rocksdb --runs 3
 - B0: System malloc (no Smash)
 - DICT: With dictionary training (`SMASH_DICT_TRAIN_SAMPLES=16`)
 - T1a: No arenas (`SMASH_NUM_ARENAS=1`)
-- T1c: LZ4 only (`SMASH_VERY_COLD_TICKS=9999`)
+- T1c: Fast tier only (`SMASH_VERY_COLD_TICKS=9999`)
 - T2a: No zero-deferred (`SMASH_ABLATION_NO_ZERO_DEFERRED=ON`)
 - T1e: No prefetch (`SMASH_PREFETCH_WINDOW=0`)
 - T1f: Single worker (`SMASH_COMPRESSOR_WORKERS=1`)
@@ -285,13 +348,37 @@ Without these flags, Redis's background tasks keep pages warm and Smash cannot c
 ## Config Tuning
 
 Key constants in `include/smash/config.h`:
-- `kColdTicks = 2`: Ticks without access before LZ4 compression
-- `kVeryColdTicks = 60`: Ticks before escalating to zstd/zstd+dict
+- `kColdTicks = 2`: Ticks without access before fast-tier compression considered
+- `kVeryColdTicks = 60`: Cold-tick threshold for the deep-tier (zstd-9) profile in the ROI model
 - `kMinCompressRatio = 0.75`: Only store if compressed < 75% of original
 - `kPrefetchWindow = 2`: Pages prefetched in each direction on fault
 - `kDictTrainSamples = 0`: Pages before dictionary training (disabled by default; dicts net-negative)
 - `kNumArenas = 4`: Call-site arena count (must be power of 2)
-- `kCompressorWorkers = 2`: Parallel compression worker threads
+- `kCompressorWorkers = 2`: Initial compression worker count
+- `kMaxCompressorWorkers = 8`: Cap for adaptive worker scaling (Little's Law)
 - `kCompressStoreShards = 8`: CompressStore lock shards
 - `kChunkSize = 64`: Pages per chunk for scan bitmap
 - `kLargeAllocVmThreshold = 1MB`: Only large allocs above this go in VmRegion
+
+Runtime environment variables:
+- `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc
+- `SMASH_MODE=compress_only`: Compress-only mode — track pages without replacing malloc
+- `SMASH_TRACK_EXTERNAL=1`: Register application-direct `mmap` / `mach_vm_allocate` results so the compressor sees them. Opt-in (see "External-Mapping Tracking" above)
+- `SMASH_DEFER_PHASES_MS=N`: Skip Phase 2 (compress) + Phase 3 (monitor) for the first N ms after start. Useful for workloads that establish IPC channels at startup with buffers in smash-managed pages (Firefox sweet spot is 30000)
+- `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
+- `SMASH_COLD_TIMEOUT_SEC=N`: Override cold timeout at runtime
+- `SMASH_VERY_COLD_TICKS=N`: Override deep-tier cold-tick threshold (ROI model). `9999` disables the deep tier entirely (fast tier only).
+- `SMASH_ROI_THRESHOLD=N`: Override ROI cutoff (default 1024)
+- `SMASH_FAST_COMP_MBS_HI/LO`, `SMASH_FAST_DECOMP_MBS_HI/LO`: Override fast-tier calibration
+- `SMASH_DEEP_COMP_MBS_HI/LO`, `SMASH_DEEP_DECOMP_MBS_HI/LO`: Override deep-tier calibration
+- `SMASH_CALIBRATE=always|never`: Force/skip startup calibration
+- `SMASH_CALIBRATION_FILE=path`: Cache and reload calibration
+
+## Benchmark Result Provenance
+
+Every results JSON written by `bench/run_paper_experiments.py` (`ablation_results.json`, `compress_only_results.json`, `duckdb_compression_results.json`) carries:
+
+- **Top-level `_sessions[]`** appended per runner invocation: timestamp_utc, runs_requested, quick flag, apps list, `system_info` (hostname, platform, CPU, cores, mem_gib, page_size, tool versions for cmake/gcc/clang/redis-server/memcached), `smash_env_at_start` (snapshot of all `SMASH_*` env vars), and `bench_params` (the actual keys/value_size/num_clients/cool_sec/server_flags used by each `run_*` function).
+- **Per-(app, config) `provenance`**: `cmake_flags`, `smash_env`, `source_hash` (SHA-256 of `src/` + `include/` + top-level `CMakeLists.txt`; catches uncommitted edits), `libsmash_sha256` and `libsmash_mtime`, `git_head` and `git_dirty`.
+
+When `git_head` is `null` (e.g., directory populated via rsync), `source_hash` is the authoritative "what code was measured" value. Helpers live in the runner: `collect_system_info()`, `collect_source_hash()`, `collect_git_info()`, `collect_smash_env()`, `build_provenance()`.

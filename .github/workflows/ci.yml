@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout smash
+        uses: actions/checkout@v4
+        with:
+          path: smash
+
+      # smash's CMake expects ALLOC8_DIR=$smash/../alloc8 (a sibling dir).
+      - name: Checkout alloc8 (sibling dir)
+        uses: actions/checkout@v4
+        with:
+          repository: emeryberger/alloc8
+          path: alloc8
+
+      - name: Configure
+        working-directory: smash
+        # On macOS, drop the arm64e slice — smash's CMakeLists defaults to
+        # building arm64+arm64e for full DYLD_INSERT_LIBRARIES coverage of
+        # Apple system binaries (which are arm64e), but GitHub's macos-
+        # latest runner kernel rejects user-built arm64e binaries (PAC
+        # ABI requires Apple's ARMA entitlement), causing every test to
+        # SIGSEGV at load. arm64-only is fine for unit tests.
+        #
+        # SMASH_BUILD_BENCH=ON pulls in the benchmark targets we need for
+        # the regression-spotting CI step (bench_rss, bench_sqlite).
+        # SMASH_BUILD_BENCH_DEPS=OFF skips building external services
+        # (Redis/memcached/RocksDB from source) that the paper-experiment
+        # runner uses but the quick CI doesn't need.
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DSMASH_BUILD_TESTS=ON \
+              -DSMASH_BUILD_BENCH=ON \
+              -DSMASH_BUILD_BENCH_DEPS=OFF \
+              -DSMASH_BUILD_BENCH_ALLOCATORS=OFF \
+              -DCMAKE_OSX_ARCHITECTURES=arm64
+          else
+            cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DSMASH_BUILD_TESTS=ON \
+              -DSMASH_BUILD_BENCH=ON \
+              -DSMASH_BUILD_BENCH_DEPS=OFF \
+              -DSMASH_BUILD_BENCH_ALLOCATORS=OFF
+          fi
+
+      # bench/CMakeLists.txt guards optional allocator-comparison
+      # targets (jemalloc, hoard, mesh, diehard, rocksdb) on
+      # find_library success, so missing system packages cleanly skip
+      # those targets instead of failing the build. cJSON / sqlite3 /
+      # mimalloc are FetchContent-fetched, always build.
+      - name: Build
+        working-directory: smash
+        run: cmake --build build -j
+
+      # External-mapping + malloc-compression tests exercise the live
+      # compressor under DYLD_INSERT_LIBRARIES / LD_PRELOAD; other tests
+      # cover the unit-level invariants.
+      - name: Run tests
+        working-directory: smash
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      # Regression-spotting benchmarks — runs bench_rss (in-process) and
+      # bench_sqlite (--quick under preload). Asserts headline RSS-
+      # reduction percentages stay above conservative thresholds. See
+      # bench/run_quick_ci.py for the parsing + thresholds.
+      - name: Run quick benchmarks
+        working-directory: smash
+        run: python3 bench/run_quick_ci.py --build-dir build

@@ -155,11 +155,29 @@ inline constexpr int kRoiThresholdDefault = 1024;
 // ── Compression (Phase 3+) ───────────────────────────────────────────────────
 inline constexpr int kCompressIntervalMs = 1000;
 #ifndef SMASH_COLD_TICKS
-inline constexpr int kColdTicks = 2;
+inline constexpr int kColdTicksDefault = 2;
 #else
-inline constexpr int kColdTicks = SMASH_COLD_TICKS;
+inline constexpr int kColdTicksDefault = SMASH_COLD_TICKS;
 #endif
 inline constexpr double kMinCompressRatio = 0.75;
+
+// Runtime cold timeout: SMASH_COLD_TIMEOUT_SEC overrides kColdTicks.
+// This is the primary time-space tradeoff dial.  Lower values compress
+// sooner (more space savings, more decompression faults on re-access).
+// Higher values are conservative (less savings, fewer faults).
+// Default: kColdTicksDefault * kCompressIntervalMs / 1000.
+inline int getColdTicks() {
+    static int ticks = []() {
+        const char* env = getenv("SMASH_COLD_TIMEOUT_SEC");
+        if (env) {
+            double sec = atof(env);
+            if (sec > 0)
+                return static_cast<int>(sec * 1000.0 / kCompressIntervalMs + 0.5);
+        }
+        return kColdTicksDefault;
+    }();
+    return ticks;
+}
 
 // ── Adaptive compression (Phase 5+) ─────────────────────────────────────────
 #ifndef SMASH_VERY_COLD_TICKS
@@ -194,9 +212,14 @@ inline constexpr int kMaxDictClasses = 8;        // cap total dict memory overhe
 
 // ── Compressor parallelism ───────────────────────────────────────────────────
 #ifndef SMASH_COMPRESSOR_WORKERS
-inline constexpr int kCompressorWorkers = 2;         // parallel compression workers
+inline constexpr int kCompressorWorkers = 2;         // initial compression workers
 #else
 inline constexpr int kCompressorWorkers = SMASH_COMPRESSOR_WORKERS;
+#endif
+#ifndef SMASH_MAX_COMPRESSOR_WORKERS
+inline constexpr int kMaxCompressorWorkers = 8;      // max workers (pre-allocated pool)
+#else
+inline constexpr int kMaxCompressorWorkers = SMASH_MAX_COMPRESSOR_WORKERS;
 #endif
 #ifndef SMASH_COMPRESS_STORE_SHARDS
 inline constexpr int kCompressStoreShards = 8;       // CompressStore lock shards
@@ -245,6 +268,53 @@ inline SmashMode getSmashMode() {
 
 inline bool isCompressOnlyMode() {
     return getSmashMode() == SmashMode::CompressOnly;
+}
+
+// ── Large-only mode ─────────────────────────────────────────────────────────
+// Set SMASH_LARGE_ONLY=1 to only manage large allocations through Smash.
+// Small allocations (size <= kMaxSmallSize) pass through to the system
+// allocator.  This avoids interfering with language runtimes that use their
+// own small-object allocator (e.g. Python 3.13+ mimalloc).
+inline bool isLargeOnlyMode() {
+    static bool mode = []() {
+        const char* env = getenv("SMASH_LARGE_ONLY");
+        return env && env[0] == '1';
+    }();
+    return mode;
+}
+
+// Threshold for what counts as "small" (passthrough to system) in
+// LARGE_ONLY mode. Defaults to kMaxSmallSize (16 KB). Lower values
+// route a larger fraction of allocations through smash — useful when
+// the workload's byte-volume is dominated by mid-sized allocations
+// (e.g. Firefox's 4 KB–7 KB bucket carries ~20 % of allocation volume
+// while sitting under the default threshold). Must not exceed
+// kMaxSmallSize since smash's slab path tops out there.
+inline size_t largeOnlyThreshold() {
+    static size_t threshold = []() -> size_t {
+        const char* env = getenv("SMASH_LARGE_ONLY_THRESHOLD");
+        if (!env || !*env) return kMaxSmallSize;
+        size_t v = static_cast<size_t>(atoll(env));
+        if (v == 0 || v > kMaxSmallSize) return kMaxSmallSize;
+        return v;
+    }();
+    return threshold;
+}
+
+// ── Eager-zero mode ─────────────────────────────────────────────────────────
+// Set SMASH_EAGER_ZERO=1 to memset newly-allocated buffers to zero on the
+// malloc fast path, instead of relying on the compressor thread's deferred
+// zero-on-free pass. This trades throughput for correctness with callers
+// that assume malloc returns zeroed memory (technically UB, but real-world
+// codebases rely on it). Used to A/B test whether deferred-zero is the
+// source of data-corruption crashes (e.g. ARM64 PAC failures from stale
+// pointer-shaped bytes in reissued slab slots).
+inline bool isEagerZeroMode() {
+    static bool mode = []() {
+        const char* env = getenv("SMASH_EAGER_ZERO");
+        return env && env[0] == '1';
+    }();
+    return mode;
 }
 
 } // namespace smash

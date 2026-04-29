@@ -48,6 +48,24 @@ cmake .. -DSMASH_BUILD_BENCH=ON
 make -j$(nproc)
 ```
 
+`SMASH_BUILD_BENCH=ON` enables three groups of benchmark targets, each with its own toggle:
+
+| Option | Default | What it gates |
+|--------|---------|---------------|
+| `SMASH_BUILD_BENCH_DEPS` | `ON` | Build Redis, memcached, DuckDB, RocksDB from source via `make bench_deps`. See "Build with benchmark dependencies" below. Set `OFF` to skip — the rest of the benchmark targets still build. |
+| `SMASH_BUILD_BENCH_ALLOCATORS` | `ON` | Build the allocator-comparison benches (mimalloc, jemalloc, tcmalloc, hoard, mesh, diehard, dieharder) and the `bench_allocator_compare.py` runner. Pulls in tcmalloc / mimalloc via FetchContent + ExternalProject_Add, which adds significant build time and several optional `find_library` probes. Set `OFF` for fast smash-only builds (e.g. CI regression runs). |
+
+To build only the smash-internal benches (`bench_rss`, `bench_sqlite`, `bench_throughput`, `bench_compression`, `bench_algo_compare`, etc.) without external services or competing allocators:
+
+```bash
+cmake .. -DSMASH_BUILD_BENCH=ON \
+         -DSMASH_BUILD_BENCH_DEPS=OFF \
+         -DSMASH_BUILD_BENCH_ALLOCATORS=OFF
+make -j$(nproc)
+```
+
+This is what the CI regression-spotting workflow uses (see `.github/workflows/ci.yml`).
+
 ### Build with benchmark dependencies (Redis, memcached, DuckDB, RocksDB)
 
 For full A/B benchmarking, build the external dependencies from source. This ensures they use system malloc (libc) instead of their default allocators (jemalloc), which is required for Smash to effectively compress their memory.

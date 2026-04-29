@@ -26,6 +26,8 @@ All 14 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `
 - `test_external_mapping` exercises the `SMASH_TRACK_EXTERNAL=1` registration path. The ctest invocation sets the env var; without it the test would silently no-op (registration path gated).
 - `test_malloc_compression` allocates compressible chunks via the standard `malloc` path, sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2` to itself, captures stderr, parses `compressed=N` from the smash stats line, asserts `N > 0`, then reads every byte back to verify integrity through fault-decompress. Catches regressions in the malloc-side compression path that the interposer-only tests would miss.
 
+After ctest, CI also runs `bench/run_quick_ci.py` which drives `bench_rss` (in-process: 64 MiB compressible alloc → ≥30 % peak-RSS reduction at t=10 s) and `bench_sqlite --quick` under the preloaded libsmash (≥5 % cooling-phase RSS reduction). Local baselines are ~46 % and ~13 % respectively, so the thresholds are well below noise; a real regression in the compressor or the malloc-interposed path will trip them. Configured with `-DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=OFF -DSMASH_BUILD_BENCH_ALLOCATORS=OFF` so the CI build skips Redis/memcached/RocksDB/tcmalloc/jemalloc/hoard/mesh/etc. — only the smash-internal benches are needed.
+
 ## Project Structure
 
 ```
@@ -176,6 +178,15 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 brew install memcached redis rocksdb duckdb
 # Allocator compare also needs: mimalloc, jemalloc, tcmalloc, hoard (built via FetchContent/find_library)
 ```
+
+`SMASH_BUILD_BENCH=ON` is the master switch. Two sub-flags gate heavy chunks of the bench tree, both default `ON`:
+
+| Flag | Gates |
+|------|-------|
+| `SMASH_BUILD_BENCH_DEPS` | The `bench_deps` target (Redis, memcached, DuckDB, RocksDB built from source via ExternalProject_Add). |
+| `SMASH_BUILD_BENCH_ALLOCATORS` | The allocator-comparison block — mimalloc + jemalloc + tcmalloc + hoard + mesh + diehard + dieharder targets, plus `bench_allocator_compare.py.in`. Pulls in tcmalloc via Bazel (when `bazel`/`bazelisk` is on PATH and glibc ≥ 2.35) which uses `bench/tcmalloc_patch_build.cmake` to inject a `cc_binary(libtcmalloc_preload.so)` rule into the upstream `//tcmalloc:BUILD` file. |
+
+Paper experiments need both `=ON`. CI regression runs (`.github/workflows/ci.yml`) set both `=OFF` because the quick benches (`bench_rss`, `bench_sqlite`) don't need any of those allocators or external services, and skipping the heavy paths cuts CI build time from ~10 min to ~3 min.
 
 ### Unified Experiment Runner (ablation + compress-only)
 

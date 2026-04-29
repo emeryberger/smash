@@ -48,7 +48,7 @@ jobs:
               -DSMASH_BUILD_TESTS=ON \
               -DSMASH_BUILD_BENCH=ON \
               -DSMASH_BUILD_BENCH_DEPS=OFF \
-              -DSMASH_BUILD_BENCH_ALLOCATORS=OFF \
+              -DSMASH_BUILD_BENCH_ALLOCATORS=ON \
               -DCMAKE_OSX_ARCHITECTURES=arm64
           else
             cmake -S . -B build \
@@ -56,7 +56,7 @@ jobs:
               -DSMASH_BUILD_TESTS=ON \
               -DSMASH_BUILD_BENCH=ON \
               -DSMASH_BUILD_BENCH_DEPS=OFF \
-              -DSMASH_BUILD_BENCH_ALLOCATORS=OFF
+              -DSMASH_BUILD_BENCH_ALLOCATORS=ON
           fi
 
       # bench/CMakeLists.txt guards optional allocator-comparison
@@ -82,3 +82,21 @@ jobs:
       - name: Run quick benchmarks
         working-directory: smash
         run: python3 bench/run_quick_ci.py --build-dir build
+
+      # Allocator-comparison verification: exercise each bench_alloc_*
+      # binary so we know they actually link and run. Ensures the
+      # google/tcmalloc Bazel path (gated on bazel+glibc>=2.35) and the
+      # gperftools fallback path both work end-to-end.
+      - name: Verify allocator benches
+        working-directory: smash
+        run: |
+          set -e
+          for b in system mimalloc jemalloc tcmalloc hoard mesh diehard dieharder; do
+            bin=build/bench/bench_alloc_$b
+            if [ ! -x "$bin" ]; then
+              echo "SKIP $b (not built — find_library probe missed dep)"
+              continue
+            fi
+            echo "=== bench_alloc_$b ==="
+            "$bin" --data kv --size 64 --count 50000 2>&1 | tail -6
+          done

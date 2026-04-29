@@ -1,4 +1,30 @@
 # smash/bench/CMakeLists.txt - Standalone benchmark executables
+#
+# Three layers, each on its own switch (entered only when SMASH_BUILD_BENCH=ON
+# is set in the parent CMakeLists.txt):
+#
+#   default (always built when SMASH_BUILD_BENCH=ON):
+#     bench_rss, bench_sqlite, bench_throughput, bench_latency,
+#     bench_compression, bench_dict_experiment, bench_algo_compare,
+#     bench_kv_store, bench_coldhotmix, bench_json,
+#     bench_heap_compress*, sample_heap_pages
+#
+#   SMASH_BUILD_BENCH_ALLOCATORS=ON  (default):
+#     allocator-comparison binaries — mimalloc / jemalloc / tcmalloc
+#     (Bazel-built google/tcmalloc when bazel + glibc>=2.35; gperftools
+#     fallback otherwise) / hoard / mesh / diehard / dieharder, plus
+#     bench_allocator_compare.py. Pulls in tcmalloc via Bazel using
+#     bench/tcmalloc_patch_build.cmake; the rest via find_library.
+#
+#   SMASH_BUILD_BENCH_DEPS=ON  (default):
+#     a `bench_deps` make target that builds Redis / memcached /
+#     DuckDB / RocksDB from source (separate ExternalProject_Add).
+#     Adds 10–20 minutes to the first build. Set OFF to skip the
+#     custom-built versions and use system installs (brew etc.).
+#
+# The CI workflow (.github/workflows/ci.yml) sets both sub-flags OFF
+# so it builds only the smash-internal default layer — fast, no
+# external dependencies, sufficient for regression spotting.
 
 find_package(Threads REQUIRED)
 
@@ -10,9 +36,8 @@ option(SMASH_BUILD_BENCH_DEPS "Build external benchmark dependencies (Redis, mem
 # Pulls in tcmalloc/jemalloc/mimalloc/hoard/etc. via FetchContent +
 # find_library + ExternalProject_Add. Keep ON for paper experiments;
 # set OFF for the regression-spotting CI where those benches add a
-# lot of build time and one of the ExternalProject_Add patch paths
-# (Bazel-based google/tcmalloc) needs a tcmalloc_patch_build.cmake
-# file that's not in the repo.
+# lot of build time and the Bazel-based google/tcmalloc path requires
+# `bazel`/`bazelisk` on PATH plus glibc >= 2.35.
 option(SMASH_BUILD_BENCH_ALLOCATORS "Build allocator-comparison benchmarks (mimalloc, jemalloc, tcmalloc, hoard, mesh, diehard)" ON)
 
 set(SMASH_BENCH_INCLUDE_DIRS

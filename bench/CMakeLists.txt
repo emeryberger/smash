@@ -6,6 +6,15 @@ find_package(Threads REQUIRED)
 # ON by default when SMASH_BUILD_BENCH=ON.  Set -DSMASH_BUILD_BENCH_DEPS=OFF to skip.
 option(SMASH_BUILD_BENCH_DEPS "Build external benchmark dependencies (Redis, memcached, RocksDB)" ON)
 
+# ── Option to build allocator-comparison benches ─────────────────────────────
+# Pulls in tcmalloc/jemalloc/mimalloc/hoard/etc. via FetchContent +
+# find_library + ExternalProject_Add. Keep ON for paper experiments;
+# set OFF for the regression-spotting CI where those benches add a
+# lot of build time and one of the ExternalProject_Add patch paths
+# (Bazel-based google/tcmalloc) needs a tcmalloc_patch_build.cmake
+# file that's not in the repo.
+option(SMASH_BUILD_BENCH_ALLOCATORS "Build allocator-comparison benchmarks (mimalloc, jemalloc, tcmalloc, hoard, mesh, diehard)" ON)
+
 set(SMASH_BENCH_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
   ${CMAKE_CURRENT_SOURCE_DIR}/../src
@@ -145,6 +154,7 @@ smash_add_standalone_bench(bench_sqlite bench_sqlite.cpp)
 target_link_libraries(bench_sqlite PRIVATE sqlite3_static)
 
 # ── Allocator substrate comparison benchmarks ───────────────────────────────
+if(SMASH_BUILD_BENCH_ALLOCATORS)
 
 # Helper to add allocator comparison benchmark variant
 function(smash_add_alloc_bench name alloc_define)
@@ -369,12 +379,16 @@ else()
   message(STATUS "DieHarder not found (optional)")
 endif()
 
+endif() # SMASH_BUILD_BENCH_ALLOCATORS
+
 # Python runner (configure paths)
-configure_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/bench_allocator_compare.py.in
-  ${CMAKE_CURRENT_BINARY_DIR}/bench_allocator_compare.py
-  @ONLY
-)
+if(SMASH_BUILD_BENCH_ALLOCATORS)
+  configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/bench_allocator_compare.py.in
+    ${CMAKE_CURRENT_BINARY_DIR}/bench_allocator_compare.py
+    @ONLY
+  )
+endif()
 
 # ── Shell script benchmarks (configure paths) ──────────────────────────────
 configure_file(

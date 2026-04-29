@@ -48,13 +48,15 @@ jobs:
               -DSMASH_BUILD_TESTS=ON \
               -DSMASH_BUILD_BENCH=ON \
               -DSMASH_BUILD_BENCH_DEPS=OFF \
+              -DSMASH_BUILD_BENCH_ALLOCATORS=OFF \
               -DCMAKE_OSX_ARCHITECTURES=arm64
           else
             cmake -S . -B build \
               -DCMAKE_BUILD_TYPE=Release \
               -DSMASH_BUILD_TESTS=ON \
               -DSMASH_BUILD_BENCH=ON \
-              -DSMASH_BUILD_BENCH_DEPS=OFF
+              -DSMASH_BUILD_BENCH_DEPS=OFF \
+              -DSMASH_BUILD_BENCH_ALLOCATORS=OFF
           fi
 
       # bench/CMakeLists.txt guards optional allocator-comparison

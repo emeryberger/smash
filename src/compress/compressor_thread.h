@@ -261,6 +261,15 @@ class CompressorThread {
     std::atomic<uint64_t> dict_tie_count_{0};    // equal size
     std::atomic<int64_t>  dict_total_delta_{0};  // sum of (plain_size - dict_size), positive = dict wins
 
+    // ── Heatmap instrumentation (compression ratio + hot fraction) ────────
+    // These counters measure actual workload characteristics for heatmap overlay.
+    // Reset via resetHeatmapStats() or SIGUSR1; read via SIGUSR2 stats dump.
+    std::atomic<uint64_t> hm_bytes_original_{0};    // sum of original page sizes
+    std::atomic<uint64_t> hm_bytes_compressed_{0};  // sum of compressed sizes
+    std::atomic<uint64_t> hm_pages_compressed_{0};  // count of pages compressed
+    std::atomic<uint64_t> hm_pages_accessed_{0};    // pages accessed (touched in Phase 1)
+    std::atomic<uint64_t> hm_pages_monitored_{0};   // pages that entered monitoring
+
     // ── Thread management ─────────────────────────────────────────────────
     pthread_t coord_thread_{};
     static constexpr int kMaxHelpers = kMaxCompressorWorkers > 1 ? kMaxCompressorWorkers - 1 : 1;
@@ -452,6 +461,8 @@ class CompressorThread {
                 if (accessed_[i].load(std::memory_order_relaxed)) {
                     cold_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
+                    // Heatmap instrumentation: count pages accessed this tick
+                    hm_pages_accessed_.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     if (cold_count_[i] < 255) cold_count_[i]++;
                 }
@@ -531,6 +542,8 @@ class CompressorThread {
             if (states_->transition(i, PageState::ACTIVE,
                                        PageState::ACTIVE_MONITORING)) {
                 vm::protectPages(vm_->pageAddress(i), kPageSize, true, false);
+                // Heatmap instrumentation: track pages entering monitoring
+                hm_pages_monitored_.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -738,6 +751,11 @@ class CompressorThread {
 
         // Record compressed page info (with algo in top 2 bits)
         compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
+
+        // Heatmap instrumentation: track compression ratio
+        hm_bytes_original_.fetch_add(kPageSize, std::memory_order_relaxed);
+        hm_bytes_compressed_.fetch_add(comp_size, std::memory_order_relaxed);
+        hm_pages_compressed_.fetch_add(1, std::memory_order_relaxed);
 
         states_->set(page_idx, PageState::COMPRESSED);
         locks_->unlock(page_idx);
@@ -1269,12 +1287,30 @@ public:
             case PageState::COMPRESSED: ++compressed; break;
             }
         }
-        char buf[256];
+        // Heatmap instrumentation: compute derived metrics
+        uint64_t hm_orig = self->hm_bytes_original_.load(std::memory_order_relaxed);
+        uint64_t hm_comp = self->hm_bytes_compressed_.load(std::memory_order_relaxed);
+        uint64_t hm_pages = self->hm_pages_compressed_.load(std::memory_order_relaxed);
+        uint64_t hm_accessed = self->hm_pages_accessed_.load(std::memory_order_relaxed);
+        uint64_t hm_monitored = self->hm_pages_monitored_.load(std::memory_order_relaxed);
+
+        // Compression ratio: original / compressed (e.g., 8.0 = 8:1 compression)
+        double comp_ratio = (hm_comp > 0) ? (double)hm_orig / hm_comp : 0.0;
+        // Compressibility: percentage of bytes saved (e.g., 87.5% for 8:1 ratio)
+        double compress_pct = (hm_orig > 0) ? 100.0 * (1.0 - (double)hm_comp / hm_orig) : 0.0;
+        // Hot fraction: pages accessed / pages monitored (approximation)
+        // This measures what fraction of monitored pages were touched
+        double hot_pct = (hm_monitored > 0) ? 100.0 * hm_accessed / hm_monitored : 0.0;
+
+        char buf[512];
         int n = snprintf(buf, sizeof(buf),
             "[smash stats] pid=%d committed=%zu  active=%zu  monitor=%zu"
-            "  compressing=%zu  compressed=%zu  empty=%zu\n",
-            (int)getpid(), total, active, monitor, compressing, compressed,
-            empty);
+            "  compressing=%zu  compressed=%zu  empty=%zu\n"
+            "[smash heatmap] pages_compressed=%zu  ratio=%.1fx  compress_pct=%.1f%%"
+            "  hot_pct=%.1f%%  (accessed=%zu monitored=%zu)\n",
+            (int)getpid(), total, active, monitor, compressing, compressed, empty,
+            (size_t)hm_pages, comp_ratio, compress_pct, hot_pct,
+            (size_t)hm_accessed, (size_t)hm_monitored);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
@@ -1297,6 +1333,21 @@ public:
     uint64_t dictLossCount() const { return dict_loss_count_.load(std::memory_order_relaxed); }
     uint64_t dictTieCount() const { return dict_tie_count_.load(std::memory_order_relaxed); }
     int64_t dictTotalDelta() const { return dict_total_delta_.load(std::memory_order_relaxed); }
+
+    // Heatmap instrumentation accessors
+    uint64_t hmBytesOriginal() const { return hm_bytes_original_.load(std::memory_order_relaxed); }
+    uint64_t hmBytesCompressed() const { return hm_bytes_compressed_.load(std::memory_order_relaxed); }
+    uint64_t hmPagesCompressed() const { return hm_pages_compressed_.load(std::memory_order_relaxed); }
+    uint64_t hmPagesAccessed() const { return hm_pages_accessed_.load(std::memory_order_relaxed); }
+    uint64_t hmPagesMonitored() const { return hm_pages_monitored_.load(std::memory_order_relaxed); }
+
+    void resetHeatmapStats() {
+        hm_bytes_original_.store(0, std::memory_order_relaxed);
+        hm_bytes_compressed_.store(0, std::memory_order_relaxed);
+        hm_pages_compressed_.store(0, std::memory_order_relaxed);
+        hm_pages_accessed_.store(0, std::memory_order_relaxed);
+        hm_pages_monitored_.store(0, std::memory_order_relaxed);
+    }
 
     int dictsTrainedCount() const {
         int count = 0;

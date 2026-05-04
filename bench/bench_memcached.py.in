@@ -25,6 +25,19 @@ import random
 
 # ── Paths (substituted by CMake configure_file) ─────────────────────────
 BUILD_DIR = "@CMAKE_BINARY_DIR@"
+BENCH_DEPS_DIR = os.path.join(BUILD_DIR, "bench", "deps")
+
+
+def _find_tool(name):
+    """Prefer the vendored build in bench/deps/bin, fall back to PATH."""
+    built = os.path.join(BENCH_DEPS_DIR, "bin", name)
+    if os.path.isfile(built) and os.access(built, os.X_OK):
+        return built
+    return shutil.which(name)
+
+
+MEMCACHED = _find_tool("memcached")
+DUCKDB = _find_tool("duckdb")
 
 # ── Platform detection ───────────────────────────────────────────────────
 IS_DARWIN = platform.system() == "Darwin"
@@ -33,9 +46,11 @@ SMASH_LIB = os.path.join(BUILD_DIR, "libsmash.dylib" if IS_DARWIN else "libsmash
 
 
 def check_prereqs():
-    for tool, pkg in [("memcached", "memcached"), ("duckdb", "duckdb")]:
-        if not shutil.which(tool):
-            print(f"SKIP: {tool} not found in PATH (brew install {pkg})")
+    for tool, path, pkg in [("memcached", MEMCACHED, "memcached"),
+                            ("duckdb", DUCKDB, "duckdb")]:
+        if path is None:
+            print(f"SKIP: {tool} not found (build deps with "
+                  f"-DSMASH_BUILD_BENCH_DEPS=ON or install {pkg})")
             sys.exit(0)
     if not os.path.isfile(SMASH_LIB):
         print(f"ERROR: libsmash not found at {SMASH_LIB}")
@@ -88,7 +103,7 @@ def mc_version(port):
 def generate_corpus(corpus_path, tpch_sf):
     print(f"  Generating TPC-H JSON corpus (sf={tpch_sf})...")
     subprocess.run(
-        ["duckdb", "-c", f"""
+        [DUCKDB, "-c", f"""
 INSTALL tpch;
 LOAD tpch;
 CALL dbgen(sf={tpch_sf});

@@ -43,7 +43,8 @@ if(NOT WIN32)
 endif()
 
 # ── Pull in alloc8 ────────────────────────────────────────────────────────────
-# Look for alloc8 as a sibling directory, or allow override via ALLOC8_DIR
+# Prefer a sibling alloc8 checkout (developer workflow). If none exists and no
+# ALLOC8_DIR was given, fetch it from GitHub via FetchContent.
 set(ALLOC8_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../alloc8" CACHE PATH "Path to alloc8 source")
 
 # On Linux, use Smash's version script (extends alloc8's with syscall wrappers)
@@ -51,13 +52,23 @@ set(ALLOC8_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../alloc8" CACHE PATH "Path to alloc
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(ALLOC8_VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map" CACHE INTERNAL "Version script" FORCE)
 endif()
-if(NOT EXISTS "${ALLOC8_DIR}/CMakeLists.txt")
-  message(FATAL_ERROR "alloc8 not found at ${ALLOC8_DIR}. Set ALLOC8_DIR to the alloc8 source directory.")
+
+include(FetchContent)
+
+if(EXISTS "${ALLOC8_DIR}/CMakeLists.txt")
+  add_subdirectory("${ALLOC8_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/alloc8")
+else()
+  message(STATUS "alloc8 not found at ${ALLOC8_DIR}; fetching via FetchContent")
+  FetchContent_Declare(
+    alloc8
+    GIT_REPOSITORY https://github.com/emeryberger/alloc8.git
+    GIT_TAG main
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(alloc8)
 endif()
-add_subdirectory("${ALLOC8_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/alloc8")
 
 # ── LZ4 compression library ──────────────────────────────────────────────────
-include(FetchContent)
 FetchContent_Declare(
   lz4
   GIT_REPOSITORY https://github.com/lz4/lz4.git

@@ -126,7 +126,26 @@ APPS = ["sqlite", "rocksdb", "duckdb", "memcached", "redis", "redis_ext",
 IS_DARWIN = platform.system() == "Darwin"
 PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
 LIB_SUFFIX = ".dylib" if IS_DARWIN else ".so"
-MESH_LIB = "/usr/local/lib/libmesh.dylib" if IS_DARWIN else "/usr/lib/libmesh.so"
+# Check common Mesh library locations
+def _find_mesh_lib():
+    if IS_DARWIN:
+        candidates = [
+            "/usr/local/lib/libmesh.dylib",
+            os.path.expanduser("~/git/mesh-build/build/lib/libmesh.dylib"),
+        ]
+    else:
+        candidates = [
+            "/usr/lib/libmesh.so",
+            "/usr/local/lib/libmesh.so",
+            "/local/home/emerydb/git/mesh-build/build/lib/libmesh.so",
+            os.path.expanduser("~/git/mesh-build/build/lib/libmesh.so"),
+        ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]  # Fall back to first candidate
+
+MESH_LIB = _find_mesh_lib()
 
 
 # ── Provenance ───────────────────────────────────────────────────────────────
@@ -518,7 +537,11 @@ def run_sqlite(build_dir, smash_lib, quick):
 
 def run_rocksdb(build_dir, smash_lib, quick):
     """Run bench_rocksdb C++ binary with RSS timeline sampling."""
-    exe = build_dir / "bench" / "bench_rocksdb"
+    # Prefer the built-from-source binary (linked against our vendored
+    # RocksDB + LZ4/zstd); fall back to the system-linked one if present.
+    exe = build_dir / "bench" / "bench_rocksdb_builtin"
+    if not exe.exists():
+        exe = build_dir / "bench" / "bench_rocksdb"
     if exe.exists():
         args = ["--keys", "200000", "--value-size", "256",
                 "--cool", "5", "--serve", "10"] if quick else []
@@ -1909,6 +1932,252 @@ def run_duckdb_compression_experiment(build_dir, source_dir, quick, output_dir, 
     return all_results
 
 
+# ── DuckDB compressible-data experiment ───────────────────────────────────────
+
+def run_duckdb_compressible_bench(build_dir, smash_lib, quick):
+    """Run DuckDB benchmark with highly compressible synthetic data.
+
+    Creates a table with patterns that Smash can compress effectively:
+    - Sparse columns (99% NULL/zero)
+    - Low-cardinality strings (few distinct values)
+    - Repeated padding strings
+
+    This demonstrates Smash's value when in-memory data has compressible patterns
+    that DuckDB's columnar format doesn't optimize.
+    """
+    duckdb_bin = get_binary("duckdb", build_dir)
+    if not check_binary("duckdb", build_dir):
+        return None
+
+    # Match SQLite benchmark: 500K rows with ~300 byte text (~150MB data)
+    # Quick mode: 100K rows for faster testing
+    num_rows = 100_000 if quick else 500_000
+    cool_sec = 10 if quick else 20  # Match SQLite cooling times
+
+    env = os.environ.copy()
+    if smash_lib:
+        env[PRELOAD_VAR] = str(smash_lib)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = os.path.join(tmpdir, "marker.csv")
+
+        proc = subprocess.Popen(
+            [duckdb_bin, ":memory:"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+
+        # Phase 1: Create table matching SQLite benchmark pattern
+        # SQLite uses 500K rows with ~300 byte text containing word patterns + hex
+        #
+        # Key difference from previous attempts: use md5() to generate unique but
+        # structured strings. Each row has different content, but the hex format
+        # means adjacent rows share byte-level patterns (0-9, a-f characters).
+        # DuckDB can't dictionary-encode these, but Smash can still compress at
+        # the page level because hex strings have limited character entropy.
+        fill_sql = f"""
+CREATE TABLE kv_data AS
+SELECT
+    i AS id,
+    now() + INTERVAL (i) SECOND AS created_at,
+    -- Generate ~300 bytes of hex data per row (unique per row, but compressible)
+    -- md5() returns 32 hex chars, concatenate multiple with varying seeds
+    md5(i::VARCHAR) ||
+    md5((i * 31)::VARCHAR) ||
+    md5((i * 37)::VARCHAR) ||
+    md5((i * 41)::VARCHAR) ||
+    md5((i * 43)::VARCHAR) ||
+    md5((i * 47)::VARCHAR) ||
+    md5((i * 53)::VARCHAR) ||
+    md5((i * 59)::VARCHAR) ||
+    md5((i * 61)::VARCHAR) ||
+    substring(md5((i * 67)::VARCHAR), 1, 12) AS text_value
+FROM range({num_rows}) t(i);
+
+COPY (SELECT 'fill_done') TO '{marker}' (HEADER false);
+"""
+
+        try:
+            proc.stdin.write(fill_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            print("    duckdb-compressible: process exited during fill")
+            return None
+
+        fill_timeout = 120 if quick else 300
+        if not _wait_file(marker, "fill_done", timeout=fill_timeout):
+            print(f"    duckdb-compressible: fill timed out after {fill_timeout}s")
+            proc.terminate()
+            return None
+
+        peak_rss = get_rss_mb(proc.pid)
+        if peak_rss <= 0:
+            print("    duckdb-compressible: could not measure fill RSS")
+            proc.terminate()
+            return None
+
+        # Phase 2: Cool — let Smash compress idle pages
+        rss_timeline = [peak_rss]
+        min_rss = peak_rss
+        for _ in range(cool_sec):
+            time.sleep(1)
+            rss = get_rss_mb(proc.pid)
+            if rss > 0:
+                rss_timeline.append(rss)
+                min_rss = min(min_rss, rss)
+            else:
+                rss_timeline.append(rss_timeline[-1])
+
+        cool_rss = get_rss_mb(proc.pid)
+        if cool_rss <= 0:
+            cool_rss = min_rss
+
+        # Phase 3: Query — access subset of data (triggers decompression)
+        if os.path.exists(marker):
+            os.remove(marker)
+
+        # Phase 3: Query only recent 5% of rows (like SQLite's time-series access)
+        # This keeps recent data hot while old data stays cold
+        hot_threshold = int(num_rows * 0.95)  # rows >= this are "hot"
+        serve_sql = f"""
+SELECT count(*), length(text_value)
+FROM kv_data
+WHERE id >= {hot_threshold};
+""" * 10  # Run 10 times like SQLite
+
+        serve_sql += f"\nCOPY (SELECT 'serve_done') TO '{marker}' (HEADER false);\n"
+
+        try:
+            proc.stdin.write(serve_sql.encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            serve_rss = cool_rss
+        else:
+            if _wait_file(marker, "serve_done", timeout=60):
+                serve_rss = get_rss_mb(proc.pid)
+                if serve_rss <= 0:
+                    serve_rss = cool_rss
+            else:
+                serve_rss = cool_rss
+
+        # Cleanup
+        try:
+            proc.stdin.write(b".quit\n")
+            proc.stdin.flush()
+            proc.wait(timeout=5)
+        except Exception:
+            proc.terminate()
+
+        # Compute AUC (area under RSS curve during cool phase)
+        auc = sum(rss_timeline)  # Each sample is 1 second apart
+
+        reduction_pct = 100 * (peak_rss - min_rss) / peak_rss if peak_rss > 0 else 0
+
+        return {
+            "peak_rss_mb": peak_rss,
+            "min_rss_mb": min_rss,
+            "cool_rss_mb": cool_rss,
+            "serve_rss_mb": serve_rss,
+            "steady_rss_mb": serve_rss,
+            "auc_mb_sec": auc,
+            "rss_reduction_pct": reduction_pct,
+            "rss_timeline": rss_timeline,
+            "num_rows": num_rows,
+        }
+
+
+def run_duckdb_compressible_experiment(build_dir, source_dir, quick, output_dir, runs=1):
+    """Compare SQLite vs DuckDB on equivalent workload with/without Smash.
+
+    Four configurations:
+      1. sqlite_baseline:  SQLite with system malloc
+      2. sqlite_smash:     SQLite with Smash
+      3. duckdb_baseline:  DuckDB with system malloc
+      4. duckdb_smash:     DuckDB with Smash
+
+    Both use equivalent workloads (500K rows with ~300 byte text, time-series access).
+    Shows that Smash benefits row-store (SQLite) more than columnar (DuckDB).
+    """
+    results_path = output_dir / "sqlite_vs_duckdb_results.json"
+    smash_lib = build_dir / f"libsmash{LIB_SUFFIX}"
+
+    # Ensure default build
+    rebuild(build_dir, {}, source_dir)
+
+    all_results = {}
+    if results_path.exists():
+        all_results = json.loads(results_path.read_text())
+
+    # Run both SQLite and DuckDB with/without Smash
+    configs = [
+        ("sqlite_baseline", "sqlite", None),
+        ("sqlite_smash",    "sqlite", smash_lib),
+        ("duckdb_baseline", "duckdb", None),
+        ("duckdb_smash",    "duckdb", smash_lib),
+    ]
+
+    t0 = time.time()
+    for config_name, db_type, lib in configs:
+        existing = all_results.get(config_name)
+        if existing and len(existing.get("runs", [])) >= runs:
+            print(f"  {config_name}: cached ({len(existing['runs'])} runs)")
+            continue
+
+        run_results = []
+        for run_num in range(1, runs + 1):
+            print(f"  {config_name} run {run_num}...", end="", flush=True)
+            if db_type == "sqlite":
+                metrics = run_sqlite(build_dir, lib, quick)
+            else:
+                metrics = run_duckdb_compressible_bench(build_dir, lib, quick)
+
+            if metrics:
+                peak = metrics.get("peak_rss_mb", 0)
+                minr = metrics.get("min_rss_mb", 0)
+                red = metrics.get("rss_reduction_pct", 0)
+                print(f" peak={peak:.0f}MB min={minr:.0f}MB reduction={red:.1f}%")
+                run_results.append(metrics)
+            else:
+                print(" SKIP")
+                break
+
+        if run_results:
+            all_results[config_name] = {
+                "runs": run_results,
+                "median": _median_metrics(run_results),
+            }
+
+        results_path.write_text(json.dumps(all_results, indent=2))
+
+    # Print comparison table
+    print(f"\n  SQLite vs DuckDB Comparison (same workload: 500K rows, ~300B text)")
+    print(f"  {'Config':<20s} {'Peak RSS':>12s} {'Steady RSS':>12s} {'Smash Benefit':>14s}")
+    print("  " + "-" * 60)
+
+    for db in ["sqlite", "duckdb"]:
+        base = all_results.get(f"{db}_baseline", {}).get("median", {})
+        smash = all_results.get(f"{db}_smash", {}).get("median", {})
+        base_steady = base.get("steady_rss_mb", base.get("min_rss_mb", 0))
+        smash_steady = smash.get("steady_rss_mb", smash.get("min_rss_mb", 0))
+
+        if base_steady > 0 and smash_steady > 0:
+            benefit = 100 * (base_steady - smash_steady) / base_steady
+            benefit_str = f"{benefit:+.1f}%"
+        else:
+            benefit_str = "---"
+
+        base_peak = base.get("peak_rss_mb", 0)
+        smash_peak = smash.get("peak_rss_mb", 0)
+        print(f"  {db}_baseline{' '*(14-len(db))} {base_peak:>10.0f}MB {base_steady:>10.0f}MB")
+        print(f"  {db}_smash{' '*(17-len(db))} {smash_peak:>10.0f}MB {smash_steady:>10.0f}MB {benefit_str:>14s}")
+
+    elapsed = time.time() - t0
+    print(f"\nSQLite vs DuckDB experiment complete in {elapsed:.0f}s.")
+    print(f"Results: {results_path}")
+    return all_results
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _median_metrics(runs):
@@ -2039,6 +2308,8 @@ def main():
     parser.add_argument("--compress-only-only", action="store_true")
     parser.add_argument("--duckdb-compression-only", action="store_true",
                         help="Run only the DuckDB compression comparison experiment")
+    parser.add_argument("--duckdb-compressible-only", action="store_true",
+                        help="Run only the DuckDB compressible-data experiment")
     parser.add_argument("--build-dir", default=".", help="Build directory (default: .)")
     parser.add_argument("--output-dir", default=None,
                         help="Output directory for results (default: paper_results/<platform>)")
@@ -2090,14 +2361,17 @@ def main():
     ablation_results = {}
     co_results = {}
 
-    if not args.compress_only_only and not args.duckdb_compression_only:
+    # Skip main experiments if running a specific DuckDB experiment
+    skip_main = args.duckdb_compression_only or args.duckdb_compressible_only
+
+    if not args.compress_only_only and not skip_main:
         print("=" * 70)
         print("  ABLATION STUDY")
         print("=" * 70)
         ablation_results = run_ablation(build_dir, source_dir, apps, args.quick,
                                         output_dir, runs=args.runs)
 
-    if not args.ablation_only and not args.duckdb_compression_only:
+    if not args.ablation_only and not skip_main:
         print("\n" + "=" * 70)
         print("  COMPRESS-ONLY EXPERIMENT")
         print("=" * 70)
@@ -2105,12 +2379,21 @@ def main():
                                        output_dir, runs=args.runs)
 
     # DuckDB compression comparison (if duckdb is in app list)
-    if "duckdb" in apps and not args.ablation_only and not args.compress_only_only:
+    if "duckdb" in apps and not args.ablation_only and not args.compress_only_only and not args.duckdb_compressible_only:
         print("\n" + "=" * 70)
         print("  DUCKDB COMPRESSION EXPERIMENT")
         print("=" * 70)
         run_duckdb_compression_experiment(build_dir, source_dir, args.quick,
                                           output_dir, runs=args.runs)
+
+    # DuckDB compressible-data experiment
+    if "duckdb" in apps and (args.duckdb_compressible_only or
+                              (not args.ablation_only and not args.compress_only_only and not args.duckdb_compression_only)):
+        print("\n" + "=" * 70)
+        print("  DUCKDB COMPRESSIBLE-DATA EXPERIMENT")
+        print("=" * 70)
+        run_duckdb_compressible_experiment(build_dir, source_dir, args.quick,
+                                           output_dir, runs=args.runs)
 
     # Generate tables
     tables_path = output_dir / "paper_tables.txt"

@@ -178,6 +178,9 @@ endif()
 smash_add_standalone_bench(bench_sqlite bench_sqlite.cpp)
 target_link_libraries(bench_sqlite PRIVATE sqlite3_static)
 
+# Heatmap benchmark: coldness × compressibility sweep
+smash_add_standalone_bench(bench_heatmap bench_heatmap.cpp)
+
 # ── Allocator substrate comparison benchmarks ───────────────────────────────
 if(SMASH_BUILD_BENCH_ALLOCATORS)
 
@@ -674,6 +677,72 @@ if(SMASH_BUILD_BENCH_DEPS)
     message(WARNING "autoreconf not found — cannot build memcached.  Install: brew install autoconf automake")
   endif()
 
+  # ── LZ4 1.9.4 (static, installed into BENCH_DEPS_DIR) ─────────────────────
+  # RocksDB's rocksdb-lz4 / smash+lz4 configs need LZ4 linked in. System
+  # lz4-devel isn't guaranteed on the runner, so we vendor it alongside the
+  # other bench deps. zstd is vendored the same way below; both are also
+  # passed to rocksdb_build via CMAKE_PREFIX_PATH so RocksDB's
+  # find_package / find_library calls locate them.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_BENCH_LZ4_STATIC ${BENCH_DEPS_DIR}/lib/liblz4.a)
+    set(_BENCH_ZSTD_STATIC ${BENCH_DEPS_DIR}/lib/libzstd.a)
+  else()
+    set(_BENCH_LZ4_STATIC ${BENCH_DEPS_DIR}/lib/liblz4.a)
+    set(_BENCH_ZSTD_STATIC ${BENCH_DEPS_DIR}/lib/libzstd.a)
+  endif()
+
+  ExternalProject_Add(bench_lz4_build
+    GIT_REPOSITORY https://github.com/lz4/lz4.git
+    GIT_TAG v1.9.4
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/lz4
+    SOURCE_SUBDIR build/cmake
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      -DBUILD_STATIC_LIBS=ON
+      -DBUILD_SHARED_LIBS=OFF
+      -DLZ4_BUILD_CLI=OFF
+      -DLZ4_BUILD_LEGACY_LZ4C=OFF
+      -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+      -DCMAKE_INSTALL_LIBDIR=lib
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j${NCPU}
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    BUILD_BYPRODUCTS
+      ${_BENCH_LZ4_STATIC}
+      ${BENCH_DEPS_DIR}/include/lz4.h
+  )
+
+  # ── Zstandard 1.5.6 (static, installed into BENCH_DEPS_DIR) ───────────────
+  ExternalProject_Add(bench_zstd_build
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG v1.5.6
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/zstd
+    SOURCE_SUBDIR build/cmake
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      -DZSTD_BUILD_STATIC=ON
+      -DZSTD_BUILD_SHARED=OFF
+      -DZSTD_BUILD_PROGRAMS=OFF
+      -DZSTD_BUILD_TESTS=OFF
+      -DZSTD_BUILD_CONTRIB=OFF
+      -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+      -DCMAKE_INSTALL_LIBDIR=lib
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j${NCPU}
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    BUILD_BYPRODUCTS
+      ${_BENCH_ZSTD_STATIC}
+      ${BENCH_DEPS_DIR}/include/zstd.h
+  )
+
   # ── RocksDB 9.8.4 (static library, no gflags/tools) ───────────────────────
   # -Wno-error=nontrivial-memcall is Clang-only; GCC doesn't recognize it.
   # Conditionally include the entire argument to avoid passing an empty
@@ -689,6 +758,7 @@ if(SMASH_BUILD_BENCH_DEPS)
     GIT_TAG v9.8.4
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/rocksdb
+    DEPENDS bench_lz4_build bench_zstd_build
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
@@ -699,8 +769,14 @@ if(SMASH_BUILD_BENCH_DEPS)
       -DWITH_BENCHMARK_TOOLS=OFF
       -DWITH_TOOLS=OFF
       -DWITH_GFLAGS=OFF
+      -DWITH_LZ4=ON
+      -DWITH_ZSTD=ON
+      -DCMAKE_PREFIX_PATH=${BENCH_DEPS_DIR}
+      -Dlz4_ROOT=${BENCH_DEPS_DIR}
+      -Dzstd_ROOT=${BENCH_DEPS_DIR}
       -DROCKSDB_BUILD_SHARED=OFF
       -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+      -DCMAKE_INSTALL_LIBDIR=lib
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j${NCPU}
     INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
@@ -741,6 +817,153 @@ if(SMASH_BUILD_BENCH_DEPS)
     BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/duckdb
   )
 
+  # ── LevelDB 1.23 (static library) ──────────────────────────────────────────
+  # LevelDB uses an arena allocator over malloc — Smash should work.
+  ExternalProject_Add(leveldb_build
+    GIT_REPOSITORY https://github.com/google/leveldb.git
+    GIT_TAG 1.23
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/leveldb
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      -DLEVELDB_BUILD_TESTS=OFF
+      -DLEVELDB_BUILD_BENCHMARKS=OFF
+      -DBUILD_SHARED_LIBS=OFF
+      -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+      -DCMAKE_INSTALL_LIBDIR=lib
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j${NCPU}
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    BUILD_BYPRODUCTS
+      ${BENCH_DEPS_DIR}/lib/libleveldb.a
+      ${BENCH_DEPS_DIR}/include/leveldb/db.h
+  )
+  message(STATUS "  LevelDB 1.23 (static)")
+
+  # ── Varnish 7.6.0 (HTTP cache, supports -s malloc backend) ────────────────
+  # Varnish with -s malloc uses system malloc for cache storage.
+  # Requires: autotools, pcre2, python3
+  find_program(AUTORECONF autoreconf)
+  find_library(PCRE2_LIB pcre2-8 HINTS /usr/lib /usr/lib64 /usr/local/lib)
+  find_path(PCRE2_INCLUDE pcre2.h HINTS /usr/include /usr/local/include)
+  if(AUTORECONF AND PCRE2_LIB)
+    ExternalProject_Add(varnish_build
+      GIT_REPOSITORY https://github.com/varnishcache/varnish-cache.git
+      GIT_TAG varnish-7.6.0
+      GIT_SHALLOW TRUE
+      PREFIX ${BENCH_DEPS_DIR}/varnish
+      CONFIGURE_COMMAND
+        cd <SOURCE_DIR> && ./autogen.sh &&
+        <SOURCE_DIR>/configure
+          --prefix=${BENCH_DEPS_DIR}
+          --disable-dependency-tracking
+          --without-jemalloc
+      BUILD_IN_SOURCE TRUE
+      BUILD_COMMAND make -j${NCPU}
+      INSTALL_COMMAND make install
+      BUILD_BYPRODUCTS
+        ${BENCH_DEPS_DIR}/sbin/varnishd
+        ${BENCH_DEPS_DIR}/bin/varnishstat
+    )
+    message(STATUS "  Varnish 7.6.0 (without jemalloc)")
+  else()
+    if(NOT AUTORECONF)
+      message(STATUS "  Varnish: skipped (autoreconf not found)")
+    elseif(NOT PCRE2_LIB)
+      message(STATUS "  Varnish: skipped (pcre2 not found - install pcre2-devel)")
+    endif()
+  endif()
+
+  # ── MongoDB 8.0 (community server, without tcmalloc) ──────────────────────
+  # MongoDB bundles tcmalloc by default. Build with --allocator=system for
+  # system malloc. This is a large build (~30 min).
+  # Also build a tcmalloc variant for baseline comparison.
+  # MongoDB 8.0 requires Python 3.9-3.11 (pkg_resources incompatible with 3.12+)
+  find_program(PYTHON3_11 python3.11)
+  find_program(PYTHON3_10 python3.10)
+  find_program(PYTHON3_9 python3.9)
+  if(PYTHON3_11)
+    set(MONGODB_PYTHON ${PYTHON3_11})
+  elseif(PYTHON3_10)
+    set(MONGODB_PYTHON ${PYTHON3_10})
+  elseif(PYTHON3_9)
+    set(MONGODB_PYTHON ${PYTHON3_9})
+  else()
+    set(MONGODB_PYTHON "")
+  endif()
+  if(MONGODB_PYTHON)
+    # MongoDB without tcmalloc (uses system malloc)
+    # Patch SConstruct to use packaging.version instead of deprecated pkg_resources.
+    # Uses --linker=bfd (system ld) since lld/gold may not be installed.
+    ExternalProject_Add(mongodb_build
+      GIT_REPOSITORY https://github.com/mongodb/mongo.git
+      GIT_TAG r8.0.0
+      GIT_SHALLOW TRUE
+      PREFIX ${BENCH_DEPS_DIR}/mongodb
+      CONFIGURE_COMMAND ""
+      PATCH_COMMAND
+        sed -i "s/from pkg_resources import parse_version/from packaging.version import parse as parse_version/" <SOURCE_DIR>/SConstruct
+      BUILD_IN_SOURCE TRUE
+      BUILD_COMMAND
+        ${MONGODB_PYTHON} buildscripts/scons.py
+          DESTDIR=${BENCH_DEPS_DIR}/mongodb-system
+          --allocator=system
+          --linker=bfd
+          --disable-warnings-as-errors
+          -j${NCPU}
+          install-mongod
+      INSTALL_COMMAND
+        ${CMAKE_COMMAND} -E copy
+          <SOURCE_DIR>/build/install/bin/mongod
+          ${BENCH_DEPS_DIR}/bin/mongod-system
+      BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/mongod-system
+    )
+
+    # MongoDB with tcmalloc (baseline for comparison)
+    ExternalProject_Add(mongodb_tcmalloc_build
+      GIT_REPOSITORY https://github.com/mongodb/mongo.git
+      GIT_TAG r8.0.0
+      GIT_SHALLOW TRUE
+      PREFIX ${BENCH_DEPS_DIR}/mongodb-tcmalloc
+      CONFIGURE_COMMAND ""
+      PATCH_COMMAND
+        sed -i "s/from pkg_resources import parse_version/from packaging.version import parse as parse_version/" <SOURCE_DIR>/SConstruct
+      BUILD_IN_SOURCE TRUE
+      BUILD_COMMAND
+        ${MONGODB_PYTHON} buildscripts/scons.py
+          DESTDIR=${BENCH_DEPS_DIR}/mongodb-tcmalloc
+          --allocator=tcmalloc-google
+          --linker=bfd
+          --disable-warnings-as-errors
+          -j${NCPU}
+          install-mongod
+      INSTALL_COMMAND
+        ${CMAKE_COMMAND} -E copy
+          <SOURCE_DIR>/build/install/bin/mongod
+          ${BENCH_DEPS_DIR}/bin/mongod-tcmalloc
+      BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/mongod-tcmalloc
+    )
+    message(STATUS "  MongoDB 8.0 (system malloc) using ${MONGODB_PYTHON}")
+    message(STATUS "  MongoDB 8.0 (tcmalloc, baseline)")
+  else()
+    message(STATUS "  MongoDB: skipped (python3.9/3.10/3.11 not found)")
+  endif()
+
+  # ── bench_leveldb linked against our static LevelDB ─────────────────────────
+  add_executable(bench_leveldb bench_leveldb.cpp)
+  _get_filtered_dir_compile_options(leveldb_opts)
+  set_target_properties(bench_leveldb PROPERTIES COMPILE_OPTIONS "${leveldb_opts}")
+  target_include_directories(bench_leveldb PRIVATE ${BENCH_DEPS_DIR}/include)
+  target_link_libraries(bench_leveldb PRIVATE
+    ${BENCH_DEPS_DIR}/lib/libleveldb.a
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+  )
+  add_dependencies(bench_leveldb leveldb_build)
+
   # ── Export paths ───────────────────────────────────────────────────────────
   set(BENCH_REDIS_SERVER   ${BENCH_DEPS_DIR}/bin/redis-server-libc CACHE PATH "")
   set(BENCH_REDIS_CLI      ${BENCH_DEPS_DIR}/bin/redis-cli         CACHE PATH "")
@@ -751,10 +974,15 @@ if(SMASH_BUILD_BENCH_DEPS)
   set(BENCH_DUCKDB         ${BENCH_DEPS_DIR}/bin/duckdb            CACHE PATH "")
   set(BENCH_ROCKSDB_LIB    ${BENCH_DEPS_DIR}/lib/librocksdb.a      CACHE PATH "")
   set(BENCH_ROCKSDB_INCLUDE ${BENCH_DEPS_DIR}/include              CACHE PATH "")
+  set(BENCH_LEVELDB_LIB    ${BENCH_DEPS_DIR}/lib/libleveldb.a      CACHE PATH "")
+  set(BENCH_LEVELDB_INCLUDE ${BENCH_DEPS_DIR}/include              CACHE PATH "")
+  set(BENCH_VARNISHD       ${BENCH_DEPS_DIR}/sbin/varnishd         CACHE PATH "")
+  set(BENCH_MONGOD_SYSTEM  ${BENCH_DEPS_DIR}/bin/mongod-system     CACHE PATH "")
+  set(BENCH_MONGOD_TCMALLOC ${BENCH_DEPS_DIR}/bin/mongod-tcmalloc  CACHE PATH "")
 
   # Convenience target: `make bench_deps`
   add_custom_target(bench_deps)
-  add_dependencies(bench_deps redis_build redis_smash_build rocksdb_build duckdb_build)
+  add_dependencies(bench_deps redis_build redis_smash_build rocksdb_build duckdb_build leveldb_build)
   if(TARGET libevent_build)
     add_dependencies(bench_deps libevent_build)
   endif()
@@ -763,6 +991,12 @@ if(SMASH_BUILD_BENCH_DEPS)
   endif()
   if(TARGET tcmalloc_build)
     add_dependencies(bench_deps tcmalloc_build)
+  endif()
+  if(TARGET varnish_build)
+    add_dependencies(bench_deps varnish_build)
+  endif()
+  if(TARGET mongodb_build)
+    add_dependencies(bench_deps mongodb_build mongodb_tcmalloc_build)
   endif()
 
   message(STATUS "Benchmark dependencies (${BENCH_DEPS_DIR}):")
@@ -792,23 +1026,22 @@ if(SMASH_BUILD_BENCH_DEPS)
     Threads::Threads
     ${CMAKE_DL_LIBS}
   )
-  # RocksDB static lib needs its transitive compression dependencies
+  # RocksDB static lib needs its transitive compression dependencies.
+  # LZ4 and zstd are vendored (bench_lz4_build / bench_zstd_build); link
+  # the static archives we just installed. zlib/bz2/snappy are optional
+  # system libs — include when present.
   find_package(ZLIB)
   find_library(BZ2_LIB bz2)
-  find_library(LZ4_SYSTEM_LIB lz4)
-  find_library(ZSTD_SYSTEM_LIB zstd)
   find_library(SNAPPY_LIB snappy)
+  target_link_libraries(bench_rocksdb_builtin PRIVATE
+    ${_BENCH_LZ4_STATIC}
+    ${_BENCH_ZSTD_STATIC}
+  )
   if(ZLIB_FOUND)
     target_link_libraries(bench_rocksdb_builtin PRIVATE ZLIB::ZLIB)
   endif()
   if(BZ2_LIB)
     target_link_libraries(bench_rocksdb_builtin PRIVATE ${BZ2_LIB})
-  endif()
-  if(LZ4_SYSTEM_LIB)
-    target_link_libraries(bench_rocksdb_builtin PRIVATE ${LZ4_SYSTEM_LIB})
-  endif()
-  if(ZSTD_SYSTEM_LIB)
-    target_link_libraries(bench_rocksdb_builtin PRIVATE ${ZSTD_SYSTEM_LIB})
   endif()
   if(SNAPPY_LIB)
     target_link_libraries(bench_rocksdb_builtin PRIVATE ${SNAPPY_LIB})

@@ -59,14 +59,14 @@ def run_benchmark(name, cmd, sample_at, timeout=60):
 
     output = stderr.decode() + stdout.decode()
 
-    # Parse heatmap line
+    # Parse heatmap line (new format with hot_sum/total_sum/ticks)
     hm_match = re.search(
         r'\[smash heatmap\].*?'
         r'pages_compressed=(\d+).*?'
         r'ratio=([0-9.]+)x.*?'
         r'compress_pct=([0-9.]+)%.*?'
         r'hot_pct=([0-9.]+)%.*?'
-        r'accessed=(\d+).*?monitored=(\d+)',
+        r'hot_sum=(\d+).*?total_sum=(\d+).*?ticks=(\d+)',
         output
     )
 
@@ -82,8 +82,9 @@ def run_benchmark(name, cmd, sample_at, timeout=60):
             'compression_ratio': float(hm_match.group(2)),
             'compress_pct': float(hm_match.group(3)),
             'hot_pct': float(hm_match.group(4)),
-            'pages_accessed': int(hm_match.group(5)),
-            'pages_monitored': int(hm_match.group(6)),
+            'hot_pages_sum': int(hm_match.group(5)),
+            'total_pages_sum': int(hm_match.group(6)),
+            'tick_count': int(hm_match.group(7)),
             'rss_reduction_pct': float(rss_match.group(1)) if rss_match else None,
         }
     return None

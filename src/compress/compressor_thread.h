@@ -267,8 +267,11 @@ class CompressorThread {
     std::atomic<uint64_t> hm_bytes_original_{0};    // sum of original page sizes
     std::atomic<uint64_t> hm_bytes_compressed_{0};  // sum of compressed sizes
     std::atomic<uint64_t> hm_pages_compressed_{0};  // count of pages compressed
-    std::atomic<uint64_t> hm_pages_accessed_{0};    // pages accessed (touched in Phase 1)
-    std::atomic<uint64_t> hm_pages_monitored_{0};   // pages that entered monitoring
+    // Hot fraction tracking: sum of (hot_pages, total_pages) each tick
+    // hot_pct = 100 * hm_hot_pages_sum_ / hm_total_pages_sum_
+    std::atomic<uint64_t> hm_hot_pages_sum_{0};     // sum of hot page counts per tick
+    std::atomic<uint64_t> hm_total_pages_sum_{0};   // sum of total page counts per tick
+    std::atomic<uint64_t> hm_tick_count_{0};        // number of ticks sampled
 
     // ── Thread management ─────────────────────────────────────────────────
     pthread_t coord_thread_{};
@@ -306,6 +309,9 @@ class CompressorThread {
     // Per-worker counters for the current tick (reset each tick)
     std::atomic<uint32_t> worker_pages_eligible_[kMaxCompressorWorkers]{};
     std::atomic<uint32_t> worker_pages_compressed_[kMaxCompressorWorkers]{};
+    // Heatmap: per-worker hot page count for current tick (Phase 1)
+    std::atomic<uint32_t> worker_hot_pages_[kMaxCompressorWorkers]{};
+    std::atomic<uint32_t> worker_total_pages_[kMaxCompressorWorkers]{};
 
     // Exponential moving averages (fixed-point: multiply by 256 to avoid float)
     // EMA update: ema = ema + (sample - ema) / 4   (α = 1/4, ~4-tick response)
@@ -454,15 +460,17 @@ class CompressorThread {
     // ── Phase implementations ─────────────────────────────────────────────
 
     // Phase 1: Process access bits and update cold counts
-    void phase1Range(size_t start, size_t end) {
+    void phase1Range(size_t start, size_t end, int worker_id = 0) {
+        uint32_t hot_count = 0;
+        uint32_t total_count = 0;
         forEachLivePage(start, end, [&](size_t i) {
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+                ++total_count;
                 if (accessed_[i].load(std::memory_order_relaxed)) {
                     cold_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
-                    // Heatmap instrumentation: count pages accessed this tick
-                    hm_pages_accessed_.fetch_add(1, std::memory_order_relaxed);
+                    ++hot_count;
                 } else {
                     if (cold_count_[i] < 255) cold_count_[i]++;
                 }
@@ -471,6 +479,9 @@ class CompressorThread {
                 if (cold_count_[i] < 255) cold_count_[i]++;
             }
         });
+        // Record per-worker hot page stats for this tick
+        worker_hot_pages_[worker_id].store(hot_count, std::memory_order_relaxed);
+        worker_total_pages_[worker_id].store(total_count, std::memory_order_relaxed);
     }
 
     // Phase 2: Compress cold pages
@@ -542,8 +553,6 @@ class CompressorThread {
             if (states_->transition(i, PageState::ACTIVE,
                                        PageState::ACTIVE_MONITORING)) {
                 vm::protectPages(vm_->pageAddress(i), kPageSize, true, false);
-                // Heatmap instrumentation: track pages entering monitoring
-                hm_pages_monitored_.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -930,7 +939,7 @@ class CompressorThread {
 
     void executePhase(int phase, int worker_id) {
         auto& w = workers_[worker_id];
-        if (phase == 1) phase1Range(w.range_start, w.range_end);
+        if (phase == 1) phase1Range(w.range_start, w.range_end, worker_id);
         else if (phase == 2) phase2Range(worker_id, w.range_start, w.range_end);
         else if (phase == 3) phase3Range(w.range_start, w.range_end);
     }
@@ -1008,6 +1017,18 @@ class CompressorThread {
         }
 
         dispatch(1);  // Phase 1: access tracking
+
+        // Heatmap: aggregate per-worker hot page counts from this tick
+        {
+            uint32_t tick_hot = 0, tick_total = 0;
+            for (int w = 0; w < nw; ++w) {
+                tick_hot += worker_hot_pages_[w].load(std::memory_order_relaxed);
+                tick_total += worker_total_pages_[w].load(std::memory_order_relaxed);
+            }
+            hm_hot_pages_sum_.fetch_add(tick_hot, std::memory_order_relaxed);
+            hm_total_pages_sum_.fetch_add(tick_total, std::memory_order_relaxed);
+            hm_tick_count_.fetch_add(1, std::memory_order_relaxed);
+        }
 
         if (!defer_phases) dispatch(2);  // Phase 2: compression
         // Phase 3 mprotects ACTIVE pages to PROT_READ for write-fault tracking.
@@ -1291,26 +1312,27 @@ public:
         uint64_t hm_orig = self->hm_bytes_original_.load(std::memory_order_relaxed);
         uint64_t hm_comp = self->hm_bytes_compressed_.load(std::memory_order_relaxed);
         uint64_t hm_pages = self->hm_pages_compressed_.load(std::memory_order_relaxed);
-        uint64_t hm_accessed = self->hm_pages_accessed_.load(std::memory_order_relaxed);
-        uint64_t hm_monitored = self->hm_pages_monitored_.load(std::memory_order_relaxed);
+        uint64_t hm_hot_sum = self->hm_hot_pages_sum_.load(std::memory_order_relaxed);
+        uint64_t hm_total_sum = self->hm_total_pages_sum_.load(std::memory_order_relaxed);
+        uint64_t hm_ticks = self->hm_tick_count_.load(std::memory_order_relaxed);
 
         // Compression ratio: original / compressed (e.g., 8.0 = 8:1 compression)
         double comp_ratio = (hm_comp > 0) ? (double)hm_orig / hm_comp : 0.0;
         // Compressibility: percentage of bytes saved (e.g., 87.5% for 8:1 ratio)
         double compress_pct = (hm_orig > 0) ? 100.0 * (1.0 - (double)hm_comp / hm_orig) : 0.0;
-        // Hot fraction: pages accessed / pages monitored (approximation)
-        // This measures what fraction of monitored pages were touched
-        double hot_pct = (hm_monitored > 0) ? 100.0 * hm_accessed / hm_monitored : 0.0;
+        // Hot fraction: average (hot pages / total pages) across all ticks
+        // This measures what fraction of active pages are accessed each tick
+        double hot_pct = (hm_total_sum > 0) ? 100.0 * hm_hot_sum / hm_total_sum : 0.0;
 
         char buf[512];
         int n = snprintf(buf, sizeof(buf),
             "[smash stats] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  empty=%zu\n"
             "[smash heatmap] pages_compressed=%zu  ratio=%.1fx  compress_pct=%.1f%%"
-            "  hot_pct=%.1f%%  (accessed=%zu monitored=%zu)\n",
+            "  hot_pct=%.1f%%  (hot_sum=%zu total_sum=%zu ticks=%zu)\n",
             (int)getpid(), total, active, monitor, compressing, compressed, empty,
             (size_t)hm_pages, comp_ratio, compress_pct, hot_pct,
-            (size_t)hm_accessed, (size_t)hm_monitored);
+            (size_t)hm_hot_sum, (size_t)hm_total_sum, (size_t)hm_ticks);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
@@ -1338,15 +1360,17 @@ public:
     uint64_t hmBytesOriginal() const { return hm_bytes_original_.load(std::memory_order_relaxed); }
     uint64_t hmBytesCompressed() const { return hm_bytes_compressed_.load(std::memory_order_relaxed); }
     uint64_t hmPagesCompressed() const { return hm_pages_compressed_.load(std::memory_order_relaxed); }
-    uint64_t hmPagesAccessed() const { return hm_pages_accessed_.load(std::memory_order_relaxed); }
-    uint64_t hmPagesMonitored() const { return hm_pages_monitored_.load(std::memory_order_relaxed); }
+    uint64_t hmHotPagesSum() const { return hm_hot_pages_sum_.load(std::memory_order_relaxed); }
+    uint64_t hmTotalPagesSum() const { return hm_total_pages_sum_.load(std::memory_order_relaxed); }
+    uint64_t hmTickCount() const { return hm_tick_count_.load(std::memory_order_relaxed); }
 
     void resetHeatmapStats() {
         hm_bytes_original_.store(0, std::memory_order_relaxed);
         hm_bytes_compressed_.store(0, std::memory_order_relaxed);
         hm_pages_compressed_.store(0, std::memory_order_relaxed);
-        hm_pages_accessed_.store(0, std::memory_order_relaxed);
-        hm_pages_monitored_.store(0, std::memory_order_relaxed);
+        hm_hot_pages_sum_.store(0, std::memory_order_relaxed);
+        hm_total_pages_sum_.store(0, std::memory_order_relaxed);
+        hm_tick_count_.store(0, std::memory_order_relaxed);
     }
 
     int dictsTrainedCount() const {

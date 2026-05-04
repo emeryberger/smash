@@ -5,13 +5,14 @@ Memcached's slab allocator calls malloc() for ~1MB slab pages, so
 DYLD_INSERT intercepts them. Cold slabs (items not accessed) get
 compressed by Smash.
 
-Requires: memcached and duckdb CLI in PATH.
+Requires: memcached in PATH. DuckDB is optional (for TPC-H data).
 
 Usage:
     python3 bench_memcached.py [--quick]
 """
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -46,12 +47,12 @@ SMASH_LIB = os.path.join(BUILD_DIR, "libsmash.dylib" if IS_DARWIN else "libsmash
 
 
 def check_prereqs():
-    for tool, path, pkg in [("memcached", MEMCACHED, "memcached"),
-                            ("duckdb", DUCKDB, "duckdb")]:
-        if path is None:
-            print(f"SKIP: {tool} not found (build deps with "
-                  f"-DSMASH_BUILD_BENCH_DEPS=ON or install {pkg})")
-            sys.exit(0)
+    if MEMCACHED is None:
+        print("SKIP: memcached not found (build deps with "
+              "-DSMASH_BUILD_BENCH_DEPS=ON or install memcached)")
+        sys.exit(0)
+    if DUCKDB is None:
+        print("  NOTE: duckdb not found, will use simple JSON corpus")
     if not os.path.isfile(SMASH_LIB):
         print(f"ERROR: libsmash not found at {SMASH_LIB}")
         print("Build with: cmake .. -DSMASH_BUILD_BENCH=ON && make -j")
@@ -100,8 +101,8 @@ def mc_version(port):
 
 # ── Corpus generation ────────────────────────────────────────────────────
 
-def generate_corpus(corpus_path, tpch_sf):
-    print(f"  Generating TPC-H JSON corpus (sf={tpch_sf})...")
+def generate_corpus_duckdb(corpus_path, tpch_sf):
+    """Generate TPC-H JSON corpus using DuckDB (if available)."""
     subprocess.run(
         [DUCKDB, "-c", f"""
 INSTALL tpch;
@@ -119,8 +120,50 @@ COPY (
 """],
         check=True, capture_output=True,
     )
-    nlines = sum(1 for _ in open(corpus_path))
-    print(f"  Corpus: {nlines} JSON records")
+
+
+def generate_corpus_simple(corpus_path, num_records):
+    """Generate simple JSON corpus without DuckDB dependency."""
+    import string
+    with open(corpus_path, 'w') as f:
+        for i in range(num_records):
+            # Generate compressible JSON with repeating patterns
+            name = f"Customer_{i:07d}"
+            addr = f"{i % 1000} Main Street, City {i % 100}, State {i % 50}"
+            phone = f"{(i % 900) + 100}-{(i % 900) + 100}-{(i % 9000) + 1000}"
+            comment = f"This is order number {i}. " * 3
+            record = {
+                "id": i,
+                "customer": name,
+                "addr": addr,
+                "phone": phone,
+                "segment": ["AUTOMOBILE", "BUILDING", "FURNITURE", "MACHINERY", "HOUSEHOLD"][i % 5],
+                "status": ["O", "F", "P"][i % 3],
+                "total": round(100 + (i % 10000) * 0.01, 2),
+                "date": f"202{i % 5}-{(i % 12) + 1:02d}-{(i % 28) + 1:02d}",
+                "priority": ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"][i % 5],
+                "order_note": comment,
+                "customer_note": f"Customer since 20{10 + i % 15}"
+            }
+            f.write(json.dumps(record) + '\n')
+
+
+def generate_corpus(corpus_path, tpch_sf, num_keys):
+    """Generate JSON corpus for memcached benchmark."""
+    if DUCKDB:
+        print(f"  Generating TPC-H JSON corpus (sf={tpch_sf})...")
+        try:
+            generate_corpus_duckdb(corpus_path, tpch_sf)
+            nlines = sum(1 for _ in open(corpus_path))
+            print(f"  Corpus: {nlines} JSON records (TPC-H)")
+            return
+        except Exception as e:
+            print(f"  DuckDB failed: {e}, falling back to simple corpus")
+
+    # Fallback: generate simple JSON without DuckDB
+    print(f"  Generating simple JSON corpus ({num_keys} records)...")
+    generate_corpus_simple(corpus_path, num_keys + 10000)  # extra for safety
+    print(f"  Corpus: {num_keys + 10000} JSON records (simple)")
 
 
 # ── Benchmark phases ─────────────────────────────────────────────────────
@@ -178,6 +221,49 @@ def serve_hot_gets(port, duration, num_keys, hot_keys, batch=500):
     return total, ops
 
 
+def serve_hot_gets_with_latency(port, duration, num_keys, hot_keys, sample_interval=10):
+    """Send random GETs to the hot subset, measuring latency every sample_interval ops.
+    Returns (total_gets, ops_per_sec, latencies_us)."""
+    hot_start = num_keys - hot_keys
+    total = 0
+    latencies = []
+    t0 = time.time()
+    deadline = t0 + duration
+    while time.time() < deadline:
+        idx = random.randint(hot_start, num_keys - 1)
+        key = f"key:{idx:07d}"
+        # Measure latency for sampled requests
+        if total % sample_interval == 0:
+            lat = mc_get_with_latency(port, key)
+            if lat is not None:
+                latencies.append(lat)
+        else:
+            mc_send(port, f"get {key}\r\n")
+        total += 1
+    elapsed = max(time.time() - t0, 0.001)
+    ops = int(total / elapsed)
+    return total, ops, latencies
+
+
+def mc_get_with_latency(port, key):
+    """Send a single GET and measure round-trip latency in microseconds."""
+    try:
+        with socket.create_connection(("localhost", port), timeout=5) as sock:
+            cmd = f"get {key}\r\nquit\r\n".encode()
+            t0 = time.perf_counter()
+            sock.sendall(cmd)
+            sock.settimeout(2)
+            try:
+                while sock.recv(65536):
+                    pass
+            except (socket.timeout, ConnectionError):
+                pass
+            t1 = time.perf_counter()
+            return (t1 - t0) * 1e6  # microseconds
+    except (ConnectionError, OSError):
+        return None
+
+
 def access_cold_keys(port, cold_start, cold_count, batch_size=5000):
     """GET a sequential range of cold keys.  Returns (elapsed_sec, ops_per_sec)."""
     print(f"  Accessing {cold_count} cold keys starting at {cold_start}...")
@@ -192,6 +278,25 @@ def access_cold_keys(port, cold_start, cold_count, batch_size=5000):
     ops = int(cold_count / elapsed)
     print(f"  Done: {elapsed:.1f}s ({ops:,} GET/s)")
     return elapsed, ops
+
+
+def access_cold_keys_with_latency(port, cold_start, cold_count):
+    """GET cold keys one at a time, measuring individual latencies.
+    Returns (latencies_us, elapsed_sec, ops_per_sec)."""
+    print(f"  Accessing {cold_count} cold keys with latency measurement...")
+    latencies = []
+    t0 = time.time()
+    for i in range(cold_count):
+        key = f"key:{cold_start + i:07d}"
+        lat = mc_get_with_latency(port, key)
+        if lat is not None:
+            latencies.append(lat)
+        if (i + 1) % 1000 == 0:
+            print(f"    {i + 1}/{cold_count}...")
+    elapsed = max(time.time() - t0, 0.001)
+    ops = int(len(latencies) / elapsed) if elapsed > 0 else 0
+    print(f"  Done: {elapsed:.1f}s ({ops:,} GET/s)")
+    return latencies, elapsed, ops
 
 
 # ── RSS background monitor ───────────────────────────────────────────────
@@ -252,7 +357,7 @@ def run_pass(label, port, use_smash, cfg, corpus_path):
     print(f"\n[{label}] Starting memcached on port {port}...")
 
     mc_opts = [
-        "memcached", "-p", str(port), "-m", "512", "-t", "1",
+        MEMCACHED, "-p", str(port), "-m", "512", "-t", "1",
         "-o", "no_lru_crawler,no_lru_maintainer",
     ]
     env = dict(os.environ)
@@ -300,24 +405,39 @@ def run_pass(label, port, use_smash, cfg, corpus_path):
     metrics["cool_rss"] = cool_rss
     print(f"  Post-cool RSS: {cool_rss:.1f} MB")
 
-    # Phase 3: Serve hot 5%
+    # Phase 3: Serve hot 5% with latency measurement
     hot_keys = cfg.num_keys // 20
     print(f"[{label}] Phase 3: Serve hot {hot_keys} keys for {cfg.serve}s...")
-    serve_total, serve_ops = serve_hot_gets(port, cfg.serve, cfg.num_keys, hot_keys)
+    serve_total, serve_ops, hot_latencies = serve_hot_gets_with_latency(
+        port, cfg.serve, cfg.num_keys, hot_keys, sample_interval=10)
     serve_rss = get_rss_mb(proc.pid)
     metrics["serve_ops"] = serve_ops
     metrics["serve_rss"] = serve_rss
+    metrics["hot_latencies"] = hot_latencies
+    if hot_latencies:
+        hot_latencies_sorted = sorted(hot_latencies)
+        n = len(hot_latencies_sorted)
+        metrics["hot_p50_us"] = hot_latencies_sorted[n // 2]
+        metrics["hot_p99_us"] = hot_latencies_sorted[int(n * 0.99)]
+        print(f"  Hot p50/p99: {metrics['hot_p50_us']:.1f} / {metrics['hot_p99_us']:.1f} us")
     print(f"  Serve: {serve_total:,} GETs, {serve_ops:,} GET/s")
     print(f"  Serve RSS: {serve_rss:.1f} MB")
 
-    # Phase 4: Cold re-access
-    cold_keys = cfg.num_keys // 10
-    print(f"[{label}] Phase 4: Access {cold_keys} cold keys...")
-    cold_sec, cold_ops = access_cold_keys(port, 0, cold_keys)
+    # Phase 4: Cold re-access with latency measurement
+    cold_keys = min(cfg.num_keys // 10, 5000)  # Limit for per-key latency measurement
+    print(f"[{label}] Phase 4: Access {cold_keys} cold keys with latency...")
+    cold_latencies, cold_sec, cold_ops = access_cold_keys_with_latency(port, 0, cold_keys)
     cold_rss = get_rss_mb(proc.pid)
     metrics["cold_sec"] = cold_sec
     metrics["cold_ops"] = cold_ops
     metrics["cold_rss"] = cold_rss
+    metrics["cold_latencies"] = cold_latencies
+    if cold_latencies:
+        cold_latencies_sorted = sorted(cold_latencies)
+        n = len(cold_latencies_sorted)
+        metrics["cold_p50_us"] = cold_latencies_sorted[n // 2]
+        metrics["cold_p99_us"] = cold_latencies_sorted[int(n * 0.99)]
+        print(f"  Cold p50/p99: {metrics['cold_p50_us']:.1f} / {metrics['cold_p99_us']:.1f} us")
     print(f"  Cold re-access RSS: {cold_rss:.1f} MB")
 
     # Stop
@@ -412,7 +532,7 @@ def main():
     tmpdir = tempfile.mkdtemp()
     corpus_path = os.path.join(tmpdir, "tpch_corpus.jsonl")
     try:
-        generate_corpus(corpus_path, cfg.tpch_sf)
+        generate_corpus(corpus_path, cfg.tpch_sf, cfg.num_keys)
 
         base_metrics = run_pass("baseline", 11311, False, cfg, corpus_path)
         smash_metrics = run_pass("smash", 11312, True, cfg, corpus_path)
@@ -437,6 +557,40 @@ def main():
             smash_metrics["_rss_monitor"].dump_csv(
                 os.path.join(rss_smash_dir, "memcached_rss.csv"))
             print(f"  Wrote {rss_smash_dir}/memcached_rss.csv")
+
+        # Write latency CSV files if SMASH_LATENCY_DIR is set
+        latency_dir = os.environ.get("SMASH_LATENCY_DIR")
+        if latency_dir:
+            os.makedirs(latency_dir, exist_ok=True)
+            if smash_metrics and "hot_latencies" in smash_metrics:
+                path = os.path.join(latency_dir, "memcached_hot.csv")
+                with open(path, "w") as f:
+                    f.write("latency_us\n")
+                    for lat in smash_metrics["hot_latencies"]:
+                        f.write(f"{lat:.3f}\n")
+                print(f"  Wrote {path} ({len(smash_metrics['hot_latencies'])} samples)")
+            if smash_metrics and "cold_latencies" in smash_metrics:
+                path = os.path.join(latency_dir, "memcached_cold.csv")
+                with open(path, "w") as f:
+                    f.write("latency_us\n")
+                    for lat in smash_metrics["cold_latencies"]:
+                        f.write(f"{lat:.3f}\n")
+                print(f"  Wrote {path} ({len(smash_metrics['cold_latencies'])} samples)")
+
+        # Output METRIC lines for paper experiments
+        if smash_metrics:
+            print()
+            if "hot_p50_us" in smash_metrics:
+                print(f"METRIC hot_p50_us {smash_metrics['hot_p50_us']:.2f}")
+            if "hot_p99_us" in smash_metrics:
+                print(f"METRIC hot_p99_us {smash_metrics['hot_p99_us']:.2f}")
+            if "cold_p50_us" in smash_metrics:
+                print(f"METRIC cold_p50_us {smash_metrics['cold_p50_us']:.2f}")
+            if "cold_p99_us" in smash_metrics:
+                print(f"METRIC cold_p99_us {smash_metrics['cold_p99_us']:.2f}")
+            if "min_rss" in smash_metrics and "peak_rss" in smash_metrics:
+                reduction = (1 - smash_metrics["min_rss"] / smash_metrics["peak_rss"]) * 100
+                print(f"METRIC rss_reduction_pct {reduction:.1f}")
 
         print()
         print("Done.")

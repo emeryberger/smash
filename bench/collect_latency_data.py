@@ -132,6 +132,59 @@ def run_leveldb(build_dir, latency_dir, quick):
     return run_benchmark("LevelDB", [str(exe)], build_dir, latency_dir, quick)
 
 
+def run_memcached(build_dir, latency_dir, quick):
+    """Run Memcached benchmark."""
+    exe = build_dir / "bench" / "bench_memcached.py"
+    if not exe.exists():
+        print(f"  bench_memcached.py not found at {exe}")
+        return None
+
+    print(f"\n{'='*60}")
+    print(f"Running Memcached...")
+    print(f"{'='*60}")
+
+    env = os.environ.copy()
+    env["SMASH_LATENCY_DIR"] = str(latency_dir)
+
+    cmd = ["python3", str(exe)]
+    if quick:
+        cmd.append("--quick")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 minute timeout for memcached
+        )
+
+        # Print last 30 lines of output
+        if result.stdout:
+            for line in result.stdout.splitlines()[-30:]:
+                print(f"  {line}")
+
+        metrics = parse_metrics(result.stdout)
+
+        if metrics:
+            print(f"\n  Results:")
+            if "cold_p50_us" in metrics:
+                print(f"    Cold access p50: {metrics['cold_p50_us']:.2f} us")
+            if "cold_p99_us" in metrics:
+                print(f"    Cold access p99: {metrics['cold_p99_us']:.2f} us")
+            if "rss_reduction_pct" in metrics:
+                print(f"    RSS reduction: {metrics['rss_reduction_pct']:.1f}%")
+
+        return metrics
+
+    except subprocess.TimeoutExpired:
+        print(f"  ERROR: Memcached timed out")
+        return None
+    except Exception as e:
+        print(f"  ERROR: Memcached failed: {e}")
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Collect latency data for CDF plots")
     parser.add_argument("--output-dir", "-o", default="latency_data",
@@ -139,7 +192,7 @@ def main():
     parser.add_argument("--quick", "-q", action="store_true",
                         help="Run quick versions of benchmarks")
     parser.add_argument("--benchmarks", "-b", nargs="+",
-                        choices=["sqlite", "rocksdb", "leveldb", "all"],
+                        choices=["sqlite", "rocksdb", "leveldb", "memcached", "all"],
                         default=["all"],
                         help="Which benchmarks to run")
     args = parser.parse_args()
@@ -156,7 +209,7 @@ def main():
 
     benchmarks = args.benchmarks
     if "all" in benchmarks:
-        benchmarks = ["sqlite", "rocksdb", "leveldb"]
+        benchmarks = ["sqlite", "rocksdb", "leveldb", "memcached"]
 
     results = {}
 
@@ -170,6 +223,8 @@ def main():
             metrics = run_rocksdb(build_dir, latency_dir, args.quick)
         elif bench == "leveldb":
             metrics = run_leveldb(build_dir, latency_dir, args.quick)
+        elif bench == "memcached":
+            metrics = run_memcached(build_dir, latency_dir, args.quick)
         else:
             continue
 

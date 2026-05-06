@@ -160,8 +160,6 @@ extern "C" int smash_kevent(int kq, const struct kevent* changelist, int nchange
                             struct kevent* eventlist, int nevents,
                             const struct timespec* timeout) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm) {
-    }
     int ret = smash::vm::retryWithDecompress(
         [&] {
             return reinterpret_cast<kevent_fn>(smash_interpose_smash_kevent.original)(
@@ -202,8 +200,6 @@ extern "C" int smash_kevent64(int kq,
                               unsigned int flags,
                               const struct timespec* timeout) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm) {
-    }
     int ret = smash::vm::retryWithDecompress(
         [&] {
             return reinterpret_cast<kevent64_fn>(smash_interpose_smash_kevent64.original)(
@@ -397,8 +393,6 @@ extern "C" mach_msg_return_t smash_mach_msg_overwrite(
     auto* vm = smash::g_smash_vm_region;
     size_t send_buf_size = send_size;
     size_t rcv_buf_size = rcv_msg ? rcv_limit : rcv_size;
-    if (vm) {
-    }
     OolPinTracker ool_tracker;
     if (vm && msg && (option & MACH_SEND_MSG)) {
         smash_pin_ool_descriptors(msg, vm, ool_tracker);
@@ -571,7 +565,6 @@ extern "C" ssize_t smash_recvmsg(int s, struct msghdr* msg, int flags) {
             if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
                 smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         });
-    if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
     return ret;
 }
 
@@ -585,7 +578,6 @@ extern "C" ssize_t smash_sendmsg(int s, const struct msghdr* msg, int flags) {
             if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
                 smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
         });
-    if (vm && msg && msg->msg_iov && msg->msg_iovlen > 0)
     return ret;
 }
 
@@ -601,7 +593,6 @@ extern "C" int smash_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     int ret = smash::vm::retryWithDecompress(
         [&] { return reinterpret_cast<poll_fn>(smash_interpose_smash_poll.original)(fds, nfds, timeout); },
         [&] { if (vm && fds && nfds > 0) smash::vm::walkPagesForFault(fds, fds_bytes, vm); });
-    if (vm && fds && nfds > 0)
     return ret;
 }
 
@@ -698,8 +689,6 @@ static inline void warmFileBuffer(FILE* stream, smash::VmRegion* vm) {
 }
 
 static inline void unpinFileBuffer(FILE* stream, smash::VmRegion* vm) {
-    if (stream && stream->_bf._base && stream->_bf._size > 0) {
-    }
 }
 
 using fread_fn = size_t(*)(void*, size_t, size_t, FILE*);

@@ -251,7 +251,6 @@ extern "C" CO_EXPORT int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
         smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
     }
     int ret = orig_poll(fds, nfds, timeout);
-    if (vm && fds && nfds > 0)
     return ret;
 }
 
@@ -262,7 +261,6 @@ extern "C" CO_EXPORT int epoll_wait(int epfd, struct epoll_event* events, int ma
         smash::vm::warmPages(events, maxevents * sizeof(struct epoll_event), vm);
     }
     int ret = orig_epoll_wait(epfd, events, maxevents, timeout);
-    if (vm && events && maxevents > 0)
     return ret;
 }
 

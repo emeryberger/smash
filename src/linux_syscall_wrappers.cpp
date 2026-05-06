@@ -214,7 +214,6 @@ SMASH_VISIBLE ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
     ssize_t ret = smash::vm::retryWithDecompress(
         [&] { return real_recvmsg(s, msg, flags); },
         [&] { if (in_heap) smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm); });
-    if (in_heap)
     return ret;
 }
 
@@ -227,7 +226,6 @@ SMASH_VISIBLE ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
     ssize_t ret = smash::vm::retryWithDecompress(
         [&] { return real_sendmsg(s, msg, flags); },
         [&] { if (in_heap) smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm); });
-    if (in_heap)
     return ret;
 }
 
@@ -343,10 +341,6 @@ SMASH_VISIBLE int recvmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
     SMASH_LAZY_RESOLVE(fn_t, recvmmsg);
     if (!real_recvmmsg) return syscall(SYS_recvmmsg, sockfd, msgvec, vlen, flags, timeout);
     auto* vm = smash::g_smash_vm_region;
-    // Warm all iovec buffers across all messages
-    for (unsigned i = 0; i < vlen; ++i) {
-        struct msghdr* msg = &msgvec[i].msg_hdr;
-    }
     int ret = smash::vm::retryWithDecompress(
         [&] { return real_recvmmsg(sockfd, msgvec, vlen, flags, timeout); },
         [&] {
@@ -356,10 +350,6 @@ SMASH_VISIBLE int recvmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
                     smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
             }
         });
-    for (unsigned i = 0; i < vlen; ++i) {
-        struct msghdr* msg = &msgvec[i].msg_hdr;
-        if (msg->msg_iov && msg->msg_iovlen > 0)
-    }
     return ret;
 }
 
@@ -369,9 +359,6 @@ SMASH_VISIBLE int sendmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
     SMASH_LAZY_RESOLVE(fn_t, sendmmsg);
     if (!real_sendmmsg) return syscall(SYS_sendmmsg, sockfd, msgvec, vlen, flags);
     auto* vm = smash::g_smash_vm_region;
-    for (unsigned i = 0; i < vlen; ++i) {
-        struct msghdr* msg = &msgvec[i].msg_hdr;
-    }
     int ret = smash::vm::retryWithDecompress(
         [&] { return real_sendmmsg(sockfd, msgvec, vlen, flags); },
         [&] {
@@ -381,10 +368,6 @@ SMASH_VISIBLE int sendmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
                     smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
             }
         });
-    for (unsigned i = 0; i < vlen; ++i) {
-        struct msghdr* msg = &msgvec[i].msg_hdr;
-        if (msg->msg_iov && msg->msg_iovlen > 0)
-    }
     return ret;
 }
 

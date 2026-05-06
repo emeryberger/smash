@@ -520,7 +520,6 @@ extern "C" int co_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
         smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
     }
     int ret = CO_ORIG(poll_fn_t, co_poll)(fds, nfds, timeout);
-    if (vm && fds && nfds > 0)
     return ret;
 }
 
@@ -558,10 +557,6 @@ extern "C" int co_kevent(int kq, const struct kevent* changelist, int nchanges,
                 smash::vm::warmPages(eventlist, nevents * sizeof(struct kevent), vm);
         }
     }
-    if (vm) {
-        if (changelist && nchanges > 0)
-        if (eventlist && nevents > 0)
-    }
     return ret;
 }
 
@@ -583,7 +578,6 @@ static inline void unpinFileBuffer(FILE* stream, smash::VmRegion* vm) {
     if (!stream) return;
     void* base = stream->_bf._base;
     int size = stream->_bf._size;
-    if (base && size > 0)
 }
 
 using fread_fn_t = size_t(*)(void*, size_t, size_t, FILE*);
@@ -749,7 +743,6 @@ extern "C" int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
         smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
     }
     int ret = orig_poll(fds, nfds, timeout);
-    if (vm && fds && nfds > 0)
     return ret;
 }
 
@@ -763,7 +756,6 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
         smash::vm::warmPages(events, maxevents * sizeof(struct epoll_event), vm);
     }
     int ret = orig_epoll_wait(epfd, events, maxevents, timeout);
-    if (vm && events && maxevents > 0)
     return ret;
 }
 

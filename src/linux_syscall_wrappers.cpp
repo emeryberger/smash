@@ -483,14 +483,6 @@ static inline void warmGlibcFileBuffer(FILE* stream, smash::VmRegion* vm) {
     }
 }
 
-static inline void unpinGlibcFileBuffer(FILE* stream, smash::VmRegion* vm) {
-    if (!stream || !vm) return;
-    char* base = stream->_IO_buf_base;
-    char* end  = stream->_IO_buf_end;
-    if (base && end > base) {
-        size_t sz = static_cast<size_t>(end - base);
-        if (bufferInHeap(base, sz, vm))
-    }
 }
 
 SMASH_VISIBLE size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
@@ -503,7 +495,6 @@ SMASH_VISIBLE size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     if (pin_buf) smash::vm::warmPages(ptr, total, vm);
     warmGlibcFileBuffer(stream, vm);
     size_t ret = real_fread(ptr, size, nmemb, stream);
-    unpinGlibcFileBuffer(stream, vm);
     return ret;
 }
 
@@ -516,7 +507,6 @@ SMASH_VISIBLE char* fgets(char* s, int size, FILE* stream) {
     if (pin_s) smash::vm::warmPages(s, size, vm);
     warmGlibcFileBuffer(stream, vm);
     char* ret = real_fgets(s, size, stream);
-    unpinGlibcFileBuffer(stream, vm);
     return ret;
 }
 
@@ -527,7 +517,6 @@ SMASH_VISIBLE int fgetc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     warmGlibcFileBuffer(stream, vm);
     int ret = real_fgetc(stream);
-    unpinGlibcFileBuffer(stream, vm);
     return ret;
 }
 
@@ -546,7 +535,6 @@ SMASH_VISIBLE size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* st
         smash::vm::warmPages(const_cast<void*>(ptr), total, vm);
     warmGlibcFileBuffer(stream, vm);
     size_t ret = real_fwrite(ptr, size, nmemb, stream);
-    unpinGlibcFileBuffer(stream, vm);
     return ret;
 }
 
@@ -557,7 +545,6 @@ SMASH_VISIBLE int fflush(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     warmGlibcFileBuffer(stream, vm);
     int ret = real_fflush(stream);
-    unpinGlibcFileBuffer(stream, vm);
     return ret;
 }
 

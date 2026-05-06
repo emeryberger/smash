@@ -688,9 +688,6 @@ static inline void warmFileBuffer(FILE* stream, smash::VmRegion* vm) {
     }
 }
 
-static inline void unpinFileBuffer(FILE* stream, smash::VmRegion* vm) {
-}
-
 using fread_fn = size_t(*)(void*, size_t, size_t, FILE*);
 using fgets_fn = char*(*)(char*, int, FILE*);
 
@@ -705,7 +702,6 @@ extern "C" size_t smash_fread(void* ptr, size_t size, size_t nitems, FILE* strea
     }
     size_t ret = reinterpret_cast<fread_fn>(smash_interpose_smash_fread.original)(ptr, size, nitems, stream);
     if (vm) {
-        unpinFileBuffer(stream, vm);
     }
     return ret;
 }
@@ -720,7 +716,6 @@ extern "C" char* smash_fgets(char* str, int size, FILE* stream) {
     }
     char* ret = reinterpret_cast<fgets_fn>(smash_interpose_smash_fgets.original)(str, size, stream);
     if (vm) {
-        unpinFileBuffer(stream, vm);
     }
     return ret;
 }
@@ -740,7 +735,6 @@ extern "C" int smash_fgetc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
     int ret = reinterpret_cast<fgetc_fn>(smash_interpose_smash_fgetc.original)(stream);
-    if (vm) unpinFileBuffer(stream, vm);
     return ret;
 }
 
@@ -750,7 +744,6 @@ extern "C" int smash_getc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
     int ret = reinterpret_cast<getc_fn>(smash_interpose_smash_getc.original)(stream);
-    if (vm) unpinFileBuffer(stream, vm);
     return ret;
 }
 
@@ -773,7 +766,6 @@ extern "C" size_t smash_fwrite(const void* ptr, size_t size, size_t nitems, FILE
         warmFileBuffer(stream, vm);
     }
     size_t ret = reinterpret_cast<fwrite_fn>(smash_interpose_smash_fwrite.original)(ptr, size, nitems, stream);
-    if (vm) unpinFileBuffer(stream, vm);
     return ret;
 }
 
@@ -783,7 +775,6 @@ extern "C" int smash_fflush(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
     int ret = reinterpret_cast<fflush_fn>(smash_interpose_smash_fflush.original)(stream);
-    if (vm) unpinFileBuffer(stream, vm);
     return ret;
 }
 

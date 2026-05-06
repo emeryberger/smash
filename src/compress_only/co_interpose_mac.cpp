@@ -274,12 +274,6 @@ static inline void warmFileBuffer(FILE* stream, smash::VmRegion* vm) {
     }
 }
 
-static inline void unpinFileBuffer(FILE* stream, smash::VmRegion* vm) {
-    if (!stream) return;
-    void* base = stream->_bf._base;
-    int size = stream->_bf._size;
-}
-
 using fread_fn_t = size_t(*)(void*, size_t, size_t, FILE*);
 using fgets_fn_t = char*(*)(char*, int, FILE*);
 using fgetc_fn_t = int(*)(FILE*);
@@ -297,7 +291,6 @@ extern "C" size_t co_fread(void* ptr, size_t size, size_t nitems, FILE* stream) 
     }
     size_t ret = CO_ORIG(fread_fn_t, co_fread)(ptr, size, nitems, stream);
     if (vm) {
-        unpinFileBuffer(stream, vm);
     }
     return ret;
 }
@@ -312,7 +305,6 @@ extern "C" char* co_fgets(char* str, int size, FILE* stream) {
     }
     char* ret = CO_ORIG(fgets_fn_t, co_fgets)(str, size, stream);
     if (vm) {
-        unpinFileBuffer(stream, vm);
     }
     return ret;
 }
@@ -323,7 +315,6 @@ extern "C" int co_fgetc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
     int ret = CO_ORIG(fgetc_fn_t, co_fgetc)(stream);
-    if (vm) unpinFileBuffer(stream, vm);
     return ret;
 }
 
@@ -333,7 +324,6 @@ extern "C" int co_getc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
     int ret = CO_ORIG(fgetc_fn_t, co_getc)(stream);
-    if (vm) unpinFileBuffer(stream, vm);
     return ret;
 }
 
@@ -347,7 +337,6 @@ extern "C" size_t co_fwrite(const void* ptr, size_t size, size_t nitems, FILE* s
         warmFileBuffer(stream, vm);
     }
     size_t ret = CO_ORIG(fwrite_fn_t, co_fwrite)(ptr, size, nitems, stream);
-    if (vm) unpinFileBuffer(stream, vm);
     return ret;
 }
 
@@ -357,7 +346,6 @@ extern "C" int co_fflush(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
     int ret = CO_ORIG(fflush_fn_t, co_fflush)(stream);
-    if (vm) unpinFileBuffer(stream, vm);
     return ret;
 }
 

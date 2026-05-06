@@ -108,16 +108,22 @@ inline auto retryOnEfault(Syscall syscall, Rewarm rewarm)
     return ret;
 }
 
-// Touch one byte per page in [buf, buf+len). Reads suffice — they trigger
-// the fault handler from PROT_NONE/PROT_READ → decompress → upgrade to RW.
-// Read-only (no write-back) so it's safe on read-only mappings.
+// Touch one byte per page in [buf, buf+len) to trigger the fault handler.
+// Reads alone are insufficient: a PROT_NONE page faults on read (handler
+// decompresses → PROT_RW), but a PROT_READ monitoring page does not fault
+// on read (read access is allowed) — only the write below transitions it
+// back to PROT_RW via the handler. The read-then-write-back pattern is
+// content-preserving and safe on any Smash-managed page (vm->contains()
+// filter) since smash-protected pages always have PROT_RW underneath.
 inline void walkPagesForFault(const void* buf, size_t len, VmRegion* vm) {
     if (!buf || !len || !vm) return;
     auto base = reinterpret_cast<uintptr_t>(buf);
     auto end = base + len;
     for (auto p = base & ~(static_cast<uintptr_t>(kPageSize) - 1); p < end; p += kPageSize) {
         if (!vm->contains(p)) continue;
-        (void)*reinterpret_cast<volatile char*>(p);
+        volatile char* vp = reinterpret_cast<volatile char*>(p);
+        char c = *vp;   // PROT_NONE → fault → decompress
+        *vp = c;        // PROT_READ → fault → upgrade to PROT_RW
     }
 }
 

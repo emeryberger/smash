@@ -483,8 +483,6 @@ static inline void warmGlibcFileBuffer(FILE* stream, smash::VmRegion* vm) {
     }
 }
 
-}
-
 SMASH_VISIBLE size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     using fn_t = size_t(*)(void*, size_t, size_t, FILE*);
     SMASH_LAZY_RESOLVE(fn_t, fread);

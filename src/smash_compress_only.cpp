@@ -423,7 +423,7 @@ extern "C" ssize_t co_read(int fd, void* buf, size_t count);
 CO_INTERPOSE(co_read, read);
 extern "C" ssize_t co_read(int fd, void* buf, size_t count) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::pinPages(buf, count, vm); smash::vm::warmPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::pinPages(buf, count, vm);
     ssize_t ret = smash::vm::retryWithDecompress(
         [&] { return CO_ORIG(read_fn_t, co_read)(fd, buf, count); },
         [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });
@@ -435,7 +435,7 @@ extern "C" ssize_t co_write(int fd, const void* buf, size_t count);
 CO_INTERPOSE(co_write, write);
 extern "C" ssize_t co_write(int fd, const void* buf, size_t count) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::pinPages(buf, count, vm); smash::vm::warmPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::pinPages(buf, count, vm);
     ssize_t ret = smash::vm::retryWithDecompress(
         [&] { return CO_ORIG(write_fn_t, co_write)(fd, buf, count); },
         [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });

@@ -72,14 +72,6 @@ static inline bool iovecInHeap(const struct iovec* iov, int iovcnt, smash::VmReg
     return false;
 }
 
-// Helper: warm iovec array buffers (only those in heap)
-static inline void warmIovecLinux(const struct iovec* iov, int iovcnt, smash::VmRegion* vm) {
-    for (int i = 0; i < iovcnt; ++i) {
-        if (iov[i].iov_base && iov[i].iov_len && bufferInHeap(iov[i].iov_base, iov[i].iov_len, vm))
-            smash::vm::warmPages(iov[i].iov_base, iov[i].iov_len, vm);
-    }
-}
-
 // Use explicit visibility attribute - pragma doesn't work with -fvisibility=hidden
 #define SMASH_VISIBLE __attribute__((visibility("default")))
 

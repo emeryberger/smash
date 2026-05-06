@@ -133,14 +133,6 @@ typedef struct {
         reinterpret_cast<void*>(original) \
     }
 
-// Helper: warm iovec array buffers
-static inline void warmIovec(const struct iovec* iov, int iovcnt, smash::VmRegion* vm) {
-    for (int i = 0; i < iovcnt; ++i) {
-        if (iov[i].iov_base && iov[i].iov_len)
-            smash::vm::warmPages(iov[i].iov_base, iov[i].iov_len, vm);
-    }
-}
-
 // To call the real (original) function from within an interpose wrapper, we
 // read the .original field of the interpose struct. The linker resolves this
 // to the real function address at load time, before dyld processes the section.

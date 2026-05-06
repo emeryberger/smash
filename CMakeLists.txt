@@ -5,6 +5,11 @@ project(smash
   DESCRIPTION "Compression-aware memory allocator"
 )
 
+# Generate build/compile_commands.json so clangd (see .clangd) and other
+# language servers can resolve include paths, defines, and per-file flags
+# without needing the user to remember a CMake option.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Allow FetchContent_Populate for older CMake compatibility
 if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)

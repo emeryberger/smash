@@ -165,3 +165,38 @@ else()
   )
 endif()
 set_tests_properties(test_malloc_compression PROPERTIES TIMEOUT 60)
+
+# Syscall EFAULT-retry test: allocates a buffer, forces compression, then
+# issues real syscalls (read/writev/readv) directly on the compressed
+# buffer. Verifies that the EFAULT-driven retry path in syscall_compat.h
+# actually catches kernel-level buffer protection faults and recovers.
+# Without retryWithDecompress, the kernel returns -1/EFAULT and the test
+# fails. Also exercises the iovec walk path in the rewarm callback.
+add_executable(syscall_efault_test syscall_efault_test.cpp)
+set_target_properties(syscall_efault_test PROPERTIES
+  CXX_STANDARD 20
+)
+if(APPLE)
+  add_test(
+    NAME test_syscall_efault
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "DYLD_FORCE_FLAT_NAMESPACE=1"
+      "MallocNanoZone=0"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      $<TARGET_FILE:syscall_efault_test>
+  )
+else()
+  add_test(
+    NAME test_syscall_efault
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      $<TARGET_FILE:syscall_efault_test>
+  )
+endif()
+set_tests_properties(test_syscall_efault PROPERTIES TIMEOUT 60)

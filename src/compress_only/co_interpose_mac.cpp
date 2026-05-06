@@ -164,9 +164,8 @@ extern "C" ssize_t co_read(int fd, void* buf, size_t count);
 CO_INTERPOSE(co_read, read);
 extern "C" ssize_t co_read(int fd, void* buf, size_t count) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
     ssize_t ret = CO_ORIG(read_fn_t, co_read)(fd, buf, count);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
@@ -174,9 +173,8 @@ extern "C" ssize_t co_write(int fd, const void* buf, size_t count);
 CO_INTERPOSE(co_write, write);
 extern "C" ssize_t co_write(int fd, const void* buf, size_t count) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
     ssize_t ret = CO_ORIG(write_fn_t, co_write)(fd, buf, count);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
@@ -184,9 +182,8 @@ extern "C" ssize_t co_pread(int fd, void* buf, size_t count, off_t offset);
 CO_INTERPOSE(co_pread, pread);
 extern "C" ssize_t co_pread(int fd, void* buf, size_t count, off_t offset) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
     ssize_t ret = CO_ORIG(pread_fn_t, co_pread)(fd, buf, count, offset);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
@@ -194,9 +191,8 @@ extern "C" ssize_t co_pwrite(int fd, const void* buf, size_t count, off_t offset
 CO_INTERPOSE(co_pwrite, pwrite);
 extern "C" ssize_t co_pwrite(int fd, const void* buf, size_t count, off_t offset) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
     ssize_t ret = CO_ORIG(pwrite_fn_t, co_pwrite)(fd, buf, count, offset);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
@@ -204,9 +200,8 @@ extern "C" ssize_t co_readv(int fd, const struct iovec* iov, int iovcnt);
 CO_INTERPOSE(co_readv, readv);
 extern "C" ssize_t co_readv(int fd, const struct iovec* iov, int iovcnt) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) { co::warmIovec(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
+    if (vm && iov && iovcnt > 0) co::warmIovec(iov, iovcnt, vm);
     ssize_t ret = CO_ORIG(readv_fn_t, co_readv)(fd, iov, iovcnt);
-    if (vm && iov && iovcnt > 0) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
 
@@ -214,9 +209,8 @@ extern "C" ssize_t co_writev(int fd, const struct iovec* iov, int iovcnt);
 CO_INTERPOSE(co_writev, writev);
 extern "C" ssize_t co_writev(int fd, const struct iovec* iov, int iovcnt) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) { co::warmIovec(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
+    if (vm && iov && iovcnt > 0) co::warmIovec(iov, iovcnt, vm);
     ssize_t ret = CO_ORIG(writev_fn_t, co_writev)(fd, iov, iovcnt);
-    if (vm && iov && iovcnt > 0) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
 
@@ -224,9 +218,8 @@ extern "C" ssize_t co_recv(int s, void* buf, size_t len, int flags);
 CO_INTERPOSE(co_recv, recv);
 extern "C" ssize_t co_recv(int s, void* buf, size_t len, int flags) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
+    if (vm && buf && len) smash::vm::warmPages(buf, len, vm);
     ssize_t ret = CO_ORIG(recv_fn_t, co_recv)(s, buf, len, flags);
-    if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
 
@@ -234,9 +227,8 @@ extern "C" ssize_t co_send(int s, const void* buf, size_t len, int flags);
 CO_INTERPOSE(co_send, send);
 extern "C" ssize_t co_send(int s, const void* buf, size_t len, int flags) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
+    if (vm && buf && len) smash::vm::warmPages(buf, len, vm);
     ssize_t ret = CO_ORIG(send_fn_t, co_send)(s, buf, len, flags);
-    if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
 
@@ -246,10 +238,8 @@ extern "C" int co_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && fds && nfds > 0) {
         smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
-        smash::vm::pinPages(fds, nfds * sizeof(struct pollfd), vm);
     }
     int ret = CO_ORIG(poll_fn_t, co_poll)(fds, nfds, timeout);
-    if (vm && fds && nfds > 0) smash::vm::unpinPages(fds, nfds * sizeof(struct pollfd), vm);
     return ret;
 }
 
@@ -264,20 +254,12 @@ extern "C" int co_kevent(int kq, const struct kevent* changelist, int nchanges,
     if (vm) {
         if (changelist && nchanges > 0) {
             smash::vm::warmPages(changelist, nchanges * sizeof(struct kevent), vm);
-            smash::vm::pinPages(changelist, nchanges * sizeof(struct kevent), vm);
         }
         if (eventlist && nevents > 0) {
             smash::vm::warmPages(eventlist, nevents * sizeof(struct kevent), vm);
-            smash::vm::pinPages(eventlist, nevents * sizeof(struct kevent), vm);
         }
     }
     int ret = CO_ORIG(kevent_fn_t, co_kevent)(kq, changelist, nchanges, eventlist, nevents, timeout);
-    if (vm) {
-        if (changelist && nchanges > 0)
-            smash::vm::unpinPages(changelist, nchanges * sizeof(struct kevent), vm);
-        if (eventlist && nevents > 0)
-            smash::vm::unpinPages(eventlist, nevents * sizeof(struct kevent), vm);
-    }
     return ret;
 }
 
@@ -289,7 +271,6 @@ static inline void warmFileBuffer(FILE* stream, smash::VmRegion* vm) {
     int size = stream->_bf._size;
     if (base && size > 0) {
         smash::vm::warmPages(base, size, vm);
-        smash::vm::pinPages(base, size, vm);
     }
 }
 
@@ -297,7 +278,6 @@ static inline void unpinFileBuffer(FILE* stream, smash::VmRegion* vm) {
     if (!stream) return;
     void* base = stream->_bf._base;
     int size = stream->_bf._size;
-    if (base && size > 0) smash::vm::unpinPages(base, size, vm);
 }
 
 using fread_fn_t = size_t(*)(void*, size_t, size_t, FILE*);
@@ -312,12 +292,11 @@ extern "C" size_t co_fread(void* ptr, size_t size, size_t nitems, FILE* stream) 
     auto* vm = smash::g_smash_vm_region;
     size_t total = size * nitems;
     if (vm) {
-        if (ptr && total) { smash::vm::warmPages(ptr, total, vm); smash::vm::pinPages(ptr, total, vm); }
+        if (ptr && total) smash::vm::warmPages(ptr, total, vm);
         warmFileBuffer(stream, vm);
     }
     size_t ret = CO_ORIG(fread_fn_t, co_fread)(ptr, size, nitems, stream);
     if (vm) {
-        if (ptr && total) smash::vm::unpinPages(ptr, total, vm);
         unpinFileBuffer(stream, vm);
     }
     return ret;
@@ -328,12 +307,11 @@ CO_INTERPOSE(co_fgets, fgets);
 extern "C" char* co_fgets(char* str, int size, FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) {
-        if (str && size > 0) { smash::vm::warmPages(str, size, vm); smash::vm::pinPages(str, size, vm); }
+        if (str && size > 0) smash::vm::warmPages(str, size, vm);
         warmFileBuffer(stream, vm);
     }
     char* ret = CO_ORIG(fgets_fn_t, co_fgets)(str, size, stream);
     if (vm) {
-        if (str && size > 0) smash::vm::unpinPages(str, size, vm);
         unpinFileBuffer(stream, vm);
     }
     return ret;

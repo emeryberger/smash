@@ -183,72 +183,64 @@ using epoll_wait_fn_t = int(*)(int, struct epoll_event*, int, int);
 extern "C" CO_EXPORT ssize_t read(int fd, void* buf, size_t count) {
     CO_ORIG_DECL(read_fn_t, read);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
     ssize_t ret = orig_read(fd, buf, count);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
 extern "C" CO_EXPORT ssize_t write(int fd, const void* buf, size_t count) {
     CO_ORIG_DECL(write_fn_t, write);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
     ssize_t ret = orig_write(fd, buf, count);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
 extern "C" CO_EXPORT ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
     CO_ORIG_DECL(pread_fn_t, pread);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
     ssize_t ret = orig_pread(fd, buf, count, offset);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
 extern "C" CO_EXPORT ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
     CO_ORIG_DECL(pwrite_fn_t, pwrite);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) { smash::vm::warmPages(buf, count, vm); smash::vm::pinPages(buf, count, vm); }
+    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
     ssize_t ret = orig_pwrite(fd, buf, count, offset);
-    if (vm && buf && count) smash::vm::unpinPages(buf, count, vm);
     return ret;
 }
 
 extern "C" CO_EXPORT ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
     CO_ORIG_DECL(readv_fn_t, readv);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) { co::warmIovec(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
+    if (vm && iov && iovcnt > 0) co::warmIovec(iov, iovcnt, vm);
     ssize_t ret = orig_readv(fd, iov, iovcnt);
-    if (vm && iov && iovcnt > 0) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
 
 extern "C" CO_EXPORT ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
     CO_ORIG_DECL(writev_fn_t, writev);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) { co::warmIovec(iov, iovcnt, vm); smash::vm::pinIovec(iov, iovcnt, vm); }
+    if (vm && iov && iovcnt > 0) co::warmIovec(iov, iovcnt, vm);
     ssize_t ret = orig_writev(fd, iov, iovcnt);
-    if (vm && iov && iovcnt > 0) smash::vm::unpinIovec(iov, iovcnt, vm);
     return ret;
 }
 
 extern "C" CO_EXPORT ssize_t recv(int s, void* buf, size_t len, int flags) {
     CO_ORIG_DECL(recv_fn_t, recv);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
+    if (vm && buf && len) smash::vm::warmPages(buf, len, vm);
     ssize_t ret = orig_recv(s, buf, len, flags);
-    if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
 
 extern "C" CO_EXPORT ssize_t send(int s, const void* buf, size_t len, int flags) {
     CO_ORIG_DECL(send_fn_t, send);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) { smash::vm::warmPages(buf, len, vm); smash::vm::pinPages(buf, len, vm); }
+    if (vm && buf && len) smash::vm::warmPages(buf, len, vm);
     ssize_t ret = orig_send(s, buf, len, flags);
-    if (vm && buf && len) smash::vm::unpinPages(buf, len, vm);
     return ret;
 }
 
@@ -257,11 +249,9 @@ extern "C" CO_EXPORT int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && fds && nfds > 0) {
         smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
-        smash::vm::pinPages(fds, nfds * sizeof(struct pollfd), vm);
     }
     int ret = orig_poll(fds, nfds, timeout);
     if (vm && fds && nfds > 0)
-        smash::vm::unpinPages(fds, nfds * sizeof(struct pollfd), vm);
     return ret;
 }
 
@@ -270,11 +260,9 @@ extern "C" CO_EXPORT int epoll_wait(int epfd, struct epoll_event* events, int ma
     auto* vm = smash::g_smash_vm_region;
     if (vm && events && maxevents > 0) {
         smash::vm::warmPages(events, maxevents * sizeof(struct epoll_event), vm);
-        smash::vm::pinPages(events, maxevents * sizeof(struct epoll_event), vm);
     }
     int ret = orig_epoll_wait(epfd, events, maxevents, timeout);
     if (vm && events && maxevents > 0)
-        smash::vm::unpinPages(events, maxevents * sizeof(struct epoll_event), vm);
     return ret;
 }
 

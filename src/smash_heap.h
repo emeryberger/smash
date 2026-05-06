@@ -446,8 +446,6 @@ public:
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
             g_smash_page_states_for_external = &page_states_;
-            vm::g_page_pins = bootstrapArray<std::atomic<uint8_t>>(
-                vm_region_.totalPages());
 
             if constexpr (kMeasureCohorts) {
                 cohort_pages_len_ = vm_region_.totalPages();

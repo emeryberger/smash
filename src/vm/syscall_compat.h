@@ -111,3 +111,56 @@ inline mach_msg_return_t retryMachOnInvalidData(Syscall syscall, Walk walk) {
 #endif
 
 } // namespace smash::vm
+
+// Forward declaration of the global VmRegion pointer (defined in
+// smash_heap.cpp). Declared in the smash:: namespace to match the
+// definition. The wrapper templates below use it without pulling in
+// smash_heap.h (which would create circular include dependencies).
+namespace smash { extern VmRegion* g_smash_vm_region; }
+
+namespace smash::vm {
+
+// ── High-level wrapper templates ──────────────────────────────────────────
+// Most syscall wrappers touch one or two userspace buffers and want the
+// "if EFAULT, walk + retry" loop. These templates collapse the boilerplate
+// to a single line per wrapper.
+
+// Single-buffer wrapper (read/write/recv/send/poll/epoll_wait/fstat/...).
+template <typename Syscall>
+inline auto retryWith1Buf(Syscall syscall, const void* buf, size_t len)
+    -> decltype(syscall()) {
+    auto* vm = ::smash::g_smash_vm_region;
+    return retryWithDecompress(
+        syscall,
+        [&] { if (vm && buf && len) walkPagesForFault(buf, len, vm); });
+}
+
+// Two-buffer wrapper (kevent/kevent64 changelist + eventlist).
+template <typename Syscall>
+inline auto retryWith2Bufs(Syscall syscall,
+                           const void* a, size_t a_len,
+                           const void* b, size_t b_len)
+    -> decltype(syscall()) {
+    auto* vm = ::smash::g_smash_vm_region;
+    return retryWithDecompress(
+        syscall,
+        [&] {
+            if (vm) {
+                if (a && a_len) walkPagesForFault(a, a_len, vm);
+                if (b && b_len) walkPagesForFault(b, b_len, vm);
+            }
+        });
+}
+
+// Iovec wrapper (readv/writev). Walks every iovec entry on retry.
+template <typename Syscall>
+inline auto retryWithIovec(Syscall syscall,
+                           const struct iovec* iov, int iovcnt)
+    -> decltype(syscall()) {
+    auto* vm = ::smash::g_smash_vm_region;
+    return retryWithDecompress(
+        syscall,
+        [&] { if (vm && iov && iovcnt > 0) walkIovecForFault(iov, iovcnt, vm); });
+}
+
+} // namespace smash::vm

@@ -28,6 +28,8 @@
 #include <sys/select.h>
 #include <sys/random.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
 #include <poll.h>
 #include <cstdarg>
 #include <cstdio>
@@ -87,96 +89,72 @@ SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, read);
     if (!real_read) return syscall(SYS_read, fd, buf, count);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, count, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_read(fd, buf, count); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 SMASH_VISIBLE ssize_t write(int fd, const void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, const void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, write);
     if (!real_write) return syscall(SYS_write, fd, buf, count);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, count, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_write(fd, buf, count); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 SMASH_VISIBLE ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
     using fn_t = ssize_t(*)(int, void*, size_t, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pread);
     if (!real_pread) return syscall(SYS_pread64, fd, buf, count, offset);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, count, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_pread(fd, buf, count, offset); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 SMASH_VISIBLE ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
     using fn_t = ssize_t(*)(int, const void*, size_t, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pwrite);
     if (!real_pwrite) return syscall(SYS_pwrite64, fd, buf, count, offset);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, count, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_pwrite(fd, buf, count, offset); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 SMASH_VISIBLE ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, readv);
     if (!real_readv) return syscall(SYS_readv, fd, iov, iovcnt);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = iovecInHeap(iov, iovcnt, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWithIovec(
         [&] { return real_readv(fd, iov, iovcnt); },
-        [&] { if (in_heap) smash::vm::walkIovecForFault(iov, iovcnt, vm); });
-    return ret;
+        iov, iovcnt);
 }
 
 SMASH_VISIBLE ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, writev);
     if (!real_writev) return syscall(SYS_writev, fd, iov, iovcnt);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = iovecInHeap(iov, iovcnt, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWithIovec(
         [&] { return real_writev(fd, iov, iovcnt); },
-        [&] { if (in_heap) smash::vm::walkIovecForFault(iov, iovcnt, vm); });
-    return ret;
+        iov, iovcnt);
 }
 
 SMASH_VISIBLE ssize_t recv(int s, void* buf, size_t len, int flags) {
     using fn_t = ssize_t(*)(int, void*, size_t, int);
     SMASH_LAZY_RESOLVE(fn_t, recv);
     if (!real_recv) return syscall(SYS_recvfrom, s, buf, len, flags, nullptr, nullptr);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, len, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_recv(s, buf, len, flags); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, len, vm); });
-    return ret;
+        buf, len);
 }
 
 SMASH_VISIBLE ssize_t send(int s, const void* buf, size_t len, int flags) {
     using fn_t = ssize_t(*)(int, const void*, size_t, int);
     SMASH_LAZY_RESOLVE(fn_t, send);
     if (!real_send) return syscall(SYS_sendto, s, buf, len, flags, nullptr, 0);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, len, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_send(s, buf, len, flags); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, len, vm); });
-    return ret;
+        buf, len);
 }
 
 SMASH_VISIBLE ssize_t recvfrom(int s, void* buf, size_t len, int flags,
@@ -184,12 +162,9 @@ SMASH_VISIBLE ssize_t recvfrom(int s, void* buf, size_t len, int flags,
     using fn_t = ssize_t(*)(int, void*, size_t, int, struct sockaddr*, socklen_t*);
     SMASH_LAZY_RESOLVE(fn_t, recvfrom);
     if (!real_recvfrom) return syscall(SYS_recvfrom, s, buf, len, flags, from, fromlen);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, len, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_recvfrom(s, buf, len, flags, from, fromlen); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, len, vm); });
-    return ret;
+        buf, len);
 }
 
 SMASH_VISIBLE ssize_t sendto(int s, const void* buf, size_t len, int flags,
@@ -197,12 +172,9 @@ SMASH_VISIBLE ssize_t sendto(int s, const void* buf, size_t len, int flags,
     using fn_t = ssize_t(*)(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
     SMASH_LAZY_RESOLVE(fn_t, sendto);
     if (!real_sendto) return syscall(SYS_sendto, s, buf, len, flags, to, tolen);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, len, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_sendto(s, buf, len, flags, to, tolen); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, len, vm); });
-    return ret;
+        buf, len);
 }
 
 SMASH_VISIBLE ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
@@ -414,6 +386,32 @@ SMASH_VISIBLE int getpeername(int sockfd, struct sockaddr* addr, socklen_t* addr
     return ret;
 }
 
+// ── fstat / fstatfs ─────────────────────────────────────────────────────────
+// Both write a struct (stat / statfs) into a userspace buffer. The buffer
+// is normally on the stack but heap-allocated struct stat / struct statfs
+// is a real pattern in long-lived state-tracking code.
+SMASH_VISIBLE int fstat(int fd, struct stat* st) {
+    using fn_t = int(*)(int, struct stat*);
+    SMASH_LAZY_RESOLVE(fn_t, fstat);
+    if (!real_fstat) {
+        // glibc historically routed fstat through __fxstat(version, ...).
+        // Falling back to the raw syscall covers both layouts.
+        return syscall(SYS_fstat, fd, st);
+    }
+    return smash::vm::retryWith1Buf(
+        [&] { return real_fstat(fd, st); },
+        st, sizeof(struct stat));
+}
+
+SMASH_VISIBLE int fstatfs(int fd, struct statfs* st) {
+    using fn_t = int(*)(int, struct statfs*);
+    SMASH_LAZY_RESOLVE(fn_t, fstatfs);
+    if (!real_fstatfs) return syscall(SYS_fstatfs, fd, st);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_fstatfs(fd, st); },
+        st, sizeof(struct statfs));
+}
+
 // ── getrandom ───────────────────────────────────────────────────────────────
 // The kernel fills a userspace buffer with random bytes. NSS/OpenSSL/Firefox
 // use this for cryptographic initialization.
@@ -421,12 +419,9 @@ SMASH_VISIBLE ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
     using fn_t = ssize_t(*)(void*, size_t, unsigned int);
     SMASH_LAZY_RESOLVE(fn_t, getrandom);
     if (!real_getrandom) return syscall(SYS_getrandom, buf, buflen, flags);
-    auto* vm = smash::g_smash_vm_region;
-    bool in_heap = bufferInHeap(buf, buflen, vm);
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return real_getrandom(buf, buflen, flags); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(buf, buflen, vm); });
-    return ret;
+        buf, buflen);
 }
 
 // ── getcwd buffer hooks ─────────────────────────────────────────────────────

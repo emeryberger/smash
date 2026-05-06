@@ -29,20 +29,22 @@
 //      both iovec slots were touched, exercising the iovec walk path).
 
 #include <cerrno>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <string>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 namespace {
 
 constexpr size_t kBufBytes  = 16 * 1024 * 1024;  // 16 MiB
-constexpr size_t kSleepSec  = 5;                  // ≥ 2 × COLD_TIMEOUT_SEC=1
+constexpr size_t kSleepSec  = 3;                  // ≥ 2 × COLD_TIMEOUT_SEC=1
 constexpr size_t kSliceSize = 4 * 1024 * 1024;    // 4 MiB per iovec slot
 
 void fillCompressible(unsigned char* p, size_t bytes, unsigned char tag) {
@@ -258,6 +260,204 @@ int main() {
     }
     fprintf(stderr, "syscall_efault_test: readv() into compressed buffer PASSED\n");
 
+    // ── Phase 5: send + recv via socketpair ───────────────────────────────
+    // Tests two interposed syscalls in a single round-trip. Use a small
+    // message that fits in the default SO_SNDBUF (typically 8 KiB on
+    // macOS), so blocking send completes in one shot, followed by blocking
+    // recv. Send reads from compressed buf; recv writes into compressed
+    // recv_buf — both kernel-side buffer touches.
+    constexpr size_t kMsgBytes = 4096;  // single page, fits any SO_SNDBUF
+    fillCompressible(buf, kBufBytes, 0xDD);
+    auto* recv_buf = static_cast<unsigned char*>(std::malloc(kBufBytes));
+    if (!recv_buf) { fprintf(stderr, "FAIL: malloc recv_buf\n"); return 1; }
+    fillCompressible(recv_buf, kBufBytes, 0x99);
+
+    if (!waitForCompression("pre-send/recv")) return 1;
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        fprintf(stderr, "FAIL: socketpair errno=%d\n", errno);
+        return 1;
+    }
+    ssize_t s_n = send(sv[0], buf, kMsgBytes, 0);
+    if (s_n != static_cast<ssize_t>(kMsgBytes)) {
+        fprintf(stderr, "FAIL: send() returned %zd errno=%d (%s)\n",
+                s_n, errno, std::strerror(errno));
+        return 1;
+    }
+    ssize_t r_n = recv(sv[1], recv_buf, kMsgBytes, MSG_WAITALL);
+    if (r_n != static_cast<ssize_t>(kMsgBytes)) {
+        fprintf(stderr, "FAIL: recv() returned %zd errno=%d (%s)\n",
+                r_n, errno, std::strerror(errno));
+        return 1;
+    }
+    close(sv[0]);
+    close(sv[1]);
+    if (std::memcmp(buf, recv_buf, kMsgBytes) != 0) {
+        fprintf(stderr, "FAIL: send/recv roundtrip data mismatch\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: send/recv via socketpair PASSED\n");
+
+    // ── Phase 6: pread() into compressed buffer ───────────────────────────
+    // Same hazard as read() but the kernel goes through the SYS_pread path
+    // — separate wrapper, separate code path through retryWithDecompress.
+    fillCompressible(buf, kBufBytes, 0xEE);
+    if (!waitForCompression("pre-pread")) return 1;
+
+    char tmp_path[] = "/tmp/smash-efault-pread-XXXXXX";
+    int tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) { fprintf(stderr, "FAIL: mkstemp\n"); return 1; }
+    unlink(tmp_path);
+    // Write a deterministic 1 MiB into the temp file.
+    constexpr size_t kPreadBytes = 1 * 1024 * 1024;
+    auto* src = static_cast<unsigned char*>(std::malloc(kPreadBytes));
+    if (!src) { fprintf(stderr, "FAIL: malloc src\n"); return 1; }
+    for (size_t i = 0; i < kPreadBytes; ++i)
+        src[i] = static_cast<unsigned char>((i * 31) & 0xff);
+    if (write(tmp_fd, src, kPreadBytes) != static_cast<ssize_t>(kPreadBytes)) {
+        fprintf(stderr, "FAIL: write to temp file\n");
+        return 1;
+    }
+    // Now pread back into the (still potentially compressed) buf.
+    size_t pread_total = 0;
+    while (pread_total < kPreadBytes) {
+        ssize_t n = pread(tmp_fd, buf + pread_total,
+                          kPreadBytes - pread_total,
+                          static_cast<off_t>(pread_total));
+        if (n < 0) {
+            fprintf(stderr, "FAIL: pread() errno=%d (%s)\n",
+                    errno, std::strerror(errno));
+            return 1;
+        }
+        if (n == 0) {
+            fprintf(stderr, "FAIL: pread returned 0 mid-read\n");
+            return 1;
+        }
+        pread_total += static_cast<size_t>(n);
+    }
+    close(tmp_fd);
+    if (std::memcmp(buf, src, kPreadBytes) != 0) {
+        fprintf(stderr, "FAIL: pread() data mismatch — kernel did not "
+                "fully populate the buffer through the EFAULT path\n");
+        return 1;
+    }
+    std::free(src);
+    fprintf(stderr, "syscall_efault_test: pread() into compressed buffer PASSED\n");
+
+    // ── Phase 7: poll() with heap-allocated pollfd array ──────────────────
+    // The pollfd array itself sits in heap memory. The kernel writes
+    // back revents when a fd becomes ready. If the array is on a
+    // compressed page, the kernel write hits EFAULT → retry → walk →
+    // succeed.
+    constexpr size_t kPollFdCount = 1024;  // ~16 KiB — at least one full page
+    auto* fds = static_cast<struct pollfd*>(
+        std::calloc(kPollFdCount, sizeof(struct pollfd)));
+    if (!fds) { fprintf(stderr, "FAIL: calloc fds\n"); return 1; }
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+        fprintf(stderr, "FAIL: socketpair (poll)\n"); return 1;
+    }
+    // Make the first slot a real fd that is writable (always ready);
+    // the rest are dup'd no-op fds at -1 (poll skips them).
+    fds[0].fd = sp[0];
+    fds[0].events = POLLOUT;
+    for (size_t i = 1; i < kPollFdCount; ++i) {
+        fds[i].fd = -1;  // skipped
+        fds[i].events = 0;
+    }
+    if (!waitForCompression("pre-poll")) return 1;
+
+    int poll_ret = poll(fds, kPollFdCount, /*timeout_ms=*/100);
+    if (poll_ret < 0) {
+        fprintf(stderr, "FAIL: poll() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    if (!(fds[0].revents & POLLOUT)) {
+        fprintf(stderr, "FAIL: poll() did not write revents into compressed "
+                "pollfd array (revents=0x%x)\n", fds[0].revents);
+        return 1;
+    }
+    close(sp[0]);
+    close(sp[1]);
+    std::free(fds);
+    fprintf(stderr, "syscall_efault_test: poll() with heap pollfd PASSED\n");
+
+    // ── Phase 8: recvmsg/sendmsg via socketpair (multi-iovec) ─────────────
+    // Like phase 5 but driven through the iovec walk path of recvmsg/
+    // sendmsg's rewarm callback. Small total to fit in default SO_SNDBUF.
+    constexpr size_t kIovSlice = 1024;          // 1 KiB per slot
+    constexpr size_t kIovTotal = kIovSlice * 4; // 4 KiB across 4 iovecs
+    fillCompressible(buf, kBufBytes, 0x77);
+    fillCompressible(recv_buf, kBufBytes, 0x88);
+    if (!waitForCompression("pre-recvmsg/sendmsg")) return 1;
+
+    int sm[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sm) < 0) {
+        fprintf(stderr, "FAIL: socketpair (msg)\n"); return 1;
+    }
+    iovec siov[4];
+    for (int i = 0; i < 4; ++i) {
+        siov[i].iov_base = buf + i * kIovSlice;
+        siov[i].iov_len  = kIovSlice;
+    }
+    iovec riov[4];
+    for (int i = 0; i < 4; ++i) {
+        riov[i].iov_base = recv_buf + i * kIovSlice;
+        riov[i].iov_len  = kIovSlice;
+    }
+    msghdr smsg{}; smsg.msg_iov = siov; smsg.msg_iovlen = 4;
+    msghdr rmsg{}; rmsg.msg_iov = riov; rmsg.msg_iovlen = 4;
+    ssize_t sm_n = sendmsg(sm[0], &smsg, 0);
+    if (sm_n != static_cast<ssize_t>(kIovTotal)) {
+        fprintf(stderr, "FAIL: sendmsg() returned %zd errno=%d (%s)\n",
+                sm_n, errno, std::strerror(errno));
+        return 1;
+    }
+    ssize_t rm_n = recvmsg(sm[1], &rmsg, MSG_WAITALL);
+    if (rm_n != static_cast<ssize_t>(kIovTotal)) {
+        fprintf(stderr, "FAIL: recvmsg() returned %zd errno=%d (%s)\n",
+                rm_n, errno, std::strerror(errno));
+        return 1;
+    }
+    close(sm[0]);
+    close(sm[1]);
+    if (std::memcmp(buf, recv_buf, kIovTotal) != 0) {
+        fprintf(stderr, "FAIL: sendmsg/recvmsg roundtrip mismatch\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: sendmsg/recvmsg via socketpair PASSED\n");
+
+    // ── Phase 9: fstat() into heap-allocated struct stat ──────────────────
+    // fstat is NOT historically interposed by smash. Now that the wrapper
+    // pattern is trivial (5 lines of retryWithDecompress), we add it.
+    // The kernel writes a struct stat into a userspace buffer; if that
+    // buffer is on a compressed page, EFAULT.
+    // Allocate the struct stat *inside* the big heap region so it shares
+    // pages with the rest of buf — guarantees the page is compressed.
+    auto* st = reinterpret_cast<struct stat*>(buf);
+    std::memset(st, 0, sizeof(struct stat));
+    fillCompressible(buf + sizeof(struct stat),
+                     kBufBytes - sizeof(struct stat), 0x55);
+    if (!waitForCompression("pre-fstat")) return 1;
+
+    int fstat_fd = open("/dev/null", O_RDONLY);
+    if (fstat_fd < 0) { fprintf(stderr, "FAIL: open /dev/null for fstat\n"); return 1; }
+    if (fstat(fstat_fd, st) != 0) {
+        fprintf(stderr, "FAIL: fstat() errno=%d (%s) — wrapper missing or "
+                "EFAULT path broken\n", errno, std::strerror(errno));
+        return 1;
+    }
+    close(fstat_fd);
+    if (st->st_mode == 0) {
+        fprintf(stderr, "FAIL: fstat() returned 0 but st_mode==0 — kernel "
+                "did not actually populate the struct\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: fstat() with heap struct stat PASSED\n");
+
+    std::free(recv_buf);
     std::free(buf);
     fprintf(stderr, "syscall_efault_test: ALL PASSED\n");
     return 0;

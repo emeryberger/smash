@@ -422,21 +422,17 @@ using write_fn_t = ssize_t(*)(int, const void*, size_t);
 extern "C" ssize_t co_read(int fd, void* buf, size_t count);
 CO_INTERPOSE(co_read, read);
 extern "C" ssize_t co_read(int fd, void* buf, size_t count) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return CO_ORIG(read_fn_t, co_read)(fd, buf, count); },
-        [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 extern "C" ssize_t co_write(int fd, const void* buf, size_t count);
 CO_INTERPOSE(co_write, write);
 extern "C" ssize_t co_write(int fd, const void* buf, size_t count) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return CO_ORIG(write_fn_t, co_write)(fd, buf, count); },
-        [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 // ── pread / pwrite ───────────────────────────────────────────────────────────

@@ -199,4 +199,4 @@ else()
       $<TARGET_FILE:syscall_efault_test>
   )
 endif()
-set_tests_properties(test_syscall_efault PROPERTIES TIMEOUT 60)
+set_tests_properties(test_syscall_efault PROPERTIES TIMEOUT 180)

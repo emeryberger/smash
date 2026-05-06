@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
 #include <poll.h>
 #include <unistd.h>
 #include <mach/mach.h>
@@ -502,21 +504,17 @@ using send_fn = ssize_t(*)(int, const void*, size_t, int);
 extern "C" ssize_t smash_recv(int s, void* buf, size_t len, int flags);
 SMASH_INTERPOSE(smash_recv, recv);
 extern "C" ssize_t smash_recv(int s, void* buf, size_t len, int flags) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return reinterpret_cast<recv_fn>(smash_interpose_smash_recv.original)(s, buf, len, flags); },
-        [&] { if (vm && buf && len) smash::vm::walkPagesForFault(buf, len, vm); });
-    return ret;
+        buf, len);
 }
 
 extern "C" ssize_t smash_send(int s, const void* buf, size_t len, int flags);
 SMASH_INTERPOSE(smash_send, send);
 extern "C" ssize_t smash_send(int s, const void* buf, size_t len, int flags) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return reinterpret_cast<send_fn>(smash_interpose_smash_send.original)(s, buf, len, flags); },
-        [&] { if (vm && buf && len) smash::vm::walkPagesForFault(buf, len, vm); });
-    return ret;
+        buf, len);
 }
 
 // ── recvfrom / sendto ────────────────────────────────────────────────────────
@@ -598,6 +596,33 @@ extern "C" int smash_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
 
 // epoll_wait interposition is Linux-only (see linux_syscall_wrappers.cpp)
 
+// ── fstat / fstatfs ─────────────────────────────────────────────────────────
+// Both write a struct (stat / statfs) into a userspace buffer. The buffer
+// is normally on the stack but heap-allocated struct stat / struct statfs
+// is a real pattern (e.g., callers that pass a heap-allocated *st through
+// many layers). With the EFAULT-retry pattern, adding wrappers is cheap.
+
+using fstat_fn = int(*)(int, struct stat*);
+using fstatfs_fn = int(*)(int, struct statfs*);
+
+extern "C" int smash_fstat(int fd, struct stat* st);
+SMASH_INTERPOSE(smash_fstat, fstat);
+extern "C" int smash_fstat(int fd, struct stat* st) {
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return reinterpret_cast<fstat_fn>(smash_interpose_smash_fstat.original)(fd, st); },
+        [&] { if (vm && st) smash::vm::walkPagesForFault(st, sizeof(struct stat), vm); });
+}
+
+extern "C" int smash_fstatfs(int fd, struct statfs* st);
+SMASH_INTERPOSE(smash_fstatfs, fstatfs);
+extern "C" int smash_fstatfs(int fd, struct statfs* st) {
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return reinterpret_cast<fstatfs_fn>(smash_interpose_smash_fstatfs.original)(fd, st); },
+        [&] { if (vm && st) smash::vm::walkPagesForFault(st, sizeof(struct statfs), vm); });
+}
+
 // ── read / write ────────────────────────────────────────────────────────────
 
 using read_fn = ssize_t(*)(int, void*, size_t);
@@ -606,21 +631,17 @@ using write_fn = ssize_t(*)(int, const void*, size_t);
 extern "C" ssize_t smash_read(int fd, void* buf, size_t count);
 SMASH_INTERPOSE(smash_read, read);
 extern "C" ssize_t smash_read(int fd, void* buf, size_t count) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return reinterpret_cast<read_fn>(smash_interpose_smash_read.original)(fd, buf, count); },
-        [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 extern "C" ssize_t smash_write(int fd, const void* buf, size_t count);
 SMASH_INTERPOSE(smash_write, write);
 extern "C" ssize_t smash_write(int fd, const void* buf, size_t count) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return reinterpret_cast<write_fn>(smash_interpose_smash_write.original)(fd, buf, count); },
-        [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 // ── pread / pwrite ──────────────────────────────────────────────────────────
@@ -631,21 +652,17 @@ using pwrite_fn = ssize_t(*)(int, const void*, size_t, off_t);
 extern "C" ssize_t smash_pread(int fd, void* buf, size_t count, off_t offset);
 SMASH_INTERPOSE(smash_pread, pread);
 extern "C" ssize_t smash_pread(int fd, void* buf, size_t count, off_t offset) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return reinterpret_cast<pread_fn>(smash_interpose_smash_pread.original)(fd, buf, count, offset); },
-        [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 extern "C" ssize_t smash_pwrite(int fd, const void* buf, size_t count, off_t offset);
 SMASH_INTERPOSE(smash_pwrite, pwrite);
 extern "C" ssize_t smash_pwrite(int fd, const void* buf, size_t count, off_t offset) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWith1Buf(
         [&] { return reinterpret_cast<pwrite_fn>(smash_interpose_smash_pwrite.original)(fd, buf, count, offset); },
-        [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });
-    return ret;
+        buf, count);
 }
 
 // ── readv / writev ──────────────────────────────────────────────────────────
@@ -656,21 +673,17 @@ using writev_fn = ssize_t(*)(int, const struct iovec*, int);
 extern "C" ssize_t smash_readv(int fd, const struct iovec* iov, int iovcnt);
 SMASH_INTERPOSE(smash_readv, readv);
 extern "C" ssize_t smash_readv(int fd, const struct iovec* iov, int iovcnt) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWithIovec(
         [&] { return reinterpret_cast<readv_fn>(smash_interpose_smash_readv.original)(fd, iov, iovcnt); },
-        [&] { if (vm && iov && iovcnt > 0) smash::vm::walkIovecForFault(iov, iovcnt, vm); });
-    return ret;
+        iov, iovcnt);
 }
 
 extern "C" ssize_t smash_writev(int fd, const struct iovec* iov, int iovcnt);
 SMASH_INTERPOSE(smash_writev, writev);
 extern "C" ssize_t smash_writev(int fd, const struct iovec* iov, int iovcnt) {
-    auto* vm = smash::g_smash_vm_region;
-    ssize_t ret = smash::vm::retryWithDecompress(
+    return smash::vm::retryWithIovec(
         [&] { return reinterpret_cast<writev_fn>(smash_interpose_smash_writev.original)(fd, iov, iovcnt); },
-        [&] { if (vm && iov && iovcnt > 0) smash::vm::walkIovecForFault(iov, iovcnt, vm); });
-    return ret;
+        iov, iovcnt);
 }
 
 // ── fread / fgets (buffered I/O) ────────────────────────────────────────────

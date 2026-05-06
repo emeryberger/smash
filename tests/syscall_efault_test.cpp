@@ -211,14 +211,9 @@ int main() {
     int urand2 = open("/dev/urandom", O_RDONLY);
     if (urand2 < 0) { fprintf(stderr, "FAIL: open /dev/urandom #2\n"); return 1; }
 
-    iovec riov[2];
-    riov[0].iov_base = buf;
-    riov[0].iov_len  = kSliceSize;
-    riov[1].iov_base = buf + kSliceSize;
-    riov[1].iov_len  = kSliceSize;
-    // /dev/urandom is required to fill the request fully via a single
-    // kernel call; readv will return when one slice's worth comes back
-    // shorter, so loop until both are filled.
+    // /dev/urandom may return short on a single readv(); loop until both
+    // slices are filled, rebuilding the iovec each pass to skip already
+    // satisfied slots.
     size_t filled[2] = {0, 0};
     while (filled[0] < kSliceSize || filled[1] < kSliceSize) {
         iovec live[2];

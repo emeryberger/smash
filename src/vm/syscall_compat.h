@@ -17,7 +17,12 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <sys/uio.h>
+
+#ifdef __APPLE__
+#include <mach/message.h>
+#endif
 
 namespace smash::vm {
 
@@ -102,5 +107,75 @@ inline auto retryOnEfault(Syscall syscall, Rewarm rewarm)
     }
     return ret;
 }
+
+// Touch one byte per page in [buf, buf+len). Reads suffice — they trigger
+// the fault handler from PROT_NONE/PROT_READ → decompress → upgrade to RW.
+// Read-only (no write-back) so it's safe on read-only mappings.
+inline void walkPagesForFault(const void* buf, size_t len, VmRegion* vm) {
+    if (!buf || !len || !vm) return;
+    auto base = reinterpret_cast<uintptr_t>(buf);
+    auto end = base + len;
+    for (auto p = base & ~(static_cast<uintptr_t>(kPageSize) - 1); p < end; p += kPageSize) {
+        if (!vm->contains(p)) continue;
+        (void)*reinterpret_cast<volatile char*>(p);
+    }
+}
+
+inline void walkIovecForFault(const struct iovec* iov, int iovcnt, VmRegion* vm) {
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].iov_base && iov[i].iov_len)
+            walkPagesForFault(iov[i].iov_base, iov[i].iov_len, vm);
+    }
+}
+
+// Retry a syscall on EFAULT, walking buffer pages between attempts to
+// trigger the fault handler. Up to 8 attempts with µs-scale backoff
+// (1, 2, 4, ..., 128µs). The compressor tick runs at ~10ms, so even
+// 8 attempts at 128µs is well inside one tick — outlasts any compressor
+// race that could re-compress between walk and retry.
+//
+// Bounded retry (not unbounded) so a genuine bug — caller passed an
+// unmapped pointer — still surfaces as EFAULT instead of livelocking.
+template <typename Syscall, typename Walk>
+inline auto retryWithDecompress(Syscall syscall, Walk walk)
+    -> decltype(syscall()) {
+    auto ret = syscall();
+    long backoff_ns = 1000;  // 1µs
+    for (int attempt = 0;
+         ret == -1 && errno == EFAULT && attempt < 8;
+         ++attempt) {
+        walk();
+        if (attempt > 0) {
+            struct timespec ts = {0, backoff_ns};
+            nanosleep(&ts, nullptr);
+            backoff_ns *= 2;
+        }
+        ret = syscall();
+    }
+    return ret;
+}
+
+#ifdef __APPLE__
+// Mach equivalent: kernel signals a buffer-touch failure during mach_msg
+// via MACH_RCV_INVALID_DATA / MACH_SEND_INVALID_DATA rather than EFAULT.
+// Same retry shape as retryWithDecompress.
+template <typename Syscall, typename Walk>
+inline mach_msg_return_t retryMachOnInvalidData(Syscall syscall, Walk walk) {
+    auto ret = syscall();
+    long backoff_ns = 1000;
+    for (int attempt = 0;
+         (ret == MACH_RCV_INVALID_DATA || ret == MACH_SEND_INVALID_DATA) && attempt < 8;
+         ++attempt) {
+        walk();
+        if (attempt > 0) {
+            struct timespec ts = {0, backoff_ns};
+            nanosleep(&ts, nullptr);
+            backoff_ns *= 2;
+        }
+        ret = syscall();
+    }
+    return ret;
+}
+#endif
 
 } // namespace smash::vm

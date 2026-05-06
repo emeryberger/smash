@@ -60,9 +60,15 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 
 ## Syscall & Buffered I/O Compatibility
 
-Smash's mprotect-based monitoring (PROT_READ) and compression (PROT_NONE) can conflict with kernel syscalls that access userspace buffers. The kernel returns EFAULT instead of triggering SIGSEGV.
+Smash's mprotect-based monitoring (PROT_READ) and compression (PROT_NONE) can conflict with kernel syscalls that access userspace buffers. **The kernel does not raise a signal for syscall-side faults**: when `copy_from_user`/`copy_to_user` (Linux) or `copyin`/`copyout` (macOS) hits a protected page during a syscall, the kernel uses the page-fault fixup path to convert the fault into `-EFAULT` and discard the address. The SIGSEGV/SIGBUS handler in `fault_handler.h` only fires for direct user-code accesses; for syscalls we have to detect EFAULT ourselves and trigger a userspace touch (which *does* go through the handler) so the page can be decompressed.
 
-### DYLD interposition limitations (macOS)
+### EFAULT-driven decompress-and-retry (`syscall_compat.h::retryWithDecompress`)
+
+Every buffer-taking syscall wrapper follows the same shape: call the real syscall, on `errno == EFAULT` walk the buffer pages (one byte per page; the SIGSEGV handler decompresses), then retry. Bounded to 8 attempts with µs-scale exponential backoff (1, 2, 4, …, 128 µs); the compressor tick fires at ~10 ms intervals so 8 attempts at 128 µs is well inside one tick. Bounded so unmapped-pointer bugs surface as EFAULT instead of livelocking. `retryMachOnInvalidData` is the same shape but keyed on `MACH_RCV_INVALID_DATA` / `MACH_SEND_INVALID_DATA` for the mach_msg trio.
+
+The PageState CAS + per-page lock are sufficient for correctness — there is no separate pin counter. The fault handler takes the same per-page lock as the compressor's `transition(ACTIVE → COMPRESSING)`, so syscall-retry → walk → fault → handler → decompress → retry is correct without a pin counter.
+
+### DYLD interposition limitations (macOS) — the buffered-I/O carve-out
 
 `__DATA,__interpose` only intercepts **cross-dylib** GOT calls. Intra-libSystem calls are invisible:
 - `fread()`/`fgetc()` → internal `read()`: NOT intercepted (same dylib)
@@ -70,11 +76,15 @@ Smash's mprotect-based monitoring (PROT_READ) and compression (PROT_NONE) can co
 - C++ iostream (`std::cin`) → `getc_unlocked` → `__srget` → `read()` (all intra-libSystem)
 - Direct `read()` from application code: IS intercepted (cross-dylib)
 
-### Solutions implemented in `smash_heap.cpp`
+For these paths the EFAULT-retry model does not help — those syscalls happen inside libc and never enter our wrapper. Two carve-outs exist:
 
-1. **Syscall interposition**: Interpose `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `recv`, `send`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `poll`, `kevent` (macOS), `epoll_wait`, `epoll_pwait` (Linux) — warm and pin buffer pages before calling real syscall
-2. **Buffered I/O interposition** (macOS): Interpose `fread`, `fgets`, `fgetc`, `getc`, `fwrite`, `fflush` — warm and pin both user buffer AND the FILE's internal buffer (`stream->_bf._base`)
-3. **stdio buffer pinning** (`compressor_thread.h`): `pinStdioBuffers()` permanently pins stdin/stdout/stderr FILE struct + buffer pages at first compressor tick. This covers the intra-libSystem blind spot for standard streams.
+1. **Buffered I/O wrappers** (`fread`/`fgets`/`fgetc`/`getc`/`fwrite`/`fflush` on both platforms): proactively `warmPages` the user buffer + the FILE's internal buffer (macOS `stream->_bf._base`, Linux `stream->_IO_buf_base`) before delegating to libc. There is no retry path because libc's internal `__read` is intra-dylib.
+2. **stdio buffer warming** (`compressor_thread.h::warmStdioBuffers`, macOS-only): re-warms `stdin`/`stdout`/`stderr` FILE struct + buffer each compressor tick so the kernel never finds them protected. Without this, intra-libSystem `getc_unlocked` / `__srget` would EFAULT inside libc with no retry surface.
+
+### Interposed functions
+
+- macOS (`smash_heap.cpp`): `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `recv`, `send`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `poll`, `kevent`, `kevent64`, `mach_msg`, `mach_msg_overwrite`, `mach_msg2_internal`, plus the buffered-I/O carve-out above.
+- Linux (`linux_syscall_wrappers.cpp`): everything macOS has minus the Mach trio plus `ppoll`, `select`, `pselect`, `accept`, `accept4`, `recvmmsg`, `sendmmsg`, `getsockopt`, `getsockname`, `getpeername`, `getrandom`, `epoll_wait`, `epoll_pwait`.
 
 ### Platform-specific interposition patterns
 
@@ -83,10 +93,10 @@ Smash's mprotect-based monitoring (PROT_READ) and compression (PROT_NONE) can co
 extern "C" ssize_t smash_read(int fd, void* buf, size_t count);
 SMASH_INTERPOSE(smash_read, read);
 extern "C" ssize_t smash_read(int fd, void* buf, size_t count) {
-    // ... warm/pin ...
-    ssize_t ret = reinterpret_cast<read_fn>(smash_interpose_smash_read.original)(fd, buf, count);
-    // ... unpin ...
-    return ret;
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return reinterpret_cast<read_fn>(smash_interpose_smash_read.original)(fd, buf, count); },
+        [&] { if (vm && buf && count) smash::vm::walkPagesForFault(buf, count, vm); });
 }
 ```
 
@@ -96,14 +106,6 @@ extern "C" ssize_t smash_read(int fd, void* buf, size_t count) {
 SMASH_VISIBLE int epoll_wait_232(...) { return epoll_wait(...); }
 __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 ```
-
-### Page pinning (`syscall_compat.h`)
-
-`g_page_pins` is a per-page atomic counter. Pages with pin count > 0 are skipped by both Phase 2 (compression) and Phase 3 (monitoring). Used by syscall wrappers to protect kernel buffers during blocking calls.
-
-### EFAULT retry on syscall TOCTOU (`syscall_compat.h::retryOnEfault`)
-
-Pinning closes most of the race between syscall wrappers and the compressor's per-page mprotect, but a nanosecond-scale TOCTOU window remains: the compressor can read `pin == 0`, the wrapper can bump `pin` to 1, then the compressor proceeds with mprotect anyway. Once the page is `PROT_NONE` / `PROT_READ` the kernel returns EFAULT synchronously and no fault handler can recover. Every buffer-taking I/O wrapper (read/write/pread/pwrite/readv/writev/recv/send/recvfrom/sendto/recvmsg/sendmsg/poll on macOS; the same plus ppoll/select/pselect/accept/accept4/recvmmsg/sendmmsg/getsockopt/getsockname/getpeername/getrandom/epoll_wait/epoll_pwait on Linux) wraps the syscall in `retryOnEfault(syscall, rewarm)` — pin is held across all attempts; on EFAULT the rewarm callback re-warms the buffer and the syscall is retried up to 3×. The mach_msg family does the same against `MACH_SEND/RCV_INVALID_DATA`.
 
 ## External-Mapping Tracking (`SMASH_TRACK_EXTERNAL=1`)
 

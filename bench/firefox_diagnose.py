@@ -218,6 +218,14 @@ def section_firefox_binary(firefox: str) -> bool:
     is_snap = ("/snap/" in firefox or "/var/lib/snapd" in firefox or
                sh(f"snap list firefox 2>/dev/null | grep -q firefox && echo y").strip() == "y")
     if is_snap:
+        # Pick the right Mozilla download URL for this arch.
+        arch = os.uname().machine
+        if arch in ("x86_64", "amd64"):
+            mozilla_os = "linux64"
+        elif arch in ("aarch64", "arm64"):
+            mozilla_os = "linux-aarch64"
+        else:
+            mozilla_os = f"linux-{arch}  # may not exist; check archive.mozilla.org"
         print()
         print("!!! firefox is from snap — snap confinement strips LD_PRELOAD")
         print("!!! at the sandbox boundary. The wrapper /usr/bin/firefox loads")
@@ -225,11 +233,17 @@ def section_firefox_binary(firefox: str) -> bool:
         print("!!! the env is scrubbed. There is no fix for this short of using")
         print("!!! a non-snap Firefox build.")
         print("!!!")
-        print("!!! Replace with the Mozilla tarball:")
-        print("!!!   wget -O- 'https://download.mozilla.org/?product=firefox-latest-ssl&os=linux64&lang=en-US' \\")
-        print("!!!     | tar -xj")
-        print("!!!   ./firefox/firefox")
-        print("!!! Then re-run this script with that binary path.")
+        print(f"!!! Option A — Mozilla tarball ({arch}):")
+        print(f"!!!   wget -O firefox.tar.xz \\")
+        print(f"!!!     'https://download.mozilla.org/?product=firefox-latest-ssl&os={mozilla_os}&lang=en-US'")
+        print(f"!!!   tar -xf firefox.tar.xz")
+        print(f"!!!   ./firefox/firefox --version    # confirm arch")
+        print("!!!")
+        print("!!! Option B — non-snap distro package (ARM64 Ubuntu ships .deb, not snap):")
+        print("!!!   sudo apt install firefox-esr && firefox-esr --version")
+        print("!!!")
+        print("!!! Then re-run this script:")
+        print("!!!   python3 firefox_diagnose.py /path/to/libsmash.so /path/to/firefox")
         return True
     return False
 

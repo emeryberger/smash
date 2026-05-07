@@ -164,29 +164,46 @@ def stage_patch() -> None:
     print(f"patched {aset.relative_to(SRCDIR)}")
 
 
+def clean_build_env() -> dict[str, str]:
+    """Strip any inherited CFLAGS / LDFLAGS / LD_PRELOAD / etc. from the
+    environment we hand to configure + make. The user's interactive shell
+    can have leftovers from earlier smash testing (LD_PRELOAD pointing at
+    libsmash, CFLAGS containing a stray Firefox temp dir, …) that confuse
+    autoconf and gcc."""
+    drop = {"CFLAGS", "CPPFLAGS", "CXXFLAGS", "LDFLAGS", "LIBS",
+            "LD_PRELOAD", "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES", "DYLD_FORCE_FLAT_NAMESPACE",
+            "MallocNanoZone",
+            "SMASH_BANNER", "SMASH_DEBUG", "SMASH_STATS",
+            "SMASH_TRACK_EXTERNAL", "SMASH_LARGE_ONLY",
+            "SMASH_DEFER_PHASES_MS", "SMASH_COLD_TIMEOUT_SEC"}
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
 def stage_configure_build() -> None:
     hr("configure + make + make install (postgres-shim)")
+    env = clean_build_env()
     if (INSTDIR / "bin" / "postgres").is_file():
         # Do a quick incremental rebuild in case aset.c changed since last time.
         print(f"installed binary already exists at {INSTDIR}/bin/postgres")
         # Force re-make of just the patched file to pick up edits
         sh(["make", "-C", "src/backend/utils/mmgr", "-j", str(os.cpu_count() or 4)],
-           cwd=SRCDIR, quiet=True)
-        sh(["make", "-j", str(os.cpu_count() or 4)], cwd=SRCDIR, quiet=True)
-        sh(["make", "install"], cwd=SRCDIR, quiet=True)
+           cwd=SRCDIR, env=env, quiet=True)
+        sh(["make", "-j", str(os.cpu_count() or 4)], cwd=SRCDIR, env=env, quiet=True)
+        sh(["make", "install"], cwd=SRCDIR, env=env, quiet=True)
         return
     INSTDIR.mkdir(parents=True, exist_ok=True)
     sh(["./configure",
         f"--prefix={INSTDIR}",
         "--without-readline", "--without-zlib", "--without-icu",
         "--without-llvm",
-        "--enable-debug",  # keeps frame pointers; doesn't affect behaviour
+        "--enable-debug",
         "CFLAGS=-O2"],
-       cwd=SRCDIR)
-    sh(["make", "-j", str(os.cpu_count() or 4)], cwd=SRCDIR)
-    sh(["make", "install"], cwd=SRCDIR)
+       cwd=SRCDIR, env=env)
+    sh(["make", "-j", str(os.cpu_count() or 4)], cwd=SRCDIR, env=env)
+    sh(["make", "install"], cwd=SRCDIR, env=env)
     # contrib/pgbench
-    sh(["make", "-C", "contrib/pgbench", "install"], cwd=SRCDIR)
+    sh(["make", "-C", "contrib/pgbench", "install"], cwd=SRCDIR, env=env)
 
 
 def stage_run(libsmash: Path) -> int:

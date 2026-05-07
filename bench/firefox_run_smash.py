@@ -36,18 +36,51 @@ from pathlib import Path
 def stop_snap_firefox() -> None:
     """Kill ALL firefoxes (snap + any leftover tarball process). Without
     this, Firefox refuses to start because the default profile dir is
-    locked: 'Firefox is already running, but is not responding.'"""
+    locked: 'Firefox is already running, but is not responding.'
+
+    Identify victims by /proc/PID/exe — the actual binary path, NOT
+    the cmdline. Cmdline matching kills the diagnostic script itself
+    (since its argv has "firefox_run_smash.py" in it)."""
+    import signal
+    import time as _t
+
     if shutil.which("snap"):
         if "firefox" in subprocess.run(
                 ["snap", "list"], capture_output=True, text=True).stdout:
             print(">>> stopping snap firefox to release the profile lock")
             subprocess.run(["snap", "stop", "firefox"],
                            check=False, capture_output=True)
-    print(">>> killing any other firefox processes")
-    subprocess.run(["pkill", "-f", "firefox"], check=False, capture_output=True)
-    # Give the kernel a moment to actually take them down.
-    import time as _t
-    _t.sleep(2)
+
+    me = os.getpid()
+    parents = {me, os.getppid()}
+    victims: list[int] = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        pid = int(p.name)
+        if pid in parents:
+            continue
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            continue
+        base = os.path.basename(exe)
+        if base in ("firefox", "firefox-bin", "crashhelper") or "/firefox/" in exe:
+            victims.append(pid)
+    if victims:
+        print(f">>> killing {len(victims)} existing firefox process(es): {victims[:8]}")
+        for pid in victims:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        _t.sleep(2)
+        # Force-kill any survivors.
+        for pid in victims:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
 
 def run_firefox(libsmash: str, firefox: str, log_path: str,

@@ -142,6 +142,10 @@ GLIBC_2.2.5 {
     preadv2;
     pwritev2;
 
+    # Process management (Round 4 coverage)
+    waitid;
+    wait4;
+
   local:
     *;
 };

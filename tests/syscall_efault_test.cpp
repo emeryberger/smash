@@ -42,10 +42,16 @@
 #include <poll.h>
 #include <signal.h>
 #include <string>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#ifdef __APPLE__
+#include <sys/attr.h>
+#endif
 
 namespace {
 
@@ -623,6 +629,88 @@ int main() {
         return 1;
     }
     fprintf(stderr, "syscall_efault_test: preadv() into compressed iovec PASSED\n");
+
+    // ── Phase 15: waitid + wait4 with heap siginfo_t / rusage ─────────────
+    // Spawn a trivial child, then collect status via waitid (siginfo_t into
+    // compressed buffer) and again via wait4 (rusage into compressed
+    // buffer). Both syscalls write structured data into user memory.
+    auto* si = reinterpret_cast<siginfo_t*>(buf);
+    std::memset(si, 0, sizeof(siginfo_t));
+    fillCompressible(buf + sizeof(siginfo_t),
+                     kBufBytes - sizeof(siginfo_t), 0xD1);
+    if (!waitForCompression("pre-waitid")) return 1;
+
+    pid_t child = fork();
+    if (child < 0) { fprintf(stderr, "FAIL: fork\n"); return 1; }
+    if (child == 0) {
+        _exit(42);
+    }
+    // WNOWAIT keeps the child reapable for the wait4 below.
+    if (waitid(P_PID, child, si, WEXITED | WNOWAIT) != 0) {
+        fprintf(stderr, "FAIL: waitid() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    if (si->si_pid != child || si->si_status != 42) {
+        fprintf(stderr, "FAIL: waitid() returned 0 but siginfo not populated "
+                "(pid=%d status=%d)\n", si->si_pid, si->si_status);
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: waitid() with heap siginfo_t PASSED\n");
+
+    auto* ru = reinterpret_cast<struct rusage*>(buf);
+    std::memset(ru, 0, sizeof(struct rusage));
+    fillCompressible(buf + sizeof(struct rusage),
+                     kBufBytes - sizeof(struct rusage), 0xD2);
+    if (!waitForCompression("pre-wait4")) return 1;
+    int wstatus = 0;
+    pid_t wret = wait4(child, &wstatus, 0, ru);
+    if (wret != child) {
+        fprintf(stderr, "FAIL: wait4() returned %d errno=%d (%s)\n",
+                wret, errno, std::strerror(errno));
+        return 1;
+    }
+    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 42) {
+        fprintf(stderr, "FAIL: wait4() wstatus unexpected: 0x%x\n", wstatus);
+        return 1;
+    }
+    // Sanity: at least one rusage field non-zero (e.g. ru_maxrss or ru_utime).
+    // ru_maxrss is in KB; even a trivial _exit produces a few hundred KB.
+    // If both ru_maxrss and ru_utime.tv_sec/tv_usec are zero, the kernel
+    // didn't actually populate the struct.
+    if (ru->ru_maxrss == 0 && ru->ru_utime.tv_sec == 0 &&
+        ru->ru_utime.tv_usec == 0 && ru->ru_stime.tv_sec == 0 &&
+        ru->ru_stime.tv_usec == 0) {
+        fprintf(stderr, "FAIL: wait4() returned but rusage not populated\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: wait4() with heap rusage PASSED\n");
+
+#ifdef __APPLE__
+    // ── Phase 16: getattrlist into heap attrBuf (macOS only) ──────────────
+    // Cocoa file APIs (NSFileManager etc.) funnel through getattrlist.
+    // Kernel writes a packed attribute sequence into our user buffer.
+    struct attrlist alist = {};
+    alist.bitmapcount = ATTR_BIT_MAP_COUNT;
+    alist.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_OBJTYPE;
+    constexpr size_t kAttrBufSize = 4096;
+    fillCompressible(buf, kBufBytes, 0xE1);
+    if (!waitForCompression("pre-getattrlist")) return 1;
+    int gal_ret = getattrlist("/dev/null", &alist, buf, kAttrBufSize, 0);
+    if (gal_ret != 0) {
+        fprintf(stderr, "FAIL: getattrlist() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    // First 4 bytes of the buffer are the total length the kernel wrote.
+    uint32_t total_len = *reinterpret_cast<uint32_t*>(buf);
+    if (total_len < 4 || total_len > kAttrBufSize) {
+        fprintf(stderr, "FAIL: getattrlist() returned but length=%u looks "
+                "wrong — kernel didn't write into the buffer\n", total_len);
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: getattrlist() with heap attrBuf PASSED\n");
+#endif
 
     std::free(recv_buf);
     std::free(buf);

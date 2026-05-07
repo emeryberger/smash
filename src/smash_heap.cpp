@@ -11,6 +11,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include <sys/attr.h>
+#include <sys/wait.h>
 #include <poll.h>
 #include <unistd.h>
 #include <mach/mach.h>
@@ -687,6 +689,70 @@ extern "C" ssize_t smash_pwritev(int fd, const struct iovec* iov, int iovcnt, of
     return smash::vm::retryWithIovec(
         [&] { return reinterpret_cast<pwritev_fn>(smash_interpose_smash_pwritev.original)(fd, iov, iovcnt, offset); },
         iov, iovcnt);
+}
+
+// ── getattrlist / getattrlistbulk (macOS Cocoa file APIs) ────────────────────
+// NSFileManager / NSOpenPanel / Spotlight all funnel through these. Kernel
+// writes a packed sequence of attribute values into the user-supplied
+// `attrBuf` of size `attrBufSize` — that's the EFAULT risk.
+
+using getattrlist_fn = int(*)(const char*, struct attrlist*, void*, size_t, unsigned long);
+using getattrlistbulk_fn = int(*)(int, struct attrlist*, void*, size_t, uint64_t);
+
+extern "C" int smash_getattrlist(const char* path, struct attrlist* alist,
+                                  void* attrBuf, size_t attrBufSize,
+                                  unsigned long options);
+SMASH_INTERPOSE(smash_getattrlist, getattrlist);
+extern "C" int smash_getattrlist(const char* path, struct attrlist* alist,
+                                  void* attrBuf, size_t attrBufSize,
+                                  unsigned long options) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<getattrlist_fn>(smash_interpose_smash_getattrlist.original)(
+            path, alist, attrBuf, attrBufSize, options); },
+        attrBuf, attrBufSize);
+}
+
+extern "C" int smash_getattrlistbulk(int dirfd, struct attrlist* alist,
+                                      void* attrBuf, size_t attrBufSize,
+                                      uint64_t options);
+SMASH_INTERPOSE(smash_getattrlistbulk, getattrlistbulk);
+extern "C" int smash_getattrlistbulk(int dirfd, struct attrlist* alist,
+                                      void* attrBuf, size_t attrBufSize,
+                                      uint64_t options) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<getattrlistbulk_fn>(smash_interpose_smash_getattrlistbulk.original)(
+            dirfd, alist, attrBuf, attrBufSize, options); },
+        attrBuf, attrBufSize);
+}
+
+// ── waitid / wait4 (process management) ─────────────────────────────────────
+// waitid writes a 128-byte siginfo_t into *infop; wait4 writes int wstatus
+// AND struct rusage. wstatus is usually stack (4 bytes); rusage may be heap
+// for accumulating perf counters.
+
+using waitid_fn = int(*)(idtype_t, id_t, siginfo_t*, int);
+using wait4_fn = pid_t(*)(pid_t, int*, int, struct rusage*);
+
+extern "C" int smash_waitid(idtype_t idtype, id_t id, siginfo_t* info, int options);
+SMASH_INTERPOSE(smash_waitid, waitid);
+extern "C" int smash_waitid(idtype_t idtype, id_t id, siginfo_t* info, int options) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<waitid_fn>(smash_interpose_smash_waitid.original)(idtype, id, info, options); },
+        info, sizeof(siginfo_t));
+}
+
+extern "C" pid_t smash_wait4(pid_t pid, int* wstatus, int options, struct rusage* rusage);
+SMASH_INTERPOSE(smash_wait4, wait4);
+extern "C" pid_t smash_wait4(pid_t pid, int* wstatus, int options, struct rusage* rusage) {
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return reinterpret_cast<wait4_fn>(smash_interpose_smash_wait4.original)(pid, wstatus, options, rusage); },
+        [&] {
+            if (vm) {
+                if (wstatus) smash::vm::walkPagesForFault(wstatus, sizeof(int), vm);
+                if (rusage) smash::vm::walkPagesForFault(rusage, sizeof(struct rusage), vm);
+            }
+        });
 }
 
 // ── read / write ────────────────────────────────────────────────────────────

@@ -35,8 +35,11 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <cstdarg>
 #include <cstdio>
 #include <unistd.h>
@@ -655,6 +658,35 @@ SMASH_VISIBLE ssize_t pwritev2(int fd, const struct iovec* iov, int iovcnt,
     return smash::vm::retryWithIovec(
         [&] { return real_pwritev2(fd, iov, iovcnt, offset, flags); },
         iov, iovcnt);
+}
+
+// ── waitid / wait4 (process management) ─────────────────────────────────────
+// waitid writes a 128-byte siginfo_t into *infop; wait4 writes int wstatus
+// AND struct rusage. wstatus is usually stack (4 bytes); rusage may be heap
+// for long-lived accumulating perf counters.
+
+SMASH_VISIBLE int waitid(idtype_t idtype, id_t id, siginfo_t* info, int options) {
+    using fn_t = int(*)(idtype_t, id_t, siginfo_t*, int);
+    SMASH_LAZY_RESOLVE(fn_t, waitid);
+    if (!real_waitid) return syscall(SYS_waitid, idtype, id, info, options, nullptr);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_waitid(idtype, id, info, options); },
+        info, sizeof(siginfo_t));
+}
+
+SMASH_VISIBLE pid_t wait4(pid_t pid, int* wstatus, int options, struct rusage* rusage) {
+    using fn_t = pid_t(*)(pid_t, int*, int, struct rusage*);
+    SMASH_LAZY_RESOLVE(fn_t, wait4);
+    if (!real_wait4) return syscall(SYS_wait4, pid, wstatus, options, rusage);
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return real_wait4(pid, wstatus, options, rusage); },
+        [&] {
+            if (vm) {
+                if (wstatus) smash::vm::walkPagesForFault(wstatus, sizeof(int), vm);
+                if (rusage) smash::vm::walkPagesForFault(rusage, sizeof(struct rusage), vm);
+            }
+        });
 }
 
 // ── getrandom ───────────────────────────────────────────────────────────────

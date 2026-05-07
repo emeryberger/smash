@@ -656,6 +656,16 @@ int main() {
     if (child_a == 0) {
         _exit(42);
     }
+    // DEBUG: confirm child existence + sigaction state before waitid.
+    {
+        int alive = kill(child_a, 0);
+        struct sigaction cur{};
+        sigaction(SIGCHLD, nullptr, &cur);
+        fprintf(stderr, "[debug] child_a=%d kill0=%d errno=%d "
+                "sigchld_handler=%p (SIG_IGN=%p SIG_DFL=%p)\n",
+                child_a, alive, errno,
+                (void*)cur.sa_handler, (void*)SIG_IGN, (void*)SIG_DFL);
+    }
     // WEXITED reaps the child; Linux + macOS agree on this. Spawn a
     // separate child for wait4 below since WNOWAIT semantics differ
     // across kernels (Linux returns ECHILD on the follow-up wait4).

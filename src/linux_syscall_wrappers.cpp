@@ -399,17 +399,16 @@ SMASH_VISIBLE int fstat(int fd, struct stat* st) {
 }
 
 // fstat64 path: with _FILE_OFFSET_BITS=64 + LFS, glibc's preprocessor
-// rewrites fstat→fstat64 at the call site. struct stat64 has the same
-// layout as struct stat on x86_64 modern glibc; we accept void* to dodge
-// header dependencies on _LARGEFILE64_SOURCE while still retrying with
-// a sufficiently large walk size.
-SMASH_VISIBLE int fstat64(int fd, void* st) {
-    using fn_t = int(*)(int, void*);
+// rewrites fstat→fstat64 at the call site. The signature must match
+// glibc's declaration in <sys/stat.h>; struct stat64 has the same layout
+// as struct stat on x86_64 modern glibc.
+SMASH_VISIBLE int fstat64(int fd, struct stat64* st) {
+    using fn_t = int(*)(int, struct stat64*);
     SMASH_LAZY_RESOLVE(fn_t, fstat64);
     if (!real_fstat64) return syscall(SYS_fstat, fd, st);
     return smash::vm::retryWith1Buf(
         [&] { return real_fstat64(fd, st); },
-        st, sizeof(struct stat));
+        st, sizeof(struct stat64));
 }
 
 // __fxstat(version, fd, buf) — glibc < 2.33 internal symbol that the old
@@ -424,13 +423,13 @@ SMASH_VISIBLE int __fxstat(int ver, int fd, struct stat* st) {
         st, sizeof(struct stat));
 }
 
-SMASH_VISIBLE int __fxstat64(int ver, int fd, void* st) {
-    using fn_t = int(*)(int, int, void*);
+SMASH_VISIBLE int __fxstat64(int ver, int fd, struct stat64* st) {
+    using fn_t = int(*)(int, int, struct stat64*);
     SMASH_LAZY_RESOLVE(fn_t, __fxstat64);
     if (!real___fxstat64) return syscall(SYS_fstat, fd, st);
     return smash::vm::retryWith1Buf(
         [&] { return real___fxstat64(ver, fd, st); },
-        st, sizeof(struct stat));
+        st, sizeof(struct stat64));
 }
 
 SMASH_VISIBLE int fstatfs(int fd, struct statfs* st) {

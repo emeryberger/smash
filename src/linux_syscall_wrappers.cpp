@@ -817,10 +817,13 @@ SMASH_VISIBLE int getrusage(int who, struct rusage* usage) {
         usage, sizeof(struct rusage));
 }
 
-SMASH_VISIBLE int prlimit64(pid_t pid, int resource,
+// glibc declares prlimit64's resource arg as `enum __rlimit_resource`,
+// not plain `int`, so the C-linkage signature must match exactly.
+SMASH_VISIBLE int prlimit64(pid_t pid, enum __rlimit_resource resource,
                              const struct rlimit64* new_limit,
                              struct rlimit64* old_limit) {
-    using fn_t = int(*)(pid_t, int, const struct rlimit64*, struct rlimit64*);
+    using fn_t = int(*)(pid_t, enum __rlimit_resource,
+                         const struct rlimit64*, struct rlimit64*);
     SMASH_LAZY_RESOLVE(fn_t, prlimit64);
     if (!real_prlimit64) return syscall(SYS_prlimit64, pid, resource, new_limit, old_limit);
     auto* vm = smash::g_smash_vm_region;

@@ -34,19 +34,24 @@ from pathlib import Path
 
 
 def stop_snap_firefox() -> None:
-    """If snap-firefox is running, stop it. It competes for keyboard
-    focus and adds noise to the process listing."""
+    """Kill ALL firefoxes (snap + any leftover tarball process). Without
+    this, Firefox refuses to start because the default profile dir is
+    locked: 'Firefox is already running, but is not responding.'"""
     if shutil.which("snap"):
         if "firefox" in subprocess.run(
                 ["snap", "list"], capture_output=True, text=True).stdout:
-            print(">>> stopping snap firefox to avoid window-focus competition")
+            print(">>> stopping snap firefox to release the profile lock")
             subprocess.run(["snap", "stop", "firefox"],
                            check=False, capture_output=True)
-    subprocess.run(["pkill", "-f", "/snap/firefox"],
-                   check=False, capture_output=True)
+    print(">>> killing any other firefox processes")
+    subprocess.run(["pkill", "-f", "firefox"], check=False, capture_output=True)
+    # Give the kernel a moment to actually take them down.
+    import time as _t
+    _t.sleep(2)
 
 
-def run_firefox(libsmash: str, firefox: str, log_path: str) -> int:
+def run_firefox(libsmash: str, firefox: str, log_path: str,
+                headless: bool, url: str | None) -> int:
     env = os.environ.copy()
     env["LD_PRELOAD"] = os.path.abspath(libsmash)
     env["SMASH_BANNER"] = "1"
@@ -55,16 +60,33 @@ def run_firefox(libsmash: str, firefox: str, log_path: str) -> int:
     env["SMASH_DEFER_PHASES_MS"] = "30000"
     env["SMASH_TRACK_EXTERNAL"] = "1"
     env["SMASH_LARGE_ONLY"] = "0"
+    # Ubuntu 24.04 default blocks unprivileged user namespaces unless
+    # the AppArmor profile allows them. Tarball firefox doesn't have
+    # such a profile, so disable Firefox's content sandbox — we're
+    # testing smash, not Firefox security.
+    env["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
 
-    print(f">>> launching {firefox}")
-    print(">>> Browse normally. Quit Firefox when you're done; this script "
-          "will then print a summary.")
+    # Always use a fresh profile directory so we never collide with a
+    # leftover snap-firefox profile lock.
+    import tempfile
+    profile = tempfile.mkdtemp(prefix="smash-ff-")
+    print(f">>> using fresh profile dir: {profile}")
+
+    cmd = [firefox, "--no-remote", "--profile", profile]
+    if headless:
+        cmd.insert(1, "--headless")
+    if url:
+        cmd.append(url)
+
+    print(f">>> launching {' '.join(cmd)}")
+    print(">>> Browse / let it run. Quit Firefox (or Ctrl-C this script) "
+          "when done; the summary will then print.")
     print(f">>> Output → terminal AND {log_path}")
     print()
 
     log = open(log_path, "wb")
     proc = subprocess.Popen(
-        [firefox],
+        cmd,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -190,6 +212,10 @@ def main() -> int:
                     help="Output log file (default: firefox-smash.log)")
     ap.add_argument("--no-stop-snap", action="store_true",
                     help="Don't stop snap-firefox before launching")
+    ap.add_argument("--headless", action="store_true",
+                    help="Run firefox --headless (good for VMs without display)")
+    ap.add_argument("--url", default=None,
+                    help="URL to load (default: open with new-tab page)")
     args = ap.parse_args()
 
     if sys.platform != "linux":
@@ -209,7 +235,8 @@ def main() -> int:
     if not args.no_stop_snap:
         stop_snap_firefox()
 
-    rc = run_firefox(args.libsmash, args.firefox, args.log)
+    rc = run_firefox(args.libsmash, args.firefox, args.log,
+                     args.headless, args.url)
     analyse(args.log)
     print(f"\n>>> full log saved to {args.log}")
     return rc

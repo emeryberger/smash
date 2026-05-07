@@ -943,6 +943,17 @@ class CompressorThread {
         // before our wrapper sees the call.
         warmStdioBuffers();
 
+        // SMASH_DEBUG=1: print a stats line every ~50 ticks (~5s at the
+        // current 100ms tick cadence). Mirrors the SIGUSR2 stats format
+        // so log scrapers can use one parser.
+        if (s_debug_enabled_) {
+            static thread_local int debug_tick_counter = 0;
+            if (++debug_tick_counter >= 50) {
+                debug_tick_counter = 0;
+                sigusr1Handler(0);
+            }
+        }
+
         size_t committed = vm_->committedPages();
         if (committed == 0) return;
 
@@ -1232,6 +1243,20 @@ public:
             });
         }
 
+        // SMASH_DEBUG=1: emit a banner now (compressor came up) and a
+        // stats line every Nth tick during the run. Distinct from
+        // SMASH_STATS=1 (atexit-only) — SMASH_DEBUG is for watching
+        // activity live without having to chase PIDs and send SIGUSR2.
+        const char* dbg_env = std::getenv("SMASH_DEBUG");
+        s_debug_enabled_ = dbg_env && dbg_env[0] == '1';
+        if (s_debug_enabled_) {
+            char buf[160];
+            int n = snprintf(buf, sizeof(buf),
+                "[smash debug] compressor start pid=%d workers=%d\n",
+                (int)getpid(), kCompressorWorkers);
+            if (n > 0) (void)!write(2, buf, (size_t)n);
+        }
+
         // Start initial helper threads (adaptive scaling may create more later)
         int initial_helpers = kCompressorWorkers > 1 ? kCompressorWorkers - 1 : 0;
         for (int i = 0; i < initial_helpers; ++i) {
@@ -1248,6 +1273,7 @@ public:
     }
 
     static inline CompressorThread* s_stats_instance_ = nullptr;
+    static inline bool s_debug_enabled_ = false;
 
     static void sigusr1Handler(int) {
         auto* self = s_stats_instance_;

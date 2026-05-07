@@ -943,12 +943,12 @@ class CompressorThread {
         // before our wrapper sees the call.
         warmStdioBuffers();
 
-        // SMASH_DEBUG=1: print a stats line every ~50 ticks (~5s at the
-        // current 100ms tick cadence). Mirrors the SIGUSR2 stats format
-        // so log scrapers can use one parser.
+        // SMASH_DEBUG=1: print a stats line every 5 ticks (~5s at the
+        // 1000ms compressor cadence — kCompressIntervalMs). Mirrors the
+        // SIGUSR2 stats format so log scrapers can use one parser.
         if (s_debug_enabled_) {
-            static thread_local int debug_tick_counter = 0;
-            if (++debug_tick_counter >= 50) {
+            static int debug_tick_counter = 0;
+            if (++debug_tick_counter >= 5) {
                 debug_tick_counter = 0;
                 sigusr1Handler(0);
             }

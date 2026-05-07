@@ -4,6 +4,7 @@
 #include <alloc8/alloc8.h>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <unistd.h>
 
 #ifdef __APPLE__
@@ -49,16 +50,21 @@ __attribute__((constructor(60)))
 static void smash_print_banner() {
     const char* on = std::getenv("SMASH_BANNER");
     if (!on || on[0] != '1') return;
-    char buf[256];
+    char ts[32] = {};
+    time_t now = time(nullptr);
+    struct tm tm_buf;
+    if (localtime_r(&now, &tm_buf))
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    char buf[320];
     int n = std::snprintf(buf, sizeof(buf),
-        "[smash] loaded pid=%d ppid=%d "
+        "[smash] %s loaded pid=%d ppid=%d "
 #ifdef __APPLE__
         "platform=darwin"
 #else
         "platform=linux"
 #endif
         "\n",
-        (int)getpid(), (int)getppid());
+        ts, (int)getpid(), (int)getppid());
     if (n > 0) (void)!write(2, buf, (size_t)n);
 }
 

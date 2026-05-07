@@ -85,10 +85,14 @@ def start_postgres(tools: dict[str, str], libsmash: str, datadir: Path,
     env["SMASH_DEFER_PHASES_MS"] = "5000"
     env["SMASH_LARGE_ONLY"] = "0"
     # Quieten postgres' own logging so smash output is easy to find.
+    # Place the Unix socket in our writable datadir; default
+    # /var/run/postgresql is owned by the postgres user and unwritable.
+    socket_dir = datadir.parent
     cmd = [
         tools["postgres"],
         "-D", str(datadir),
         "-p", str(port),
+        "-c", f"unix_socket_directories={socket_dir}",
         "-c", "shared_buffers=64MB",   # Small — most heap should be per-backend
         "-c", "work_mem=8MB",          # Force backends to allocate visibly
         "-c", "max_connections=20",
@@ -108,13 +112,13 @@ def start_postgres(tools: dict[str, str], libsmash: str, datadir: Path,
     return proc
 
 
-def wait_for_ready(tools: dict[str, str], port: int,
+def wait_for_ready(tools: dict[str, str], port: int, sockdir: str,
                    timeout_s: int = 30) -> bool:
     psql = tools["psql"]
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         r = subprocess.run(
-            [psql, "-h", "127.0.0.1", "-p", str(port),
+            [psql, "-h", sockdir, "-p", str(port),
              "-U", "smashuser", "-d", "postgres",
              "-tAc", "SELECT 1"],
             capture_output=True, text=True)
@@ -140,24 +144,24 @@ def stop_postgres(proc: subprocess.Popen) -> None:
 # ── workload ────────────────────────────────────────────────────────────────
 
 
-def run_pgbench(tools: dict[str, str], port: int, scale: int,
-                clients: int, dwell_sec: int) -> None:
+def run_pgbench(tools: dict[str, str], port: int, sockdir: str,
+                scale: int, clients: int, dwell_sec: int) -> None:
     pgbench = tools["pgbench"]
     psql = tools["psql"]
     # Create the test database.
     subprocess.run(
-        [psql, "-h", "127.0.0.1", "-p", str(port),
+        [psql, "-h", sockdir, "-p", str(port),
          "-U", "smashuser", "-d", "postgres",
          "-c", "CREATE DATABASE smash_pgbench"],
         check=True, capture_output=True)
     print(f">>> pgbench -i -s {scale} (initialising schema)")
     subprocess.run(
-        [pgbench, "-h", "127.0.0.1", "-p", str(port),
+        [pgbench, "-h", sockdir, "-p", str(port),
          "-U", "smashuser", "-i", "-s", str(scale), "smash_pgbench"],
         check=True, capture_output=True)
     print(f">>> pgbench -c {clients} -T {dwell_sec} (running mixed workload)")
     r = subprocess.run(
-        [pgbench, "-h", "127.0.0.1", "-p", str(port),
+        [pgbench, "-h", sockdir, "-p", str(port),
          "-U", "smashuser", "-c", str(clients), "-T", str(dwell_sec),
          "smash_pgbench"],
         capture_output=True, text=True)
@@ -285,15 +289,17 @@ def main() -> int:
     log_path = workdir / "postgres-smash.log"
 
     proc: subprocess.Popen | None = None
+    sockdir = str(workdir)  # postgres socket lives next to datadir
     try:
         initdb(tools, datadir)
         proc = start_postgres(tools, args.libsmash, datadir,
                               args.port, log_path)
-        if not wait_for_ready(tools, args.port, timeout_s=30):
+        if not wait_for_ready(tools, args.port, sockdir, timeout_s=30):
             print("postgres did not become ready in 30s; check the log",
                   file=sys.stderr)
             return 1
-        run_pgbench(tools, args.port, args.scale, args.clients, args.dwell)
+        run_pgbench(tools, args.port, sockdir,
+                    args.scale, args.clients, args.dwell)
     finally:
         if proc is not None:
             print(">>> stopping postgres")

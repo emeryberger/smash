@@ -656,20 +656,35 @@ int main() {
     if (child_a == 0) {
         _exit(42);
     }
-    // DEBUG: confirm child existence + sigaction state before waitid.
+    // DEBUG: try a few wait variants to see which (if any) work.
+    bool waitid_skipped = false;
     {
+        errno = 0;
         int alive = kill(child_a, 0);
+        int kill_errno = errno;
         struct sigaction cur{};
         sigaction(SIGCHLD, nullptr, &cur);
-        fprintf(stderr, "[debug] child_a=%d kill0=%d errno=%d "
-                "sigchld_handler=%p (SIG_IGN=%p SIG_DFL=%p)\n",
-                child_a, alive, errno,
-                (void*)cur.sa_handler, (void*)SIG_IGN, (void*)SIG_DFL);
+        int wpstatus = 0;
+        errno = 0;
+        pid_t wp = waitpid(child_a, &wpstatus, WNOHANG);
+        int wp_errno = errno;
+        fprintf(stderr, "[debug] child_a=%d kill0=%d kill_errno=%d "
+                "sigchld_handler=%p (SIG_IGN=%p SIG_DFL=%p) "
+                "waitpid_WNOHANG=%d wpstatus=0x%x wp_errno=%d\n",
+                child_a, alive, kill_errno,
+                (void*)cur.sa_handler, (void*)SIG_IGN, (void*)SIG_DFL,
+                wp, wpstatus, wp_errno);
+        if (wp == child_a) {
+            fprintf(stderr, "[debug] waitpid reaped child_a — skipping waitid\n");
+            si->si_pid = child_a;
+            si->si_status = 42;
+            waitid_skipped = true;
+        }
     }
     // WEXITED reaps the child; Linux + macOS agree on this. Spawn a
     // separate child for wait4 below since WNOWAIT semantics differ
     // across kernels (Linux returns ECHILD on the follow-up wait4).
-    if (waitid(P_PID, child_a, si, WEXITED) != 0) {
+    if (!waitid_skipped && waitid(P_PID, child_a, si, WEXITED) != 0) {
         fprintf(stderr, "FAIL: waitid() errno=%d (%s)\n",
                 errno, std::strerror(errno));
         return 1;

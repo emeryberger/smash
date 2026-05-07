@@ -17,6 +17,8 @@
 #include <sys/mount.h>
 #include <sys/attr.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/statvfs.h>
 #include <poll.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -781,6 +783,39 @@ extern "C" pid_t smash_wait4(pid_t pid, int* wstatus, int options, struct rusage
                 if (rusage) smash::vm::walkPagesForFault(rusage, sizeof(struct rusage), vm);
             }
         });
+}
+
+// ── statvfs / fstatvfs / getrusage ──────────────────────────────────────────
+// Cross-platform output-buffer wrappers. xattr is intentionally not wrapped
+// on macOS — the Apple API takes extra (position, options) parameters and
+// is rarely called with heap-allocated values; do it later if needed.
+
+using statvfs_fn = int(*)(const char*, struct statvfs*);
+using fstatvfs_fn = int(*)(int, struct statvfs*);
+using getrusage_fn = int(*)(int, struct rusage*);
+
+extern "C" int smash_statvfs(const char* path, struct statvfs* st);
+SMASH_INTERPOSE(smash_statvfs, statvfs);
+extern "C" int smash_statvfs(const char* path, struct statvfs* st) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<statvfs_fn>(smash_interpose_smash_statvfs.original)(path, st); },
+        st, sizeof(struct statvfs));
+}
+
+extern "C" int smash_fstatvfs(int fd, struct statvfs* st);
+SMASH_INTERPOSE(smash_fstatvfs, fstatvfs);
+extern "C" int smash_fstatvfs(int fd, struct statvfs* st) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<fstatvfs_fn>(smash_interpose_smash_fstatvfs.original)(fd, st); },
+        st, sizeof(struct statvfs));
+}
+
+extern "C" int smash_getrusage(int who, struct rusage* usage);
+SMASH_INTERPOSE(smash_getrusage, getrusage);
+extern "C" int smash_getrusage(int who, struct rusage* usage) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<getrusage_fn>(smash_interpose_smash_getrusage.original)(who, usage); },
+        usage, sizeof(struct rusage));
 }
 
 // ── read / write ────────────────────────────────────────────────────────────

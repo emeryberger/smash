@@ -146,6 +146,18 @@ GLIBC_2.2.5 {
     waitid;
     wait4;
 
+    # statvfs / xattr / rusage / rlimit (Round 5 coverage)
+    statvfs;
+    fstatvfs;
+    getxattr;
+    lgetxattr;
+    fgetxattr;
+    listxattr;
+    llistxattr;
+    flistxattr;
+    getrusage;
+    prlimit64;
+
   local:
     *;
 };

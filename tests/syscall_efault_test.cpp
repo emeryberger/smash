@@ -45,6 +45,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -642,8 +643,43 @@ int main() {
     // fstat / statx / getdents64, all of which are independently
     // confirmed to intercept correctly.
 
+    // ── Phase 16: statvfs / getrusage with heap output structs ────────────
+    // Both are POSIX cross-platform.
+    auto* svfs = reinterpret_cast<struct statvfs*>(buf);
+    std::memset(svfs, 0, sizeof(struct statvfs));
+    fillCompressible(buf + sizeof(struct statvfs),
+                     kBufBytes - sizeof(struct statvfs), 0xF1);
+    if (!waitForCompression("pre-statvfs")) return 1;
+    if (statvfs("/", svfs) != 0) {
+        fprintf(stderr, "FAIL: statvfs() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    if (svfs->f_bsize == 0) {
+        fprintf(stderr, "FAIL: statvfs() returned 0 but f_bsize==0\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: statvfs() with heap struct statvfs PASSED\n");
+
+    auto* rru = reinterpret_cast<struct rusage*>(buf);
+    std::memset(rru, 0, sizeof(struct rusage));
+    fillCompressible(buf + sizeof(struct rusage),
+                     kBufBytes - sizeof(struct rusage), 0xF2);
+    if (!waitForCompression("pre-getrusage")) return 1;
+    if (getrusage(RUSAGE_SELF, rru) != 0) {
+        fprintf(stderr, "FAIL: getrusage() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    // ru_maxrss is non-zero for any non-trivial process.
+    if (rru->ru_maxrss == 0) {
+        fprintf(stderr, "FAIL: getrusage() returned 0 but ru_maxrss==0\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: getrusage() with heap struct rusage PASSED\n");
+
 #ifdef __APPLE__
-    // ── Phase 16: getattrlist into heap attrBuf (macOS only) ──────────────
+    // ── Phase 17: getattrlist into heap attrBuf (macOS only) ──────────────
     // Cocoa file APIs (NSFileManager etc.) funnel through getattrlist.
     // Kernel writes a packed attribute sequence into our user buffer.
     struct attrlist alist = {};

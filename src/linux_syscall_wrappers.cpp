@@ -35,8 +35,10 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <sys/xattr.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -711,6 +713,125 @@ SMASH_VISIBLE pid_t wait4(pid_t pid, int* wstatus, int options, struct rusage* r
             if (vm) {
                 if (wstatus) smash::vm::walkPagesForFault(wstatus, sizeof(int), vm);
                 if (rusage) smash::vm::walkPagesForFault(rusage, sizeof(struct rusage), vm);
+            }
+        });
+}
+
+// ── statvfs / fstatvfs ──────────────────────────────────────────────────────
+// POSIX path-form statfs. struct statvfs is similar in size to statfs (~112B);
+// heap-allocated when callers track multiple filesystems.
+SMASH_VISIBLE int statvfs(const char* path, struct statvfs* st) {
+    using fn_t = int(*)(const char*, struct statvfs*);
+    SMASH_LAZY_RESOLVE(fn_t, statvfs);
+    if (!real_statvfs) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return smash::vm::retryWith1Buf(
+        [&] { return real_statvfs(path, st); },
+        st, sizeof(struct statvfs));
+}
+
+SMASH_VISIBLE int fstatvfs(int fd, struct statvfs* st) {
+    using fn_t = int(*)(int, struct statvfs*);
+    SMASH_LAZY_RESOLVE(fn_t, fstatvfs);
+    if (!real_fstatvfs) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return smash::vm::retryWith1Buf(
+        [&] { return real_fstatvfs(fd, st); },
+        st, sizeof(struct statvfs));
+}
+
+// ── xattr family ────────────────────────────────────────────────────────────
+// getxattr / lgetxattr / fgetxattr write attribute value into user buffer.
+// listxattr / llistxattr / flistxattr write a NUL-separated name list.
+// Used by SELinux/AppArmor labels, cap_net_raw, mac sandbox metadata, etc.
+SMASH_VISIBLE ssize_t getxattr(const char* path, const char* name,
+                                void* value, size_t size) {
+    using fn_t = ssize_t(*)(const char*, const char*, void*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, getxattr);
+    if (!real_getxattr) return syscall(SYS_getxattr, path, name, value, size);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_getxattr(path, name, value, size); },
+        value, size);
+}
+
+SMASH_VISIBLE ssize_t lgetxattr(const char* path, const char* name,
+                                 void* value, size_t size) {
+    using fn_t = ssize_t(*)(const char*, const char*, void*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, lgetxattr);
+    if (!real_lgetxattr) return syscall(SYS_lgetxattr, path, name, value, size);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_lgetxattr(path, name, value, size); },
+        value, size);
+}
+
+SMASH_VISIBLE ssize_t fgetxattr(int fd, const char* name,
+                                 void* value, size_t size) {
+    using fn_t = ssize_t(*)(int, const char*, void*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, fgetxattr);
+    if (!real_fgetxattr) return syscall(SYS_fgetxattr, fd, name, value, size);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_fgetxattr(fd, name, value, size); },
+        value, size);
+}
+
+SMASH_VISIBLE ssize_t listxattr(const char* path, char* list, size_t size) {
+    using fn_t = ssize_t(*)(const char*, char*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, listxattr);
+    if (!real_listxattr) return syscall(SYS_listxattr, path, list, size);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_listxattr(path, list, size); },
+        list, size);
+}
+
+SMASH_VISIBLE ssize_t llistxattr(const char* path, char* list, size_t size) {
+    using fn_t = ssize_t(*)(const char*, char*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, llistxattr);
+    if (!real_llistxattr) return syscall(SYS_llistxattr, path, list, size);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_llistxattr(path, list, size); },
+        list, size);
+}
+
+SMASH_VISIBLE ssize_t flistxattr(int fd, char* list, size_t size) {
+    using fn_t = ssize_t(*)(int, char*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, flistxattr);
+    if (!real_flistxattr) return syscall(SYS_flistxattr, fd, list, size);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_flistxattr(fd, list, size); },
+        list, size);
+}
+
+// ── getrusage / prlimit64 ───────────────────────────────────────────────────
+// getrusage writes struct rusage; prlimit64 writes (and optionally reads)
+// struct rlimit. Both can be heap-allocated when callers persist them.
+SMASH_VISIBLE int getrusage(int who, struct rusage* usage) {
+    using fn_t = int(*)(int, struct rusage*);
+    SMASH_LAZY_RESOLVE(fn_t, getrusage);
+    if (!real_getrusage) return syscall(SYS_getrusage, who, usage);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_getrusage(who, usage); },
+        usage, sizeof(struct rusage));
+}
+
+SMASH_VISIBLE int prlimit64(pid_t pid, int resource,
+                             const struct rlimit64* new_limit,
+                             struct rlimit64* old_limit) {
+    using fn_t = int(*)(pid_t, int, const struct rlimit64*, struct rlimit64*);
+    SMASH_LAZY_RESOLVE(fn_t, prlimit64);
+    if (!real_prlimit64) return syscall(SYS_prlimit64, pid, resource, new_limit, old_limit);
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return real_prlimit64(pid, resource, new_limit, old_limit); },
+        [&] {
+            if (vm) {
+                if (new_limit)
+                    smash::vm::walkPagesForFault(new_limit, sizeof(struct rlimit64), vm);
+                if (old_limit)
+                    smash::vm::walkPagesForFault(old_limit, sizeof(struct rlimit64), vm);
             }
         });
 }

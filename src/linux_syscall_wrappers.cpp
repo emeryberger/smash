@@ -617,6 +617,19 @@ SMASH_VISIBLE int epoll_pwait_232(int epfd, struct epoll_event* events, int maxe
     return epoll_pwait(epfd, events, maxevents, timeout, sigmask);
 }
 
+// ── fstat versioned aliases (GLIBC_2.33) ────────────────────────────────────
+// glibc 2.34 re-versioned fstat/fstat64 from GLIBC_2.2.5 to GLIBC_2.33 to
+// carry y2038-safe struct stat. C++ binaries on Ubuntu 22.04+ reference
+// fstat@GLIBC_2.33 specifically; without these aliases the dynamic linker
+// won't match our LD_PRELOAD'd fstat (which lives at GLIBC_2.2.5) and
+// goes to glibc directly.
+SMASH_VISIBLE int fstat_233(int fd, struct stat* st) {
+    return fstat(fd, st);
+}
+SMASH_VISIBLE int fstat64_233(int fd, struct stat64* st) {
+    return fstat64(fd, st);
+}
+
 // ── External-mapping interposers (mmap / munmap) ────────────────────────────
 //
 // Application-direct mmap calls (e.g., SpiderMonkey GC arenas, jemalloc
@@ -700,5 +713,7 @@ SMASH_VISIBLE int munmap(void* addr, size_t len) {
 // Create version aliases: epoll_wait_232 -> epoll_wait@GLIBC_2.3.2
 __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 __asm__(".symver epoll_pwait_232,epoll_pwait@GLIBC_2.3.2");
+__asm__(".symver fstat_233,fstat@GLIBC_2.33");
+__asm__(".symver fstat64_233,fstat64@GLIBC_2.33");
 
 #endif // __linux__

@@ -129,3 +129,16 @@ GLIBC_2.3.2 {
     epoll_wait_232;
     epoll_pwait_232;
 } GLIBC_2.2.5;
+
+# glibc 2.34 re-versioned fstat / fstat64 to GLIBC_2.33 for y2038-safe
+# struct stat. C++ binaries built against modern glibc reference
+# fstat@GLIBC_2.33 specifically; if we only export fstat@GLIBC_2.2.5
+# the dynamic linker doesn't match and our wrapper is bypassed.
+# Export at both versions so we win regardless of binding age.
+GLIBC_2.33 {
+  global:
+    fstat;
+    fstat64;
+    fstat_233;
+    fstat64_233;
+} GLIBC_2.2.5;

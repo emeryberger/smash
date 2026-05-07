@@ -447,25 +447,6 @@ int main() {
     int fstat_rc = fstat(fstat_fd, st);
     int fstat_errno = errno;
     close(fstat_fd);
-#ifdef __linux__
-    // Linux glibc remaps `fstat` to `__fxstat`/`fstat64`/`__fxstat64`
-    // depending on _FILE_OFFSET_BITS and glibc version, so our `fstat`
-    // LD_PRELOAD symbol may be bypassed. The macOS path (cross-dylib
-    // interpose hits the symbol directly) is the main coverage today.
-    // If Linux fstat returns EFAULT here, log a soft warning rather than
-    // failing — the gap is documented.
-    if (fstat_rc != 0) {
-        fprintf(stderr, "syscall_efault_test: fstat() errno=%d (%s) — "
-                "Linux glibc fstat indirection bypasses our wrapper. "
-                "Soft-skipping; macOS path tested separately.\n",
-                fstat_errno, std::strerror(fstat_errno));
-    } else if (st->st_mode == 0) {
-        fprintf(stderr, "FAIL: fstat() returned 0 but st_mode==0\n");
-        return 1;
-    } else {
-        fprintf(stderr, "syscall_efault_test: fstat() with heap struct stat PASSED\n");
-    }
-#else
     if (fstat_rc != 0) {
         fprintf(stderr, "FAIL: fstat() errno=%d (%s) — wrapper missing or "
                 "EFAULT path broken\n", fstat_errno, std::strerror(fstat_errno));
@@ -477,7 +458,6 @@ int main() {
         return 1;
     }
     fprintf(stderr, "syscall_efault_test: fstat() with heap struct stat PASSED\n");
-#endif
     fprintf(stderr, "syscall_efault_test: fstat() with heap struct stat PASSED\n");
 
     std::free(recv_buf);

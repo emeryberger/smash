@@ -378,20 +378,58 @@ SMASH_VISIBLE int getpeername(int sockfd, struct sockaddr* addr, socklen_t* addr
     return ret;
 }
 
-// ── fstat / fstatfs ─────────────────────────────────────────────────────────
-// Both write a struct (stat / statfs) into a userspace buffer. The buffer
-// is normally on the stack but heap-allocated struct stat / struct statfs
-// is a real pattern in long-lived state-tracking code.
+// ── fstat family / fstatfs ──────────────────────────────────────────────────
+// glibc's fstat ABI is a moving target:
+//   - glibc < 2.33: <sys/stat.h> declares `fstat` as a static inline that
+//     calls `__fxstat(_STAT_VER, fd, buf)`. Linker only sees __fxstat.
+//   - glibc ≥ 2.33: `fstat` is a real exported symbol, no inline stub.
+//   - With _FILE_OFFSET_BITS=64 (Ubuntu's default for C++ programs):
+//       <sys/stat.h> does `#define fstat fstat64`, so callers actually
+//       link against `fstat64` (or `__fxstat64` on old glibc).
+// To intercept reliably across all combinations, wrap every variant. Each
+// is a one-line shell over retryWith1Buf with the appropriate struct size.
+
 SMASH_VISIBLE int fstat(int fd, struct stat* st) {
     using fn_t = int(*)(int, struct stat*);
     SMASH_LAZY_RESOLVE(fn_t, fstat);
-    if (!real_fstat) {
-        // glibc historically routed fstat through __fxstat(version, ...).
-        // Falling back to the raw syscall covers both layouts.
-        return syscall(SYS_fstat, fd, st);
-    }
+    if (!real_fstat) return syscall(SYS_fstat, fd, st);
     return smash::vm::retryWith1Buf(
         [&] { return real_fstat(fd, st); },
+        st, sizeof(struct stat));
+}
+
+// fstat64 path: with _FILE_OFFSET_BITS=64 + LFS, glibc's preprocessor
+// rewrites fstat→fstat64 at the call site. struct stat64 has the same
+// layout as struct stat on x86_64 modern glibc; we accept void* to dodge
+// header dependencies on _LARGEFILE64_SOURCE while still retrying with
+// a sufficiently large walk size.
+SMASH_VISIBLE int fstat64(int fd, void* st) {
+    using fn_t = int(*)(int, void*);
+    SMASH_LAZY_RESOLVE(fn_t, fstat64);
+    if (!real_fstat64) return syscall(SYS_fstat, fd, st);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_fstat64(fd, st); },
+        st, sizeof(struct stat));
+}
+
+// __fxstat(version, fd, buf) — glibc < 2.33 internal symbol that the old
+// inline `fstat` calls into. Modern glibc still exports a deprecated stub
+// for ABI compatibility.
+SMASH_VISIBLE int __fxstat(int ver, int fd, struct stat* st) {
+    using fn_t = int(*)(int, int, struct stat*);
+    SMASH_LAZY_RESOLVE(fn_t, __fxstat);
+    if (!real___fxstat) return syscall(SYS_fstat, fd, st);
+    return smash::vm::retryWith1Buf(
+        [&] { return real___fxstat(ver, fd, st); },
+        st, sizeof(struct stat));
+}
+
+SMASH_VISIBLE int __fxstat64(int ver, int fd, void* st) {
+    using fn_t = int(*)(int, int, void*);
+    SMASH_LAZY_RESOLVE(fn_t, __fxstat64);
+    if (!real___fxstat64) return syscall(SYS_fstat, fd, st);
+    return smash::vm::retryWith1Buf(
+        [&] { return real___fxstat64(ver, fd, st); },
         st, sizeof(struct stat));
 }
 

@@ -30,6 +30,7 @@
 #include <pthread.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 
@@ -1218,6 +1219,18 @@ public:
         sa.sa_flags = SA_RESTART;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGUSR2, &sa, nullptr);
+
+        // SMASH_STATS=1: also emit a stats line on every normal process
+        // exit. atexit handlers are inherited across fork(), so each child
+        // of a multi-process app (Firefox parent + content + GPU + …)
+        // prints its own line as it shuts down. _exit() and SIGKILL skip
+        // atexit by design.
+        const char* stats_env = std::getenv("SMASH_STATS");
+        if (stats_env && stats_env[0] == '1') {
+            std::atexit([]() {
+                if (s_stats_instance_) sigusr1Handler(0);
+            });
+        }
 
         // Start initial helper threads (adaptive scaling may create more later)
         int initial_helpers = kCompressorWorkers > 1 ? kCompressorWorkers - 1 : 0;

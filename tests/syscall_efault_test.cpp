@@ -640,18 +640,20 @@ int main() {
                      kBufBytes - sizeof(siginfo_t), 0xD1);
     if (!waitForCompression("pre-waitid")) return 1;
 
-    pid_t child = fork();
-    if (child < 0) { fprintf(stderr, "FAIL: fork\n"); return 1; }
-    if (child == 0) {
+    pid_t child_a = fork();
+    if (child_a < 0) { fprintf(stderr, "FAIL: fork (waitid)\n"); return 1; }
+    if (child_a == 0) {
         _exit(42);
     }
-    // WNOWAIT keeps the child reapable for the wait4 below.
-    if (waitid(P_PID, child, si, WEXITED | WNOWAIT) != 0) {
+    // WEXITED reaps the child; Linux + macOS agree on this. Spawn a
+    // separate child for wait4 below since WNOWAIT semantics differ
+    // across kernels (Linux returns ECHILD on the follow-up wait4).
+    if (waitid(P_PID, child_a, si, WEXITED) != 0) {
         fprintf(stderr, "FAIL: waitid() errno=%d (%s)\n",
                 errno, std::strerror(errno));
         return 1;
     }
-    if (si->si_pid != child || si->si_status != 42) {
+    if (si->si_pid != child_a || si->si_status != 42) {
         fprintf(stderr, "FAIL: waitid() returned 0 but siginfo not populated "
                 "(pid=%d status=%d)\n", si->si_pid, si->si_status);
         return 1;
@@ -663,14 +665,19 @@ int main() {
     fillCompressible(buf + sizeof(struct rusage),
                      kBufBytes - sizeof(struct rusage), 0xD2);
     if (!waitForCompression("pre-wait4")) return 1;
+    pid_t child_b = fork();
+    if (child_b < 0) { fprintf(stderr, "FAIL: fork (wait4)\n"); return 1; }
+    if (child_b == 0) {
+        _exit(43);
+    }
     int wstatus = 0;
-    pid_t wret = wait4(child, &wstatus, 0, ru);
-    if (wret != child) {
+    pid_t wret = wait4(child_b, &wstatus, 0, ru);
+    if (wret != child_b) {
         fprintf(stderr, "FAIL: wait4() returned %d errno=%d (%s)\n",
                 wret, errno, std::strerror(errno));
         return 1;
     }
-    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 42) {
+    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 43) {
         fprintf(stderr, "FAIL: wait4() wstatus unexpected: 0x%x\n", wstatus);
         return 1;
     }

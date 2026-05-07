@@ -208,7 +208,20 @@ SMASH_VISIBLE ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
 SMASH_VISIBLE int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     using fn_t = int(*)(struct pollfd*, nfds_t, int);
     SMASH_LAZY_RESOLVE(fn_t, poll);
-    if (!real_poll) return syscall(SYS_poll, fds, nfds, timeout);
+    if (!real_poll) {
+#ifdef SYS_poll
+        return syscall(SYS_poll, fds, nfds, timeout);
+#else
+        // arm64 / riscv have no SYS_poll; route via ppoll.
+        struct timespec ts, *tsp = nullptr;
+        if (timeout >= 0) {
+            ts.tv_sec  = timeout / 1000;
+            ts.tv_nsec = static_cast<long>(timeout % 1000) * 1000000;
+            tsp = &ts;
+        }
+        return syscall(SYS_ppoll, fds, nfds, tsp, nullptr, 0);
+#endif
+    }
     auto* vm = smash::g_smash_vm_region;
     size_t size = static_cast<size_t>(nfds) * sizeof(struct pollfd);
     bool in_heap = bufferInHeap(fds, size, vm);
@@ -240,7 +253,20 @@ SMASH_VISIBLE int select(int nfds, fd_set* readfds, fd_set* writefds,
                          fd_set* exceptfds, struct timeval* timeout) {
     using fn_t = int(*)(int, fd_set*, fd_set*, fd_set*, struct timeval*);
     SMASH_LAZY_RESOLVE(fn_t, select);
-    if (!real_select) return syscall(SYS_select, nfds, readfds, writefds, exceptfds, timeout);
+    if (!real_select) {
+#ifdef SYS_select
+        return syscall(SYS_select, nfds, readfds, writefds, exceptfds, timeout);
+#else
+        // arm64 / riscv have no SYS_select; route via pselect6.
+        struct timespec ts, *tsp = nullptr;
+        if (timeout) {
+            ts.tv_sec  = timeout->tv_sec;
+            ts.tv_nsec = timeout->tv_usec * 1000;
+            tsp = &ts;
+        }
+        return syscall(SYS_pselect6, nfds, readfds, writefds, exceptfds, tsp, nullptr);
+#endif
+    }
     auto* vm = smash::g_smash_vm_region;
     // fd_set size depends on nfds but is bounded by sizeof(fd_set)
     size_t set_size = sizeof(fd_set);
@@ -830,7 +856,15 @@ SMASH_VISIBLE int fflush(FILE* stream) {
 SMASH_VISIBLE int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
     using fn_t = int(*)(int, struct epoll_event*, int, int);
     SMASH_LAZY_RESOLVE(fn_t, epoll_wait);
-    if (!real_epoll_wait) return syscall(SYS_epoll_wait, epfd, events, maxevents, timeout);
+    if (!real_epoll_wait) {
+#ifdef SYS_epoll_wait
+        return syscall(SYS_epoll_wait, epfd, events, maxevents, timeout);
+#else
+        // arm64 / riscv have no SYS_epoll_wait; route via epoll_pwait
+        // with NULL sigmask. _NSIG/8 = 8 (kernel sigset_t size).
+        return syscall(SYS_epoll_pwait, epfd, events, maxevents, timeout, nullptr, 8);
+#endif
+    }
     auto* vm = smash::g_smash_vm_region;
     size_t size = static_cast<size_t>(maxevents) * sizeof(struct epoll_event);
     bool in_heap = bufferInHeap(events, size, vm);

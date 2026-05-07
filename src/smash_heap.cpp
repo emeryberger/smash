@@ -37,7 +37,9 @@ smash::SystemAllocFns smash::g_system_alloc;
 
 // Early init: resolve system malloc/free before alloc8 interposition.
 // Needed for compress-only mode and large-only mode (small alloc passthrough).
-__attribute__((constructor(50)))  // Run before alloc8 (priority 100)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wprio-ctor-dtor"
+__attribute__((constructor(50)))  // Run before alloc8 (priority 101)
 static void smash_resolve_system_alloc() {
     smash::g_system_alloc.resolve();
 }
@@ -66,6 +68,7 @@ static void smash_print_banner() {
         ts, (int)getpid(), (int)getppid());
     if (n > 0) (void)!write(2, buf, (size_t)n);
 }
+#pragma GCC diagnostic pop
 
 // ── Thread cache methods that depend on Slab ─────────────────────────────────
 

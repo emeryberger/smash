@@ -9,6 +9,7 @@
 //   allowing compression of pages owned by any allocator
 #pragma once
 
+#include <new>
 #include "smash/config.h"
 #include "platform_mem.h"
 #include "page_state.h"
@@ -114,7 +115,8 @@ public:
             BootstrapAlloc::instance().allocate(
                 kTrackMaxPages * sizeof(uintptr_t), 8));
         if (!track_hash_ || !track_reverse_) return false;
-        __builtin_memset(track_hash_, 0, kTrackHashCap * sizeof(TrackEntry));
+        for (size_t i = 0; i < kTrackHashCap; ++i)
+            new (&track_hash_[i]) TrackEntry();
         __builtin_memset(track_reverse_, 0, kTrackMaxPages * sizeof(uintptr_t));
 
         if (!tracking_mode_) {

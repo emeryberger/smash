@@ -46,7 +46,7 @@ void scanVmRegions() {
         uintptr_t start, end;
         char perms[8];
         unsigned long offset, inode;
-        int major, minor;
+        unsigned int major, minor;
         int n = sscanf(line, "%lx-%lx %4s %lx %x:%x %lu",
                        &start, &end, perms, &offset, &major, &minor, &inode);
         if (n < 7) continue;
@@ -257,7 +257,7 @@ extern "C" CO_EXPORT int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
 extern "C" CO_EXPORT int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
     CO_ORIG_DECL(epoll_wait_fn_t, epoll_wait);
     auto* vm = smash::g_smash_vm_region;
-    if (vm && events && maxevents > 0) {
+    if (vm && maxevents > 0) {
         smash::vm::warmPages(events, maxevents * sizeof(struct epoll_event), vm);
     }
     int ret = orig_epoll_wait(epfd, events, maxevents, timeout);

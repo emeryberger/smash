@@ -46,7 +46,7 @@ static void testDictTrainingRoundtrip() {
     engine.init();
 
     // Collect samples: structured pages typical for size class 5 (96 bytes)
-    constexpr int kSamples = kDictTrainSamples;
+    constexpr int kSamples = kDictTrainSamples > 0 ? kDictTrainSamples : 1;
     constexpr size_t kObjSize = 96;
     constexpr uint8_t kSizeClass = 5;
 
@@ -98,7 +98,7 @@ static void testDictRatioImprovement() {
     CompressEngine engine;
     engine.init();
 
-    constexpr int kSamples = kDictTrainSamples;
+    constexpr int kSamples = kDictTrainSamples > 0 ? kDictTrainSamples : 1;
     constexpr size_t kObjSize = 96;
     constexpr uint8_t kSizeClass = 5;
 

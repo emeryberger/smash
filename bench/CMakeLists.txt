@@ -18,7 +18,7 @@
 #
 #   SMASH_BUILD_BENCH_DEPS=ON  (default):
 #     a `bench_deps` make target that builds Redis / memcached /
-#     DuckDB / RocksDB from source (separate ExternalProject_Add).
+#     RocksDB from source (separate ExternalProject_Add).
 #     Adds 10–20 minutes to the first build. Set OFF to skip the
 #     custom-built versions and use system installs (brew etc.).
 #
@@ -450,23 +450,8 @@ configure_file(
   @ONLY
 )
 configure_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/bench_duckdb.sh.in
-  ${CMAKE_CURRENT_BINARY_DIR}/bench_duckdb.sh
-  @ONLY
-)
-configure_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/bench_duckdb.py.in
-  ${CMAKE_CURRENT_BINARY_DIR}/bench_duckdb.py
-  @ONLY
-)
-configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/bench_memcached_alloc.sh.in
   ${CMAKE_CURRENT_BINARY_DIR}/bench_memcached_alloc.sh
-  @ONLY
-)
-configure_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/bench_duckdb_alloc.sh.in
-  ${CMAKE_CURRENT_BINARY_DIR}/bench_duckdb_alloc.sh
   @ONLY
 )
 configure_file(
@@ -520,7 +505,7 @@ smash_add_standalone_bench(bench_heap_compress_sqlite bench_heap_compress.cpp)
 target_compile_definitions(bench_heap_compress_sqlite PRIVATE HAS_SQLITE)
 target_link_libraries(bench_heap_compress_sqlite PRIVATE sqlite3_static lz4_static libzstd_static)
 
-# Generic variant (memcached/redis/duckdb heap fill patterns)
+# Generic variant (memcached/redis heap fill patterns)
 smash_add_standalone_bench(bench_heap_compress bench_heap_compress.cpp)
 target_link_libraries(bench_heap_compress PRIVATE lz4_static libzstd_static)
 
@@ -785,38 +770,6 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/include/rocksdb/db.h
   )
 
-  # ── DuckDB 1.2.2 (built without jemalloc extension) ─────────────────────────
-  # DuckDB bundles jemalloc as a loadable extension on Linux, which bypasses
-  # Smash interposition.  We build from source with SKIP_EXTENSIONS=jemalloc
-  # so DuckDB uses system malloc on all platforms.
-  # The build is large (~10 min) but only the CLI shell is compiled.
-  ExternalProject_Add(duckdb_build
-    GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-    GIT_TAG v1.2.2
-    GIT_SHALLOW TRUE
-    PREFIX ${BENCH_DEPS_DIR}/duckdb
-    PATCH_COMMAND ${CMAKE_COMMAND} -E echo
-      "set(SKIP_EXTENSIONS jemalloc CACHE STRING '')"
-      > <SOURCE_DIR>/extension/extension_config_local.cmake
-    CMAKE_ARGS
-      -DCMAKE_BUILD_TYPE=Release
-      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
-      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
-      -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
-      -DBUILD_SHELL=ON
-      -DBUILD_UNITTESTS=OFF
-      -DENABLE_SANITIZER=OFF
-      -DENABLE_UBSAN=OFF
-      -DOVERRIDE_GIT_DESCRIBE=v1.2.2
-      -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
-    CMAKE_CACHE_ARGS
-      "-DSKIP_EXTENSIONS:STRING=jemalloc"
-    BUILD_COMMAND ${CMAKE_COMMAND} --build . --target shell -- -j${NCPU}
-    INSTALL_COMMAND
-      ${CMAKE_COMMAND} -E copy <BINARY_DIR>/duckdb ${BENCH_DEPS_DIR}/bin/duckdb
-    BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/duckdb
-  )
-
   # ── LevelDB 1.23 (static library) ──────────────────────────────────────────
   # LevelDB uses an arena allocator over malloc — Smash should work.
   ExternalProject_Add(leveldb_build
@@ -971,7 +924,6 @@ if(SMASH_BUILD_BENCH_DEPS)
   set(BENCH_REDIS_SMASH_SERVER ${BENCH_DEPS_DIR}/bin/redis-server-smash CACHE PATH "")
   set(BENCH_REDIS_SMASH_CLI    ${BENCH_DEPS_DIR}/bin/redis-cli-smash    CACHE PATH "")
   set(BENCH_MEMCACHED      ${BENCH_DEPS_DIR}/bin/memcached         CACHE PATH "")
-  set(BENCH_DUCKDB         ${BENCH_DEPS_DIR}/bin/duckdb            CACHE PATH "")
   set(BENCH_ROCKSDB_LIB    ${BENCH_DEPS_DIR}/lib/librocksdb.a      CACHE PATH "")
   set(BENCH_ROCKSDB_INCLUDE ${BENCH_DEPS_DIR}/include              CACHE PATH "")
   set(BENCH_LEVELDB_LIB    ${BENCH_DEPS_DIR}/lib/libleveldb.a      CACHE PATH "")
@@ -982,7 +934,7 @@ if(SMASH_BUILD_BENCH_DEPS)
 
   # Convenience target: `make bench_deps`
   add_custom_target(bench_deps)
-  add_dependencies(bench_deps redis_build redis_smash_build rocksdb_build duckdb_build leveldb_build)
+  add_dependencies(bench_deps redis_build redis_smash_build rocksdb_build leveldb_build)
   if(TARGET libevent_build)
     add_dependencies(bench_deps libevent_build)
   endif()
@@ -1004,7 +956,6 @@ if(SMASH_BUILD_BENCH_DEPS)
   message(STATUS "  Redis-Smash (patched, libc malloc, idle-mode)")
   message(STATUS "  Memcached 1.6.34")
   message(STATUS "  RocksDB 9.8.4 (static)")
-  message(STATUS "  DuckDB 1.2.2 (no jemalloc)")
   if(TARGET tcmalloc_build)
     if(BAZEL_PROG AND _GLIBC_VERSION VERSION_GREATER_EQUAL "2.35")
       message(STATUS "  google/tcmalloc (latest, via Bazel 8.2.1)")
@@ -1061,9 +1012,4 @@ if(DEFINED BENCH_MEMCACHED)
   set(MEMCACHED_PATH ${BENCH_MEMCACHED})
 else()
   set(MEMCACHED_PATH "memcached")
-endif()
-if(DEFINED BENCH_DUCKDB)
-  set(DUCKDB_PATH ${BENCH_DUCKDB})
-else()
-  set(DUCKDB_PATH "duckdb")
 endif()

@@ -2,6 +2,9 @@
 #include "smash_heap.h"
 #include "vm/syscall_compat.h"
 #include <alloc8/alloc8.h>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -14,7 +17,6 @@
 #include <sys/attr.h>
 #include <sys/wait.h>
 #include <poll.h>
-#include <unistd.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #endif
@@ -35,6 +37,29 @@ smash::SystemAllocFns smash::g_system_alloc;
 __attribute__((constructor(50)))  // Run before alloc8 (priority 100)
 static void smash_resolve_system_alloc() {
     smash::g_system_alloc.resolve();
+}
+
+// SMASH_BANNER=1: print a one-line banner at library-load time so it's
+// visible whether DYLD_INSERT_LIBRARIES / LD_PRELOAD actually loaded
+// libsmash. Especially useful for multi-process apps like Firefox where
+// the launcher may exec a different binary or the path may not be picked
+// up at all. Prints to stderr via direct write() to be safe in early
+// init (before stdio is fully wired up).
+__attribute__((constructor(60)))
+static void smash_print_banner() {
+    const char* on = std::getenv("SMASH_BANNER");
+    if (!on || on[0] != '1') return;
+    char buf[256];
+    int n = std::snprintf(buf, sizeof(buf),
+        "[smash] loaded pid=%d ppid=%d "
+#ifdef __APPLE__
+        "platform=darwin"
+#else
+        "platform=linux"
+#endif
+        "\n",
+        (int)getpid(), (int)getppid());
+    if (n > 0) (void)!write(2, buf, (size_t)n);
 }
 
 // ── Thread cache methods that depend on Slab ─────────────────────────────────

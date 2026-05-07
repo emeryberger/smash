@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -523,7 +524,6 @@ int main() {
     int dir_fd = open("/", O_RDONLY | O_DIRECTORY);
     if (dir_fd < 0) { fprintf(stderr, "FAIL: open / errno=%d\n", errno); return 1; }
     constexpr size_t kDirpBytes = 32 * 1024;
-    extern ssize_t getdents64(int, void*, size_t);
     ssize_t gd_ret = getdents64(dir_fd, buf, kDirpBytes);
     if (gd_ret < 0) {
         fprintf(stderr, "FAIL: getdents64() errno=%d (%s)\n",

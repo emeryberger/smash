@@ -215,8 +215,16 @@ def section_firefox_binary(firefox: str) -> bool:
     print("snap firefox:", short(sh("snap list firefox 2>/dev/null")) or "(not installed via snap)")
     print("flatpak firefox:",
           short(sh("flatpak list | grep -i firefox 2>/dev/null")) or "(not installed via flatpak)")
-    is_snap = ("/snap/" in firefox or "/var/lib/snapd" in firefox or
-               sh(f"snap list firefox 2>/dev/null | grep -q firefox && echo y").strip() == "y")
+    # Snap detection should only look at the specific firefox binary
+    # we were asked about, NOT system-wide snap state. `snap list
+    # firefox` returns true even when the user is testing a different
+    # binary that happens to be on PATH ahead of the snap shim.
+    real_path = os.path.realpath(firefox)
+    is_snap = ("/snap/" in firefox or "/snap/" in real_path or
+               "/var/lib/snapd" in firefox or "/var/lib/snapd" in real_path)
+    if firefox != real_path:
+        print(f"realpath: {real_path}")
+    print(f"snap-confined? {is_snap}")
     if is_snap:
         # Pick the right Mozilla download URL for this arch.
         arch = os.uname().machine

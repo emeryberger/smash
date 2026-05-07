@@ -136,6 +136,12 @@ GLIBC_2.2.5 {
     readlink;
     readlinkat;
 
+    # Positioned vectored I/O (Round 3 coverage)
+    preadv;
+    pwritev;
+    preadv2;
+    pwritev2;
+
   local:
     *;
 };
@@ -160,6 +166,22 @@ GLIBC_2.28 {
     statx;
     statx_228;
 } GLIBC_2.2.5;
+
+GLIBC_2.10 {
+  global:
+    preadv;
+    pwritev;
+    preadv_210;
+    pwritev_210;
+} GLIBC_2.2.5;
+
+GLIBC_2.26 {
+  global:
+    preadv2;
+    pwritev2;
+    preadv2_226;
+    pwritev2_226;
+} GLIBC_2.10;
 
 GLIBC_2.30 {
   global:

@@ -669,6 +669,26 @@ extern "C" ssize_t smash_readlinkat(int dirfd, const char* path, char* buf, size
         buf, bufsize);
 }
 
+// ── preadv / pwritev (positioned vectored I/O) ──────────────────────────────
+using preadv_fn = ssize_t(*)(int, const struct iovec*, int, off_t);
+using pwritev_fn = ssize_t(*)(int, const struct iovec*, int, off_t);
+
+extern "C" ssize_t smash_preadv(int fd, const struct iovec* iov, int iovcnt, off_t offset);
+SMASH_INTERPOSE(smash_preadv, preadv);
+extern "C" ssize_t smash_preadv(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
+    return smash::vm::retryWithIovec(
+        [&] { return reinterpret_cast<preadv_fn>(smash_interpose_smash_preadv.original)(fd, iov, iovcnt, offset); },
+        iov, iovcnt);
+}
+
+extern "C" ssize_t smash_pwritev(int fd, const struct iovec* iov, int iovcnt, off_t offset);
+SMASH_INTERPOSE(smash_pwritev, pwritev);
+extern "C" ssize_t smash_pwritev(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
+    return smash::vm::retryWithIovec(
+        [&] { return reinterpret_cast<pwritev_fn>(smash_interpose_smash_pwritev.original)(fd, iov, iovcnt, offset); },
+        iov, iovcnt);
+}
+
 // ── read / write ────────────────────────────────────────────────────────────
 
 using read_fn = ssize_t(*)(int, void*, size_t);

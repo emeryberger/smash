@@ -566,6 +566,64 @@ int main() {
     unlink(link_path);
     fprintf(stderr, "syscall_efault_test: readlink() into heap buffer PASSED\n");
 
+    // ── Phase 14: pwritev / preadv via temp file (cross-platform) ─────────
+    // Two iovec slices both pointing into compressed pages. pwritev reads
+    // from them (kernel reads compressed source); preadv writes back into
+    // them (kernel writes compressed destination).
+    char pv_path[] = "/tmp/smash-efault-pv-XXXXXX";
+    int pv_fd = mkstemp(pv_path);
+    if (pv_fd < 0) { fprintf(stderr, "FAIL: mkstemp pv\n"); return 1; }
+    unlink(pv_path);
+
+    constexpr size_t kPvSliceSize = 64 * 1024;  // 64 KiB per iovec slot
+    constexpr size_t kPvSlots = 2;
+    constexpr size_t kPvTotal = kPvSliceSize * kPvSlots;
+    fillCompressible(buf, kBufBytes, 0xC1);
+    // Mark slot 0 with 0xCA, slot 1 with 0xCB so we can detect roundtrip.
+    std::memset(buf, 0xCA, kPvSliceSize);
+    std::memset(buf + kPvSliceSize, 0xCB, kPvSliceSize);
+    fillCompressible(buf + kPvTotal, kBufBytes - kPvTotal, 0xC2);
+
+    if (!waitForCompression("pre-pwritev")) return 1;
+    iovec wiov_pv[2];
+    wiov_pv[0].iov_base = buf;
+    wiov_pv[0].iov_len  = kPvSliceSize;
+    wiov_pv[1].iov_base = buf + kPvSliceSize;
+    wiov_pv[1].iov_len  = kPvSliceSize;
+    ssize_t pwn = pwritev(pv_fd, wiov_pv, kPvSlots, 0);
+    if (pwn != static_cast<ssize_t>(kPvTotal)) {
+        fprintf(stderr, "FAIL: pwritev() returned %zd errno=%d (%s)\n",
+                pwn, errno, std::strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: pwritev() from compressed iovec PASSED\n");
+
+    // Now preadv into a different region of buf to round-trip read.
+    fillCompressible(buf + kPvTotal, kPvTotal, 0xC3);  // erase target
+    if (!waitForCompression("pre-preadv")) return 1;
+    iovec riov_pv[2];
+    riov_pv[0].iov_base = buf + kPvTotal;
+    riov_pv[0].iov_len  = kPvSliceSize;
+    riov_pv[1].iov_base = buf + kPvTotal + kPvSliceSize;
+    riov_pv[1].iov_len  = kPvSliceSize;
+    ssize_t prn = preadv(pv_fd, riov_pv, kPvSlots, 0);
+    if (prn != static_cast<ssize_t>(kPvTotal)) {
+        fprintf(stderr, "FAIL: preadv() returned %zd errno=%d (%s)\n",
+                prn, errno, std::strerror(errno));
+        return 1;
+    }
+    close(pv_fd);
+
+    // Verify roundtrip: read region should match original written sentinels.
+    bool ok_a = bytesAllEqual(buf + kPvTotal, kPvSliceSize, 0xCA);
+    bool ok_b = bytesAllEqual(buf + kPvTotal + kPvSliceSize, kPvSliceSize, 0xCB);
+    if (!ok_a || !ok_b) {
+        fprintf(stderr, "FAIL: pwritev/preadv roundtrip mismatch (a=%d b=%d)\n",
+                ok_a, ok_b);
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: preadv() into compressed iovec PASSED\n");
+
     std::free(recv_buf);
     std::free(buf);
     fprintf(stderr, "syscall_efault_test: ALL PASSED\n");

@@ -613,6 +613,50 @@ SMASH_VISIBLE ssize_t readlinkat(int dirfd, const char* path,
         buf, bufsize);
 }
 
+// ── preadv / pwritev / preadv2 / pwritev2 ───────────────────────────────────
+// Positioned vectored I/O. preadv / pwritev added in glibc 2.10 (2009);
+// preadv2 / pwritev2 added in glibc 2.26 (2017). The kernel reads from /
+// writes to each iovec entry; on a compressed page the syscall returns
+// EFAULT exactly like read/writev.
+
+SMASH_VISIBLE ssize_t preadv(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
+    using fn_t = ssize_t(*)(int, const struct iovec*, int, off_t);
+    SMASH_LAZY_RESOLVE(fn_t, preadv);
+    if (!real_preadv) return syscall(SYS_preadv, fd, iov, iovcnt, offset);
+    return smash::vm::retryWithIovec(
+        [&] { return real_preadv(fd, iov, iovcnt, offset); },
+        iov, iovcnt);
+}
+
+SMASH_VISIBLE ssize_t pwritev(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
+    using fn_t = ssize_t(*)(int, const struct iovec*, int, off_t);
+    SMASH_LAZY_RESOLVE(fn_t, pwritev);
+    if (!real_pwritev) return syscall(SYS_pwritev, fd, iov, iovcnt, offset);
+    return smash::vm::retryWithIovec(
+        [&] { return real_pwritev(fd, iov, iovcnt, offset); },
+        iov, iovcnt);
+}
+
+SMASH_VISIBLE ssize_t preadv2(int fd, const struct iovec* iov, int iovcnt,
+                               off_t offset, int flags) {
+    using fn_t = ssize_t(*)(int, const struct iovec*, int, off_t, int);
+    SMASH_LAZY_RESOLVE(fn_t, preadv2);
+    if (!real_preadv2) return syscall(SYS_preadv2, fd, iov, iovcnt, offset, flags);
+    return smash::vm::retryWithIovec(
+        [&] { return real_preadv2(fd, iov, iovcnt, offset, flags); },
+        iov, iovcnt);
+}
+
+SMASH_VISIBLE ssize_t pwritev2(int fd, const struct iovec* iov, int iovcnt,
+                                off_t offset, int flags) {
+    using fn_t = ssize_t(*)(int, const struct iovec*, int, off_t, int);
+    SMASH_LAZY_RESOLVE(fn_t, pwritev2);
+    if (!real_pwritev2) return syscall(SYS_pwritev2, fd, iov, iovcnt, offset, flags);
+    return smash::vm::retryWithIovec(
+        [&] { return real_pwritev2(fd, iov, iovcnt, offset, flags); },
+        iov, iovcnt);
+}
+
 // ── getrandom ───────────────────────────────────────────────────────────────
 // The kernel fills a userspace buffer with random bytes. NSS/OpenSSL/Firefox
 // use this for cryptographic initialization.
@@ -829,6 +873,20 @@ SMASH_VISIBLE int statx_228(int dirfd, const char* path, int flags,
 SMASH_VISIBLE ssize_t getdents64_230(int fd, void* dirp, size_t count) {
     return getdents64(fd, dirp, count);
 }
+// preadv / pwritev introduced in glibc 2.10.
+SMASH_VISIBLE ssize_t preadv_210(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
+    return preadv(fd, iov, iovcnt, offset);
+}
+SMASH_VISIBLE ssize_t pwritev_210(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
+    return pwritev(fd, iov, iovcnt, offset);
+}
+// preadv2 / pwritev2 introduced in glibc 2.26.
+SMASH_VISIBLE ssize_t preadv2_226(int fd, const struct iovec* iov, int iovcnt, off_t offset, int flags) {
+    return preadv2(fd, iov, iovcnt, offset, flags);
+}
+SMASH_VISIBLE ssize_t pwritev2_226(int fd, const struct iovec* iov, int iovcnt, off_t offset, int flags) {
+    return pwritev2(fd, iov, iovcnt, offset, flags);
+}
 
 // ── External-mapping interposers (mmap / munmap) ────────────────────────────
 //
@@ -923,5 +981,9 @@ __asm__(".symver fstatat_233,fstatat@GLIBC_2.33");
 __asm__(".symver fstatat64_233,fstatat64@GLIBC_2.33");
 __asm__(".symver statx_228,statx@GLIBC_2.28");
 __asm__(".symver getdents64_230,getdents64@GLIBC_2.30");
+__asm__(".symver preadv_210,preadv@GLIBC_2.10");
+__asm__(".symver pwritev_210,pwritev@GLIBC_2.10");
+__asm__(".symver preadv2_226,preadv2@GLIBC_2.26");
+__asm__(".symver pwritev2_226,pwritev2@GLIBC_2.26");
 
 #endif // __linux__

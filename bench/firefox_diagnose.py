@@ -301,21 +301,23 @@ def launch_and_walk(libsmash: str, firefox: str, dwell_sec: int) -> None:
     print(f"sleeping {dwell_sec}s …")
     time.sleep(dwell_sec)
 
-    # Snapshot the tree before we kill anything. Also include any
-    # firefox-named process system-wide — sandbox-escapees (snap, flatpak)
-    # fall out of our subtree because they're in a different cgroup.
+    # Snapshot the tree before we kill anything. Also note any
+    # firefox-named processes outside our subtree — those are unrelated
+    # (e.g. user already had snap-firefox running) and shouldn't count
+    # toward our success/failure metric.
     subtree = [proc.pid] + descendants(proc.pid)
     all_ff = all_firefox_pids()
-    extra = [p for p in all_ff if p not in subtree]
-    pids = sorted(set(subtree + all_ff))
-    banner(f"process scan: {len(subtree)} in subtree under {proc.pid}; "
-           f"{len(extra)} additional firefox-named processes elsewhere")
-    if extra:
-        print(f"!!! {len(extra)} firefox process(es) escaped our subtree —")
-        print("!!! likely snap/flatpak/sandbox confinement. They will not "
-              "have inherited LD_PRELOAD.")
-        for p in extra[:5]:
-            print(f"    pid={p} exe={proc_exe(p)} cmd={short(proc_cmdline(p), 100)}")
+    unrelated = [p for p in all_ff if p not in subtree]
+    pids = subtree  # only inspect what we actually launched
+    banner(f"process scan: {len(subtree)} in OUR subtree under {proc.pid}")
+    if unrelated:
+        print(f"note: {len(unrelated)} unrelated firefox process(es) running "
+              f"on this system (e.g. snap-firefox you started earlier). "
+              f"They are NOT under test and NOT counted in the summary.")
+        for p in unrelated[:3]:
+            print(f"    [unrelated] pid={p} exe={proc_exe(p)}")
+        if len(unrelated) > 3:
+            print(f"    [unrelated] ... and {len(unrelated) - 3} more")
     rows: list[tuple[int, str, str, str, str]] = []
     for pid in pids:
         try:

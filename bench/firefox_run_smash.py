@@ -143,10 +143,14 @@ def run_firefox(libsmash: str, firefox: str, log_path: str,
 # ── log analysis ────────────────────────────────────────────────────────────
 
 
-# Lines look like:
-#   [smash stats] [2026-05-07 12:34:56] pid=12345 committed=8265  active=43  monitor=0  compressing=0  compressed=8222  empty=0
+# Lines look like (newer libsmash, bracketed):
+#   [smash stats] [2026-05-07 12:34:56] pid=12345 committed=8265 active=43 …
+# Or (older libsmash, un-bracketed):
+#   [smash stats] 2026-05-07 12:34:56 pid=12345 committed=8265 active=43 …
+# Or (oldest, no timestamp):
+#   [smash stats] pid=12345 committed=8265 active=43 …
 STATS_RE = re.compile(
-    r"\[smash stats\] \[([0-9-]+ [0-9:]+)\] pid=(\d+) "
+    r"\[smash stats\](?:\s+\[?[0-9-]+ [0-9:]+\]?)?\s+pid=(\d+)\s+"
     r"committed=(\d+)\s+active=(\d+)\s+monitor=(\d+)\s+"
     r"compressing=(\d+)\s+compressed=(\d+)\s+empty=(\d+)"
 )
@@ -163,7 +167,7 @@ def analyse(log_path: str) -> None:
         m = STATS_RE.search(raw)
         if not m:
             continue
-        _ts, pid_s, committed, active, _mon, _comp_ing, compressed, _empty = m.groups()
+        pid_s, committed, active, _mon, _comp_ing, compressed, _empty = m.groups()
         pid = int(pid_s)
         d = by_pid[pid]
         d["committed_max"] = max(d["committed_max"], int(committed))

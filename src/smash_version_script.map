@@ -107,6 +107,15 @@ GLIBC_2.2.5 {
     epoll_wait;
     epoll_pwait;
 
+    # fstat family — glibc remaps fstat → fstat64 with _FILE_OFFSET_BITS=64
+    # (Ubuntu C++ default); glibc < 2.33 calls __fxstat / __fxstat64
+    # internally. Wrap all four entry points so LD_PRELOAD wins regardless.
+    fstat;
+    fstat64;
+    __fxstat;
+    __fxstat64;
+    fstatfs;
+
   local:
     *;
 };

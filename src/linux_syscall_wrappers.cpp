@@ -392,8 +392,6 @@ SMASH_VISIBLE int getpeername(int sockfd, struct sockaddr* addr, socklen_t* addr
 SMASH_VISIBLE int fstat(int fd, struct stat* st) {
     using fn_t = int(*)(int, struct stat*);
     SMASH_LAZY_RESOLVE(fn_t, fstat);
-    fprintf(stderr, "[smash debug] fstat wrapper hit fd=%d st=%p real=%p\n",
-            fd, (void*)st, (void*)real_fstat);
     if (!real_fstat) return syscall(SYS_fstat, fd, st);
     return smash::vm::retryWith1Buf(
         [&] { return real_fstat(fd, st); },
@@ -407,8 +405,6 @@ SMASH_VISIBLE int fstat(int fd, struct stat* st) {
 SMASH_VISIBLE int fstat64(int fd, struct stat64* st) {
     using fn_t = int(*)(int, struct stat64*);
     SMASH_LAZY_RESOLVE(fn_t, fstat64);
-    fprintf(stderr, "[smash debug] fstat64 wrapper hit fd=%d st=%p real=%p\n",
-            fd, (void*)st, (void*)real_fstat64);
     if (!real_fstat64) return syscall(SYS_fstat, fd, st);
     return smash::vm::retryWith1Buf(
         [&] { return real_fstat64(fd, st); },

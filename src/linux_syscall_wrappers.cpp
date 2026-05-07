@@ -15,6 +15,11 @@
 
 #ifdef __linux__
 
+// _GNU_SOURCE is needed for `struct statx` in <sys/stat.h>.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include "smash_heap.h"
 #include "vm/syscall_compat.h"
 
@@ -30,6 +35,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <cstdarg>
 #include <cstdio>
@@ -441,6 +447,136 @@ SMASH_VISIBLE int fstatfs(int fd, struct statfs* st) {
         st, sizeof(struct statfs));
 }
 
+// ── stat / lstat / fstatat / statx ──────────────────────────────────────────
+// Same hazard as fstat: kernel writes a struct (stat / statx) into a
+// userspace buffer that may be heap-allocated and compressed. Cover the
+// same ABI surface — modern symbol, _64 LFS variant, and the legacy
+// __xstat / __lxstat / __fxstatat pre-2.33 entry points.
+
+// Fall back via SYS_newfstatat (works on every modern arch including
+// arm64/riscv where SYS_stat doesn't exist).
+SMASH_VISIBLE int stat(const char* path, struct stat* st) {
+    using fn_t = int(*)(const char*, struct stat*);
+    SMASH_LAZY_RESOLVE(fn_t, stat);
+    if (!real_stat) return syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_stat(path, st); },
+        st, sizeof(struct stat));
+}
+
+SMASH_VISIBLE int lstat(const char* path, struct stat* st) {
+    using fn_t = int(*)(const char*, struct stat*);
+    SMASH_LAZY_RESOLVE(fn_t, lstat);
+    if (!real_lstat) return syscall(SYS_newfstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_lstat(path, st); },
+        st, sizeof(struct stat));
+}
+
+SMASH_VISIBLE int fstatat(int dirfd, const char* path, struct stat* st, int flags) {
+    using fn_t = int(*)(int, const char*, struct stat*, int);
+    SMASH_LAZY_RESOLVE(fn_t, fstatat);
+    if (!real_fstatat) return syscall(SYS_newfstatat, dirfd, path, st, flags);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_fstatat(dirfd, path, st, flags); },
+        st, sizeof(struct stat));
+}
+
+SMASH_VISIBLE int stat64(const char* path, struct stat64* st) {
+    using fn_t = int(*)(const char*, struct stat64*);
+    SMASH_LAZY_RESOLVE(fn_t, stat64);
+    if (!real_stat64) return syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_stat64(path, st); },
+        st, sizeof(struct stat64));
+}
+
+SMASH_VISIBLE int lstat64(const char* path, struct stat64* st) {
+    using fn_t = int(*)(const char*, struct stat64*);
+    SMASH_LAZY_RESOLVE(fn_t, lstat64);
+    if (!real_lstat64) return syscall(SYS_newfstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_lstat64(path, st); },
+        st, sizeof(struct stat64));
+}
+
+SMASH_VISIBLE int fstatat64(int dirfd, const char* path, struct stat64* st, int flags) {
+    using fn_t = int(*)(int, const char*, struct stat64*, int);
+    SMASH_LAZY_RESOLVE(fn_t, fstatat64);
+    if (!real_fstatat64) return syscall(SYS_newfstatat, dirfd, path, st, flags);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_fstatat64(dirfd, path, st, flags); },
+        st, sizeof(struct stat64));
+}
+
+// __xstat / __lxstat / __fxstatat (and _64 variants): glibc < 2.33 internal
+// symbols that the old stat / lstat / fstatat inlines forwarded to.
+SMASH_VISIBLE int __xstat(int ver, const char* path, struct stat* st) {
+    using fn_t = int(*)(int, const char*, struct stat*);
+    SMASH_LAZY_RESOLVE(fn_t, __xstat);
+    if (!real___xstat) return syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
+    return smash::vm::retryWith1Buf(
+        [&] { return real___xstat(ver, path, st); },
+        st, sizeof(struct stat));
+}
+
+SMASH_VISIBLE int __lxstat(int ver, const char* path, struct stat* st) {
+    using fn_t = int(*)(int, const char*, struct stat*);
+    SMASH_LAZY_RESOLVE(fn_t, __lxstat);
+    if (!real___lxstat) return syscall(SYS_newfstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
+    return smash::vm::retryWith1Buf(
+        [&] { return real___lxstat(ver, path, st); },
+        st, sizeof(struct stat));
+}
+
+SMASH_VISIBLE int __fxstatat(int ver, int dirfd, const char* path, struct stat* st, int flags) {
+    using fn_t = int(*)(int, int, const char*, struct stat*, int);
+    SMASH_LAZY_RESOLVE(fn_t, __fxstatat);
+    if (!real___fxstatat) return syscall(SYS_newfstatat, dirfd, path, st, flags);
+    return smash::vm::retryWith1Buf(
+        [&] { return real___fxstatat(ver, dirfd, path, st, flags); },
+        st, sizeof(struct stat));
+}
+
+SMASH_VISIBLE int __xstat64(int ver, const char* path, struct stat64* st) {
+    using fn_t = int(*)(int, const char*, struct stat64*);
+    SMASH_LAZY_RESOLVE(fn_t, __xstat64);
+    if (!real___xstat64) return syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
+    return smash::vm::retryWith1Buf(
+        [&] { return real___xstat64(ver, path, st); },
+        st, sizeof(struct stat64));
+}
+
+SMASH_VISIBLE int __lxstat64(int ver, const char* path, struct stat64* st) {
+    using fn_t = int(*)(int, const char*, struct stat64*);
+    SMASH_LAZY_RESOLVE(fn_t, __lxstat64);
+    if (!real___lxstat64) return syscall(SYS_newfstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
+    return smash::vm::retryWith1Buf(
+        [&] { return real___lxstat64(ver, path, st); },
+        st, sizeof(struct stat64));
+}
+
+SMASH_VISIBLE int __fxstatat64(int ver, int dirfd, const char* path, struct stat64* st, int flags) {
+    using fn_t = int(*)(int, int, const char*, struct stat64*, int);
+    SMASH_LAZY_RESOLVE(fn_t, __fxstatat64);
+    if (!real___fxstatat64) return syscall(SYS_newfstatat, dirfd, path, st, flags);
+    return smash::vm::retryWith1Buf(
+        [&] { return real___fxstatat64(ver, dirfd, path, st, flags); },
+        st, sizeof(struct stat64));
+}
+
+// statx — modern stat replacement (glibc 2.28+). Single-version symbol,
+// no GLIBC_2.33 aliasing dance needed.
+SMASH_VISIBLE int statx(int dirfd, const char* path, int flags,
+                         unsigned int mask, struct statx* buf) {
+    using fn_t = int(*)(int, const char*, int, unsigned int, struct statx*);
+    SMASH_LAZY_RESOLVE(fn_t, statx);
+    if (!real_statx) return syscall(SYS_statx, dirfd, path, flags, mask, buf);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_statx(dirfd, path, flags, mask, buf); },
+        buf, sizeof(struct statx));
+}
+
 // ── getrandom ───────────────────────────────────────────────────────────────
 // The kernel fills a userspace buffer with random bytes. NSS/OpenSSL/Firefox
 // use this for cryptographic initialization.
@@ -629,6 +765,24 @@ SMASH_VISIBLE int fstat_233(int fd, struct stat* st) {
 SMASH_VISIBLE int fstat64_233(int fd, struct stat64* st) {
     return fstat64(fd, st);
 }
+SMASH_VISIBLE int stat_233(const char* path, struct stat* st) {
+    return stat(path, st);
+}
+SMASH_VISIBLE int stat64_233(const char* path, struct stat64* st) {
+    return stat64(path, st);
+}
+SMASH_VISIBLE int lstat_233(const char* path, struct stat* st) {
+    return lstat(path, st);
+}
+SMASH_VISIBLE int lstat64_233(const char* path, struct stat64* st) {
+    return lstat64(path, st);
+}
+SMASH_VISIBLE int fstatat_233(int dirfd, const char* path, struct stat* st, int flags) {
+    return fstatat(dirfd, path, st, flags);
+}
+SMASH_VISIBLE int fstatat64_233(int dirfd, const char* path, struct stat64* st, int flags) {
+    return fstatat64(dirfd, path, st, flags);
+}
 
 // ── External-mapping interposers (mmap / munmap) ────────────────────────────
 //
@@ -715,5 +869,11 @@ __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 __asm__(".symver epoll_pwait_232,epoll_pwait@GLIBC_2.3.2");
 __asm__(".symver fstat_233,fstat@GLIBC_2.33");
 __asm__(".symver fstat64_233,fstat64@GLIBC_2.33");
+__asm__(".symver stat_233,stat@GLIBC_2.33");
+__asm__(".symver stat64_233,stat64@GLIBC_2.33");
+__asm__(".symver lstat_233,lstat@GLIBC_2.33");
+__asm__(".symver lstat64_233,lstat64@GLIBC_2.33");
+__asm__(".symver fstatat_233,fstatat@GLIBC_2.33");
+__asm__(".symver fstatat64_233,fstatat64@GLIBC_2.33");
 
 #endif // __linux__

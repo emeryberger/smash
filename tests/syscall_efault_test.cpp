@@ -28,6 +28,11 @@
 //      /dev/urandom. Verify both buffers got distinct data (proving
 //      both iovec slots were touched, exercising the iovec walk path).
 
+// _GNU_SOURCE: needed for `struct statx` and STATX_BASIC_STATS on Linux.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -458,7 +463,60 @@ int main() {
         return 1;
     }
     fprintf(stderr, "syscall_efault_test: fstat() with heap struct stat PASSED\n");
-    fprintf(stderr, "syscall_efault_test: fstat() with heap struct stat PASSED\n");
+
+    // ── Phase 10: stat() / lstat() into heap struct stat ──────────────────
+    // Same hazard as fstat but goes through different wrappers (stat/lstat
+    // resolve via path; fstat via fd). Reuse the leading bytes of buf —
+    // already in the heap region the compressor monitors.
+    auto* st_path = reinterpret_cast<struct stat*>(buf);
+    std::memset(st_path, 0, sizeof(struct stat));
+    fillCompressible(buf + sizeof(struct stat),
+                     kBufBytes - sizeof(struct stat), 0xA1);
+    if (!waitForCompression("pre-stat")) return 1;
+    if (stat("/dev/null", st_path) != 0) {
+        fprintf(stderr, "FAIL: stat() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    if (st_path->st_mode == 0) {
+        fprintf(stderr, "FAIL: stat() returned 0 but st_mode==0\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: stat() with heap struct stat PASSED\n");
+
+    std::memset(st_path, 0, sizeof(struct stat));
+    fillCompressible(buf + sizeof(struct stat),
+                     kBufBytes - sizeof(struct stat), 0xA2);
+    if (!waitForCompression("pre-lstat")) return 1;
+    if (lstat("/dev/null", st_path) != 0) {
+        fprintf(stderr, "FAIL: lstat() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    if (st_path->st_mode == 0) {
+        fprintf(stderr, "FAIL: lstat() returned 0 but st_mode==0\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: lstat() with heap struct stat PASSED\n");
+
+#ifdef __linux__
+    // ── Phase 11: statx() into heap struct statx (Linux only) ─────────────
+    auto* stx = reinterpret_cast<struct statx*>(buf);
+    std::memset(stx, 0, sizeof(struct statx));
+    fillCompressible(buf + sizeof(struct statx),
+                     kBufBytes - sizeof(struct statx), 0xA3);
+    if (!waitForCompression("pre-statx")) return 1;
+    if (statx(AT_FDCWD, "/dev/null", 0, STATX_BASIC_STATS, stx) != 0) {
+        fprintf(stderr, "FAIL: statx() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    if (stx->stx_mode == 0) {
+        fprintf(stderr, "FAIL: statx() returned 0 but stx_mode==0\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: statx() with heap struct statx PASSED\n");
+#endif
 
     std::free(recv_buf);
     std::free(buf);

@@ -615,6 +615,38 @@ extern "C" int smash_fstatfs(int fd, struct statfs* st) {
         [&] { if (vm && st) smash::vm::walkPagesForFault(st, sizeof(struct statfs), vm); });
 }
 
+// ── stat / lstat / fstatat ──────────────────────────────────────────────────
+// Same hazard as fstat — kernel writes a struct stat into a userspace buffer.
+// stat / lstat take a path and write to *st; fstatat takes a dirfd + path.
+
+using stat_fn = int(*)(const char*, struct stat*);
+using lstat_fn = int(*)(const char*, struct stat*);
+using fstatat_fn = int(*)(int, const char*, struct stat*, int);
+
+extern "C" int smash_stat(const char* path, struct stat* st);
+SMASH_INTERPOSE(smash_stat, stat);
+extern "C" int smash_stat(const char* path, struct stat* st) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<stat_fn>(smash_interpose_smash_stat.original)(path, st); },
+        st, sizeof(struct stat));
+}
+
+extern "C" int smash_lstat(const char* path, struct stat* st);
+SMASH_INTERPOSE(smash_lstat, lstat);
+extern "C" int smash_lstat(const char* path, struct stat* st) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<lstat_fn>(smash_interpose_smash_lstat.original)(path, st); },
+        st, sizeof(struct stat));
+}
+
+extern "C" int smash_fstatat(int dirfd, const char* path, struct stat* st, int flags);
+SMASH_INTERPOSE(smash_fstatat, fstatat);
+extern "C" int smash_fstatat(int dirfd, const char* path, struct stat* st, int flags) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<fstatat_fn>(smash_interpose_smash_fstatat.original)(dirfd, path, st, flags); },
+        st, sizeof(struct stat));
+}
+
 // ── read / write ────────────────────────────────────────────────────────────
 
 using read_fn = ssize_t(*)(int, void*, size_t);

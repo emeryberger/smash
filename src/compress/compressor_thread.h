@@ -30,6 +30,7 @@
 #include <pthread.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 
@@ -266,7 +267,6 @@ class CompressorThread {
     static constexpr int kMaxHelpers = kMaxCompressorWorkers > 1 ? kMaxCompressorWorkers - 1 : 1;
     pthread_t helper_threads_[kMaxHelpers]{};
     std::atomic<bool> running_{false};
-    bool stdio_pinned_ = false;
 
     // Work dispatch: coordinator increments work_gen_ to signal helpers.
     // Helpers compare against their last-seen gen to detect new work.
@@ -497,32 +497,18 @@ class CompressorThread {
     // Escalate a PROT_READ-monitored page to PROT_NONE (deep monitoring).
     // Any access (read or write) will now trigger the fault handler.
     void escalateToDeepMonitoring(size_t page_idx) {
-        bool pinned = vm::g_page_pins &&
-            vm::g_page_pins[page_idx].load(std::memory_order_acquire) > 0;
-        if (pinned) return;
         void* page_addr = vm_->pageAddress(page_idx);
         vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
     }
 
-    // Phase 3: Set up access monitoring for remaining active pages
+    // Phase 3: Set up access monitoring for remaining active pages.
     //
-    // Uses per-page mprotect to prevent the TOCTOU race where a syscall
-    // wrapper pins a page between the pin check and a batched mprotect call.
-    // With batching, the race window is too wide (the entire run) and kernel
-    // syscalls get EFAULT on transiently PROT_READ pages. Per-page mprotect
-    // eliminates this by keeping the pin-check → mprotect window to a single
-    // function call. Syscall wrappers also retry on EFAULT as a final safety
-    // net for the remaining nanosecond-scale race.
-    //
-    // Performance: in compress-only mode, pages are at non-contiguous addresses
-    // so batching provides no benefit anyway. In full Smash, pages are
-    // contiguous but per-page mprotect adds ~1-2μs per page per tick which
-    // is acceptable for the correctness guarantee.
+    // Syscalls touching a transiently PROT_READ page get EFAULT instead of
+    // a SIGSEGV; the wrapper's retryWithDecompress loop catches that, walks
+    // the buffer pages (which DOES go through the fault handler), and
+    // retries. The bounded retry budget (8) outlasts a compressor tick.
     void phase3Range(size_t start, size_t end) {
         forEachLivePage(start, end, [&](size_t i) {
-            bool pinned = vm::g_page_pins &&
-                vm::g_page_pins[i].load(std::memory_order_acquire) > 0;
-            if (pinned) return;
             // CAS: only transition ACTIVE → ACTIVE_MONITORING.
             // Avoids TOCTOU race where releaseCompressedPages() sets
             // a page to EMPTY between our read and write — without CAS,
@@ -538,10 +524,6 @@ class CompressorThread {
     // ── Compress one page using worker's contexts ─────────────────────────
 
     bool compressPage(size_t page_idx, CompressWorker& worker) {
-        // Skip pinned pages (in use by a blocking syscall)
-        if (vm::g_page_pins && vm::g_page_pins[page_idx].load(std::memory_order_relaxed) > 0)
-            return false;
-
         locks_->lock(page_idx);
 
         // Verify still eligible
@@ -864,21 +846,21 @@ class CompressorThread {
         }
     }
 
-    // ── stdio buffer pinning ──────────────────────────────────────────────
+    // ── stdio buffer warming ──────────────────────────────────────────────
 
-    void pinStdioBuffers() {
+    // macOS only: DYLD interposition cannot intercept intra-libSystem calls
+    // (getc_unlocked, __srget). Those paths read from FILE._bf without going
+    // through our wrapper, so EFAULT-retry can't help. Re-warm stdin/stdout/
+    // stderr buffer pages each tick so the kernel never sees a protected page
+    // for them. On Linux, LD_PRELOAD intercepts intra-libc calls, so the
+    // EFAULT-retry path covers them; this is a no-op there.
+    void warmStdioBuffers() {
 #ifdef __APPLE__
-        // macOS only: DYLD interposition can't intercept intra-libSystem calls,
-        // so we must pin stdio buffers explicitly. On Linux, LD_PRELOAD
-        // intercepts all calls including intra-libc, so this isn't needed.
-        if (!vm::g_page_pins) return;
         FILE* streams[] = { stdin, stdout, stderr };
         for (FILE* f : streams) {
             if (!f || !f->_bf._base || f->_bf._size <= 0) continue;
             smash::vm::warmPages(f->_bf._base, f->_bf._size, vm_);
-            smash::vm::pinPages(f->_bf._base, f->_bf._size, vm_);
             smash::vm::warmPages(f, sizeof(FILE), vm_);
-            smash::vm::pinPages(f, sizeof(FILE), vm_);
         }
 #endif
     }
@@ -955,10 +937,21 @@ class CompressorThread {
             }
         }
 
-        // Pin stdio buffers once (they don't move after first use)
-        if (!stdio_pinned_) {
-            pinStdioBuffers();
-            stdio_pinned_ = true;
+        // Re-warm stdio buffers each tick (macOS-only; no-op on Linux).
+        // Without this, intra-libSystem getc_unlocked / __srget paths can
+        // hit a protected stdin/stdout/stderr buffer and EFAULT inside libc
+        // before our wrapper sees the call.
+        warmStdioBuffers();
+
+        // SMASH_DEBUG=1: print a stats line every 5 ticks (~5s at the
+        // 1000ms compressor cadence — kCompressIntervalMs). Mirrors the
+        // SIGUSR2 stats format so log scrapers can use one parser.
+        if (s_debug_enabled_) {
+            static int debug_tick_counter = 0;
+            if (++debug_tick_counter >= 5) {
+                debug_tick_counter = 0;
+                sigusr1Handler(0);
+            }
         }
 
         size_t committed = vm_->committedPages();
@@ -1238,6 +1231,34 @@ public:
         sigemptyset(&sa.sa_mask);
         sigaction(SIGUSR2, &sa, nullptr);
 
+        // SMASH_STATS=1: also emit a stats line on every normal process
+        // exit. atexit handlers are inherited across fork(), so each child
+        // of a multi-process app (Firefox parent + content + GPU + …)
+        // prints its own line as it shuts down. _exit() and SIGKILL skip
+        // atexit by design.
+        const char* stats_env = std::getenv("SMASH_STATS");
+        if (stats_env && stats_env[0] == '1') {
+            std::atexit([]() {
+                if (s_stats_instance_) sigusr1Handler(0);
+            });
+        }
+
+        // SMASH_DEBUG=1: emit a banner now (compressor came up) and a
+        // stats line every Nth tick during the run. Distinct from
+        // SMASH_STATS=1 (atexit-only) — SMASH_DEBUG is for watching
+        // activity live without having to chase PIDs and send SIGUSR2.
+        const char* dbg_env = std::getenv("SMASH_DEBUG");
+        s_debug_enabled_ = dbg_env && dbg_env[0] == '1';
+        if (s_debug_enabled_) {
+            char ts[32] = {};
+            vm::formatTimestamp(ts, sizeof(ts));
+            char buf[200];
+            int n = snprintf(buf, sizeof(buf),
+                "[smash debug] [%s] compressor start pid=%d workers=%d\n",
+                ts, (int)getpid(), kCompressorWorkers);
+            if (n > 0) (void)!write(2, buf, (size_t)n);
+        }
+
         // Start initial helper threads (adaptive scaling may create more later)
         int initial_helpers = kCompressorWorkers > 1 ? kCompressorWorkers - 1 : 0;
         for (int i = 0; i < initial_helpers; ++i) {
@@ -1254,6 +1275,7 @@ public:
     }
 
     static inline CompressorThread* s_stats_instance_ = nullptr;
+    static inline bool s_debug_enabled_ = false;
 
     static void sigusr1Handler(int) {
         auto* self = s_stats_instance_;
@@ -1269,11 +1291,13 @@ public:
             case PageState::COMPRESSED: ++compressed; break;
             }
         }
-        char buf[256];
+        char ts[32] = {};
+        vm::formatTimestamp(ts, sizeof(ts));
+        char buf[320];
         int n = snprintf(buf, sizeof(buf),
-            "[smash stats] pid=%d committed=%zu  active=%zu  monitor=%zu"
+            "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  empty=%zu\n",
-            (int)getpid(), total, active, monitor, compressing, compressed,
+            ts, (int)getpid(), total, active, monitor, compressing, compressed,
             empty);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's

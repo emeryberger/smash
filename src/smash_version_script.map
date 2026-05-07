@@ -107,6 +107,57 @@ GLIBC_2.2.5 {
     epoll_wait;
     epoll_pwait;
 
+    # fstat / stat family — glibc remaps fstat → fstat64 with
+    # _FILE_OFFSET_BITS=64 (Ubuntu C++ default); glibc < 2.33 routes through
+    # __fxstat / __xstat / __lxstat / __fxstatat (and _64 variants). Cover
+    # all the entry points so LD_PRELOAD wins regardless of glibc version
+    # or LFS settings.
+    fstat;
+    fstat64;
+    stat;
+    stat64;
+    lstat;
+    lstat64;
+    fstatat;
+    fstatat64;
+    statx;
+    __fxstat;
+    __fxstat64;
+    __xstat;
+    __xstat64;
+    __lxstat;
+    __lxstat64;
+    __fxstatat;
+    __fxstatat64;
+    fstatfs;
+
+    # Directory enumeration + symlink reads (Round 2 coverage)
+    getdents64;
+    readlink;
+    readlinkat;
+
+    # Positioned vectored I/O (Round 3 coverage)
+    preadv;
+    pwritev;
+    preadv2;
+    pwritev2;
+
+    # Process management (Round 4 coverage)
+    waitid;
+    wait4;
+
+    # statvfs / xattr / rusage / rlimit (Round 5 coverage)
+    statvfs;
+    fstatvfs;
+    getxattr;
+    lgetxattr;
+    fgetxattr;
+    listxattr;
+    llistxattr;
+    flistxattr;
+    getrusage;
+    prlimit64;
+
   local:
     *;
 };
@@ -119,4 +170,57 @@ GLIBC_2.3.2 {
     epoll_pwait;
     epoll_wait_232;
     epoll_pwait_232;
+} GLIBC_2.2.5;
+
+# glibc 2.34 re-versioned fstat / fstat64 to GLIBC_2.33 for y2038-safe
+# struct stat. C++ binaries built against modern glibc reference
+# fstat@GLIBC_2.33 specifically; if we only export fstat@GLIBC_2.2.5
+# the dynamic linker doesn't match and our wrapper is bypassed.
+# Export at both versions so we win regardless of binding age.
+GLIBC_2.28 {
+  global:
+    statx;
+    statx_228;
+} GLIBC_2.2.5;
+
+GLIBC_2.10 {
+  global:
+    preadv;
+    pwritev;
+    preadv_210;
+    pwritev_210;
+} GLIBC_2.2.5;
+
+GLIBC_2.26 {
+  global:
+    preadv2;
+    pwritev2;
+    preadv2_226;
+    pwritev2_226;
+} GLIBC_2.10;
+
+GLIBC_2.30 {
+  global:
+    getdents64;
+    getdents64_230;
+} GLIBC_2.28;
+
+GLIBC_2.33 {
+  global:
+    fstat;
+    fstat64;
+    stat;
+    stat64;
+    lstat;
+    lstat64;
+    fstatat;
+    fstatat64;
+    fstat_233;
+    fstat64_233;
+    stat_233;
+    stat64_233;
+    lstat_233;
+    lstat64_233;
+    fstatat_233;
+    fstatat64_233;
 } GLIBC_2.2.5;

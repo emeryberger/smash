@@ -127,8 +127,6 @@ inline void init() {
                       nullptr, &g_fault_handler);
 
     smash::g_smash_vm_region = &g_vm;
-    smash::vm::g_page_pins = smash::bootstrapArray<std::atomic<uint8_t>>(
-        g_vm.totalPages());
 
     g_inited.store(true, std::memory_order_release);
 }

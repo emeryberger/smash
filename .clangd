@@ -1,0 +1,5 @@
+# clangd configuration. CMake writes compile_commands.json to build/ when
+# configured with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON. Point clangd at that
+# directory so it picks up include paths, defines, and per-file flags.
+CompileFlags:
+  CompilationDatabase: build

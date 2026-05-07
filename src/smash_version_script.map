@@ -150,6 +150,12 @@ GLIBC_2.3.2 {
 # fstat@GLIBC_2.33 specifically; if we only export fstat@GLIBC_2.2.5
 # the dynamic linker doesn't match and our wrapper is bypassed.
 # Export at both versions so we win regardless of binding age.
+GLIBC_2.28 {
+  global:
+    statx;
+    statx_228;
+} GLIBC_2.2.5;
+
 GLIBC_2.33 {
   global:
     fstat;

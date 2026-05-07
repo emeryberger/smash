@@ -783,6 +783,11 @@ SMASH_VISIBLE int fstatat_233(int dirfd, const char* path, struct stat* st, int 
 SMASH_VISIBLE int fstatat64_233(int dirfd, const char* path, struct stat64* st, int flags) {
     return fstatat64(dirfd, path, st, flags);
 }
+// statx was introduced in glibc 2.28 — binaries reference statx@GLIBC_2.28.
+SMASH_VISIBLE int statx_228(int dirfd, const char* path, int flags,
+                             unsigned int mask, struct statx* buf) {
+    return statx(dirfd, path, flags, mask, buf);
+}
 
 // ── External-mapping interposers (mmap / munmap) ────────────────────────────
 //
@@ -875,5 +880,6 @@ __asm__(".symver lstat_233,lstat@GLIBC_2.33");
 __asm__(".symver lstat64_233,lstat64@GLIBC_2.33");
 __asm__(".symver fstatat_233,fstatat@GLIBC_2.33");
 __asm__(".symver fstatat64_233,fstatat64@GLIBC_2.33");
+__asm__(".symver statx_228,statx@GLIBC_2.28");
 
 #endif // __linux__

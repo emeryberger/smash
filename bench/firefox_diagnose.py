@@ -156,6 +156,25 @@ def descendants(root: int) -> list[int]:
     return sorted(out)
 
 
+def all_firefox_pids() -> list[int]:
+    """Every process system-wide whose comm or cmdline contains 'firefox'.
+    Catches sandbox-escapees that fall out of our spawn subtree."""
+    out: list[int] = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        pid = int(p.name)
+        try:
+            comm = (p / "comm").read_text(errors="replace").strip().lower()
+            cmdline = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace").lower()
+            if ("firefox" in comm) or ("firefox" in cmdline) or ("mozilla" in cmdline):
+                out.append(pid)
+        except OSError:
+            continue
+    return sorted(out)
+
+
 # ── sections ────────────────────────────────────────────────────────────────
 
 
@@ -173,7 +192,9 @@ def section_system() -> None:
           short(sh("aa-status 2>/dev/null | head -3")))
 
 
-def section_firefox_binary(firefox: str) -> None:
+def section_firefox_binary(firefox: str) -> bool:
+    """Return True if firefox is sandboxed (snap/flatpak) — caller should
+    skip the launch+walk step since it can't possibly work."""
     banner(f"firefox binary: {firefox}")
     print("type:", short(sh(f"file {shlex.quote(firefox)}")))
     print("size+mode:", short(sh(f"stat -c '%A %s %n' {shlex.quote(firefox)}")))
@@ -194,11 +215,23 @@ def section_firefox_binary(firefox: str) -> None:
     print("snap firefox:", short(sh("snap list firefox 2>/dev/null")) or "(not installed via snap)")
     print("flatpak firefox:",
           short(sh("flatpak list | grep -i firefox 2>/dev/null")) or "(not installed via flatpak)")
-    if "/snap/" in firefox or "/var/lib/snapd" in firefox:
+    is_snap = ("/snap/" in firefox or "/var/lib/snapd" in firefox or
+               sh(f"snap list firefox 2>/dev/null | grep -q firefox && echo y").strip() == "y")
+    if is_snap:
         print()
-        print("!!! firefox is from snap — snap confinement strips LD_PRELOAD.")
-        print("!!! Install Firefox from the Mozilla tarball:")
-        print("    wget -O - 'https://download.mozilla.org/?product=firefox-latest-ssl&os=linux64&lang=en-US' | tar -xj")
+        print("!!! firefox is from snap — snap confinement strips LD_PRELOAD")
+        print("!!! at the sandbox boundary. The wrapper /usr/bin/firefox loads")
+        print("!!! libsmash, then exec's into the snap confined namespace where")
+        print("!!! the env is scrubbed. There is no fix for this short of using")
+        print("!!! a non-snap Firefox build.")
+        print("!!!")
+        print("!!! Replace with the Mozilla tarball:")
+        print("!!!   wget -O- 'https://download.mozilla.org/?product=firefox-latest-ssl&os=linux64&lang=en-US' \\")
+        print("!!!     | tar -xj")
+        print("!!!   ./firefox/firefox")
+        print("!!! Then re-run this script with that binary path.")
+        return True
+    return False
 
 
 def section_libsmash(libsmash: str) -> None:
@@ -246,9 +279,21 @@ def launch_and_walk(libsmash: str, firefox: str, dwell_sec: int) -> None:
     print(f"sleeping {dwell_sec}s …")
     time.sleep(dwell_sec)
 
-    # Snapshot the tree before we kill anything.
-    pids = [proc.pid] + descendants(proc.pid)
-    banner(f"process tree under {proc.pid} — {len(pids)} processes")
+    # Snapshot the tree before we kill anything. Also include any
+    # firefox-named process system-wide — sandbox-escapees (snap, flatpak)
+    # fall out of our subtree because they're in a different cgroup.
+    subtree = [proc.pid] + descendants(proc.pid)
+    all_ff = all_firefox_pids()
+    extra = [p for p in all_ff if p not in subtree]
+    pids = sorted(set(subtree + all_ff))
+    banner(f"process scan: {len(subtree)} in subtree under {proc.pid}; "
+           f"{len(extra)} additional firefox-named processes elsewhere")
+    if extra:
+        print(f"!!! {len(extra)} firefox process(es) escaped our subtree —")
+        print("!!! likely snap/flatpak/sandbox confinement. They will not "
+              "have inherited LD_PRELOAD.")
+        for p in extra[:5]:
+            print(f"    pid={p} exe={proc_exe(p)} cmd={short(proc_cmdline(p), 100)}")
     rows: list[tuple[int, str, str, str, str]] = []
     for pid in pids:
         try:
@@ -341,8 +386,15 @@ def main() -> int:
     firefox = os.path.abspath(firefox) if os.path.exists(firefox) else firefox
 
     section_system()
-    section_firefox_binary(firefox)
+    sandboxed = section_firefox_binary(firefox)
     section_libsmash(libsmash)
+    if sandboxed:
+        banner("SUMMARY")
+        print("Firefox is in a confined sandbox (snap/flatpak). LD_PRELOAD")
+        print("cannot reach the actual Firefox processes through the sandbox")
+        print("boundary. Install a non-confined Firefox (Mozilla tarball or")
+        print("a non-snap distro package) and retry.")
+        return 0
     launch_and_walk(libsmash, firefox, args.dwell)
     return 0
 

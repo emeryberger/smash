@@ -161,6 +161,12 @@ GLIBC_2.28 {
     statx_228;
 } GLIBC_2.2.5;
 
+GLIBC_2.30 {
+  global:
+    getdents64;
+    getdents64_230;
+} GLIBC_2.28;
+
 GLIBC_2.33 {
   global:
     fstat;

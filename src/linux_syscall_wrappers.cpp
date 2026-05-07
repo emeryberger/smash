@@ -577,6 +577,42 @@ SMASH_VISIBLE int statx(int dirfd, const char* path, int flags,
         buf, sizeof(struct statx));
 }
 
+// ── getdents64 / readlink / readlinkat ──────────────────────────────────────
+// getdents64: kernel writes a sequence of struct linux_dirent64 entries into
+//   a userspace buffer (typically 32 KiB). readdir() callers in glibc go
+//   through __getdents64 internally (not interposable), but direct callers
+//   exist. Wrap the public symbol.
+// readlink / readlinkat: kernel writes the symlink target string into the
+//   user buffer.
+
+SMASH_VISIBLE ssize_t getdents64(int fd, void* dirp, size_t count) {
+    using fn_t = ssize_t(*)(int, void*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, getdents64);
+    if (!real_getdents64) return syscall(SYS_getdents64, fd, dirp, count);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_getdents64(fd, dirp, count); },
+        dirp, count);
+}
+
+SMASH_VISIBLE ssize_t readlink(const char* path, char* buf, size_t bufsize) {
+    using fn_t = ssize_t(*)(const char*, char*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, readlink);
+    if (!real_readlink) return syscall(SYS_readlinkat, AT_FDCWD, path, buf, bufsize);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_readlink(path, buf, bufsize); },
+        buf, bufsize);
+}
+
+SMASH_VISIBLE ssize_t readlinkat(int dirfd, const char* path,
+                                  char* buf, size_t bufsize) {
+    using fn_t = ssize_t(*)(int, const char*, char*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, readlinkat);
+    if (!real_readlinkat) return syscall(SYS_readlinkat, dirfd, path, buf, bufsize);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_readlinkat(dirfd, path, buf, bufsize); },
+        buf, bufsize);
+}
+
 // ── getrandom ───────────────────────────────────────────────────────────────
 // The kernel fills a userspace buffer with random bytes. NSS/OpenSSL/Firefox
 // use this for cryptographic initialization.

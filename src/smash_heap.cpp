@@ -647,6 +647,28 @@ extern "C" int smash_fstatat(int dirfd, const char* path, struct stat* st, int f
         st, sizeof(struct stat));
 }
 
+// ── readlink / readlinkat ───────────────────────────────────────────────────
+// Kernel writes the symlink target string into the user buffer.
+
+using readlink_fn = ssize_t(*)(const char*, char*, size_t);
+using readlinkat_fn = ssize_t(*)(int, const char*, char*, size_t);
+
+extern "C" ssize_t smash_readlink(const char* path, char* buf, size_t bufsize);
+SMASH_INTERPOSE(smash_readlink, readlink);
+extern "C" ssize_t smash_readlink(const char* path, char* buf, size_t bufsize) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<readlink_fn>(smash_interpose_smash_readlink.original)(path, buf, bufsize); },
+        buf, bufsize);
+}
+
+extern "C" ssize_t smash_readlinkat(int dirfd, const char* path, char* buf, size_t bufsize);
+SMASH_INTERPOSE(smash_readlinkat, readlinkat);
+extern "C" ssize_t smash_readlinkat(int dirfd, const char* path, char* buf, size_t bufsize) {
+    return smash::vm::retryWith1Buf(
+        [&] { return reinterpret_cast<readlinkat_fn>(smash_interpose_smash_readlinkat.original)(dirfd, path, buf, bufsize); },
+        buf, bufsize);
+}
+
 // ── read / write ────────────────────────────────────────────────────────────
 
 using read_fn = ssize_t(*)(int, void*, size_t);

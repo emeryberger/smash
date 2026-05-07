@@ -131,6 +131,11 @@ GLIBC_2.2.5 {
     __fxstatat64;
     fstatfs;
 
+    # Directory enumeration + symlink reads (Round 2 coverage)
+    getdents64;
+    readlink;
+    readlinkat;
+
   local:
     *;
 };

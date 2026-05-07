@@ -516,7 +516,55 @@ int main() {
         return 1;
     }
     fprintf(stderr, "syscall_efault_test: statx() with heap struct statx PASSED\n");
+
+    // ── Phase 12: getdents64() into heap dirp buffer (Linux only) ─────────
+    fillCompressible(buf, kBufBytes, 0xB1);
+    if (!waitForCompression("pre-getdents64")) return 1;
+    int dir_fd = open("/", O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) { fprintf(stderr, "FAIL: open / errno=%d\n", errno); return 1; }
+    constexpr size_t kDirpBytes = 32 * 1024;
+    extern ssize_t getdents64(int, void*, size_t);
+    ssize_t gd_ret = getdents64(dir_fd, buf, kDirpBytes);
+    if (gd_ret < 0) {
+        fprintf(stderr, "FAIL: getdents64() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    close(dir_fd);
+    if (gd_ret == 0) {
+        fprintf(stderr, "FAIL: getdents64() returned 0 entries on /\n");
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: getdents64() into heap dirp (%zd bytes) PASSED\n", gd_ret);
 #endif
+
+    // ── Phase 13: readlink() into heap buffer (cross-platform) ────────────
+    // Create a temp symlink, then readlink() into our compressed buffer.
+    char link_path[] = "/tmp/smash-efault-symlink-XXXXXX";
+    int sl_fd = mkstemp(link_path);
+    if (sl_fd < 0) { fprintf(stderr, "FAIL: mkstemp\n"); return 1; }
+    close(sl_fd);
+    unlink(link_path);
+    if (symlink("/dev/null", link_path) != 0) {
+        fprintf(stderr, "FAIL: symlink errno=%d\n", errno); return 1;
+    }
+    fillCompressible(buf, kBufBytes, 0xB2);
+    if (!waitForCompression("pre-readlink")) return 1;
+    char* linkbuf = reinterpret_cast<char*>(buf);
+    constexpr size_t kLinkBufSize = 4096;
+    ssize_t rl_ret = readlink(link_path, linkbuf, kLinkBufSize);
+    if (rl_ret < 0) {
+        fprintf(stderr, "FAIL: readlink() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    if (rl_ret < 9 /* "/dev/null" */ ||
+        std::memcmp(linkbuf, "/dev/null", 9) != 0) {
+        fprintf(stderr, "FAIL: readlink() did not write the expected target\n");
+        return 1;
+    }
+    unlink(link_path);
+    fprintf(stderr, "syscall_efault_test: readlink() into heap buffer PASSED\n");
 
     std::free(recv_buf);
     std::free(buf);

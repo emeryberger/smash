@@ -51,10 +51,7 @@ static void smash_print_banner() {
     const char* on = std::getenv("SMASH_BANNER");
     if (!on || on[0] != '1') return;
     char ts[32] = {};
-    time_t now = time(nullptr);
-    struct tm tm_buf;
-    if (localtime_r(&now, &tm_buf))
-        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    smash::vm::formatTimestamp(ts, sizeof(ts));
     char buf[320];
     int n = std::snprintf(buf, sizeof(buf),
         "[smash] %s loaded pid=%d ppid=%d "

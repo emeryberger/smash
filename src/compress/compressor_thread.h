@@ -1250,10 +1250,12 @@ public:
         const char* dbg_env = std::getenv("SMASH_DEBUG");
         s_debug_enabled_ = dbg_env && dbg_env[0] == '1';
         if (s_debug_enabled_) {
-            char buf[160];
+            char ts[32] = {};
+            vm::formatTimestamp(ts, sizeof(ts));
+            char buf[200];
             int n = snprintf(buf, sizeof(buf),
-                "[smash debug] compressor start pid=%d workers=%d\n",
-                (int)getpid(), kCompressorWorkers);
+                "[smash debug] %s compressor start pid=%d workers=%d\n",
+                ts, (int)getpid(), kCompressorWorkers);
             if (n > 0) (void)!write(2, buf, (size_t)n);
         }
 
@@ -1289,11 +1291,13 @@ public:
             case PageState::COMPRESSED: ++compressed; break;
             }
         }
-        char buf[256];
+        char ts[32] = {};
+        vm::formatTimestamp(ts, sizeof(ts));
+        char buf[320];
         int n = snprintf(buf, sizeof(buf),
-            "[smash stats] pid=%d committed=%zu  active=%zu  monitor=%zu"
+            "[smash stats] %s pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  empty=%zu\n",
-            (int)getpid(), total, active, monitor, compressing, compressed,
+            ts, (int)getpid(), total, active, monitor, compressing, compressed,
             empty);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's

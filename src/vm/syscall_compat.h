@@ -35,6 +35,20 @@
 
 namespace smash::vm {
 
+// Fill buf with "YYYY-MM-DD HH:MM:SS" from local time. Returns the
+// number of chars written (excluding the null), or 0 on failure.
+// Used by every "[smash …] …" line so log scrapers can correlate
+// across processes. localtime_r/strftime are not strictly POSIX
+// async-signal-safe but glibc/Apple implementations work in practice
+// inside our signal handlers.
+inline int formatTimestamp(char* buf, size_t cap) {
+    if (cap < 20) return 0;
+    time_t now = time(nullptr);
+    struct tm tm_buf;
+    if (!localtime_r(&now, &tm_buf)) return 0;
+    return static_cast<int>(strftime(buf, cap, "%Y-%m-%d %H:%M:%S", &tm_buf));
+}
+
 // Proactive read-then-write of one byte per page in [buf, buf+len).
 // Used by wrappers that have no retry surface (intra-libSystem buffered I/O,
 // getcwd hooks). PROT_NONE pages fault on read → handler decompresses; the

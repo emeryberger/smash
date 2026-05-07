@@ -76,7 +76,8 @@ def initdb(tools: dict[str, str], datadir: Path) -> None:
 
 
 def start_postgres(tools: dict[str, str], libsmash: str, datadir: Path,
-                   port: int, log_path: Path) -> subprocess.Popen:
+                   port: int, log_path: Path,
+                   work_mem_mb: int = 8) -> subprocess.Popen:
     env = os.environ.copy()
     env["LD_PRELOAD"] = os.path.abspath(libsmash)
     env["SMASH_BANNER"] = "1"
@@ -84,7 +85,6 @@ def start_postgres(tools: dict[str, str], libsmash: str, datadir: Path,
     env["SMASH_STATS"] = "1"
     env["SMASH_DEFER_PHASES_MS"] = "5000"
     env["SMASH_LARGE_ONLY"] = "0"
-    # Quieten postgres' own logging so smash output is easy to find.
     # Place the Unix socket in our writable datadir; default
     # /var/run/postgresql is owned by the postgres user and unwritable.
     socket_dir = datadir.parent
@@ -94,10 +94,14 @@ def start_postgres(tools: dict[str, str], libsmash: str, datadir: Path,
         "-p", str(port),
         "-c", f"unix_socket_directories={socket_dir}",
         "-c", "shared_buffers=64MB",   # Small — most heap should be per-backend
-        "-c", "work_mem=8MB",          # Force backends to allocate visibly
+        "-c", f"work_mem={work_mem_mb}MB",
         "-c", "max_connections=20",
         "-c", "fsync=off",             # Speed up pgbench init
         "-c", "synchronous_commit=off",
+        # Disable parallel workers so each query's memory shows up in
+        # one backend rather than being split across worker processes.
+        "-c", "max_parallel_workers_per_gather=0",
+        "-c", "max_parallel_workers=0",
         "-c", "log_destination=stderr",
         "-c", "logging_collector=off",
         "-c", "log_min_messages=warning",
@@ -144,8 +148,28 @@ def stop_postgres(proc: subprocess.Popen) -> None:
 # ── workload ────────────────────────────────────────────────────────────────
 
 
+# An analytical pgbench script. Each "transaction" runs three queries
+# that stress work_mem and create fresh MemoryContexts:
+#   1. ORDER BY on the largest table — forces materialization + sort
+#      of the entire pgbench_accounts table when work_mem is large
+#      enough to avoid disk; otherwise hits external sort.
+#   2. GROUP BY aggregation — hash agg materializes one entry per
+#      branch, then aggregates over all accounts.
+#   3. Hash join across two tables.
+ANALYTICAL_SQL = """\
+SELECT abalance, aid FROM pgbench_accounts ORDER BY abalance, aid LIMIT 1000;
+SELECT bid, COUNT(*), AVG(abalance), MIN(abalance), MAX(abalance)
+  FROM pgbench_accounts GROUP BY bid ORDER BY bid;
+SELECT b.bid, COUNT(*) FILTER (WHERE a.abalance > 0) AS positive,
+              SUM(a.abalance) AS total
+  FROM pgbench_branches b JOIN pgbench_accounts a ON a.bid = b.bid
+  GROUP BY b.bid;
+"""
+
+
 def run_pgbench(tools: dict[str, str], port: int, sockdir: str,
-                scale: int, clients: int, dwell_sec: int) -> None:
+                scale: int, clients: int, dwell_sec: int,
+                analytical: bool) -> None:
     pgbench = tools["pgbench"]
     psql = tools["psql"]
     # Create the test database.
@@ -159,12 +183,22 @@ def run_pgbench(tools: dict[str, str], port: int, sockdir: str,
         [pgbench, "-h", sockdir, "-p", str(port),
          "-U", "smashuser", "-i", "-s", str(scale), "smash_pgbench"],
         check=True, capture_output=True)
-    print(f">>> pgbench -c {clients} -T {dwell_sec} (running mixed workload)")
-    r = subprocess.run(
-        [pgbench, "-h", sockdir, "-p", str(port),
-         "-U", "smashuser", "-c", str(clients), "-T", str(dwell_sec),
-         "smash_pgbench"],
-        capture_output=True, text=True)
+    if analytical:
+        # Drop a custom script next to the datadir.
+        script = Path(sockdir) / "analytical.sql"
+        script.write_text(ANALYTICAL_SQL)
+        mode_label = f"analytical (custom script: {script.name})"
+        cmd = [pgbench, "-h", sockdir, "-p", str(port),
+               "-U", "smashuser", "-n",  # -n: skip vacuum (analytical, not OLTP)
+               "-c", str(clients), "-T", str(dwell_sec),
+               "-f", str(script), "smash_pgbench"]
+    else:
+        mode_label = "default mixed (TPC-B-like OLTP)"
+        cmd = [pgbench, "-h", sockdir, "-p", str(port),
+               "-U", "smashuser", "-c", str(clients), "-T", str(dwell_sec),
+               "smash_pgbench"]
+    print(f">>> pgbench -c {clients} -T {dwell_sec}  ({mode_label})")
+    r = subprocess.run(cmd, capture_output=True, text=True)
     print(r.stdout.strip())
     if r.returncode != 0:
         print(f"pgbench returned {r.returncode}: {r.stderr.strip()}",
@@ -264,11 +298,20 @@ def main() -> int:
     ap.add_argument("libsmash", help="Path to libsmash.so")
     ap.add_argument("--port", type=int, default=5499)
     ap.add_argument("--scale", type=int, default=10,
-                    help="pgbench scale factor (default 10 ≈ 150 MB schema)")
+                    help="pgbench scale factor (10 ≈ 150 MB schema; "
+                         "use 50+ for analytical mode)")
     ap.add_argument("--clients", type=int, default=4)
     ap.add_argument("--dwell", type=int, default=60,
                     help="pgbench duration in seconds")
+    ap.add_argument("--analytical", action="store_true",
+                    help="Use a sort/aggregate/join workload (stresses "
+                         "work_mem and creates fresh MemoryContexts) "
+                         "instead of pgbench's default OLTP. Recommended "
+                         "for smash validation since OLTP barely allocates.")
+    ap.add_argument("--work-mem-mb", type=int, default=None,
+                    help="postgres work_mem in MB (default 8 mixed / 128 analytical)")
     args = ap.parse_args()
+    work_mem_mb = args.work_mem_mb or (128 if args.analytical else 8)
 
     if sys.platform != "linux":
         print("Linux-only.", file=sys.stderr)
@@ -293,13 +336,15 @@ def main() -> int:
     try:
         initdb(tools, datadir)
         proc = start_postgres(tools, args.libsmash, datadir,
-                              args.port, log_path)
+                              args.port, log_path,
+                              work_mem_mb=work_mem_mb)
         if not wait_for_ready(tools, args.port, sockdir, timeout_s=30):
             print("postgres did not become ready in 30s; check the log",
                   file=sys.stderr)
             return 1
         run_pgbench(tools, args.port, sockdir,
-                    args.scale, args.clients, args.dwell)
+                    args.scale, args.clients, args.dwell,
+                    analytical=args.analytical)
     finally:
         if proc is not None:
             print(">>> stopping postgres")

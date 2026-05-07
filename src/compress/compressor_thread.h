@@ -1254,7 +1254,7 @@ public:
             vm::formatTimestamp(ts, sizeof(ts));
             char buf[200];
             int n = snprintf(buf, sizeof(buf),
-                "[smash debug] %s compressor start pid=%d workers=%d\n",
+                "[smash debug] [%s] compressor start pid=%d workers=%d\n",
                 ts, (int)getpid(), kCompressorWorkers);
             if (n > 0) (void)!write(2, buf, (size_t)n);
         }
@@ -1295,7 +1295,7 @@ public:
         vm::formatTimestamp(ts, sizeof(ts));
         char buf[320];
         int n = snprintf(buf, sizeof(buf),
-            "[smash stats] %s pid=%d committed=%zu  active=%zu  monitor=%zu"
+            "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  empty=%zu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             empty);

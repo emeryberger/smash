@@ -54,7 +54,7 @@ static void smash_print_banner() {
     smash::vm::formatTimestamp(ts, sizeof(ts));
     char buf[320];
     int n = std::snprintf(buf, sizeof(buf),
-        "[smash] %s loaded pid=%d ppid=%d "
+        "[smash] [%s] loaded pid=%d ppid=%d "
 #ifdef __APPLE__
         "platform=darwin"
 #else

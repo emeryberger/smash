@@ -634,6 +634,17 @@ int main() {
     // Spawn a trivial child, then collect status via waitid (siginfo_t into
     // compressed buffer) and again via wait4 (rusage into compressed
     // buffer). Both syscalls write structured data into user memory.
+    //
+    // Explicitly restore SIGCHLD to SIG_DFL: alloc8 and/or libsmash's
+    // init dance can leave SIGCHLD as SIG_IGN, which on Linux causes
+    // children to be auto-reaped — a subsequent waitid then sees ECHILD.
+    {
+        struct sigaction sa = {};
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGCHLD, &sa, nullptr);
+    }
+
     auto* si = reinterpret_cast<siginfo_t*>(buf);
     std::memset(si, 0, sizeof(siginfo_t));
     fillCompressible(buf + sizeof(siginfo_t),

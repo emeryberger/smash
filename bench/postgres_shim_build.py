@@ -51,58 +51,105 @@ INSTDIR = WORKDIR / "install"
 # does the simple thing. The pooling code below stays in the file but
 # is unreachable, which keeps the patch tiny + reversible.
 
-PATCH_MARKER = "/* SMASH-SHIM */"
+# PG 16's AllocSetAlloc/Free/Realloc take 2 args (no `int flags`); flag-handling
+# lives in the wrapper MemoryContextAllocExtended above. Note the patcher's
+# idempotency check looks for this exact marker — every inserted block must
+# contain it verbatim, otherwise re-runs will re-patch the file.
+#
+# The shim mimics AllocSet's existing "external chunk" code path (used today
+# for >allocChunkLimit allocations): one malloc per request, with the layout
+#   [AllocBlockData header][MemoryChunk hdr][user bytes]
+# This matters because AllocSetGetChunkContext / AllocSetRealloc / AllocSetFree
+# walk back from the user pointer to the block via ExternalChunkGetBlock and
+# read block->aset. A bare malloc(size+chunkhdr) crashes those paths.
+PATCH_MARKER = "/* SMASH-SHIM:"
 
 ASET_PATCHES = [
-    # AllocSetAlloc: replace the pooling implementation with a passthrough.
+    # AllocSetAlloc: route every palloc to libc malloc as a one-chunk block.
     {
-        "anchor": "AllocSetAlloc(MemoryContext context, Size size, int flags)\n{",
+        "anchor": "AllocSetAlloc(MemoryContext context, Size size)\n{",
         "insert": """
-\t/* SMASH-SHIM: skip chunk pooling; route every palloc to libc malloc
-\t * so LD_PRELOAD'd allocators (smash, ASan, etc.) see every request.
-\t * Header layout matches AllocSet's so AllocSetFree/Realloc still work. */
+\t/* SMASH-SHIM: skip chunk pooling; allocate a one-chunk external block via
+\t * libc malloc so LD_PRELOAD'd allocators (smash, ASan, etc.) see every
+\t * request. Layout matches AllocSetAlloc's existing large-chunk path:
+\t * [AllocBlockData][MemoryChunk hdr][user bytes]. */
 \t{
-\t\tvoid *raw = malloc(size + ALLOC_CHUNKHDRSZ);
-\t\tif (raw == NULL) {
-\t\t\tif (flags & MCXT_ALLOC_NO_OOM) return NULL;
-\t\t\telog(ERROR, "out of memory (smash-shim malloc failed for %zu)", (size_t) size);
+\t\tAllocSet _set = (AllocSet) context;
+\t\tSize _chunk_size = MAXALIGN(size);
+\t\tSize _blksize = _chunk_size + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
+\t\tAllocBlock _block = (AllocBlock) malloc(_blksize);
+\t\tif (_block == NULL)
+\t\t\treturn NULL;
+\t\tcontext->mem_allocated += _blksize;
+\t\t_block->aset = _set;
+\t\t_block->freeptr = _block->endptr = ((char *) _block) + _blksize;
+\t\tMemoryChunk *_chunk = (MemoryChunk *) (((char *) _block) + ALLOC_BLOCKHDRSZ);
+\t\tMemoryChunkSetHdrMaskExternal(_chunk, MCTX_ASET_ID);
+\t\t/* Link under set->blocks so AllocSetReset/Delete free us. */
+\t\tif (_set->blocks != NULL) {
+\t\t\t_block->prev = _set->blocks;
+\t\t\t_block->next = _set->blocks->next;
+\t\t\tif (_block->next) _block->next->prev = _block;
+\t\t\t_set->blocks->next = _block;
+\t\t} else {
+\t\t\t_block->prev = NULL;
+\t\t\t_block->next = NULL;
+\t\t\t_set->blocks = _block;
 \t\t}
-\t\tMemoryChunk *chunk = (MemoryChunk *) raw;
-\t\tMemoryChunkSetHdrMaskExternal(chunk, MCTX_ASET_ID);
-\t\tvoid *user = MemoryChunkGetPointer(chunk);
-\t\t((AllocSet) context)->header.mem_allocated += size + ALLOC_CHUNKHDRSZ;
-\t\tif (flags & MCXT_ALLOC_ZERO) memset(user, 0, size);
-\t\treturn user;
+\t\treturn MemoryChunkGetPointer(_chunk);
 \t}
 """,
     },
-    # AllocSetFree: skip the freelist; just free.
+    # AllocSetFree: unlink block, libc free.
     {
         "anchor": "AllocSetFree(void *pointer)\n{",
         "insert": """
-\t/* SMASH-SHIM: skip freelist; release directly to libc free. */
+\t/* SMASH-SHIM: external-chunk free: unlink block, libc free. */
 \t{
-\t\tMemoryChunk *chunk = PointerGetMemoryChunk(pointer);
-\t\tfree(chunk);
+\t\tMemoryChunk *_chunk = PointerGetMemoryChunk(pointer);
+\t\tAllocBlock _block = ExternalChunkGetBlock(_chunk);
+\t\tAllocSet _set = _block->aset;
+\t\t_set->header.mem_allocated -= _block->endptr - ((char *) _block);
+\t\tif (_block->prev)
+\t\t\t_block->prev->next = _block->next;
+\t\telse
+\t\t\t_set->blocks = _block->next;
+\t\tif (_block->next)
+\t\t\t_block->next->prev = _block->prev;
+\t\tfree(_block);
 \t\treturn;
 \t}
 """,
     },
-    # AllocSetRealloc: replace with libc realloc.
+    # AllocSetRealloc: libc realloc, fix up block + neighbour links.
     {
-        "anchor": "AllocSetRealloc(void *pointer, Size size, int flags)\n{",
+        "anchor": "AllocSetRealloc(void *pointer, Size size)\n{",
         "insert": """
-\t/* SMASH-SHIM: skip the in-place / shrink fast paths; route to realloc. */
+\t/* SMASH-SHIM: external-chunk realloc. */
 \t{
-\t\tMemoryChunk *chunk = PointerGetMemoryChunk(pointer);
-\t\tvoid *raw = realloc(chunk, size + ALLOC_CHUNKHDRSZ);
-\t\tif (raw == NULL) {
-\t\t\tif (flags & MCXT_ALLOC_NO_OOM) return NULL;
-\t\t\telog(ERROR, "out of memory (smash-shim realloc failed for %zu)", (size_t) size);
+\t\tMemoryChunk *_oldchunk = PointerGetMemoryChunk(pointer);
+\t\tAllocBlock _oldblock = ExternalChunkGetBlock(_oldchunk);
+\t\tAllocSet _set = _oldblock->aset;
+\t\tSize _oldblksize = _oldblock->endptr - ((char *) _oldblock);
+\t\tSize _chunk_size = MAXALIGN(size);
+\t\tSize _newblksize = _chunk_size + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
+\t\tAllocBlock _newblock = (AllocBlock) realloc(_oldblock, _newblksize);
+\t\tif (_newblock == NULL)
+\t\t\treturn NULL;
+\t\t_set->header.mem_allocated += _newblksize - _oldblksize;
+\t\t_newblock->freeptr = _newblock->endptr = ((char *) _newblock) + _newblksize;
+\t\t/* If the block moved, fix the neighbour pointers so list stays sane. */
+\t\tif (_newblock != _oldblock) {
+\t\t\tif (_newblock->prev)
+\t\t\t\t_newblock->prev->next = _newblock;
+\t\t\telse
+\t\t\t\t_set->blocks = _newblock;
+\t\t\tif (_newblock->next)
+\t\t\t\t_newblock->next->prev = _newblock;
 \t\t}
-\t\tMemoryChunk *newchunk = (MemoryChunk *) raw;
-\t\tMemoryChunkSetHdrMaskExternal(newchunk, MCTX_ASET_ID);
-\t\treturn MemoryChunkGetPointer(newchunk);
+\t\tMemoryChunk *_newchunk = (MemoryChunk *) (((char *) _newblock) + ALLOC_BLOCKHDRSZ);
+\t\tMemoryChunkSetHdrMaskExternal(_newchunk, MCTX_ASET_ID);
+\t\treturn MemoryChunkGetPointer(_newchunk);
 \t}
 """,
     },
@@ -174,6 +221,7 @@ def clean_build_env() -> dict[str, str]:
             "LD_PRELOAD", "LD_LIBRARY_PATH",
             "DYLD_INSERT_LIBRARIES", "DYLD_FORCE_FLAT_NAMESPACE",
             "MallocNanoZone",
+            "PROFILE",  # PG Makefile appends $(PROFILE) to CFLAGS/LDFLAGS
             "SMASH_BANNER", "SMASH_DEBUG", "SMASH_STATS",
             "SMASH_TRACK_EXTERNAL", "SMASH_LARGE_ONLY",
             "SMASH_DEFER_PHASES_MS", "SMASH_COLD_TIMEOUT_SEC"}
@@ -202,8 +250,7 @@ def stage_configure_build() -> None:
        cwd=SRCDIR, env=env)
     sh(["make", "-j", str(os.cpu_count() or 4)], cwd=SRCDIR, env=env)
     sh(["make", "install"], cwd=SRCDIR, env=env)
-    # contrib/pgbench
-    sh(["make", "-C", "contrib/pgbench", "install"], cwd=SRCDIR, env=env)
+    # pgbench moved out of contrib/ in PG 16; `make install` covers src/bin/pgbench.
 
 
 def stage_run(libsmash: Path) -> int:

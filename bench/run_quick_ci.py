@@ -70,7 +70,13 @@ def smash_env(libsmash: Path, base_env: dict[str, str]) -> dict[str, str]:
 
 def check_bench_rss(build_dir: Path) -> tuple[bool, str]:
     """bench_rss is linked against smash directly, no preload needed."""
-    out = run([str(build_dir / "bench" / "bench_rss")])
+    # Pin the cold-tick floor to its default (= no override means no
+    # CPU-pressure multiplier kicks in). Without this, on a busy CI runner
+    # the multiplier would push the floor up to 32 s and the 10 s
+    # bench_rss window wouldn't see any compression.
+    env = dict(os.environ)
+    env.setdefault("SMASH_COLD_TIMEOUT_SEC", "2")
+    out = run([str(build_dir / "bench" / "bench_rss")], env=env)
     # Match "  t=10s: RSS=73.7 MB (46% reduction from peak)"
     m = re.search(r"^\s*t=10s:\s+RSS=[\d.]+ MB\s+\((\-?\d+)% reduction",
                   out, re.MULTILINE)
@@ -84,6 +90,8 @@ def check_bench_rss(build_dir: Path) -> tuple[bool, str]:
 def check_bench_sqlite(build_dir: Path, libsmash: Path) -> tuple[bool, str]:
     """bench_sqlite uses system malloc; smash interposes via preload."""
     env = smash_env(libsmash, dict(os.environ))
+    # Same cold-tick pin as bench_rss — see comment there.
+    env.setdefault("SMASH_COLD_TIMEOUT_SEC", "2")
     out = run([str(build_dir / "bench" / "bench_sqlite"), "--quick"],
               env=env, timeout=180)
     # bench_sqlite emits structured "METRIC cool_reduction_pct N.N" lines —

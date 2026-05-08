@@ -33,6 +33,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <dirent.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 #include <cstdio>
 #include <lz4.h>
@@ -1132,6 +1136,110 @@ private:
     }
 
     // Adapt active worker count using Little's Law (see class comment above).
+    // CPU-pressure cap on compressor workers. Returns the maximum number of
+    // workers we should run given current system load and our own process's
+    // thread count, or 0 to mean "no cap."
+    //
+    // The compressor is background work: every worker that runs competes
+    // with the application for cores. The right answer depends on what the
+    // application is doing — a single-threaded app on an 8-core box can
+    // afford many compressor workers; a 16-threaded app on a 4-core box
+    // cannot afford any.
+    //
+    // Method: read the live thread count for *our process* (/proc/self/stat
+    // num_threads field, or task-dir count on macOS), subtract our known
+    // compressor workers to get an estimate of app threads, and reserve
+    // enough cores for them. Then add a safety floor based on system-wide
+    // 1-minute load average to back off when *other* processes are also
+    // saturating the box.
+    //
+    //   app_threads = max(1, process_threads - (helpers_created_ + 1))
+    //   sys_pressure = max(0, ceil(loadavg) - app_threads)  // outside contention
+    //   cap = max(1, nproc - app_threads - sys_pressure)
+    //
+    // Cheap, cached: re-evaluated at most every kCpuPressureSampleTicks
+    // ticks. Behind SMASH_CPU_PRESSURE_CAP=0 to allow ablation.
+    int cpuPressureWorkerCap() {
+        static const bool enabled = []{
+            const char* v = std::getenv("SMASH_CPU_PRESSURE_CAP");
+            return !(v && v[0] == '0');
+        }();
+        if (!enabled) return 0;
+
+        static const long nproc_cached = []{
+            long n = sysconf(_SC_NPROCESSORS_ONLN);
+            return n > 0 ? n : 1;
+        }();
+
+        constexpr int kCpuPressureSampleTicks = 4;
+        if (cpu_pressure_sample_age_ < kCpuPressureSampleTicks) {
+            cpu_pressure_sample_age_++;
+            return cpu_pressure_cached_cap_;
+        }
+        cpu_pressure_sample_age_ = 0;
+
+        // Live thread count of our own process. /proc/self/stat field 20 is
+        // num_threads, but stat parsing is finicky (the comm field can
+        // contain spaces); easier to count entries in /proc/self/task.
+        // On macOS, /proc isn't available → fall back to process-info.
+        int proc_threads = countOwnThreads();
+        if (proc_threads <= 0) {
+            cpu_pressure_cached_cap_ = 0;  // can't read → no cap
+            return 0;
+        }
+
+        // App threads = total minus our own compressor workers.
+        int our_workers = helpers_created_ + 1;  // helpers + coordinator
+        int app_threads = proc_threads - our_workers;
+        if (app_threads < 1) app_threads = 1;
+
+        // System-wide pressure not attributable to our own app.
+        double loads[3] = {0.0, 0.0, 0.0};
+        int sys_pressure = 0;
+        if (getloadavg(loads, 1) >= 1) {
+            int load_int = static_cast<int>(loads[0] + 0.5);
+            sys_pressure = load_int - app_threads;
+            if (sys_pressure < 0) sys_pressure = 0;
+        }
+
+        int cap = static_cast<int>(nproc_cached) - app_threads - sys_pressure;
+        if (cap < 1) cap = 1;
+        cpu_pressure_cached_cap_ = cap;
+        return cap;
+    }
+
+    // /proc/self/task/ entry count (Linux) or task_threads() (macOS).
+    // Returns -1 on error.
+    int countOwnThreads() {
+#if defined(__linux__)
+        DIR* d = opendir("/proc/self/task");
+        if (!d) return -1;
+        int count = 0;
+        while (struct dirent* e = readdir(d)) {
+            if (e->d_name[0] != '.') count++;
+        }
+        closedir(d);
+        return count > 0 ? count : -1;
+#elif defined(__APPLE__)
+        thread_array_t threads;
+        mach_msg_type_number_t n = 0;
+        if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS)
+            return -1;
+        // Free the port rights we just received.
+        for (mach_msg_type_number_t i = 0; i < n; ++i)
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        vm_deallocate(mach_task_self(),
+                      reinterpret_cast<vm_address_t>(threads),
+                      n * sizeof(thread_t));
+        return static_cast<int>(n);
+#else
+        return -1;
+#endif
+    }
+
+    int cpu_pressure_cached_cap_ = 0;
+    int cpu_pressure_sample_age_ = 1000;  // force resample on first call
+
     // Measures λ (cold arrival rate) and μ (per-worker service rate) each
     // tick, smooths with EMA (α = 1/4), and sets N = ⌈λ_ema / μ_ema⌉.
     void adaptWorkerCount(int nw) {
@@ -1169,6 +1277,16 @@ private:
         // Clamp to valid range
         if (n_needed < 1) n_needed = 1;
         if (n_needed > kMaxCompressorWorkers) n_needed = kMaxCompressorWorkers;
+
+        // CPU-pressure cap. The compressor's worker threads compete with
+        // application threads for cores; on a saturated machine, scaling up
+        // adds context-switch latency to the very fault handlers we depend on
+        // for forward progress. Cap workers at (nproc − 1) when 1-minute load
+        // average ≥ nproc. This leaves at least one core for the application
+        // and prevents the worst-case scenario where every core is running
+        // compressor work and the app times out waiting on a fault.
+        int cap = cpuPressureWorkerCap();
+        if (cap > 0 && n_needed > cap) n_needed = cap;
 
         // Ensure helper threads exist for the new count
         // (lazily create threads on first scale-up, never destroy them)

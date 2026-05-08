@@ -84,6 +84,11 @@ if(APPLE)
   target_compile_options(test_fault_cycle PRIVATE -ftls-model=initial-exec)
 endif()
 add_test(NAME test_fault_cycle COMMAND test_fault_cycle)
+# This test exercises the same compress→fault→recompress pattern that the
+# recompression-thrash back-off is designed to suppress. Disable the back-off
+# for this test so it can verify the underlying fault-cycle correctness.
+set_tests_properties(test_fault_cycle PROPERTIES
+  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0")
 
 # Interposition test: built without alloc8 linkage, run under DYLD_INSERT
 add_executable(interpose_test interpose_test.cpp)

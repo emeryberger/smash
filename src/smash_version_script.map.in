@@ -1,7 +1,12 @@
 # Smash version script for Linux
-# Extends alloc8's version script with syscall wrapper symbols
+# Extends alloc8's version script with syscall wrapper symbols.
+# The GLIBC base version is substituted at configure time — see
+# CMakeLists.txt. Picking too low a base leaves the LD_PRELOAD'd malloc
+# bypassed on archs whose minimum malloc version is higher (aarch64
+# binaries link against malloc@GLIBC_2.17, so exporting only @GLIBC_2.2.5
+# loses to libc).
 
-GLIBC_2.2.5 {
+@SMASH_GLIBC_BASE_VERSION@ {
   global:
     # Core allocation functions (from alloc8)
     malloc;
@@ -170,7 +175,7 @@ GLIBC_2.3.2 {
     epoll_pwait;
     epoll_wait_232;
     epoll_pwait_232;
-} GLIBC_2.2.5;
+} @SMASH_GLIBC_BASE_VERSION@;
 
 # glibc 2.34 re-versioned fstat / fstat64 to GLIBC_2.33 for y2038-safe
 # struct stat. C++ binaries built against modern glibc reference
@@ -181,7 +186,7 @@ GLIBC_2.28 {
   global:
     statx;
     statx_228;
-} GLIBC_2.2.5;
+} @SMASH_GLIBC_BASE_VERSION@;
 
 GLIBC_2.10 {
   global:
@@ -189,7 +194,7 @@ GLIBC_2.10 {
     pwritev;
     preadv_210;
     pwritev_210;
-} GLIBC_2.2.5;
+} @SMASH_GLIBC_BASE_VERSION@;
 
 GLIBC_2.26 {
   global:
@@ -223,4 +228,4 @@ GLIBC_2.33 {
     lstat64_233;
     fstatat_233;
     fstatat64_233;
-} GLIBC_2.2.5;
+} @SMASH_GLIBC_BASE_VERSION@;

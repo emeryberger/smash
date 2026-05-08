@@ -52,10 +52,25 @@ endif()
 # ALLOC8_DIR was given, fetch it from GitHub via FetchContent.
 set(ALLOC8_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../alloc8" CACHE PATH "Path to alloc8 source")
 
-# On Linux, use Smash's version script (extends alloc8's with syscall wrappers)
-# Must be set BEFORE add_subdirectory(alloc8) so alloc8 uses this path
+# On Linux, use Smash's version script (extends alloc8's with syscall wrappers).
+# Generated from src/smash_version_script.map.in with a per-arch GLIBC base
+# version so malloc/free etc. are exported at a version that satisfies the
+# binaries' requests (aarch64 binaries link against malloc@GLIBC_2.17, so
+# emitting only @GLIBC_2.2.5 silently bypasses LD_PRELOAD interception).
+# Must be set BEFORE add_subdirectory(alloc8) so alloc8 uses this path.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(ALLOC8_VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map" CACHE INTERNAL "Version script" FORCE)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(SMASH_GLIBC_BASE_VERSION "GLIBC_2.17")
+  else()
+    set(SMASH_GLIBC_BASE_VERSION "GLIBC_2.2.5")
+  endif()
+  configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map.in
+    ${CMAKE_CURRENT_BINARY_DIR}/smash_version_script.map
+    @ONLY
+  )
+  set(SMASH_VERSION_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/smash_version_script.map")
+  set(ALLOC8_VERSION_SCRIPT "${SMASH_VERSION_SCRIPT}" CACHE INTERNAL "Version script" FORCE)
 endif()
 
 include(FetchContent)
@@ -143,7 +158,7 @@ target_include_directories(smash PRIVATE
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash PRIVATE alloc8::headers pthread dl)
   target_link_options(smash PRIVATE
-    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map"
+    "LINKER:--version-script=${SMASH_VERSION_SCRIPT}"
     "-Bsymbolic"
   )
 else()
@@ -204,7 +219,7 @@ target_include_directories(smash_noopt PRIVATE
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash_noopt PRIVATE alloc8::headers pthread dl)
   target_link_options(smash_noopt PRIVATE
-    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map"
+    "LINKER:--version-script=${SMASH_VERSION_SCRIPT}"
     "-Bsymbolic"
   )
 else()

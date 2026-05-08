@@ -253,7 +253,12 @@ def stage_configure_build() -> None:
     # pgbench moved out of contrib/ in PG 16; `make install` covers src/bin/pgbench.
 
 
-def stage_run(libsmash: Path) -> int:
+def stage_run(libsmash: Path,
+              clients: int = 4,
+              queries: int = 200,
+              cool_sec: int = 60,
+              zipf_s: float = 1.2,
+              scale: int = 20) -> int:
     """Initialise + start the patched postgres under smash, run pgbench."""
     hr("init + run pgbench under LD_PRELOAD=libsmash.so")
     bindir = INSTDIR / "bin"
@@ -290,6 +295,13 @@ def stage_run(libsmash: Path) -> int:
            "-c", "work_mem=128MB",
            "-c", "max_parallel_workers_per_gather=0",
            "-c", "max_parallel_workers=0",
+           # Autovacuum + logical-replication launcher fork short-lived
+           # workers periodically. With smash's atfork compressor restart in
+           # play, those forks race against the child's exit and a small
+           # fraction of them SIGSEGV under load. Disable them so the
+           # per-backend numbers reflect the workload, not housekeeping noise.
+           "-c", "autovacuum=off",
+           "-c", "max_wal_senders=0",
            "-c", "fsync=off", "-c", "synchronous_commit=off",
            "-c", "log_min_messages=warning"]
     print(f">>> launching shimmed postgres (logs → {log_path})")
@@ -323,22 +335,52 @@ def stage_run(libsmash: Path) -> int:
             "-U", "smashuser", "-d", "postgres",
             "-c", "CREATE DATABASE smash"], quiet=True)
         sh([str(pgbench), "-h", str(sockdir), "-p", str(port),
-            "-U", "smashuser", "-i", "-s", "20", "smash"], quiet=True)
-        # An analytical script: sort + group-by + hash join.
-        analytical = workdir / "analytical.sql"
-        analytical.write_text("""\
-SELECT abalance, aid FROM pgbench_accounts ORDER BY abalance, aid LIMIT 1000;
-SELECT bid, COUNT(*), AVG(abalance) FROM pgbench_accounts GROUP BY bid;
-SELECT b.bid, COUNT(*), SUM(a.abalance) FROM pgbench_branches b
-  JOIN pgbench_accounts a ON a.bid = b.bid GROUP BY b.bid;
-""")
-        print(">>> pgbench analytical workload, 90s")
+            "-U", "smashuser", "-i", "-s", str(scale), "smash"], quiet=True)
+
+        # Workload script:
+        #   1. <queries> Zipfian-skewed point + range queries on
+        #      pgbench_accounts. Skewing by random_zipfian concentrates traffic
+        #      on a small hot subset, leaving the rest of the per-backend
+        #      catalog/plan/relation cache to age out untouched.
+        #   2. one all-rows aggregate so the working set isn't trivial.
+        #   3. SELECT pg_sleep(<cool_sec>) — keeps the SAME backend alive and
+        #      idle so the compressor's tick can sweep its now-cold pages.
+        #      Stats are sampled every ~5 s by smash; the SIGUSR2-on-exit dump
+        #      catches the post-cool steady state.
+        # Run with `-t 1`: each pgbench client executes the script once
+        # (heavy-work + sleep) within a single connection — no reconnect
+        # between phases means the cooling actually applies to the work.
+        naccounts = scale * 100_000
+        zipfian_block = (
+            f"\\set aid random_zipfian(1, {naccounts}, {zipf_s})\n"
+            "SELECT abalance FROM pgbench_accounts WHERE aid = :aid;\n"
+            "SELECT bid, COUNT(*), AVG(abalance) FROM pgbench_accounts "
+            "WHERE aid BETWEEN :aid AND :aid + 1000 GROUP BY bid;\n"
+        )
+        sql = (
+            f"-- Zipfian active phase: {queries} queries, parameter={zipf_s}\n"
+            + zipfian_block * queries
+            + "\n-- one full-table aggregate for plan-cache fill\n"
+              "SELECT b.bid, COUNT(*), SUM(a.abalance) FROM pgbench_branches b "
+              "JOIN pgbench_accounts a ON a.bid = b.bid GROUP BY b.bid;\n"
+              f"\n-- cool phase: backend idles {cool_sec}s in same connection\n"
+              f"SELECT pg_sleep({cool_sec});\n"
+        )
+        script = workdir / "zipfian_then_cool.sql"
+        script.write_text(sql)
+
+        print(f">>> pgbench Zipfian (s={zipf_s}, {queries} q/client) "
+              f"+ {cool_sec}s in-connection cool, clients={clients}")
         r = subprocess.run(
             [str(pgbench), "-h", str(sockdir), "-p", str(port),
-             "-U", "smashuser", "-n", "-c", "2", "-T", "90",
-             "-f", str(analytical), "smash"],
+             "-U", "smashuser", "-n",
+             "-c", str(clients), "-j", str(min(clients, 4)),
+             "-t", "1",
+             "-f", str(script), "smash"],
             capture_output=True, text=True)
         print(r.stdout.strip())
+        if r.stderr.strip():
+            print(r.stderr.strip())
     finally:
         print(">>> stopping postgres")
         try:
@@ -378,29 +420,46 @@ def analyse(log_path: Path) -> int:
     print(f"{'pid':>7}  {'samples':>7}  {'committed':>10}  {'compressed':>10}  {'compressed_MB':>12}")
     PAGE = 4096
     sum_c = sum_z = 0
+    # "Long-lived" = lived through several compressor ticks (samples > 5).
+    # That excludes pgbench-init's loader and other one-shot helpers that
+    # exit before the compressor's first scan and so always show
+    # compressed=0 — they would otherwise drag down the headline ratio
+    # without being representative of what smash can do on warm-then-cold
+    # heap memory.
+    long_c = long_z = 0
     for pid in sorted(by_pid):
         d = by_pid[pid]
         sum_c += d["c"]; sum_z += d["z"]
+        if d["n"] > 5:
+            long_c += d["c"]; long_z += d["z"]
         print(f"{pid:>7}  {d['n']:>7}  {d['c']:>10}  {d['z']:>10}  "
               f"{d['z']*PAGE/1024/1024:>11.1f}")
     print()
     sum_c_mb = sum_c * PAGE / 1024 / 1024
     sum_z_mb = sum_z * PAGE / 1024 / 1024
-    print(f"aggregate: committed={sum_c} pages ({sum_c_mb:.0f} MB), "
-          f"compressed={sum_z} pages ({sum_z_mb:.0f} MB)")
-    if sum_c > 0:
-        print(f"           compressed/committed = {sum_z/sum_c:.1%}")
+    print(f"aggregate (all pids):    committed={sum_c} pages ({sum_c_mb:.0f} MB), "
+          f"compressed={sum_z} pages ({sum_z_mb:.0f} MB), "
+          f"ratio={sum_z/max(sum_c,1):.1%}")
+    long_c_mb = long_c * PAGE / 1024 / 1024
+    long_z_mb = long_z * PAGE / 1024 / 1024
+    print(f"long-lived (samples>5):  committed={long_c} pages ({long_c_mb:.0f} MB), "
+          f"compressed={long_z} pages ({long_z_mb:.0f} MB), "
+          f"ratio={long_z/max(long_c,1):.1%}")
     if sum_c < 256:
         print()
         print("⚠️  smash still saw very little. The shim may not have taken")
         print(f"    effect — verify aset.c has the SMASH-SHIM marker:")
         print(f"      grep -c SMASH-SHIM {SRCDIR}/src/backend/utils/mmgr/aset.c")
         return 1
-    if sum_z / max(sum_c, 1) >= 0.3:
-        print(f"\n✅ Shimmed postgres + smash: real compression activity.")
+    if long_z / max(long_c, 1) >= 0.5:
+        print(f"\n✅ Shimmed postgres + smash: long-lived backends "
+              f"compress {long_z/max(long_c,1):.0%} of their heap.")
         return 0
-    print(f"\nsmash saw the heap but compression ratio is low; might be a")
-    print(f"hot-pages issue. Try a longer dwell with idle period at the end.")
+    print(f"\nsmash saw the heap. long-lived ratio is the meaningful number "
+          f"({long_z/max(long_c,1):.0%}); the all-pids aggregate also counts "
+          f"transient backends that exit before the compressor ticks. Try "
+          f"--cool=120 to let the compressor sweep more thoroughly, or --zipf=1.5 "
+          f"for stronger access skew.")
     return 0
 
 
@@ -413,6 +472,19 @@ def main() -> int:
     ap.add_argument("libsmash", help="Path to libsmash.so")
     ap.add_argument("--clean", action="store_true",
                     help=f"Wipe {WORKDIR} before starting (forces re-download/build)")
+    ap.add_argument("--clients", type=int, default=4,
+                    help="pgbench clients (default 4)")
+    ap.add_argument("--queries", type=int, default=200,
+                    help="Zipfian-skewed queries per client before the cool tail (default 200)")
+    ap.add_argument("--cool", type=int, default=60, dest="cool_sec",
+                    help="seconds each backend idles after the work (default 60). The "
+                         "smash compressor needs at least kColdTicks * tick_interval (~20 s) "
+                         "of idle to start compressing; longer = more pages reach the COMPRESSED state")
+    ap.add_argument("--zipf", type=float, default=1.2, dest="zipf_s",
+                    help="random_zipfian parameter (>0, !=1; default 1.2). Higher = more skew, so "
+                         "more rows are touched only rarely and stay cold")
+    ap.add_argument("--scale", type=int, default=20,
+                    help="pgbench --scale; affects pgbench_accounts size (default 20 → 2M rows)")
     args = ap.parse_args()
 
     if sys.platform != "linux":
@@ -428,7 +500,12 @@ def main() -> int:
     stage_download()
     stage_patch()
     stage_configure_build()
-    return stage_run(libsmash)
+    return stage_run(libsmash,
+                     clients=args.clients,
+                     queries=args.queries,
+                     cool_sec=args.cool_sec,
+                     zipf_s=args.zipf_s,
+                     scale=args.scale)
 
 
 if __name__ == "__main__":

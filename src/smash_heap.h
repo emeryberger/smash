@@ -366,6 +366,46 @@ private:
         compressor_.start();
     }
 
+public:
+    // Called from a pthread_atfork child handler. After fork, the child has
+    // inherited compression_started_=true and the parent's now-defunct
+    // pthread_t handles, so the next allocation's `if (!started) startCompression()`
+    // check short-circuits and the child runs with no compressor — hence the
+    // committed=N / compressed=0 we see in postgres backends, Redis daemonized
+    // children, etc.
+    //
+    // Atfork handler trio. The compressor runs on background threads that
+    // disappear at fork(); without this the child inherits dead pthread_t
+    // handles plus `compression_started_=true`, so its first malloc's check
+    // short-circuits and the child runs with no compressor at all (postgres
+    // backends, daemonized redis children, etc. all hit this).
+    //
+    // prepare: ask the coordinator to skip its next tick(); wait briefly
+    //   for any in-flight tick to drain. Without this, a fork that lands
+    //   mid-tick leaves the child holding page-locks (etc.) acquired by a
+    //   thread that no longer exists.
+    // parent:  resume normal ticks.
+    // child:   reset thread bookkeeping and immediately respawn the
+    //   compressor. We're in a fresh single-thread context, so
+    //   pthread_create is fine here. Inherited PageState is left alone:
+    //   COMPRESSED pages stay decompressible-on-fault because the
+    //   compressed bytes live in BootstrapAlloc memory mapped CoW.
+    void preparePauseForFork() {
+        if (!compression_inited_) return;
+        compressor_.pauseForFork();
+    }
+    void resumeAfterFork() {
+        if (!compression_inited_) return;
+        compressor_.resumeAfterFork();
+    }
+    void resetForFork() {
+        if (!compression_inited_) return;
+        compressor_.resetForFork();
+        compression_started_.store(false, std::memory_order_release);
+        startCompression();
+    }
+private:
+
     // Track allocation in compress-only mode
     void trackAllocation(void* ptr, size_t size) {
         if (!ptr || size == 0 || !compression_inited_) return;

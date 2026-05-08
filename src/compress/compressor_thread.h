@@ -268,6 +268,52 @@ class CompressorThread {
     pthread_t helper_threads_[kMaxHelpers]{};
     std::atomic<bool> running_{false};
 
+    // Fork coordination. paused_ is set by the atfork prepare handler;
+    // in_tick_ is set while the coordinator is mid-tick (holding page
+    // locks etc.). prepare waits for in_tick_=0 before letting fork()
+    // proceed, so the child never inherits a half-done tick.
+    std::atomic<bool> paused_{false};
+    std::atomic<bool> in_tick_{false};
+
+public:
+    // Pause the coordinator (called from a pthread_atfork prepare handler in
+    // the parent before fork()). Wait briefly for any in-flight tick to
+    // finish. We cap the wait so a stuck tick can never deadlock fork().
+    void pauseForFork() {
+        paused_.store(true, std::memory_order_release);
+        // Coordinator wakes on its 10 ms tick boundary. Give it a few of
+        // those (~50 ms total) to drain in_tick_ before we let fork proceed.
+        for (int i = 0; i < 50 && in_tick_.load(std::memory_order_acquire); ++i)
+            usleep(1000);
+    }
+
+    // Resume after fork() in the parent.
+    void resumeAfterFork() {
+        paused_.store(false, std::memory_order_release);
+    }
+
+    // Reset thread-management bookkeeping in a fork()'d child. The actual
+    // pthreads themselves are already gone — Linux fork() only clones the
+    // calling thread — but the parent's pthread_t handles are still in our
+    // arrays and `running_`/`helpers_created_` still claim threads exist.
+    // Without this, the singleton's startCompression() CAS fails (because
+    // compression_started_ is true) and the child runs with no compressor.
+    void resetForFork() {
+        running_.store(false, std::memory_order_release);
+        paused_.store(false, std::memory_order_release);
+        in_tick_.store(false, std::memory_order_release);
+        coord_thread_ = pthread_t{};
+        for (int i = 0; i < kMaxHelpers; ++i) {
+            helper_threads_[i] = pthread_t{};
+            helper_done_gen_[i].store(0, std::memory_order_relaxed);
+        }
+        helpers_created_ = 0;
+        active_workers_ = kCompressorWorkers;
+        work_gen_.store(0, std::memory_order_release);
+        current_phase_ = 0;
+    }
+private:
+
     // Work dispatch: coordinator increments work_gen_ to signal helpers.
     // Helpers compare against their last-seen gen to detect new work.
     std::atomic<uint64_t> work_gen_{0};
@@ -1108,7 +1154,13 @@ class CompressorThread {
         while (self->running_.load(std::memory_order_relaxed)) {
             usleep(kCompressIntervalMs * 1000);
             if (!self->running_.load(std::memory_order_relaxed)) break;
+            // Skip the tick if a fork is in progress. The atfork prepare
+            // handler set paused_ and is waiting for in_tick_ to be 0;
+            // entering tick() now would race the impending fork().
+            if (self->paused_.load(std::memory_order_acquire)) continue;
+            self->in_tick_.store(true, std::memory_order_release);
             self->tick();
+            self->in_tick_.store(false, std::memory_order_release);
         }
         return nullptr;
     }

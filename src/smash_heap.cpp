@@ -1211,3 +1211,40 @@ static void smash_start_main_thread() {
     xxthread_init();
 #endif
 }
+
+// ── Restart the compressor after fork() ──────────────────────────────────────
+// Linux fork() only clones the calling thread, so the compressor's coordinator
+// + helper threads vanish in the child. Without this handler the child inherits
+// `compression_started_=true` and dead pthread_t handles, so its first malloc's
+// `if (!started) startCompression()` check short-circuits and the child runs
+// with no compressor. Postgres backends, Redis daemonized children, etc. show
+// committed=N / compressed=0 because of this. Re-init the bookkeeping in the
+// child so the next allocation re-runs startCompression() with fresh threads.
+//
+// macOS doesn't allow fork() in a multi-threaded program (it deadlocks Mach
+// ports), so this handler only matters on Linux. Registering it on both
+// platforms is harmless: the macOS atfork registration just never fires.
+extern "C" {
+static void smash_atfork_prepare() {
+    auto* heap = SmashRedirect::getHeap();
+    if (heap) heap->preparePauseForFork();
+}
+static void smash_atfork_parent() {
+    auto* heap = SmashRedirect::getHeap();
+    if (heap) heap->resumeAfterFork();
+}
+static void smash_atfork_child() {
+    // The HeapRedirect singleton is already constructed by the time anyone is
+    // forking — we accessed it on the very first malloc in the parent. Calling
+    // getHeap() here doesn't allocate.
+    auto* heap = SmashRedirect::getHeap();
+    if (heap) heap->resetForFork();
+}
+}
+
+__attribute__((constructor(202)))  // After smash_start_main_thread (201)
+static void smash_register_atfork() {
+    pthread_atfork(smash_atfork_prepare,
+                   smash_atfork_parent,
+                   smash_atfork_child);
+}

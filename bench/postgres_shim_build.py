@@ -36,8 +36,10 @@ PG_TARBALL = f"postgresql-{PG_VERSION}.tar.bz2"
 PG_URL = f"https://ftp.postgresql.org/pub/source/v{PG_VERSION}/{PG_TARBALL}"
 
 WORKDIR = Path("/tmp/smash-pg-shim")
-SRCDIR = WORKDIR / f"postgresql-{PG_VERSION}"
-INSTDIR = WORKDIR / "install"
+SRCDIR = WORKDIR / f"postgresql-{PG_VERSION}"          # shim source (patched)
+INSTDIR = WORKDIR / "install"                          # shim binaries
+SRCDIR_STOCK = WORKDIR / f"postgresql-{PG_VERSION}-stock"  # unpatched source
+INSTDIR_STOCK = WORKDIR / "install-stock"              # unpatched binaries
 
 
 # ── the shim patch ──────────────────────────────────────────────────────────
@@ -177,23 +179,31 @@ def sh(cmd: list[str], cwd: Path | None = None,
 # ── stages ──────────────────────────────────────────────────────────────────
 
 
-def stage_download() -> None:
-    hr(f"download postgresql-{PG_VERSION} source")
-    if SRCDIR.is_dir():
-        print(f"already extracted at {SRCDIR}")
+def stage_download(srcdir: Path = SRCDIR) -> None:
+    hr(f"download postgresql-{PG_VERSION} source ({srcdir.name})")
+    if srcdir.is_dir():
+        print(f"already extracted at {srcdir}")
         return
     WORKDIR.mkdir(parents=True, exist_ok=True)
     tarball = WORKDIR / PG_TARBALL
     if not tarball.is_file():
         print(f"fetching {PG_URL}")
         urllib.request.urlretrieve(PG_URL, tarball)
-    print(f"extracting {tarball.name}")
-    sh(["tar", "-xjf", str(tarball)], cwd=WORKDIR)
+    print(f"extracting {tarball.name} → {srcdir.name}")
+    # tar -xjf creates "postgresql-X.Y" by default; for the stock build we
+    # extract into a temp dir then rename to the desired srcdir name.
+    if srcdir.name == f"postgresql-{PG_VERSION}":
+        sh(["tar", "-xjf", str(tarball)], cwd=WORKDIR)
+    else:
+        tmp = Path(tempfile.mkdtemp(dir=WORKDIR, prefix="extract-"))
+        sh(["tar", "-xjf", str(tarball), "-C", str(tmp)])
+        (tmp / f"postgresql-{PG_VERSION}").rename(srcdir)
+        shutil.rmtree(tmp)
 
 
-def stage_patch() -> None:
-    hr("apply SMASH-SHIM patch to aset.c")
-    aset = SRCDIR / "src" / "backend" / "utils" / "mmgr" / "aset.c"
+def stage_patch(srcdir: Path = SRCDIR) -> None:
+    hr(f"apply SMASH-SHIM patch to aset.c ({srcdir.name})")
+    aset = srcdir / "src" / "backend" / "utils" / "mmgr" / "aset.c"
     text = aset.read_text()
     if PATCH_MARKER in text:
         print("aset.c already patched.")
@@ -208,7 +218,7 @@ def stage_patch() -> None:
     if new == text:
         sys.exit("no patches applied — anchors didn't match. Aborting.")
     aset.write_text(new)
-    print(f"patched {aset.relative_to(SRCDIR)}")
+    print(f"patched {aset.relative_to(srcdir)}")
 
 
 def clean_build_env() -> dict[str, str]:
@@ -228,40 +238,100 @@ def clean_build_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k not in drop}
 
 
-def stage_configure_build() -> None:
-    hr("configure + make + make install (postgres-shim)")
+def stage_configure_build(srcdir: Path = SRCDIR, instdir: Path = INSTDIR,
+                          label: str = "shim") -> None:
+    hr(f"configure + make + make install (postgres-{label})")
     env = clean_build_env()
-    if (INSTDIR / "bin" / "postgres").is_file():
+    if (instdir / "bin" / "postgres").is_file():
         # Do a quick incremental rebuild in case aset.c changed since last time.
-        print(f"installed binary already exists at {INSTDIR}/bin/postgres")
+        print(f"installed binary already exists at {instdir}/bin/postgres")
         # Force re-make of just the patched file to pick up edits
         sh(["make", "-C", "src/backend/utils/mmgr", "-j", str(os.cpu_count() or 4)],
-           cwd=SRCDIR, env=env, quiet=True)
-        sh(["make", "-j", str(os.cpu_count() or 4)], cwd=SRCDIR, env=env, quiet=True)
-        sh(["make", "install"], cwd=SRCDIR, env=env, quiet=True)
+           cwd=srcdir, env=env, quiet=True)
+        sh(["make", "-j", str(os.cpu_count() or 4)], cwd=srcdir, env=env, quiet=True)
+        sh(["make", "install"], cwd=srcdir, env=env, quiet=True)
         return
-    INSTDIR.mkdir(parents=True, exist_ok=True)
-    sh(["./configure",
-        f"--prefix={INSTDIR}",
+    instdir.mkdir(parents=True, exist_ok=True)
+    sh([f"{srcdir}/configure",
+        f"--prefix={instdir}",
         "--without-readline", "--without-zlib", "--without-icu",
         "--without-llvm",
         "--enable-debug",
         "CFLAGS=-O2"],
-       cwd=SRCDIR, env=env)
-    sh(["make", "-j", str(os.cpu_count() or 4)], cwd=SRCDIR, env=env)
-    sh(["make", "install"], cwd=SRCDIR, env=env)
+       cwd=srcdir, env=env)
+    sh(["make", "-j", str(os.cpu_count() or 4)], cwd=srcdir, env=env)
+    sh(["make", "install"], cwd=srcdir, env=env)
     # pgbench moved out of contrib/ in PG 16; `make install` covers src/bin/pgbench.
 
 
-def stage_run(libsmash: Path,
+def build_zipfian_sql(queries: int, zipf_s: float, scale: int,
+                      cool_sec: int, with_full_join: bool = True) -> str:
+    """Generate the workload script.
+    cool_sec=0          → no in-connection sleep
+    with_full_join=True → append one full-table JOIN at the end (heavy; useful
+                          for the cool workload's plan-cache fill, harmful for
+                          the perf workload where each transaction repeats it)
+    """
+    naccounts = scale * 100_000
+    zipfian_block = (
+        f"\\set aid random_zipfian(1, {naccounts}, {zipf_s})\n"
+        "SELECT abalance FROM pgbench_accounts WHERE aid = :aid;\n"
+        "SELECT bid, COUNT(*), AVG(abalance) FROM pgbench_accounts "
+        "WHERE aid BETWEEN :aid AND :aid + 1000 GROUP BY bid;\n"
+    )
+    sql = (
+        f"-- Zipfian queries, parameter={zipf_s}, repetitions={queries}\n"
+        + zipfian_block * queries
+    )
+    if with_full_join:
+        sql += ("\n-- one full-table aggregate for plan-cache fill\n"
+                "SELECT b.bid, COUNT(*), SUM(a.abalance) FROM pgbench_branches b "
+                "JOIN pgbench_accounts a ON a.bid = b.bid GROUP BY b.bid;\n")
+    if cool_sec > 0:
+        sql += (f"\n-- cool phase: backend idles {cool_sec}s in same connection\n"
+                f"SELECT pg_sleep({cool_sec});\n")
+    return sql
+
+
+# Parsed pgbench output.
+PGBENCH_TPS_RE = re.compile(r"tps\s*=\s*([\d.]+)")
+PGBENCH_LATENCY_RE = re.compile(r"latency average\s*=\s*([\d.]+)\s*ms")
+PGBENCH_LATENCY_STDDEV_RE = re.compile(r"latency stddev\s*=\s*([\d.]+)\s*ms")
+
+
+def stage_run(instdir: Path,
+              libsmash: Path | None = None,
+              preload: Path | None = None,
+              preload_label: str = "",
+              workload: str = "cool",
               clients: int = 4,
               queries: int = 200,
               cool_sec: int = 60,
               zipf_s: float = 1.2,
-              scale: int = 20) -> int:
-    """Initialise + start the patched postgres under smash, run pgbench."""
-    hr("init + run pgbench under LD_PRELOAD=libsmash.so")
-    bindir = INSTDIR / "bin"
+              scale: int = 20,
+              perf_duration_sec: int = 60,
+              quiet_pgbench: bool = False) -> dict:
+    """Initialise + start postgres, run pgbench, return parsed stats.
+
+    Returns a dict with: mode (label), tps, latency_avg_ms, latency_stddev_ms,
+    smash_committed_pages, smash_compressed_pages, log_path.
+
+    If `libsmash` is set, that's the smash LD_PRELOAD path AND smash-specific
+    env vars (SMASH_BANNER, SMASH_DEBUG, ...) are set. If `preload` is set
+    instead, it's a generic LD_PRELOAD (e.g. jemalloc) with no smash env. At
+    most one of `libsmash` / `preload` should be non-None.
+    """
+    label_mode = ("shim" if instdir == INSTDIR else "stock")
+    if libsmash:
+        label_alloc = "smash"
+    elif preload:
+        label_alloc = preload_label or preload.stem
+    else:
+        label_alloc = "libc"
+    label = f"{label_mode}/{label_alloc}/{workload}"
+    hr(f"run {label}")
+
+    bindir = instdir / "bin"
     initdb = bindir / "initdb"
     postgres = bindir / "postgres"
     psql = bindir / "psql"
@@ -270,7 +340,7 @@ def stage_run(libsmash: Path,
         if not b.is_file():
             sys.exit(f"missing: {b}")
 
-    workdir = Path(tempfile.mkdtemp(prefix="smash-pg-shim-run-"))
+    workdir = Path(tempfile.mkdtemp(prefix=f"smash-pg-{label_mode}-run-"))
     datadir = workdir / "pgdata"
     log_path = workdir / "postgres.log"
     sockdir = workdir
@@ -282,12 +352,22 @@ def stage_run(libsmash: Path,
         "--auth=trust", "--username=smashuser"], quiet=True)
 
     env = os.environ.copy()
-    env["LD_PRELOAD"] = str(libsmash.resolve())
-    env["SMASH_BANNER"] = "1"
-    env["SMASH_DEBUG"] = "1"
-    env["SMASH_STATS"] = "1"
-    env["SMASH_DEFER_PHASES_MS"] = "5000"
-    env["SMASH_LARGE_ONLY"] = "0"
+    # Always strip stale smash env from the user's shell so a cross-config
+    # lifetime can't accidentally re-enable it.
+    for k in list(env):
+        if k.startswith("SMASH_"):
+            del env[k]
+    if libsmash:
+        env["LD_PRELOAD"] = str(libsmash.resolve())
+        env["SMASH_BANNER"] = "1"
+        env["SMASH_DEBUG"] = "1"
+        env["SMASH_STATS"] = "1"
+        env["SMASH_DEFER_PHASES_MS"] = "5000"
+        env["SMASH_LARGE_ONLY"] = "0"
+    elif preload:
+        env["LD_PRELOAD"] = str(preload.resolve())
+    else:
+        env.pop("LD_PRELOAD", None)
 
     cmd = [str(postgres), "-D", str(datadir), "-p", str(port),
            "-c", f"unix_socket_directories={sockdir}",
@@ -300,11 +380,13 @@ def stage_run(libsmash: Path,
            # play, those forks race against the child's exit and a small
            # fraction of them SIGSEGV under load. Disable them so the
            # per-backend numbers reflect the workload, not housekeeping noise.
+           # Also keep stock/shim runs symmetric — same server config across
+           # all comparison points.
            "-c", "autovacuum=off",
            "-c", "max_wal_senders=0",
            "-c", "fsync=off", "-c", "synchronous_commit=off",
            "-c", "log_min_messages=warning"]
-    print(f">>> launching shimmed postgres (logs → {log_path})")
+    print(f">>> launching {label_mode} postgres (logs → {log_path})")
     log = open(log_path, "wb")
     proc = subprocess.Popen(
         cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -327,62 +409,64 @@ def stage_run(libsmash: Path,
         print(log_path.read_text()[-2000:])
         try: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception: pass
-        return 1
+        return {"mode": label, "ok": False}
 
+    pgbench_stdout = ""
     try:
-        print(">>> pgbench setup")
+        if not quiet_pgbench:
+            print(">>> pgbench setup")
         sh([str(psql), "-h", str(sockdir), "-p", str(port),
             "-U", "smashuser", "-d", "postgres",
             "-c", "CREATE DATABASE smash"], quiet=True)
         sh([str(pgbench), "-h", str(sockdir), "-p", str(port),
             "-U", "smashuser", "-i", "-s", str(scale), "smash"], quiet=True)
 
-        # Workload script:
-        #   1. <queries> Zipfian-skewed point + range queries on
-        #      pgbench_accounts. Skewing by random_zipfian concentrates traffic
-        #      on a small hot subset, leaving the rest of the per-backend
-        #      catalog/plan/relation cache to age out untouched.
-        #   2. one all-rows aggregate so the working set isn't trivial.
-        #   3. SELECT pg_sleep(<cool_sec>) — keeps the SAME backend alive and
-        #      idle so the compressor's tick can sweep its now-cold pages.
-        #      Stats are sampled every ~5 s by smash; the SIGUSR2-on-exit dump
-        #      catches the post-cool steady state.
-        # Run with `-t 1`: each pgbench client executes the script once
-        # (heavy-work + sleep) within a single connection — no reconnect
-        # between phases means the cooling actually applies to the work.
-        naccounts = scale * 100_000
-        zipfian_block = (
-            f"\\set aid random_zipfian(1, {naccounts}, {zipf_s})\n"
-            "SELECT abalance FROM pgbench_accounts WHERE aid = :aid;\n"
-            "SELECT bid, COUNT(*), AVG(abalance) FROM pgbench_accounts "
-            "WHERE aid BETWEEN :aid AND :aid + 1000 GROUP BY bid;\n"
-        )
-        sql = (
-            f"-- Zipfian active phase: {queries} queries, parameter={zipf_s}\n"
-            + zipfian_block * queries
-            + "\n-- one full-table aggregate for plan-cache fill\n"
-              "SELECT b.bid, COUNT(*), SUM(a.abalance) FROM pgbench_branches b "
-              "JOIN pgbench_accounts a ON a.bid = b.bid GROUP BY b.bid;\n"
-              f"\n-- cool phase: backend idles {cool_sec}s in same connection\n"
-              f"SELECT pg_sleep({cool_sec});\n"
-        )
-        script = workdir / "zipfian_then_cool.sql"
-        script.write_text(sql)
+        if workload == "cool":
+            # One transaction per client: heavy work + 60 s in-connection
+            # sleep. Stays in one connection so the per-backend MemoryContext
+            # ages out — that's what smash's compressor needs.
+            sql = build_zipfian_sql(queries, zipf_s, scale, cool_sec)
+            script = workdir / "workload_cool.sql"
+            script.write_text(sql)
+            label_sub = (f"Zipfian (s={zipf_s}, {queries} q/client) "
+                         f"+ {cool_sec}s cool, clients={clients}")
+            args = ["-c", str(clients), "-j", str(min(clients, 4)),
+                    "-t", "1", "-f", str(script), "smash"]
+        elif workload == "perf":
+            # Throughput measurement: same Zipfian shape, no full-table join,
+            # no sleep tail. Use `-T` so we get a stable TPS over a fixed
+            # wall-clock interval. Each transaction is one zipfian point
+            # lookup + one 1000-row range aggregate; pgbench repeats this for
+            # `perf_duration_sec` and reports tps + latency.
+            sql = build_zipfian_sql(queries=1, zipf_s=zipf_s, scale=scale,
+                                    cool_sec=0, with_full_join=False)
+            script = workdir / "workload_perf.sql"
+            script.write_text(sql)
+            label_sub = (f"Zipfian perf (s={zipf_s}, "
+                         f"-T={perf_duration_sec}s, clients={clients})")
+            args = ["-c", str(clients), "-j", str(min(clients, 4)),
+                    "-T", str(perf_duration_sec),
+                    "-f", str(script), "smash"]
+        else:
+            sys.exit(f"unknown workload: {workload}")
 
-        print(f">>> pgbench Zipfian (s={zipf_s}, {queries} q/client) "
-              f"+ {cool_sec}s in-connection cool, clients={clients}")
+        if not quiet_pgbench:
+            print(f">>> pgbench {label_sub}")
+        # `-r` enables per-command latency reporting AND ensures the trailing
+        # "latency stddev = X ms" line appears in pgbench's summary even when
+        # the session is short.
         r = subprocess.run(
             [str(pgbench), "-h", str(sockdir), "-p", str(port),
-             "-U", "smashuser", "-n",
-             "-c", str(clients), "-j", str(min(clients, 4)),
-             "-t", "1",
-             "-f", str(script), "smash"],
+             "-U", "smashuser", "-n", "-r", *args],
             capture_output=True, text=True)
-        print(r.stdout.strip())
-        if r.stderr.strip():
-            print(r.stderr.strip())
+        pgbench_stdout = r.stdout.strip()
+        if not quiet_pgbench:
+            print(pgbench_stdout)
+            if r.stderr.strip():
+                print(r.stderr.strip())
     finally:
-        print(">>> stopping postgres")
+        if not quiet_pgbench:
+            print(">>> stopping postgres")
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             proc.wait(timeout=15)
@@ -391,7 +475,45 @@ def stage_run(libsmash: Path,
             except Exception: pass
         log.close()
 
-    return analyse(log_path)
+    # Parse pgbench output.
+    tps = float(PGBENCH_TPS_RE.search(pgbench_stdout).group(1)) \
+        if PGBENCH_TPS_RE.search(pgbench_stdout) else float("nan")
+    lat_avg = float(PGBENCH_LATENCY_RE.search(pgbench_stdout).group(1)) \
+        if PGBENCH_LATENCY_RE.search(pgbench_stdout) else float("nan")
+    lat_std_m = PGBENCH_LATENCY_STDDEV_RE.search(pgbench_stdout)
+    lat_std = float(lat_std_m.group(1)) if lat_std_m else float("nan")
+
+    # Smash stats (only meaningful when libsmash != None).
+    sum_committed = sum_compressed = 0
+    if libsmash and log_path.exists():
+        text = log_path.read_text(errors="replace")
+        by_pid: dict[int, dict[str, int]] = defaultdict(
+            lambda: {"c": 0, "z": 0, "n": 0})
+        for m in STATS_RE.finditer(text):
+            pid = int(m.group(1))
+            by_pid[pid]["c"] = max(by_pid[pid]["c"], int(m.group(2)))
+            by_pid[pid]["z"] = max(by_pid[pid]["z"], int(m.group(3)))
+        sum_committed = sum(d["c"] for d in by_pid.values())
+        sum_compressed = sum(d["z"] for d in by_pid.values())
+
+    return {
+        "mode": label,
+        "ok": True,
+        "tps": tps,
+        "latency_avg_ms": lat_avg,
+        "latency_stddev_ms": lat_std,
+        "smash_committed_pages": sum_committed,
+        "smash_compressed_pages": sum_compressed,
+        "log_path": str(log_path),
+    }
+
+
+def stage_run_legacy(libsmash: Path, **kw) -> int:
+    """Backward-compat wrapper for the old single-run-with-stats path."""
+    res = stage_run(INSTDIR, libsmash=libsmash, workload="cool", **kw)
+    if not res.get("ok"):
+        return 1
+    return analyse(Path(res["log_path"]))
 
 
 # ── log analysis ────────────────────────────────────────────────────────────
@@ -485,6 +607,18 @@ def main() -> int:
                          "more rows are touched only rarely and stay cold")
     ap.add_argument("--scale", type=int, default=20,
                     help="pgbench --scale; affects pgbench_accounts size (default 20 → 2M rows)")
+    ap.add_argument("--mode",
+                    choices=["shim-smash", "shim", "stock", "compare"],
+                    default="shim-smash",
+                    help="What to run. shim-smash (default): patched postgres + LD_PRELOAD libsmash, "
+                         "cool workload — measures compression. shim: patched postgres only, no smash, "
+                         "perf workload — measures cost of the malloc-passthrough. stock: unpatched "
+                         "postgres, no smash, perf workload — true baseline. compare: run all three "
+                         "with the perf workload and print a side-by-side table.")
+    ap.add_argument("--perf-duration", type=int, default=60,
+                    help="seconds for the perf workload (pgbench -T). Ignored for cool workload.")
+    ap.add_argument("--runs", type=int, default=1,
+                    help="repetitions per mode for --mode=compare (median is reported)")
     args = ap.parse_args()
 
     if sys.platform != "linux":
@@ -497,15 +631,127 @@ def main() -> int:
         print(f">>> rm -rf {WORKDIR}")
         shutil.rmtree(WORKDIR)
 
-    stage_download()
-    stage_patch()
-    stage_configure_build()
-    return stage_run(libsmash,
-                     clients=args.clients,
-                     queries=args.queries,
-                     cool_sec=args.cool_sec,
-                     zipf_s=args.zipf_s,
-                     scale=args.scale)
+    # Always make the shim build available — it's needed by every mode except
+    # `stock`. `compare` needs both.
+    needs_shim = args.mode in ("shim-smash", "shim", "compare")
+    needs_stock = args.mode in ("stock", "compare")
+
+    if needs_shim:
+        stage_download(SRCDIR)
+        stage_patch(SRCDIR)
+        stage_configure_build(SRCDIR, INSTDIR, label="shim")
+    if needs_stock:
+        stage_download(SRCDIR_STOCK)
+        # No stage_patch — that's the whole point.
+        stage_configure_build(SRCDIR_STOCK, INSTDIR_STOCK, label="stock")
+
+    common = dict(clients=args.clients, queries=args.queries,
+                  cool_sec=args.cool_sec, zipf_s=args.zipf_s,
+                  scale=args.scale, perf_duration_sec=args.perf_duration)
+
+    if args.mode == "shim-smash":
+        # Old default behaviour: cool workload + smash, dump the analysis.
+        res = stage_run(INSTDIR, libsmash=libsmash, workload="cool", **common)
+        if not res["ok"]: return 1
+        return analyse(Path(res["log_path"]))
+    if args.mode == "shim":
+        res = stage_run(INSTDIR, libsmash=None, workload="perf", **common)
+        return 0 if res["ok"] else 1
+    if args.mode == "stock":
+        res = stage_run(INSTDIR_STOCK, libsmash=None, workload="perf", **common)
+        return 0 if res["ok"] else 1
+    if args.mode == "compare":
+        return run_compare(libsmash, runs=args.runs, **common)
+    return 2
+
+
+def find_jemalloc() -> Path | None:
+    """Look for libjemalloc.so on standard Linux paths. Returns None if not
+    installed (the jemalloc rows just get reported as 'no successful runs')."""
+    candidates = [
+        "/usr/lib/aarch64-linux-gnu/libjemalloc.so.2",
+        "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+        "/usr/lib/libjemalloc.so.2",
+        "/usr/local/lib/libjemalloc.so.2",
+    ]
+    for p in candidates:
+        if Path(p).exists():
+            return Path(p)
+    # Fall back to ldconfig cache.
+    try:
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True,
+                             text=True, check=False).stdout
+        for line in out.splitlines():
+            if "libjemalloc.so" in line and "=>" in line:
+                return Path(line.split("=>")[-1].strip())
+    except Exception:
+        pass
+    return None
+
+
+def run_compare(libsmash: Path, runs: int = 1, **common) -> int:
+    """Run stock / shim / shim+smash with the perf workload, print a table.
+
+    Adds jemalloc (LD_PRELOAD'd libjemalloc.so) variants of stock + shim too,
+    so we can isolate three orthogonal axes:
+      - palloc pooling: stock keeps it, shim removes it.
+      - malloc impl: libc / jemalloc / smash.
+      - smash compression: only `shim+smash` gets it.
+    """
+    jemalloc = find_jemalloc()
+    if jemalloc is None:
+        print("[warn] libjemalloc.so not found — jemalloc configs will be skipped")
+    # (label, instdir, libsmash, preload, preload_label)
+    configs = [
+        ("stock",          INSTDIR_STOCK, None,     None,     ""),
+        ("stock+jemalloc", INSTDIR_STOCK, None,     jemalloc, "jemalloc"),
+        ("shim",           INSTDIR,       None,     None,     ""),
+        ("shim+jemalloc",  INSTDIR,       None,     jemalloc, "jemalloc"),
+        ("shim+smash",     INSTDIR,       libsmash, None,     ""),
+    ]
+    results: dict[str, list[dict]] = {label: [] for label, *_ in configs}
+    for r in range(runs):
+        for label, instdir, lib, preload, preload_label in configs:
+            if preload is None and preload_label == "jemalloc":
+                # jemalloc not installed; skip.
+                continue
+            print(f"\n=== run {r+1}/{runs} — {label} ===")
+            res = stage_run(instdir, libsmash=lib,
+                            preload=preload, preload_label=preload_label,
+                            workload="perf", quiet_pgbench=True, **common)
+            if not res.get("ok"):
+                print(f"  FAILED, see log: {res.get('log_path','?')}")
+                continue
+            print(f"  tps={res['tps']:.1f}  "
+                  f"latency_avg={res['latency_avg_ms']:.2f} ms  "
+                  f"latency_stddev={res['latency_stddev_ms']:.2f} ms")
+            results[label].append(res)
+
+    hr("COMPARISON SUMMARY")
+    print(f"{'config':<16} {'runs':>4} {'tps_med':>10} {'tps_min':>10} {'tps_max':>10} "
+          f"{'lat_avg_med':>12} {'lat_std_med':>12}")
+    base_tps = None
+    for label, *_ in configs:
+        rs = results[label]
+        if not rs:
+            print(f"{label:<16} {'0':>4}  (no successful runs)")
+            continue
+        tpsv = sorted(r["tps"] for r in rs)
+        latv = sorted(r["latency_avg_ms"] for r in rs)
+        # latency_stddev_ms can be NaN if pgbench didn't emit it; filter them.
+        stdv = sorted(r["latency_stddev_ms"] for r in rs
+                      if r["latency_stddev_ms"] == r["latency_stddev_ms"])  # !=NaN
+        med = lambda v: v[len(v)//2] if v else float("nan")
+        tps_med = med(tpsv)
+        if label == "stock":
+            base_tps = tps_med
+        delta = ""
+        if base_tps and tps_med:
+            d = (tps_med - base_tps) / base_tps * 100
+            delta = f"  ({d:+.1f}% vs stock)"
+        print(f"{label:<16} {len(rs):>4} {tps_med:>10.1f} {tpsv[0]:>10.1f} "
+              f"{tpsv[-1]:>10.1f} {med(latv):>12.2f} {med(stdv):>12.2f}{delta}")
+    return 0
 
 
 if __name__ == "__main__":

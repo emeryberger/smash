@@ -85,10 +85,14 @@ if(APPLE)
 endif()
 add_test(NAME test_fault_cycle COMMAND test_fault_cycle)
 # This test exercises the same compress→fault→recompress pattern that the
-# recompression-thrash back-off is designed to suppress. Disable the back-off
-# for this test so it can verify the underlying fault-cycle correctness.
+# recompression-thrash back-off is designed to suppress, and runs on busy CI
+# runners where the cold-tick floor multiplier would otherwise keep pages
+# from being compressed within the test's tick budget. Disable both for this
+# test so it can verify the underlying fault-cycle correctness.
+# SMASH_COLD_TIMEOUT_SEC=1 sets cold_ticks_overridden, which bypasses the
+# CPU-pressure floor multiplier (see compressor_thread.h::phase2Range).
 set_tests_properties(test_fault_cycle PROPERTIES
-  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0")
+  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0;SMASH_COLD_TIMEOUT_SEC=1")
 
 # Interposition test: built without alloc8 linkage, run under DYLD_INSERT
 add_executable(interpose_test interpose_test.cpp)

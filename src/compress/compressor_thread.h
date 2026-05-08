@@ -563,14 +563,20 @@ private:
         // CPU-pressure floor multiplier. The same signal that caps active
         // workers also tells us "the application needs cycles, don't compress
         // marginally-cold pages." Under saturation, raise the cold threshold
-        // 8× so a page must be idle for ~16 s (vs. 2 s default) before
-        // becoming a compression candidate. This is the load-bearing fix for
-        // the hang: planner/parser pages reach floor=2 in 2 s of "no
-        // detected access" (PROT_READ misses reads), get compressed, the
-        // next planner step faults on every access, and the backend stalls.
-        // Raising the bar to 16 s means most query pages survive the test
-        // duration uncompressed.
-        uint32_t cpu_mul = cpuPressureFloorMultiplier();
+        // so a page must be idle far longer before becoming a compression
+        // candidate. This is the load-bearing fix for the hang: planner /
+        // parser pages reach floor=2 in 2 s of "no detected access"
+        // (PROT_READ misses reads), get compressed, the next planner step
+        // faults on every access, and the backend stalls. Raising the bar
+        // means most query pages survive the test duration uncompressed.
+        //
+        // Skip the multiplier when the caller has explicitly overridden
+        // cold_ticks_floor (via SMASH_COLD_TIMEOUT_SEC or SMASH_COLD_TICKS):
+        // they know what they want, and unit tests rely on quick
+        // compression even when the runner is busy.
+        uint32_t cpu_mul = cfg.cold_ticks_overridden
+                         ? 1u
+                         : cpuPressureFloorMultiplier();
         uint32_t floor = base_floor * cpu_mul;
         forEachLivePage(start, end, [&](size_t i) {
             if (cold_count_[i] < floor) return;
@@ -1218,13 +1224,15 @@ private:
         int cap = static_cast<int>(nproc_cached) - app_threads - sys_pressure;
         if (cap < 1) cap = 1;
         cpu_pressure_cached_cap_ = cap;
-        // "active" = real contention: the application alone is using the
-        // box at or above its core count. Be strict — the cold-floor
-        // multiplier this gates is heavy-handed (8× idle requirement) and
-        // would break unit tests that legitimately just want compression
-        // to happen quickly.
+        // "active" = real contention: BOTH the application has more
+        // threads than cores AND the system load average says the box is
+        // at-or-above capacity. Either signal alone is too weak — macOS
+        // counts service threads in our task (a single-threaded test sees
+        // ~5 Mach threads), so app_threads >= nproc fires on quiet boxes
+        // and breaks unit tests that need quick compression. loadavg alone
+        // can be slow to update. Requiring both yields a stable signal.
         cpu_pressure_active_ = (app_threads >= nproc_cached)
-                            || (sys_pressure >= 1);
+                            && (sys_pressure >= 1);
         return cap;
     }
 

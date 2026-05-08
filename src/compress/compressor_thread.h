@@ -558,8 +558,20 @@ private:
     // cold and Phase 2 compresses it on the next tick.
     void phase2Range(int worker_id, size_t start, size_t end) {
         const ROIConfig& cfg = ROIConfig::instance();
-        uint32_t floor = cfg.cold_ticks_floor;
+        uint32_t base_floor = cfg.cold_ticks_floor;
         bool backoff_enabled = cfg.recompress_backoff;
+        // CPU-pressure floor multiplier. The same signal that caps active
+        // workers also tells us "the application needs cycles, don't compress
+        // marginally-cold pages." Under saturation, raise the cold threshold
+        // 8× so a page must be idle for ~16 s (vs. 2 s default) before
+        // becoming a compression candidate. This is the load-bearing fix for
+        // the hang: planner/parser pages reach floor=2 in 2 s of "no
+        // detected access" (PROT_READ misses reads), get compressed, the
+        // next planner step faults on every access, and the backend stalls.
+        // Raising the bar to 16 s means most query pages survive the test
+        // duration uncompressed.
+        uint32_t cpu_mul = cpuPressureFloorMultiplier();
+        uint32_t floor = base_floor * cpu_mul;
         forEachLivePage(start, end, [&](size_t i) {
             if (cold_count_[i] < floor) return;
             PageState st = states_->get(i);
@@ -1164,7 +1176,7 @@ private:
             const char* v = std::getenv("SMASH_CPU_PRESSURE_CAP");
             return !(v && v[0] == '0');
         }();
-        if (!enabled) return 0;
+        if (!enabled) { cpu_pressure_active_ = false; return 0; }
 
         static const long nproc_cached = []{
             long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -1185,6 +1197,7 @@ private:
         int proc_threads = countOwnThreads();
         if (proc_threads <= 0) {
             cpu_pressure_cached_cap_ = 0;  // can't read → no cap
+            cpu_pressure_active_ = false;
             return 0;
         }
 
@@ -1205,6 +1218,13 @@ private:
         int cap = static_cast<int>(nproc_cached) - app_threads - sys_pressure;
         if (cap < 1) cap = 1;
         cpu_pressure_cached_cap_ = cap;
+        // "active" = real contention: the application alone is using the
+        // box at or above its core count. Be strict — the cold-floor
+        // multiplier this gates is heavy-handed (8× idle requirement) and
+        // would break unit tests that legitimately just want compression
+        // to happen quickly.
+        cpu_pressure_active_ = (app_threads >= nproc_cached)
+                            || (sys_pressure >= 1);
         return cap;
     }
 
@@ -1239,6 +1259,27 @@ private:
 
     int cpu_pressure_cached_cap_ = 0;
     int cpu_pressure_sample_age_ = 1000;  // force resample on first call
+    bool cpu_pressure_active_ = false;    // last sample said the box is hot
+
+    // Multiplier on cold_ticks_floor when the CPU is saturated. The cap
+    // alone (workers ≤ nproc-app_threads) isn't enough on a 2-CPU host
+    // running a thread-heavy app like postgres: the coordinator alone can
+    // still compress an entire backend's working set in a few ticks,
+    // triggering a fault storm on the next query. Raising the floor also
+    // delays the *first* compression of fresh pages — long enough that
+    // continuously-touched workload pages survive uncompressed.
+    //
+    // Value chosen so worst-case "cold time before compression" is ~32 s
+    // at the default floor of 2 ticks (kCompressIntervalMs=1000). Pages
+    // truly idle for that long are worth compressing; a 2 s gap on a hot
+    // workload page isn't, and the cost of getting it wrong on a sustained
+    // workload is the fault-storm hangs we observed at lower thresholds.
+    static constexpr uint32_t kCpuPressureFloorMultiplier = 16;
+    uint32_t cpuPressureFloorMultiplier() {
+        // cpuPressureWorkerCap is called every tick from adaptWorkerCount;
+        // use its cached signal rather than resampling.
+        return cpu_pressure_active_ ? kCpuPressureFloorMultiplier : 1;
+    }
 
     // Measures λ (cold arrival rate) and μ (per-worker service rate) each
     // tick, smooths with EMA (α = 1/4), and sets N = ⌈λ_ema / μ_ema⌉.

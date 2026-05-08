@@ -79,6 +79,19 @@ class CompressorThread {
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
     uint8_t* cold_count_ = nullptr;
+    // Per-page recompression count: bumped on every COMPRESSED → ACTIVE
+    // fault, decayed in phase1Range when the page settles cold.  phase2Range
+    // raises the effective cold-tick floor by 2^min(rc + bucket_bias, kMaxBackoffShift).
+    // Saturating uint8_t — the bucket EMA captures values above ~6 anyway.
+    uint8_t* recompress_count_ = nullptr;
+
+    // Per-(arena, size_class) recompression-rate signal. Single shared
+    // table (not per-worker) so the fault handler can update it without
+    // first finding the right worker. Relaxed atomics; tearing on the EMA
+    // is acceptable.  Indexed by `arena * kNumClasses + size_class`.
+    std::atomic<uint16_t>* bucket_rc_ema_x256_ = nullptr;  // ×256 fixed-point
+    std::atomic<uint8_t>*  bucket_rc_count_ = nullptr;     // sample count, capped 64
+    static constexpr size_t kBucketTableLen = kNumArenas * kNumClasses;
 
     // Cohort measurement (kMeasureCohorts).  Points to SmashHeap's CohortPage
     // array — opaque here to avoid circular include.  Layout matches
@@ -500,12 +513,30 @@ private:
                     accessed_[i].store(false, std::memory_order_relaxed);
                 } else {
                     if (cold_count_[i] < 255) cold_count_[i]++;
+                    decayRecompressCount(i);
                 }
             } else if (st == PageState::COMPRESSED) {
                 // Keep counting for compressed pages so zstd upgrade can trigger
                 if (cold_count_[i] < 255) cold_count_[i]++;
+                decayRecompressCount(i);
             }
         });
+    }
+
+    // Slowly decay the per-page recompression count once a page settles into
+    // a long cold streak. We trigger one decrement every kRcDecayColdTicks
+    // ticks of inactivity (edge-detect on cold_count_), and a hard reset
+    // when cold_count_ saturates — by that point the page has been quiet
+    // for ~255 ticks and any prior thrash history is stale.
+    inline void decayRecompressCount(size_t i) {
+        uint8_t cc = cold_count_[i];
+        if (cc == 255) {
+            recompress_count_[i] = 0;
+        } else if (cc >= kRcDecayColdTicks
+                   && cc % kRcDecayColdTicks == 0
+                   && recompress_count_[i] > 0) {
+            recompress_count_[i]--;
+        }
     }
 
     // Phase 2: Compress cold pages
@@ -522,19 +553,66 @@ private:
     // survives one full tick at PROT_NONE without any access, it is truly
     // cold and Phase 2 compresses it on the next tick.
     void phase2Range(int worker_id, size_t start, size_t end) {
-        uint32_t floor = ROIConfig::instance().cold_ticks_floor;
+        const ROIConfig& cfg = ROIConfig::instance();
+        uint32_t floor = cfg.cold_ticks_floor;
+        bool backoff_enabled = cfg.recompress_backoff;
         forEachLivePage(start, end, [&](size_t i) {
             if (cold_count_[i] < floor) return;
             PageState st = states_->get(i);
-            if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
-                if (cold_count_[i] == floor && st == PageState::ACTIVE_MONITORING) {
-                    escalateToDeepMonitoring(i);
-                } else if (cold_count_[i] > floor) {
-                    // Page is eligible for compression — count it
-                    worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
-                    if (compressPage(i, workers_[worker_id])) {
-                        worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
+            if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING)
+                return;
+
+            // Recompression-thrash gate. Pages that have been faulted back
+            // from COMPRESSED before, or that live in a (arena, size_class)
+            // bucket whose pages are doing the same, must stay idle longer
+            // before becoming eligible again. Effective floor doubles per
+            // accumulated recompress event, capped at kMaxBackoffShift.
+            //
+            // Looked up via the span so we also pick up the new-page bias
+            // from the per-bucket EMA — fresh pages from a known-thrashy
+            // call site inherit the wait without needing their own history.
+            uint32_t eff_floor = floor;
+            if (backoff_enabled) {
+                uint8_t rc = recompress_count_[i];
+                uint8_t bucket_bias = 0;
+                if (page_map_) {
+                    void* page_addr = vm_->pageAddress(i);
+                    Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
+                    if (sp && !sp->is_large && sp->size_class < kNumClasses) {
+                        size_t bidx = static_cast<size_t>(sp->arena_id) * kNumClasses
+                                    + sp->size_class;
+                        if (bidx < kBucketTableLen) {
+                            // Bucket bias: a single recompress event in this
+                            // (arena, size_class) bucket gives bias=1 to fresh
+                            // pages in the same bucket — they get a longer
+                            // initial cold window without needing to thrash
+                            // themselves first. Threshold=256 ≈ "one full rc
+                            // sample" with α=1/4 EMA.
+                            uint16_t ema = bucket_rc_ema_x256_[bidx].load(
+                                std::memory_order_relaxed);
+                            if (ema >= kBucketRcBiasThreshold_x256) bucket_bias = 1;
+                        }
                     }
+                }
+                uint32_t shift32 = static_cast<uint32_t>(rc) + bucket_bias;
+                if (shift32 > kMaxBackoffShift) shift32 = kMaxBackoffShift;
+                uint64_t wide_floor = static_cast<uint64_t>(floor) << shift32;
+                if (wide_floor > kMaxEffectiveFloorTicks)
+                    wide_floor = kMaxEffectiveFloorTicks;
+                eff_floor = static_cast<uint32_t>(wide_floor);
+            }
+
+            if (cold_count_[i] == floor && st == PageState::ACTIVE_MONITORING) {
+                // Always escalate to deep monitoring at the BASE floor —
+                // this just changes protection, not compression. It gives
+                // the compressor more accurate access info for thrashy
+                // pages (which we won't compress anyway until eff_floor).
+                escalateToDeepMonitoring(i);
+            } else if (cold_count_[i] > floor && cold_count_[i] >= eff_floor) {
+                // Page is eligible for compression — count it
+                worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
+                if (compressPage(i, workers_[worker_id])) {
+                    worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
                 }
             }
         });
@@ -1213,6 +1291,11 @@ public:
         compressed_ = bootstrapArray<CompressedPageInfo>(max_pages);
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
+        recompress_count_ = bootstrapArray<uint8_t>(max_pages);
+
+        // Per-bucket recompression EMA table (kNumArenas × kNumClasses entries).
+        bucket_rc_ema_x256_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
+        bucket_rc_count_    = bootstrapArray<std::atomic<uint8_t>>(kBucketTableLen);
 
         // Chunk bitmap
         num_chunks_ = (max_pages + kChunkSize - 1) / kChunkSize;
@@ -1429,14 +1512,43 @@ public:
             cold_count_[page_idx] = 0;
             locks_->unlock(page_idx);
 
+            // Recompression-thrash signal. The act of faulting back from
+            // COMPRESSED is direct evidence the page was hotter than we
+            // thought; bump the per-page count and feed the per-bucket EMA
+            // so phase2 backs off on this page (and on fresh pages from the
+            // same allocation site) the next round.
+            uint8_t prev_rc = recompress_count_[page_idx];
+            if (prev_rc < 255) recompress_count_[page_idx] = prev_rc + 1;
+
             // Adaptive cap: decompression = re-warm evidence.  Notify the
             // heap so it can bias cap sizing for this (arena, sc) toward
             // "hot" (no cap / larger cap).
-            if (decompressed_fn_ && page_map_) {
+            //
+            // Same lookup gives us (arena, size_class) for the bucket EMA
+            // update — do both in one Span fetch.
+            if (page_map_) {
                 Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
                 if (sp && !sp->is_large && sp->size_class < kNumClasses) {
-                    decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
-                                     decompressed_ctx_);
+                    if (decompressed_fn_) {
+                        decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
+                                         decompressed_ctx_);
+                    }
+                    size_t bidx = static_cast<size_t>(sp->arena_id) * kNumClasses
+                                + sp->size_class;
+                    if (bidx < kBucketTableLen) {
+                        // EMA α=1/4, ×256 fixed-point. Relaxed atomics; tearing
+                        // on the EMA is acceptable.
+                        uint16_t old = bucket_rc_ema_x256_[bidx].load(std::memory_order_relaxed);
+                        uint16_t sample_x256 = static_cast<uint16_t>(prev_rc + 1) * 256;
+                        uint8_t cnt = bucket_rc_count_[bidx].load(std::memory_order_relaxed);
+                        uint16_t neu = (cnt == 0)
+                            ? sample_x256
+                            : static_cast<uint16_t>(static_cast<int32_t>(old)
+                                + (static_cast<int32_t>(sample_x256) - static_cast<int32_t>(old)) / 4);
+                        bucket_rc_ema_x256_[bidx].store(neu, std::memory_order_relaxed);
+                        if (cnt < 64)
+                            bucket_rc_count_[bidx].store(cnt + 1, std::memory_order_relaxed);
+                    }
                 }
             }
 
@@ -1494,6 +1606,7 @@ public:
             }
             states_->set(i, PageState::EMPTY);
             cold_count_[i] = 0;
+            recompress_count_[i] = 0;
             accessed_[i].store(false, std::memory_order_relaxed);
             locks_->unlock(i);
         }

@@ -185,6 +185,48 @@ inline constexpr int kVeryColdTicks = 60;         // ~1 min → zstd deep
 #else
 inline constexpr int kVeryColdTicks = SMASH_VERY_COLD_TICKS;
 #endif
+
+// ── Recompression-thrash back-off ──────────────────────────────────────────
+//
+// When a page is compressed and then immediately faulted back (compress →
+// decompress → recompress loop), per-page `recompress_count_` is bumped on
+// each fault. The compressor's phase 2 gate raises the effective cold-tick
+// floor by `floor << min(recompress_count + bucket_bias, kMaxBackoffShift)`,
+// so a thrashy page must stay idle proportionally longer before being
+// eligible for compression again. The penalty decays once the page truly
+// cools off — see compressor_thread.h::phase1Range.
+#ifndef SMASH_RECOMPRESS_MAX_SHIFT
+inline constexpr int kMaxBackoffShift = 6;        // 64× floor max
+#else
+inline constexpr int kMaxBackoffShift = SMASH_RECOMPRESS_MAX_SHIFT;
+#endif
+
+#ifndef SMASH_RECOMPRESS_MAX_FLOOR_TICKS
+inline constexpr int kMaxEffectiveFloorTicks = 200;  // sanity cap (~3.3 min)
+#else
+inline constexpr int kMaxEffectiveFloorTicks = SMASH_RECOMPRESS_MAX_FLOOR_TICKS;
+#endif
+
+#ifndef SMASH_RECOMPRESS_DECAY_TICKS
+inline constexpr int kRcDecayColdTicks = 8;       // decay edge spacing in cold-ticks
+#else
+inline constexpr int kRcDecayColdTicks = SMASH_RECOMPRESS_DECAY_TICKS;
+#endif
+
+// EMA divisor (×256 fixed-point) for proportional per-bucket bias on the
+// back-off shift. `bucket_bias = bucket_ema_x256 / kBucketRcBiasThreshold_x256`
+// (capped at kMaxBackoffShift). 256 = "every full unit of average rc in this
+// bucket adds +1 to the shift", so a single recompress event in a bucket
+// immediately gives every other page in that bucket bias=1 (eff_floor=2×).
+// This is load-bearing: without aggressive propagation, fresh pages from a
+// thrashy call site each have to individually thrash before any backoff
+// applies, which doesn't converge on workloads that allocate hundreds of
+// pages per second from the same site.
+#ifndef SMASH_RECOMPRESS_BUCKET_BIAS_X256
+inline constexpr int kBucketRcBiasThreshold_x256 = 256;
+#else
+inline constexpr int kBucketRcBiasThreshold_x256 = SMASH_RECOMPRESS_BUCKET_BIAS_X256;
+#endif
 #ifndef SMASH_DICT_TRAIN_SAMPLES
 inline constexpr int kDictTrainSamples = 0;       // disabled: dicts net-negative (see EXPERIMENTS.md)
 #else

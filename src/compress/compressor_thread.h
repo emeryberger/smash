@@ -560,6 +560,22 @@ private:
         const ROIConfig& cfg = ROIConfig::instance();
         uint32_t base_floor = cfg.cold_ticks_floor;
         bool backoff_enabled = cfg.recompress_backoff;
+
+        // Hard skip: under sustained pressure, the box can't really afford
+        // background compression at all. Even one compressor worker
+        // generating page-protect transitions interferes with the very
+        // fault handlers we depend on, leading to the catastrophic hangs
+        // seen with shim+smash on a 2-CPU pgbench. The cold-floor
+        // multiplier delays compression but doesn't eliminate it; if we
+        // ALSO see that Little's Law would have asked for more workers
+        // than the cap allows AND the caller hasn't overridden cold_ticks
+        // (which is "I know what I want — compress eagerly"), just skip
+        // phase 2 entirely this tick. Decay-only behaviour.
+        if (cpu_pressure_active_
+            && !cfg.cold_ticks_overridden
+            && active_workers_ <= 1) {
+            return;
+        }
         // CPU-pressure floor multiplier. The same signal that caps active
         // workers also tells us "the application needs cycles, don't compress
         // marginally-cold pages." Under saturation, raise the cold threshold
@@ -1215,24 +1231,37 @@ private:
         // System-wide pressure not attributable to our own app.
         double loads[3] = {0.0, 0.0, 0.0};
         int sys_pressure = 0;
+        int load_int = 0;
         if (getloadavg(loads, 1) >= 1) {
-            int load_int = static_cast<int>(loads[0] + 0.5);
+            load_int = static_cast<int>(loads[0] + 0.5);
             sys_pressure = load_int - app_threads;
             if (sys_pressure < 0) sys_pressure = 0;
         }
 
         int cap = static_cast<int>(nproc_cached) - app_threads - sys_pressure;
+        bool unclamped_negative = cap < 1;
         if (cap < 1) cap = 1;
         cpu_pressure_cached_cap_ = cap;
-        // "active" = real contention: BOTH the application has more
-        // threads than cores AND the system load average says the box is
-        // at-or-above capacity. Either signal alone is too weak — macOS
-        // counts service threads in our task (a single-threaded test sees
-        // ~5 Mach threads), so app_threads >= nproc fires on quiet boxes
-        // and breaks unit tests that need quick compression. loadavg alone
-        // can be slow to update. Requiring both yields a stable signal.
-        cpu_pressure_active_ = (app_threads >= nproc_cached)
-                            && (sys_pressure >= 1);
+        // "active" = the cap actually constrains us — if Little's Law
+        // would have asked for more workers than we can give it, we're
+        // contended. Use this to also raise cold_ticks_floor in
+        // phase2Range, so newly-allocated pages aren't compressed in the
+        // first 2 s of an active workload (which they otherwise would be,
+        // because PROT_READ-monitoring doesn't see read-only access and
+        // pages "look" cold).
+        //
+        // Per-process app_threads is small (a single postgres backend has
+        // 3 threads), so an absolute "app_threads >= nproc" trigger
+        // rarely fires for backend-style workloads. Using the unclamped
+        // cap value catches the case: a single backend on a 2-core box
+        // gets cap = 2 - 3 = -1 (clamped to 1), and we know the box can't
+        // really afford the compressor's full pool.
+        //
+        // Unit tests use SMASH_COLD_TIMEOUT_SEC=1 → cold_ticks_overridden
+        // → multiplier bypassed entirely (see phase2Range).
+        cpu_pressure_active_ = unclamped_negative
+                            || (sys_pressure >= 1)
+                            || (cap < kCompressorWorkers);
         return cap;
     }
 

@@ -13,8 +13,9 @@ Three merged PRs, one open:
 - **PR #13 (open, awaiting CI)** — a thrash-mitigation stack:
   1. Per-page + per-(arena, size_class) recompression tracking with exponential back-off on the cold-tick floor.
   2. Thread-aware CPU-pressure cap on the active worker count (counts our process's threads via `/proc/self/task` on Linux / `task_threads()` on macOS, subtracts known compressor workers, leaves enough cores for the application).
-  3. 16× multiplier on the cold-tick floor when the box is genuinely contended (`app_threads >= nproc` AND `loadavg ≥ app_threads + 1`). Bypassed when the user explicitly sets `SMASH_COLD_TIMEOUT_SEC` / `SMASH_COLD_TICKS`.
-  4. `bench/postgres_shim_build.py --mode=compare` driver: builds stock + shim postgres side-by-side, runs perf workloads under stock / stock+jemalloc / shim / shim+jemalloc / shim+smash, hard 4× perf-duration timeout fuse, pkill cleanup that catches `smashuser` backends (postgres calls `setsid()` per connection, so `killpg(postmaster_pgid)` misses them).
+  3. 16× multiplier on the cold-tick floor when the cap clamps below the configured worker pool. Bypassed when the user explicitly sets `SMASH_COLD_TIMEOUT_SEC` / `SMASH_COLD_TICKS`.
+  4. **Hard-skip phase 2** when the cap is tight (≤ 1 active worker) AND no explicit override. Decay-only behaviour. Eliminates the timeouts we couldn't kill with the multiplier alone — pages stay where they are until the cap relaxes (e.g., the workload's idle phase), then compression resumes.
+  5. `bench/postgres_shim_build.py --mode=compare` driver: builds stock + shim postgres side-by-side, runs perf workloads under stock / stock+jemalloc / shim / shim+jemalloc / shim+smash, hard 4× perf-duration timeout fuse, pkill cleanup that catches `smashuser` backends (postgres calls `setsid()` per connection, so `killpg(postmaster_pgid)` misses them).
 
 ## State of the repo
 
@@ -39,23 +40,21 @@ Three valuable scripts in `bench/`:
 
 **Cool-tail workload** (default `--mode=shim-smash`):
 ```
-long-lived (samples>5):  committed=7147 pages (28 MB),
-                         compressed=7100 pages (28 MB), ratio=99.3%
+long-lived (samples>5):  committed=7153 pages (28 MB),
+                         compressed=7116 pages (28 MB), ratio=99.5%
 ```
 
-**Perf workload** (`--mode=compare --runs 5 --clients 2 --perf-duration 30`):
+**Perf workload, 8-iteration loop** (`-T 60 -c 2`, post hard-skip):
 ```
-config           runs    tps_med    tps_min    tps_max    Δ vs stock
-stock               5    11182.8     9742.0    11205.9         —
-stock+jemalloc      5    11235.4    11097.2    11343.6      +0.5 %
-shim                5    10029.6     9722.8    10105.2     -10.3 %
-shim+jemalloc       5    10851.7    10699.6    10902.3      -3.0 %
-shim+smash          5     8039.4     7506.7    (1 timeout)  -28.1 %
+median 5278 tps, range 5263–5341 (1.5% spread), 0 timeouts in 8 iters,
+0 compressions during workload (smash defers under sustained pressure)
 ```
+
+The earlier 5×5 comparison numbers (stock 11183, stock+jemalloc 11235, shim 10030, shim+jemalloc 10852) are unchanged — they don't go through smash. shim+smash is now stable but trades compression for stability under contention.
 
 `shim+jemalloc` within ~3 % of stock validates the *Reconsidering Custom Memory Allocation* (Berger/Zorn/McKinley, OOPSLA 2002) thesis on this codebase: removing palloc's pooling and dropping in jemalloc nearly recovers the loss.
 
-`shim+smash` still has occasional pgbench timeouts on this 2-CPU VM. **Pending: re-test on a bigger VM.** With more cores the CPU cap is less restrictive (compressor workers + app threads no longer compete for every core), the floor multiplier triggers less often, and the timeout rate should drop.
+`shim+smash` perf TPS is conservative on this 2-CPU box because smash's malloc overhead is nontrivial AND the hard-skip prevents any compression at all. **Pending: re-test on a bigger VM** — with more cores the cap relaxes (cap ≥ kCompressorWorkers), the hard-skip is dormant, smash compresses normally, and we get back to the cool-tail-style 99 % per-backend numbers without sacrificing perf throughput.
 
 ## Step 1 — confirm baseline state
 
@@ -108,7 +107,10 @@ python3 bench/postgres_shim_build.py linux-build/libsmash.so \
 
 In priority order:
 
-1. **Run the perf comparison on a larger-core VM** (the user has been ramping core count up). Goal: validate that the timeout rate drops to zero. If it doesn't, the next likely culprit is the first-compression flurry described in PR #13 — fresh pages with no thrash history can still get into the compress→fault loop on a 60-second window. Possible mitigations: anticipatory "freshly-allocated, give it more time" heuristic, or feed the existing `kColdArenaFeedback` decompress signal into the compression gate.
+1. **Run the perf comparison on a larger-core VM** (the user has been ramping core count up). Goal: confirm the hard-skip becomes dormant (cap ≥ kCompressorWorkers) and shim+smash recovers the compression behaviour without timeouts. The expectation:
+   - 2-CPU: hard-skip active, no compression during perf, stable but ~−50 % vs. stock. Cool-tail unaffected.
+   - 4+-CPU: cap rarely clamps to 1, smash compresses normally, perf TPS approaches `shim+jemalloc`, cool-tail still 99 %.
+   If timeouts reappear at higher core counts, the fix probably needs to engage hard-skip even when the cap is 2 (not just 1) but only when `cap < kCompressorWorkers`. Tunable.
 
 2. **Cross-check on more workloads.** The cool-tail design point (long-running backend that idles) should reproduce on Redis, memcached, RocksDB. The `bench/` directory has scripts for those (`bench_redis.sh` etc.) but they predate the comparison driver — port one to the same `--mode=compare` pattern if the perf-vs-jemalloc number is interesting elsewhere too.
 

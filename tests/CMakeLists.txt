@@ -45,6 +45,11 @@ if(APPLE)
   target_compile_options(test_compression PRIVATE -ftls-model=initial-exec)
 endif()
 add_test(NAME test_compression COMMAND test_compression)
+# Drive the compressor through ticks deterministically — bypass the
+# CPU-pressure hard-skip and floor multiplier with an explicit
+# cold-ticks override.
+set_tests_properties(test_compression PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2")
 
 # Dictionary training test (needs LZ4 + zstd)
 add_executable(test_dictionary test_dictionary.cpp)
@@ -63,6 +68,8 @@ if(APPLE)
   target_compile_options(test_prefetch PRIVATE -ftls-model=initial-exec)
 endif()
 add_test(NAME test_prefetch COMMAND test_prefetch)
+set_tests_properties(test_prefetch PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2")
 
 # Contention test (needs LZ4 + zstd + smash_heap.cpp)
 add_executable(test_contention

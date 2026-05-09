@@ -50,7 +50,20 @@ median 5278 tps, range 5263–5341 (1.5% spread), 0 timeouts in 8 iters,
 0 compressions during workload (smash defers under sustained pressure)
 ```
 
-The earlier 5×5 comparison numbers (stock 11183, stock+jemalloc 11235, shim 10030, shim+jemalloc 10852) are unchanged — they don't go through smash. shim+smash is now stable but trades compression for stability under contention.
+**Perf 5×5 comparison** (`--mode=compare --runs 5 --clients 2 --perf-duration 30`,
+re-measured 2026-05-09 with system load present):
+```
+config           runs    tps_med    tps_min    tps_max    Δ vs stock
+stock               5     7047.9     6835.3     7087.8         —
+stock+jemalloc      5     7071.1     6823.4     7081.2      +0.3%
+shim                5     6455.6     5902.4     6489.1      −8.4%
+shim+jemalloc       5     6794.1     6745.4     6886.8      −3.6%
+shim+smash          5     5269.4     5214.9     5274.8     −25.2%
+```
+First clean 5×5 with **zero timeouts** since we started chasing this. All
+five configs completed all five runs. Absolute TPS is lower than the
+earlier 11K runs because the box was carrying more background load this
+time — relative ordering is the more meaningful signal.
 
 `shim+jemalloc` within ~3 % of stock validates the *Reconsidering Custom Memory Allocation* (Berger/Zorn/McKinley, OOPSLA 2002) thesis on this codebase: removing palloc's pooling and dropping in jemalloc nearly recovers the loss.
 

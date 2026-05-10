@@ -154,8 +154,21 @@ inline constexpr int kRoiThresholdDefault = 1024;
 
 // ── Compression (Phase 3+) ───────────────────────────────────────────────────
 inline constexpr int kCompressIntervalMs = 1000;
+// Default 10 ticks (= 10 s at the 1 s tick interval). Lower values compress
+// more aggressively but starve continuous workloads of read-only working set
+// — PROT_READ-monitoring is blind to reads, so a page being constantly read
+// looks identical to an idle one. Span::allocate() resets cold_count on
+// alloc activity, but the program may go from "burst-allocating" to
+// "read-only execution" with no further allocs, and a 2-tick floor will
+// then catch the read-only working set in 2 s flat. 10 ticks gives the
+// workload time to establish access patterns through the rc-backoff
+// mechanism (one fault → eff_floor doubles) before the wave of fresh
+// pages becomes eligible.
+//
+// Tests pin their own value via SMASH_COLD_TIMEOUT_SEC / SMASH_COLD_TICKS,
+// so unit-test latency is unaffected.
 #ifndef SMASH_COLD_TICKS
-inline constexpr int kColdTicksDefault = 2;
+inline constexpr int kColdTicksDefault = 10;
 #else
 inline constexpr int kColdTicksDefault = SMASH_COLD_TICKS;
 #endif

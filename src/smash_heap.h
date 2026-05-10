@@ -475,7 +475,8 @@ public:
                             static_cast<uint8_t>(i), &page_map_,
                             &vm_region_, &page_states_,
                             releaseHook, this,
-                            static_cast<uint8_t>(a), cap);
+                            static_cast<uint8_t>(a), cap,
+                            compressor_.coldCounts());
                         if constexpr (kAdaptiveCap) {
                             slabs_[a * kNumClasses + i].setCapFn(
                                 adaptiveCapQuery, this);

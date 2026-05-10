@@ -558,42 +558,16 @@ private:
     // cold and Phase 2 compresses it on the next tick.
     void phase2Range(int worker_id, size_t start, size_t end) {
         const ROIConfig& cfg = ROIConfig::instance();
-        uint32_t base_floor = cfg.cold_ticks_floor;
+        uint32_t floor = cfg.cold_ticks_floor;
         bool backoff_enabled = cfg.recompress_backoff;
 
-        // Hard skip: under sustained pressure, the box can't really afford
-        // background compression at all. Even one compressor worker
-        // generating page-protect transitions interferes with the very
-        // fault handlers we depend on, leading to the catastrophic hangs
-        // seen with shim+smash on a 2-CPU pgbench. The cold-floor
-        // multiplier delays compression but doesn't eliminate it; if we
-        // ALSO see that Little's Law would have asked for more workers
-        // than the cap allows AND the caller hasn't overridden cold_ticks
-        // (which is "I know what I want — compress eagerly"), just skip
-        // phase 2 entirely this tick. Decay-only behaviour.
-        if (cpu_pressure_active_
-            && !cfg.cold_ticks_overridden
-            && active_workers_ <= 1) {
-            return;
-        }
-        // CPU-pressure floor multiplier. The same signal that caps active
-        // workers also tells us "the application needs cycles, don't compress
-        // marginally-cold pages." Under saturation, raise the cold threshold
-        // so a page must be idle far longer before becoming a compression
-        // candidate. This is the load-bearing fix for the hang: planner /
-        // parser pages reach floor=2 in 2 s of "no detected access"
-        // (PROT_READ misses reads), get compressed, the next planner step
-        // faults on every access, and the backend stalls. Raising the bar
-        // means most query pages survive the test duration uncompressed.
-        //
-        // Skip the multiplier when the caller has explicitly overridden
-        // cold_ticks_floor (via SMASH_COLD_TIMEOUT_SEC or SMASH_COLD_TICKS):
-        // they know what they want, and unit tests rely on quick
-        // compression even when the runner is busy.
-        uint32_t cpu_mul = cfg.cold_ticks_overridden
-                         ? 1u
-                         : cpuPressureFloorMultiplier();
-        uint32_t floor = base_floor * cpu_mul;
+        // No CPU-pressure multiplier and no per-tick compression budget.
+        // The right signal for "don't compress this page yet" isn't
+        // CPU saturation — it's "the program is still allocating into
+        // this page." Span::allocate() resets cold_count_ for the page
+        // it just handed out a chunk on, so a page being filled simply
+        // never reaches the floor. Recompression-thrash is handled
+        // independently by the per-page rc backoff below.
         forEachLivePage(start, end, [&](size_t i) {
             if (cold_count_[i] < floor) return;
             PageState st = states_->get(i);
@@ -1198,7 +1172,7 @@ private:
             const char* v = std::getenv("SMASH_CPU_PRESSURE_CAP");
             return !(v && v[0] == '0');
         }();
-        if (!enabled) { cpu_pressure_active_ = false; return 0; }
+        if (!enabled) return 0;
 
         static const long nproc_cached = []{
             long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -1219,7 +1193,6 @@ private:
         int proc_threads = countOwnThreads();
         if (proc_threads <= 0) {
             cpu_pressure_cached_cap_ = 0;  // can't read → no cap
-            cpu_pressure_active_ = false;
             return 0;
         }
 
@@ -1239,29 +1212,8 @@ private:
         }
 
         int cap = static_cast<int>(nproc_cached) - app_threads - sys_pressure;
-        bool unclamped_negative = cap < 1;
         if (cap < 1) cap = 1;
         cpu_pressure_cached_cap_ = cap;
-        // "active" = the cap actually constrains us — if Little's Law
-        // would have asked for more workers than we can give it, we're
-        // contended. Use this to also raise cold_ticks_floor in
-        // phase2Range, so newly-allocated pages aren't compressed in the
-        // first 2 s of an active workload (which they otherwise would be,
-        // because PROT_READ-monitoring doesn't see read-only access and
-        // pages "look" cold).
-        //
-        // Per-process app_threads is small (a single postgres backend has
-        // 3 threads), so an absolute "app_threads >= nproc" trigger
-        // rarely fires for backend-style workloads. Using the unclamped
-        // cap value catches the case: a single backend on a 2-core box
-        // gets cap = 2 - 3 = -1 (clamped to 1), and we know the box can't
-        // really afford the compressor's full pool.
-        //
-        // Unit tests use SMASH_COLD_TIMEOUT_SEC=1 → cold_ticks_overridden
-        // → multiplier bypassed entirely (see phase2Range).
-        cpu_pressure_active_ = unclamped_negative
-                            || (sys_pressure >= 1)
-                            || (cap < kCompressorWorkers);
         return cap;
     }
 
@@ -1296,27 +1248,6 @@ private:
 
     int cpu_pressure_cached_cap_ = 0;
     int cpu_pressure_sample_age_ = 1000;  // force resample on first call
-    bool cpu_pressure_active_ = false;    // last sample said the box is hot
-
-    // Multiplier on cold_ticks_floor when the CPU is saturated. The cap
-    // alone (workers ≤ nproc-app_threads) isn't enough on a 2-CPU host
-    // running a thread-heavy app like postgres: the coordinator alone can
-    // still compress an entire backend's working set in a few ticks,
-    // triggering a fault storm on the next query. Raising the floor also
-    // delays the *first* compression of fresh pages — long enough that
-    // continuously-touched workload pages survive uncompressed.
-    //
-    // Value chosen so worst-case "cold time before compression" is ~32 s
-    // at the default floor of 2 ticks (kCompressIntervalMs=1000). Pages
-    // truly idle for that long are worth compressing; a 2 s gap on a hot
-    // workload page isn't, and the cost of getting it wrong on a sustained
-    // workload is the fault-storm hangs we observed at lower thresholds.
-    static constexpr uint32_t kCpuPressureFloorMultiplier = 16;
-    uint32_t cpuPressureFloorMultiplier() {
-        // cpuPressureWorkerCap is called every tick from adaptWorkerCount;
-        // use its cached signal rather than resampling.
-        return cpu_pressure_active_ ? kCpuPressureFloorMultiplier : 1;
-    }
 
     // Measures λ (cold arrival rate) and μ (per-worker service rate) each
     // tick, smooths with EMA (α = 1/4), and sets N = ⌈λ_ema / μ_ema⌉.
@@ -1470,6 +1401,12 @@ private:
     }
 
 public:
+    // Pointer to the per-page cold-tick counter array, valid after init().
+    // Slab::allocate exposes this to Span so freshly-allocated chunks reset
+    // the cold counter for their containing page — pages still receiving
+    // allocations should never be eligible for compression.
+    uint8_t* coldCounts() const { return cold_count_; }
+
     void init(VmRegion* vm, PageStateTable* states, PageLockTable* locks,
               CompressStore* store, CompressEngine* engine,
               PageMap* page_map = nullptr,

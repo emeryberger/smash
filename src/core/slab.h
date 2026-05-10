@@ -38,6 +38,11 @@ class Slab {
     PageMap* page_map_;   // set during init, shared across all slabs
     VmRegion* vm_region_ = nullptr;
     PageStateTable* page_states_ = nullptr;
+    // Per-page cold-tick counter array owned by CompressorThread.  Plumbed
+    // into Span so the bitmap walk can clear the cold counter on the page
+    // it just handed out a chunk on — pages still receiving allocations
+    // should not be eligible for compression yet.
+    uint8_t* cold_counts_ = nullptr;
     void (*release_hook_)(size_t, size_t, void*) = nullptr;
     void* release_ctx_ = nullptr;
 
@@ -61,6 +66,16 @@ class Slab {
 
         Span* span = newSpanDescriptor();
         span->init(mem, info.pages, size_class_, arena_id_, currentCap());
+        // Plumb the page-state lookup so Span::allocate() can avoid handing
+        // out chunks on COMPRESSED pages (would fault on first user access),
+        // and the cold-count array so allocate() can reset coldness on the
+        // page it just handed a chunk out on.
+        if (vm_region_ && page_states_) {
+            span->page_states = page_states_;
+            span->first_page_vm_idx = static_cast<uint32_t>(
+                vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem)));
+            span->cold_counts = cold_counts_;
+        }
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
     }
@@ -113,13 +128,15 @@ public:
               void (*hook)(size_t, size_t, void*) = nullptr,
               void* hook_ctx = nullptr,
               uint8_t arena_id = 0,
-              uint32_t max_slots_per_page = 0) {
+              uint32_t max_slots_per_page = 0,
+              uint8_t* cold_counts = nullptr) {
         size_class_ = sc;
         arena_id_ = arena_id;
         max_slots_per_page_ = max_slots_per_page;
         page_map_ = pm;
         vm_region_ = vr;
         page_states_ = ps;
+        cold_counts_ = cold_counts;
         release_hook_ = hook;
         release_ctx_ = hook_ctx;
     }

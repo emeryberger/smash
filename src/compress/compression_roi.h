@@ -118,6 +118,12 @@ struct ROIConfig {
     uint32_t cold_ticks_floor = kColdTicksDefault;
     uint32_t very_cold_ticks = kVeryColdTicks;
 
+    // Recompression-thrash back-off (see config.h::kMaxBackoffShift et al.).
+    // The master switch defaults to 1 (active). Set SMASH_RECOMPRESS_BACKOFF=0
+    // to ablate; phase2 then ignores recompress_count_ and bucket EMAs and
+    // gates only on cold_ticks_floor as before.
+    bool recompress_backoff = true;
+
     AlgoProfile profiles[4];
     int num_profiles = 0;
 
@@ -162,6 +168,10 @@ struct ROIConfig {
         if (vct_env) {
             very_cold_ticks = static_cast<uint32_t>(std::atoi(vct_env));
             very_cold_ticks_overridden = true;
+        }
+
+        if (const char* rb = std::getenv("SMASH_RECOMPRESS_BACKOFF")) {
+            recompress_backoff = (std::atoi(rb) != 0);
         }
 
         // 2. Try loading calibration file

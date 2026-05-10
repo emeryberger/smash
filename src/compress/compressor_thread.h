@@ -33,6 +33,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <dirent.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 #include <cstdio>
 #include <lz4.h>
@@ -79,6 +83,19 @@ class CompressorThread {
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
     uint8_t* cold_count_ = nullptr;
+    // Per-page recompression count: bumped on every COMPRESSED → ACTIVE
+    // fault, decayed in phase1Range when the page settles cold.  phase2Range
+    // raises the effective cold-tick floor by 2^min(rc + bucket_bias, kMaxBackoffShift).
+    // Saturating uint8_t — the bucket EMA captures values above ~6 anyway.
+    uint8_t* recompress_count_ = nullptr;
+
+    // Per-(arena, size_class) recompression-rate signal. Single shared
+    // table (not per-worker) so the fault handler can update it without
+    // first finding the right worker. Relaxed atomics; tearing on the EMA
+    // is acceptable.  Indexed by `arena * kNumClasses + size_class`.
+    std::atomic<uint16_t>* bucket_rc_ema_x256_ = nullptr;  // ×256 fixed-point
+    std::atomic<uint8_t>*  bucket_rc_count_ = nullptr;     // sample count, capped 64
+    static constexpr size_t kBucketTableLen = kNumArenas * kNumClasses;
 
     // Cohort measurement (kMeasureCohorts).  Points to SmashHeap's CohortPage
     // array — opaque here to avoid circular include.  Layout matches
@@ -500,12 +517,30 @@ private:
                     accessed_[i].store(false, std::memory_order_relaxed);
                 } else {
                     if (cold_count_[i] < 255) cold_count_[i]++;
+                    decayRecompressCount(i);
                 }
             } else if (st == PageState::COMPRESSED) {
                 // Keep counting for compressed pages so zstd upgrade can trigger
                 if (cold_count_[i] < 255) cold_count_[i]++;
+                decayRecompressCount(i);
             }
         });
+    }
+
+    // Slowly decay the per-page recompression count once a page settles into
+    // a long cold streak. We trigger one decrement every kRcDecayColdTicks
+    // ticks of inactivity (edge-detect on cold_count_), and a hard reset
+    // when cold_count_ saturates — by that point the page has been quiet
+    // for ~255 ticks and any prior thrash history is stale.
+    inline void decayRecompressCount(size_t i) {
+        uint8_t cc = cold_count_[i];
+        if (cc == 255) {
+            recompress_count_[i] = 0;
+        } else if (cc >= kRcDecayColdTicks
+                   && cc % kRcDecayColdTicks == 0
+                   && recompress_count_[i] > 0) {
+            recompress_count_[i]--;
+        }
     }
 
     // Phase 2: Compress cold pages
@@ -522,19 +557,100 @@ private:
     // survives one full tick at PROT_NONE without any access, it is truly
     // cold and Phase 2 compresses it on the next tick.
     void phase2Range(int worker_id, size_t start, size_t end) {
-        uint32_t floor = ROIConfig::instance().cold_ticks_floor;
+        const ROIConfig& cfg = ROIConfig::instance();
+        uint32_t base_floor = cfg.cold_ticks_floor;
+        bool backoff_enabled = cfg.recompress_backoff;
+
+        // Hard skip: under sustained pressure, the box can't really afford
+        // background compression at all. Even one compressor worker
+        // generating page-protect transitions interferes with the very
+        // fault handlers we depend on, leading to the catastrophic hangs
+        // seen with shim+smash on a 2-CPU pgbench. The cold-floor
+        // multiplier delays compression but doesn't eliminate it; if we
+        // ALSO see that Little's Law would have asked for more workers
+        // than the cap allows AND the caller hasn't overridden cold_ticks
+        // (which is "I know what I want — compress eagerly"), just skip
+        // phase 2 entirely this tick. Decay-only behaviour.
+        if (cpu_pressure_active_
+            && !cfg.cold_ticks_overridden
+            && active_workers_ <= 1) {
+            return;
+        }
+        // CPU-pressure floor multiplier. The same signal that caps active
+        // workers also tells us "the application needs cycles, don't compress
+        // marginally-cold pages." Under saturation, raise the cold threshold
+        // so a page must be idle far longer before becoming a compression
+        // candidate. This is the load-bearing fix for the hang: planner /
+        // parser pages reach floor=2 in 2 s of "no detected access"
+        // (PROT_READ misses reads), get compressed, the next planner step
+        // faults on every access, and the backend stalls. Raising the bar
+        // means most query pages survive the test duration uncompressed.
+        //
+        // Skip the multiplier when the caller has explicitly overridden
+        // cold_ticks_floor (via SMASH_COLD_TIMEOUT_SEC or SMASH_COLD_TICKS):
+        // they know what they want, and unit tests rely on quick
+        // compression even when the runner is busy.
+        uint32_t cpu_mul = cfg.cold_ticks_overridden
+                         ? 1u
+                         : cpuPressureFloorMultiplier();
+        uint32_t floor = base_floor * cpu_mul;
         forEachLivePage(start, end, [&](size_t i) {
             if (cold_count_[i] < floor) return;
             PageState st = states_->get(i);
-            if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
-                if (cold_count_[i] == floor && st == PageState::ACTIVE_MONITORING) {
-                    escalateToDeepMonitoring(i);
-                } else if (cold_count_[i] > floor) {
-                    // Page is eligible for compression — count it
-                    worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
-                    if (compressPage(i, workers_[worker_id])) {
-                        worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
+            if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING)
+                return;
+
+            // Recompression-thrash gate. Pages that have been faulted back
+            // from COMPRESSED before, or that live in a (arena, size_class)
+            // bucket whose pages are doing the same, must stay idle longer
+            // before becoming eligible again. Effective floor doubles per
+            // accumulated recompress event, capped at kMaxBackoffShift.
+            //
+            // Looked up via the span so we also pick up the new-page bias
+            // from the per-bucket EMA — fresh pages from a known-thrashy
+            // call site inherit the wait without needing their own history.
+            uint32_t eff_floor = floor;
+            if (backoff_enabled) {
+                uint8_t rc = recompress_count_[i];
+                uint8_t bucket_bias = 0;
+                if (page_map_) {
+                    void* page_addr = vm_->pageAddress(i);
+                    Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
+                    if (sp && !sp->is_large && sp->size_class < kNumClasses) {
+                        size_t bidx = static_cast<size_t>(sp->arena_id) * kNumClasses
+                                    + sp->size_class;
+                        if (bidx < kBucketTableLen) {
+                            // Bucket bias: a single recompress event in this
+                            // (arena, size_class) bucket gives bias=1 to fresh
+                            // pages in the same bucket — they get a longer
+                            // initial cold window without needing to thrash
+                            // themselves first. Threshold=256 ≈ "one full rc
+                            // sample" with α=1/4 EMA.
+                            uint16_t ema = bucket_rc_ema_x256_[bidx].load(
+                                std::memory_order_relaxed);
+                            if (ema >= kBucketRcBiasThreshold_x256) bucket_bias = 1;
+                        }
                     }
+                }
+                uint32_t shift32 = static_cast<uint32_t>(rc) + bucket_bias;
+                if (shift32 > kMaxBackoffShift) shift32 = kMaxBackoffShift;
+                uint64_t wide_floor = static_cast<uint64_t>(floor) << shift32;
+                if (wide_floor > kMaxEffectiveFloorTicks)
+                    wide_floor = kMaxEffectiveFloorTicks;
+                eff_floor = static_cast<uint32_t>(wide_floor);
+            }
+
+            if (cold_count_[i] == floor && st == PageState::ACTIVE_MONITORING) {
+                // Always escalate to deep monitoring at the BASE floor —
+                // this just changes protection, not compression. It gives
+                // the compressor more accurate access info for thrashy
+                // pages (which we won't compress anyway until eff_floor).
+                escalateToDeepMonitoring(i);
+            } else if (cold_count_[i] > floor && cold_count_[i] >= eff_floor) {
+                // Page is eligible for compression — count it
+                worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
+                if (compressPage(i, workers_[worker_id])) {
+                    worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
                 }
             }
         });
@@ -1054,6 +1170,154 @@ private:
     }
 
     // Adapt active worker count using Little's Law (see class comment above).
+    // CPU-pressure cap on compressor workers. Returns the maximum number of
+    // workers we should run given current system load and our own process's
+    // thread count, or 0 to mean "no cap."
+    //
+    // The compressor is background work: every worker that runs competes
+    // with the application for cores. The right answer depends on what the
+    // application is doing — a single-threaded app on an 8-core box can
+    // afford many compressor workers; a 16-threaded app on a 4-core box
+    // cannot afford any.
+    //
+    // Method: read the live thread count for *our process* (/proc/self/stat
+    // num_threads field, or task-dir count on macOS), subtract our known
+    // compressor workers to get an estimate of app threads, and reserve
+    // enough cores for them. Then add a safety floor based on system-wide
+    // 1-minute load average to back off when *other* processes are also
+    // saturating the box.
+    //
+    //   app_threads = max(1, process_threads - (helpers_created_ + 1))
+    //   sys_pressure = max(0, ceil(loadavg) - app_threads)  // outside contention
+    //   cap = max(1, nproc - app_threads - sys_pressure)
+    //
+    // Cheap, cached: re-evaluated at most every kCpuPressureSampleTicks
+    // ticks. Behind SMASH_CPU_PRESSURE_CAP=0 to allow ablation.
+    int cpuPressureWorkerCap() {
+        static const bool enabled = []{
+            const char* v = std::getenv("SMASH_CPU_PRESSURE_CAP");
+            return !(v && v[0] == '0');
+        }();
+        if (!enabled) { cpu_pressure_active_ = false; return 0; }
+
+        static const long nproc_cached = []{
+            long n = sysconf(_SC_NPROCESSORS_ONLN);
+            return n > 0 ? n : 1;
+        }();
+
+        constexpr int kCpuPressureSampleTicks = 4;
+        if (cpu_pressure_sample_age_ < kCpuPressureSampleTicks) {
+            cpu_pressure_sample_age_++;
+            return cpu_pressure_cached_cap_;
+        }
+        cpu_pressure_sample_age_ = 0;
+
+        // Live thread count of our own process. /proc/self/stat field 20 is
+        // num_threads, but stat parsing is finicky (the comm field can
+        // contain spaces); easier to count entries in /proc/self/task.
+        // On macOS, /proc isn't available → fall back to process-info.
+        int proc_threads = countOwnThreads();
+        if (proc_threads <= 0) {
+            cpu_pressure_cached_cap_ = 0;  // can't read → no cap
+            cpu_pressure_active_ = false;
+            return 0;
+        }
+
+        // App threads = total minus our own compressor workers.
+        int our_workers = helpers_created_ + 1;  // helpers + coordinator
+        int app_threads = proc_threads - our_workers;
+        if (app_threads < 1) app_threads = 1;
+
+        // System-wide pressure not attributable to our own app.
+        double loads[3] = {0.0, 0.0, 0.0};
+        int sys_pressure = 0;
+        int load_int = 0;
+        if (getloadavg(loads, 1) >= 1) {
+            load_int = static_cast<int>(loads[0] + 0.5);
+            sys_pressure = load_int - app_threads;
+            if (sys_pressure < 0) sys_pressure = 0;
+        }
+
+        int cap = static_cast<int>(nproc_cached) - app_threads - sys_pressure;
+        bool unclamped_negative = cap < 1;
+        if (cap < 1) cap = 1;
+        cpu_pressure_cached_cap_ = cap;
+        // "active" = the cap actually constrains us — if Little's Law
+        // would have asked for more workers than we can give it, we're
+        // contended. Use this to also raise cold_ticks_floor in
+        // phase2Range, so newly-allocated pages aren't compressed in the
+        // first 2 s of an active workload (which they otherwise would be,
+        // because PROT_READ-monitoring doesn't see read-only access and
+        // pages "look" cold).
+        //
+        // Per-process app_threads is small (a single postgres backend has
+        // 3 threads), so an absolute "app_threads >= nproc" trigger
+        // rarely fires for backend-style workloads. Using the unclamped
+        // cap value catches the case: a single backend on a 2-core box
+        // gets cap = 2 - 3 = -1 (clamped to 1), and we know the box can't
+        // really afford the compressor's full pool.
+        //
+        // Unit tests use SMASH_COLD_TIMEOUT_SEC=1 → cold_ticks_overridden
+        // → multiplier bypassed entirely (see phase2Range).
+        cpu_pressure_active_ = unclamped_negative
+                            || (sys_pressure >= 1)
+                            || (cap < kCompressorWorkers);
+        return cap;
+    }
+
+    // /proc/self/task/ entry count (Linux) or task_threads() (macOS).
+    // Returns -1 on error.
+    int countOwnThreads() {
+#if defined(__linux__)
+        DIR* d = opendir("/proc/self/task");
+        if (!d) return -1;
+        int count = 0;
+        while (struct dirent* e = readdir(d)) {
+            if (e->d_name[0] != '.') count++;
+        }
+        closedir(d);
+        return count > 0 ? count : -1;
+#elif defined(__APPLE__)
+        thread_array_t threads;
+        mach_msg_type_number_t n = 0;
+        if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS)
+            return -1;
+        // Free the port rights we just received.
+        for (mach_msg_type_number_t i = 0; i < n; ++i)
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        vm_deallocate(mach_task_self(),
+                      reinterpret_cast<vm_address_t>(threads),
+                      n * sizeof(thread_t));
+        return static_cast<int>(n);
+#else
+        return -1;
+#endif
+    }
+
+    int cpu_pressure_cached_cap_ = 0;
+    int cpu_pressure_sample_age_ = 1000;  // force resample on first call
+    bool cpu_pressure_active_ = false;    // last sample said the box is hot
+
+    // Multiplier on cold_ticks_floor when the CPU is saturated. The cap
+    // alone (workers ≤ nproc-app_threads) isn't enough on a 2-CPU host
+    // running a thread-heavy app like postgres: the coordinator alone can
+    // still compress an entire backend's working set in a few ticks,
+    // triggering a fault storm on the next query. Raising the floor also
+    // delays the *first* compression of fresh pages — long enough that
+    // continuously-touched workload pages survive uncompressed.
+    //
+    // Value chosen so worst-case "cold time before compression" is ~32 s
+    // at the default floor of 2 ticks (kCompressIntervalMs=1000). Pages
+    // truly idle for that long are worth compressing; a 2 s gap on a hot
+    // workload page isn't, and the cost of getting it wrong on a sustained
+    // workload is the fault-storm hangs we observed at lower thresholds.
+    static constexpr uint32_t kCpuPressureFloorMultiplier = 16;
+    uint32_t cpuPressureFloorMultiplier() {
+        // cpuPressureWorkerCap is called every tick from adaptWorkerCount;
+        // use its cached signal rather than resampling.
+        return cpu_pressure_active_ ? kCpuPressureFloorMultiplier : 1;
+    }
+
     // Measures λ (cold arrival rate) and μ (per-worker service rate) each
     // tick, smooths with EMA (α = 1/4), and sets N = ⌈λ_ema / μ_ema⌉.
     void adaptWorkerCount(int nw) {
@@ -1091,6 +1355,16 @@ private:
         // Clamp to valid range
         if (n_needed < 1) n_needed = 1;
         if (n_needed > kMaxCompressorWorkers) n_needed = kMaxCompressorWorkers;
+
+        // CPU-pressure cap. The compressor's worker threads compete with
+        // application threads for cores; on a saturated machine, scaling up
+        // adds context-switch latency to the very fault handlers we depend on
+        // for forward progress. Cap workers at (nproc − 1) when 1-minute load
+        // average ≥ nproc. This leaves at least one core for the application
+        // and prevents the worst-case scenario where every core is running
+        // compressor work and the app times out waiting on a fault.
+        int cap = cpuPressureWorkerCap();
+        if (cap > 0 && n_needed > cap) n_needed = cap;
 
         // Ensure helper threads exist for the new count
         // (lazily create threads on first scale-up, never destroy them)
@@ -1213,6 +1487,11 @@ public:
         compressed_ = bootstrapArray<CompressedPageInfo>(max_pages);
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
+        recompress_count_ = bootstrapArray<uint8_t>(max_pages);
+
+        // Per-bucket recompression EMA table (kNumArenas × kNumClasses entries).
+        bucket_rc_ema_x256_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
+        bucket_rc_count_    = bootstrapArray<std::atomic<uint8_t>>(kBucketTableLen);
 
         // Chunk bitmap
         num_chunks_ = (max_pages + kChunkSize - 1) / kChunkSize;
@@ -1429,14 +1708,43 @@ public:
             cold_count_[page_idx] = 0;
             locks_->unlock(page_idx);
 
+            // Recompression-thrash signal. The act of faulting back from
+            // COMPRESSED is direct evidence the page was hotter than we
+            // thought; bump the per-page count and feed the per-bucket EMA
+            // so phase2 backs off on this page (and on fresh pages from the
+            // same allocation site) the next round.
+            uint8_t prev_rc = recompress_count_[page_idx];
+            if (prev_rc < 255) recompress_count_[page_idx] = prev_rc + 1;
+
             // Adaptive cap: decompression = re-warm evidence.  Notify the
             // heap so it can bias cap sizing for this (arena, sc) toward
             // "hot" (no cap / larger cap).
-            if (decompressed_fn_ && page_map_) {
+            //
+            // Same lookup gives us (arena, size_class) for the bucket EMA
+            // update — do both in one Span fetch.
+            if (page_map_) {
                 Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
                 if (sp && !sp->is_large && sp->size_class < kNumClasses) {
-                    decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
-                                     decompressed_ctx_);
+                    if (decompressed_fn_) {
+                        decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
+                                         decompressed_ctx_);
+                    }
+                    size_t bidx = static_cast<size_t>(sp->arena_id) * kNumClasses
+                                + sp->size_class;
+                    if (bidx < kBucketTableLen) {
+                        // EMA α=1/4, ×256 fixed-point. Relaxed atomics; tearing
+                        // on the EMA is acceptable.
+                        uint16_t old = bucket_rc_ema_x256_[bidx].load(std::memory_order_relaxed);
+                        uint16_t sample_x256 = static_cast<uint16_t>(prev_rc + 1) * 256;
+                        uint8_t cnt = bucket_rc_count_[bidx].load(std::memory_order_relaxed);
+                        uint16_t neu = (cnt == 0)
+                            ? sample_x256
+                            : static_cast<uint16_t>(static_cast<int32_t>(old)
+                                + (static_cast<int32_t>(sample_x256) - static_cast<int32_t>(old)) / 4);
+                        bucket_rc_ema_x256_[bidx].store(neu, std::memory_order_relaxed);
+                        if (cnt < 64)
+                            bucket_rc_count_[bidx].store(cnt + 1, std::memory_order_relaxed);
+                    }
                 }
             }
 
@@ -1494,6 +1802,7 @@ public:
             }
             states_->set(i, PageState::EMPTY);
             cold_count_[i] = 0;
+            recompress_count_[i] = 0;
             accessed_[i].store(false, std::memory_order_relaxed);
             locks_->unlock(i);
         }

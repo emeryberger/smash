@@ -45,6 +45,11 @@ if(APPLE)
   target_compile_options(test_compression PRIVATE -ftls-model=initial-exec)
 endif()
 add_test(NAME test_compression COMMAND test_compression)
+# Drive the compressor through ticks deterministically — bypass the
+# CPU-pressure hard-skip and floor multiplier with an explicit
+# cold-ticks override.
+set_tests_properties(test_compression PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2")
 
 # Dictionary training test (needs LZ4 + zstd)
 add_executable(test_dictionary test_dictionary.cpp)
@@ -63,6 +68,8 @@ if(APPLE)
   target_compile_options(test_prefetch PRIVATE -ftls-model=initial-exec)
 endif()
 add_test(NAME test_prefetch COMMAND test_prefetch)
+set_tests_properties(test_prefetch PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2")
 
 # Contention test (needs LZ4 + zstd + smash_heap.cpp)
 add_executable(test_contention
@@ -84,6 +91,15 @@ if(APPLE)
   target_compile_options(test_fault_cycle PRIVATE -ftls-model=initial-exec)
 endif()
 add_test(NAME test_fault_cycle COMMAND test_fault_cycle)
+# This test exercises the same compress→fault→recompress pattern that the
+# recompression-thrash back-off is designed to suppress, and runs on busy CI
+# runners where the cold-tick floor multiplier would otherwise keep pages
+# from being compressed within the test's tick budget. Disable both for this
+# test so it can verify the underlying fault-cycle correctness.
+# SMASH_COLD_TIMEOUT_SEC=1 sets cold_ticks_overridden, which bypasses the
+# CPU-pressure floor multiplier (see compressor_thread.h::phase2Range).
+set_tests_properties(test_fault_cycle PROPERTIES
+  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0;SMASH_COLD_TIMEOUT_SEC=1")
 
 # Interposition test: built without alloc8 linkage, run under DYLD_INSERT
 add_executable(interpose_test interpose_test.cpp)

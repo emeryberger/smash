@@ -41,26 +41,35 @@ extern VmRegion* g_smash_vm_region;
 // Same lifetime contract as g_smash_vm_region.
 extern PageStateTable* g_smash_page_states_for_external;
 
-inline ThreadCache*& currentThreadCache() {
-    static thread_local ThreadCache* cache = nullptr;
-    return cache;
-}
+// TLS variables on the malloc fast path are declared extern at namespace
+// scope with tls_model("initial-exec"), and defined in smash_heap.cpp.
+// libsmash is always loaded via LD_PRELOAD (so its TLS block is part of
+// the startup-time TLS reservation), which makes initial-exec safe.
+// Without this, the compiler emits __tls_get_addr indirections for
+// every static-local thread_local in an inline function, costing one
+// dependent indirect call per TLS access on the hot path.
+extern __attribute__((tls_model("initial-exec")))
+    thread_local ThreadCache* g_thread_cache;
+
+extern __attribute__((tls_model("initial-exec")))
+    thread_local int g_full_mode_cached;  // -1 = unknown, 0 = bypass, 1 = full
+
+[[gnu::always_inline]]
+inline ThreadCache*& currentThreadCache() { return g_thread_cache; }
 
 // One-shot cache of "full mode" (= not compress-only, not large-only, no
 // eager-zero).  If any of those env-var modes is on, the malloc fast path
-// has to bypass to the slow path; if none, the fast path is safe.  The
-// modes are static-initialised once per process, but the helpers used
-// magic-static guards (acquire-load on every call).  Caching in TLS with
-// a constant-initialised int makes the per-call check a single TLS load.
+// has to bypass to the slow path; if none, the fast path is safe.
 [[gnu::always_inline]]
 inline bool fullMallocPath() {
-    thread_local int cached = -1;
-    if (cached < 0) [[unlikely]] {
-        cached = (!isCompressOnlyMode()
-               && !isLargeOnlyMode()
-               && !isEagerZeroMode()) ? 1 : 0;
+    int s = g_full_mode_cached;
+    if (s < 0) [[unlikely]] {
+        s = (!isCompressOnlyMode()
+          && !isLargeOnlyMode()
+          && !isEagerZeroMode()) ? 1 : 0;
+        g_full_mode_cached = s;
     }
-    return cached == 1;
+    return s == 1;
 }
 
 // ── System malloc/free pointers for compress-only mode ──────────────────────

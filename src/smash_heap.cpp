@@ -145,6 +145,16 @@ smash::VmRegion* smash::g_smash_vm_region = nullptr;
 // gate every state mutation on this being non-null.
 smash::PageStateTable* smash::g_smash_page_states_for_external = nullptr;
 
+// TLS for the malloc fast path.  initial-exec model: libsmash is always
+// LD_PRELOAD'd, so its TLS block is part of the program's startup TLS
+// reservation, and accesses use a direct tpidr_el0 + offset load instead
+// of a __tls_get_addr indirection.
+__attribute__((tls_model("initial-exec")))
+thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
+
+__attribute__((tls_model("initial-exec")))
+thread_local int smash::g_full_mode_cached = -1;
+
 // ── Syscall interposition for kernel buffer compatibility ────────────────────
 //
 // Kernel syscalls access userspace buffers directly without triggering SIGSEGV.

@@ -287,3 +287,57 @@ return a;
 Total expected win is additive only in the limit — these candidates
 overlap. Realistically the first three should net ~50–80 µs/txn (over
 half the gap); the rest squeezes the last 20 %.
+
+---
+
+## Results so far (branch `malloc-fast-path-opt`)
+
+After 6 commits the smash-specific gap vs `shim+jemalloc` closed from
+23.8 % to 22.0 %. The 2-CPU VM's noise floor (load average swings
+0.3 → 2.5 during a single 5×5) dominates further small wins.
+
+| commit | change | result |
+|---|---|---|
+| `880d1690` | BootstrapAlloc::owns bounds-check | within noise (clean refactor) |
+| `173491d2` | Cherry-pick alloc-aware-coldness | stability foundation (0 timeouts vs flaky master); enables clean measurement |
+| `15e3fda9` | `kThreadCacheMaxPerClass` 64 → 128 | **+2.4 % measured** (5186 → 5312 tps) |
+| `5ff1a80e` | Extract malloc fast path | neutral; frame 4576 B → 48 B, body 5928 B → ~30 inline insn |
+| `102fab28` | `tls_model("initial-exec")` for fast-path TLS | neutral on noisy 2-CPU; disasm confirms `__tls_get_addr` indirection removed |
+
+Headline 5×5 (`--mode=compare --runs 5 --clients 2 --perf-duration 30`):
+
+```
+                  shim+smash / shim+jemalloc    gap vs jemalloc
+stable baseline      5186 / 6806 = 76.2 %         23.8 %
+after tc128          5312 / 6815 = 78.0 %         22.0 %   ← measurable win
+after fast-path      5252 / 6753 = 77.8 %         22.2 %   ← within noise
+after initial-exec   load-variance dominated; disasm-verified structural win
+```
+
+Cool-tail compression 99.6 %; bench_rss 44 %; bench_sqlite 63.7 %;
+0 timeouts in every measured 5×5.
+
+### What didn't work
+
+- **Per-thread span MRU for `free()`** (plan #2) regressed ~5 %. pgbench's
+  free pattern has low MRU hit rate; the bounds check becomes pure
+  overhead on top of the eventual PageMap lookup. Reverted.
+- **Hide `xx*` from version script** (plan #1b) caused LTO to inline all
+  of `SmashHeap::malloc` into the exported `malloc` symbol, producing a
+  41 KB function with 4576-byte stack frame and triggering intermittent
+  perf regression + timeouts. Reverted; the cleaner fast-path extract
+  (`5ff1a80e`) achieved the same structural goal in a controlled way.
+
+### What's not done
+
+- **Direct page-to-span table** (plan #4) — skipped due to user
+  constraint against substantial space overhead (32 MiB).
+- **Compressor skip-tick when idle** (plan #6) — not attempted; touches
+  compressor logic.
+- **`callsiteArena` MRU** (plan #8) — likely to regress like the free
+  MRU on this workload (low hit rate from many call sites).
+- **Bigger-VM measurement** — the 2-CPU box's noise floor (~3–5 % when
+  load is fluctuating) means changes that move the needle by 1–2 %
+  can't be confidently measured here. Structural changes (fast-path
+  extract, initial-exec TLS) may show clearer wins on a quieter machine
+  with more cores.

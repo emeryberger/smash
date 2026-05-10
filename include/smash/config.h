@@ -138,8 +138,12 @@ inline constexpr size_t kBootstrapExpandSize = 16 * 1024 * 1024;    // 16 MB
 inline constexpr int kBootstrapMaxRegions = 64;
 
 // ── Thread cache ─────────────────────────────────────────────────────────────
-inline constexpr int kThreadCacheMaxPerClass = 64;
-inline constexpr int kThreadCacheBatchSize = 32;
+// Doubled from 64/32 to halve the rate of slab-lock acquisitions on
+// pgbench-class workloads.  Per-thread memory cost: 64 size classes ×
+// 128 ptrs × 8 B = 64 KiB per thread (was 32 KiB).  Cool-tail RSS ratio
+// at 99.3 % is the gate — a per-thread 32 KiB inflation is negligible.
+inline constexpr int kThreadCacheMaxPerClass = 128;
+inline constexpr int kThreadCacheBatchSize = 64;
 
 // ── Page map ─────────────────────────────────────────────────────────────────
 // 48-bit virtual address space assumed

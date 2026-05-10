@@ -99,6 +99,10 @@ class BootstrapAlloc {
     }
 
 public:
+    // Singleton instance, accessed on every free() via owns().  Profiling
+    // showed this as 6.5% of free()'s CPU when not inlined; mark hot+inline
+    // so the post-init fast path becomes a single relaxed-load + branch.
+    [[gnu::always_inline, gnu::hot]]
     static BootstrapAlloc& instance() {
         // Manual singleton to avoid __cxa_guard (which might call malloc on some platforms)
         alignas(BootstrapAlloc) static char buf[sizeof(BootstrapAlloc)];
@@ -140,6 +144,7 @@ public:
         return p;
     }
 
+    [[gnu::always_inline, gnu::hot]]
     bool owns(const void* ptr) const {
         auto p = reinterpret_cast<uintptr_t>(ptr);
         // Fast-reject: ptr outside any bootstrap region's envelope.

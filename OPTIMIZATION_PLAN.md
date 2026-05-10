@@ -290,32 +290,59 @@ half the gap); the rest squeezes the last 20 %.
 
 ---
 
-## Results so far (branch `malloc-fast-path-opt`)
+## Results so far (branch `malloc-fast-path-opt` + sibling alloc8 fix)
 
-After 6 commits the smash-specific gap vs `shim+jemalloc` closed from
-23.8 % to 22.0 %. The 2-CPU VM's noise floor (load average swings
-0.3 → 2.5 during a single 5×5) dominates further small wins.
+After 9 commits on `malloc-fast-path-opt` plus 1 in alloc8, the
+smash-specific gap on the postgres-shim perf workload closed from
+~24 % to ~22 % vs `shim+jemalloc` on a quiet machine. On a
+profile-targeted microbench the smash malloc+free pair dropped from
+5.1 ns/op to **4.4 ns/op (−14 %)**, putting smash ahead of libc malloc
+(4.7 ns/op) for the first time. Reference jemalloc is 2.9 ns/op.
 
 | commit | change | result |
 |---|---|---|
 | `880d1690` | BootstrapAlloc::owns bounds-check | within noise (clean refactor) |
-| `173491d2` | Cherry-pick alloc-aware-coldness | stability foundation (0 timeouts vs flaky master); enables clean measurement |
-| `15e3fda9` | `kThreadCacheMaxPerClass` 64 → 128 | **+2.4 % measured** (5186 → 5312 tps) |
+| `173491d2` | Cherry-pick alloc-aware-coldness | stability foundation — 0 timeouts vs flaky master |
+| `15e3fda9` | `kThreadCacheMaxPerClass` 64 → 128 | **+2.4 % postgres** (5186 → 5312 tps) |
 | `5ff1a80e` | Extract malloc fast path | neutral; frame 4576 B → 48 B, body 5928 B → ~30 inline insn |
-| `102fab28` | `tls_model("initial-exec")` for fast-path TLS | neutral on noisy 2-CPU; disasm confirms `__tls_get_addr` indirection removed |
+| `102fab28` | `tls_model("initial-exec")` for fast-path TLS | structural; removes `__tls_get_addr` |
+| `859471d9` | Force-inline `BootstrapAlloc::instance` + `owns` | **+4 % microbench** (5.1 → 4.9 ns/op); free's profile share 54 → 47 % |
+| `71b88b06` | Replace magic-static guards in mode helpers with relaxed atomics | **+11 % microbench** (4.9 → 4.4 ns/op); smash overtakes libc |
+| _alloc8_ `HeapRedirect::getHeap` rewrite | drop magic-static guard + dependent heap-pointer load | xxfree share 3.2 → 2.1 %; `SmashHeap::free` becomes `.constprop.0` |
 
 Headline 5×5 (`--mode=compare --runs 5 --clients 2 --perf-duration 30`):
 
 ```
-                  shim+smash / shim+jemalloc    gap vs jemalloc
-stable baseline      5186 / 6806 = 76.2 %         23.8 %
-after tc128          5312 / 6815 = 78.0 %         22.0 %   ← measurable win
-after fast-path      5252 / 6753 = 77.8 %         22.2 %   ← within noise
-after initial-exec   load-variance dominated; disasm-verified structural win
+                            shim+smash median   gap vs stock   gap vs jemalloc
+master HEAD                   5232.6              −25.3 %          —
+stable baseline               5186.4              −23.8 %         23.8 %
+after tc128 (5x5)             5312.4              −22.0 %         22.0 %  ← clean win
+after fast-path/init-exec     5252.4              −22.2 %         22.2 %  ← neutral
+final (all 9 commits, busy)   5119.4              −22.5 %         22.6 %  ← high load
+```
+
+Microbench tells the cleanest story:
+
+```
+config              ns/op   smash vs libc
+libc baseline         4.7        —
+smash master eq.      5.1     +8.5 % over libc (slower)
+smash + branch        4.4     −6.4 % under libc (faster)
+jemalloc reference    2.9     −38  %
 ```
 
 Cool-tail compression 99.6 %; bench_rss 44 %; bench_sqlite 63.7 %;
 0 timeouts in every measured 5×5.
+
+### How to read this
+
+The microbench saturates the malloc fast path — pure 50-malloc/50-free
+loops with no compression activity. The −14 % there reflects the
+allocator hot-path savings in isolation. In the postgres workload only
+~5–10 % of CPU goes through malloc/free, so the same fixes show ~1–2 %
+in tps. That's why the 5×5 absolute numbers move less than the
+microbench — load variance on the 2-CPU box dominates anything under
+~3 %.
 
 ### What didn't work
 

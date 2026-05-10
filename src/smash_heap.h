@@ -46,6 +46,23 @@ inline ThreadCache*& currentThreadCache() {
     return cache;
 }
 
+// One-shot cache of "full mode" (= not compress-only, not large-only, no
+// eager-zero).  If any of those env-var modes is on, the malloc fast path
+// has to bypass to the slow path; if none, the fast path is safe.  The
+// modes are static-initialised once per process, but the helpers used
+// magic-static guards (acquire-load on every call).  Caching in TLS with
+// a constant-initialised int makes the per-call check a single TLS load.
+[[gnu::always_inline]]
+inline bool fullMallocPath() {
+    thread_local int cached = -1;
+    if (cached < 0) [[unlikely]] {
+        cached = (!isCompressOnlyMode()
+               && !isLargeOnlyMode()
+               && !isEagerZeroMode()) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 // ── System malloc/free pointers for compress-only mode ──────────────────────
 // Resolved early before any malloc interposition is active.
 using MallocFn = void*(*)(size_t);
@@ -546,7 +563,13 @@ public:
         else if (cp.first_ra != ra_hash) cp.mixed_ra = 1;
     }
 
-    void* malloc(size_t size) {
+    // Out-of-line cold path for everything malloc() can't handle on the
+    // fast path: compress-only/large-only/eager-zero modes, size > 16 KiB
+    // (large alloc), or thread cache miss (refill from slab).  Marked
+    // noinline+cold so the fast-path body stays small and the prologue
+    // can be a single register save pair.
+    [[gnu::noinline, gnu::cold]]
+    void* mallocSlow(size_t size) {
         if (isCompressOnlyMode()) {
             // During early init, g_system_alloc may not be resolved yet
             if (!g_system_alloc.malloc) return nullptr;
@@ -577,8 +600,6 @@ public:
                     stampCohort(ptr, ra32);
                 }
             }
-            // SMASH_EAGER_ZERO=1: zero the slot synchronously instead of
-            // relying on the compressor's deferred zeroFreeSlots() pass.
             if (ptr && isEagerZeroMode())
                 __builtin_memset(ptr, 0, classSize(sc));
             return ptr;
@@ -586,6 +607,21 @@ public:
         void* ptr = large_alloc_.allocate(size, kMinAlignment);
         if (ptr && isEagerZeroMode()) __builtin_memset(ptr, 0, size);
         return ptr;
+    }
+
+    // Hot path.  size in [1, kMaxSmallSize] AND thread cache already
+    // initialised AND non-empty for this size class → return the cached
+    // pointer.  Anything else falls into mallocSlow.  Everything past the
+    // first `[[likely]]` returns directly without a function call.
+    [[gnu::always_inline]]
+    void* malloc(size_t size) {
+        if (fullMallocPath() && size > 0 && size <= kMaxSmallSize) [[likely]] {
+            uint8_t sc = sizeToClass(size);
+            if (ThreadCache* tc = currentThreadCache()) [[likely]] {
+                if (void* ptr = tc->allocate(sc)) [[likely]] return ptr;
+            }
+        }
+        return mallocSlow(size);
     }
 
     void free(void* ptr) {

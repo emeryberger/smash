@@ -2,6 +2,7 @@
 #pragma once
 
 #include <alloc8/platform.h>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -315,16 +316,27 @@ inline constexpr size_t kVmRegionSize = kVmMaxPages * kPageSize;
 
 enum class SmashMode { Full, CompressOnly };
 
+// Mode helpers used to wrap their cached values in `static T cached = []()...();`,
+// which triggers the C++ magic-static guard: an acquire-load + branch on every
+// call.  perf-record on a smash-LD_PRELOADed micro-bench showed those guards
+// taking ~7-10 % of free()'s CPU.  Switch to a hand-rolled lazy init backed by
+// std::atomic<int>: the post-init fast path is a single relaxed `ldr`, no
+// acquire fence, no guard check.  -1 = uninitialised, all other values are
+// the cached state.
 inline SmashMode getSmashMode() {
-    static SmashMode mode = []() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
         const char* env = getenv("SMASH_MODE");
-        if (env && strcmp(env, "compress_only") == 0)
-            return SmashMode::CompressOnly;
-        return SmashMode::Full;
-    }();
-    return mode;
+        v = (env && strcmp(env, "compress_only") == 0)
+            ? static_cast<int>(SmashMode::CompressOnly)
+            : static_cast<int>(SmashMode::Full);
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return static_cast<SmashMode>(v);
 }
 
+[[gnu::always_inline, gnu::hot]]
 inline bool isCompressOnlyMode() {
     return getSmashMode() == SmashMode::CompressOnly;
 }
@@ -334,12 +346,16 @@ inline bool isCompressOnlyMode() {
 // Small allocations (size <= kMaxSmallSize) pass through to the system
 // allocator.  This avoids interfering with language runtimes that use their
 // own small-object allocator (e.g. Python 3.13+ mimalloc).
+[[gnu::always_inline, gnu::hot]]
 inline bool isLargeOnlyMode() {
-    static bool mode = []() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
         const char* env = getenv("SMASH_LARGE_ONLY");
-        return env && env[0] == '1';
-    }();
-    return mode;
+        v = (env && env[0] == '1') ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
 }
 
 // Threshold for what counts as "small" (passthrough to system) in
@@ -349,15 +365,21 @@ inline bool isLargeOnlyMode() {
 // (e.g. Firefox's 4 KB–7 KB bucket carries ~20 % of allocation volume
 // while sitting under the default threshold). Must not exceed
 // kMaxSmallSize since smash's slab path tops out there.
+[[gnu::always_inline, gnu::hot]]
 inline size_t largeOnlyThreshold() {
-    static size_t threshold = []() -> size_t {
+    static std::atomic<size_t> cached{0};   // 0 = unset
+    size_t v = cached.load(std::memory_order_relaxed);
+    if (v == 0) [[unlikely]] {
         const char* env = getenv("SMASH_LARGE_ONLY_THRESHOLD");
-        if (!env || !*env) return kMaxSmallSize;
-        size_t v = static_cast<size_t>(atoll(env));
-        if (v == 0 || v > kMaxSmallSize) return kMaxSmallSize;
-        return v;
-    }();
-    return threshold;
+        size_t result = kMaxSmallSize;
+        if (env && *env) {
+            size_t parsed = static_cast<size_t>(atoll(env));
+            if (parsed > 0 && parsed <= kMaxSmallSize) result = parsed;
+        }
+        cached.store(result, std::memory_order_relaxed);
+        return result;
+    }
+    return v;
 }
 
 // ── Eager-zero mode ─────────────────────────────────────────────────────────
@@ -368,12 +390,16 @@ inline size_t largeOnlyThreshold() {
 // codebases rely on it). Used to A/B test whether deferred-zero is the
 // source of data-corruption crashes (e.g. ARM64 PAC failures from stale
 // pointer-shaped bytes in reissued slab slots).
+[[gnu::always_inline, gnu::hot]]
 inline bool isEagerZeroMode() {
-    static bool mode = []() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
         const char* env = getenv("SMASH_EAGER_ZERO");
-        return env && env[0] == '1';
-    }();
-    return mode;
+        v = (env && env[0] == '1') ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
 }
 
 } // namespace smash

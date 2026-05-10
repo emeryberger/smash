@@ -28,6 +28,16 @@ class BootstrapAlloc {
     std::atomic<size_t> num_regions_{0};
     Spinlock expand_lock_;
 
+    // Address bounds covering all regions added so far.  Lets owns()
+    // reject the common case (a non-bootstrap pointer) with a single
+    // pair of relaxed atomic loads, instead of iterating regions_.
+    // Region ranges may have gaps inside [lo, hi] so a hit still falls
+    // through to the precise loop below — but every free() in the
+    // postgres workload reaches owns() with a slab pointer outside
+    // bootstrap memory, and the bounds check rejects in 4 instructions.
+    std::atomic<uintptr_t> bounds_lo_{UINTPTR_MAX};
+    std::atomic<uintptr_t> bounds_hi_{0};
+
     void* tryAllocFrom(Region& r, size_t size, size_t align) {
         size_t off = r.offset.load(std::memory_order_relaxed);
         for (;;) {
@@ -51,6 +61,21 @@ class BootstrapAlloc {
         regions_[idx].capacity = size;
         regions_[idx].offset.store(0, std::memory_order_relaxed);
         num_regions_.store(idx + 1, std::memory_order_release);
+
+        // Extend [lo, hi] envelope so owns() can fast-reject pointers
+        // that don't fall in any bootstrap region.  Atomicity matters
+        // only for monotonicity; a stale bound just causes an extra
+        // (correct) loop iteration in owns().
+        uintptr_t base = reinterpret_cast<uintptr_t>(mem);
+        uintptr_t end = base + size;
+        for (uintptr_t lo = bounds_lo_.load(std::memory_order_relaxed); base < lo; ) {
+            if (bounds_lo_.compare_exchange_weak(lo, base, std::memory_order_relaxed))
+                break;
+        }
+        for (uintptr_t hi = bounds_hi_.load(std::memory_order_relaxed); end > hi; ) {
+            if (bounds_hi_.compare_exchange_weak(hi, end, std::memory_order_relaxed))
+                break;
+        }
         return true;
     }
 
@@ -117,6 +142,13 @@ public:
 
     bool owns(const void* ptr) const {
         auto p = reinterpret_cast<uintptr_t>(ptr);
+        // Fast-reject: ptr outside any bootstrap region's envelope.
+        // The two relaxed loads are 2 instructions on aarch64; the
+        // alternative (the loop below) is 5+ per region.
+        if (p < bounds_lo_.load(std::memory_order_relaxed)) return false;
+        if (p >= bounds_hi_.load(std::memory_order_relaxed)) return false;
+        // Inside envelope but possibly in a gap between regions — fall
+        // through to the precise scan.
         size_t n = num_regions_.load(std::memory_order_acquire);
         for (size_t i = 0; i < n; ++i) {
             auto base = reinterpret_cast<uintptr_t>(regions_[i].base);

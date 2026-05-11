@@ -10,6 +10,7 @@
 #pragma once
 
 #include <new>
+#include <sys/mman.h>
 #include "smash/config.h"
 #include "platform_mem.h"
 #include "page_state.h"
@@ -21,6 +22,10 @@
 #include <cstdint>
 
 namespace smash {
+
+// Forward declaration so VmRegion can store an atomic<Span*>* without pulling
+// in the full Span definition (avoids circular include with core/span.h).
+struct Span;
 
 class VmRegion {
     // Mode determined at init time
@@ -84,6 +89,16 @@ class VmRegion {
     // counter assigns external indices starting at kVmMaxPages.
     std::atomic<size_t> external_count_{0};
 
+    // Flat direct page-index → Span* table. Sized to total_pages_ entries
+    // (8 B each) and mmap'd with MAP_NORESERVE so we only pay RSS for the
+    // committed slice (~6K pages → ~48 KB resident for a 100 MB heap).
+    // Provides a single-load lookup that replaces the two-level radix
+    // walk on the free() hot path. Sits outside BootstrapAlloc-managed
+    // memory because the radix tree allocates lazily L2 pages from
+    // BootstrapAlloc and we want the flat table to escape that.
+    std::atomic<Span*>* page_to_span_ = nullptr;
+    size_t page_to_span_bytes_ = 0;  // total mapped bytes (for cleanup / sizing)
+
     size_t lookupIdx(uintptr_t addr) const {
         if (!track_hash_) return 0;
         uintptr_t key = addr >> kPageShift;
@@ -126,15 +141,32 @@ public:
             contig_pages_ = region_size / kPageSize;
             total_pages_ = contig_pages_ + kTrackMaxPages;
             base_ = static_cast<char*>(vm::reservePages(region_size));
-            return base_ != nullptr;
+            if (!base_) return false;
         } else {
             // Compress-only mode: contiguous arena is unused; tracked pages
             // get indices 1..kTrackMaxPages-1 (index 0 reserved as sentinel).
             (void)region_size;
             total_pages_ = kTrackMaxPages;
             next_page_.store(1, std::memory_order_relaxed);
-            return true;
         }
+
+        // Lazy flat page-index → Span* table. MAP_NORESERVE means the kernel
+        // backs only the pages we touch — virtual cost = total_pages_*8B
+        // (~32 MiB at kVmMaxPages=1M), resident cost ≈ committed-pages*8B
+        // rounded to OS-page granularity.
+        page_to_span_bytes_ = total_pages_ * sizeof(std::atomic<Span*>);
+        void* m = ::mmap(nullptr, page_to_span_bytes_,
+                         PROT_READ | PROT_WRITE,
+                         MAP_ANON | MAP_PRIVATE | MAP_NORESERVE,
+                         -1, 0);
+        if (m == MAP_FAILED) {
+            page_to_span_ = nullptr;
+            page_to_span_bytes_ = 0;
+            // Non-fatal: callers fall back to the radix tree via PageMap.
+        } else {
+            page_to_span_ = static_cast<std::atomic<Span*>*>(m);
+        }
+        return true;
     }
 
     bool isTrackingMode() const { return tracking_mode_; }
@@ -313,6 +345,50 @@ public:
         size_t local = index - contig_pages_;
         if (local >= kTrackMaxPages) return nullptr;
         return reinterpret_cast<void*>(track_reverse_[local]);
+    }
+
+    // ── Flat page-index → Span* table ───────────────────────────────────────
+    // Single-load lookup that replaces the two-level radix walk on the
+    // free()/getSize() hot path. Returns nullptr if the table isn't mapped
+    // (early init, mmap failure) or if the page isn't currently owned by a
+    // span — callers fall back to PageMap::get() in that case.
+    [[gnu::always_inline]]
+    Span* getSpan(size_t page_idx) const {
+        if (!page_to_span_) [[unlikely]] return nullptr;
+        if (page_idx >= total_pages_) [[unlikely]] return nullptr;
+        return page_to_span_[page_idx].load(std::memory_order_acquire);
+    }
+
+    [[gnu::always_inline]]
+    void setSpan(size_t page_idx, Span* span) {
+        if (!page_to_span_) [[unlikely]] return;
+        if (page_idx >= total_pages_) [[unlikely]] return;
+        page_to_span_[page_idx].store(span, std::memory_order_release);
+    }
+
+    // True iff the flat table is mapped (mmap succeeded in init()). Used by
+    // PageMap to decide whether to write the flat slot in addition to the
+    // radix tree.
+    bool hasSpanTable() const { return page_to_span_ != nullptr; }
+
+    // Cheap pointer-in-contiguous-arena check. Used by the free() / getSize()
+    // hot path to decide whether the flat span table lookup is sufficient
+    // (single load) or whether the caller must fall through to PageMap
+    // (which also handles non-VmRegion large allocations). Excludes the
+    // external-tracking tail because those pages aren't reachable through a
+    // contiguous-base offset.
+    [[gnu::always_inline]]
+    bool inContigArena(uintptr_t addr) const {
+        auto b = reinterpret_cast<uintptr_t>(base_);
+        return addr >= b && addr < b + contig_pages_ * kPageSize;
+    }
+
+    // Contig-arena-only page index. Faster than pageIndex() which dispatches
+    // on tracking-mode and hashes for external pages. Caller must have
+    // verified inContigArena(addr).
+    [[gnu::always_inline]]
+    size_t contigPageIndex(uintptr_t addr) const {
+        return (addr - reinterpret_cast<uintptr_t>(base_)) >> kPageShift;
     }
 
     char* base() const { return base_; }

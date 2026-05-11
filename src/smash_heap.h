@@ -466,6 +466,12 @@ public:
         bool vm_ok = vm_region_.init(kVmRegionSize);
 
         if (vm_ok) {
+            // Wire the radix tree to also publish span pointers into the
+            // VmRegion's flat page→Span table. Must happen before any slab
+            // initialization so the first allocation's setRange() mirrors.
+            if (!compress_only) {
+                page_map_.attachVmRegion(&vm_region_);
+            }
             page_states_.init(vm_region_.totalPages());
             page_locks_.init(vm_region_.totalPages());
             compress_store_.init();
@@ -642,7 +648,16 @@ public:
             return;
         }
 
-        Span* span = page_map_.get(reinterpret_cast<uintptr_t>(ptr));
+        // Fast path: pointer inside the VmRegion's contiguous arena → single
+        // load from the flat page→Span table. Avoids the two-level radix
+        // walk (acquire-load chain) that page_map_.get() requires.
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        Span* span;
+        if (vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()) [[likely]] {
+            span = vm_region_.getSpan(vm_region_.contigPageIndex(addr));
+        } else {
+            span = page_map_.get(addr);
+        }
         if (!span) {
             // Not a Smash-managed pointer. In large-only mode, small
             // allocations were forwarded to system malloc.
@@ -723,7 +738,17 @@ public:
             return 0;  // Can't determine size for system allocations
         }
 
-        Span* span = page_map_.get(reinterpret_cast<uintptr_t>(ptr));
+        // Same flat-table fast path as free(): single load when the pointer
+        // is inside the contiguous VmRegion arena, falling back to the
+        // radix tree for non-VmRegion pointers (e.g. large-only mode's
+        // system-malloc passthroughs).
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        Span* span;
+        if (vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()) [[likely]] {
+            span = vm_region_.getSpan(vm_region_.contigPageIndex(addr));
+        } else {
+            span = page_map_.get(addr);
+        }
         if (!span) {
             // In large-only mode, query system allocator for size.
             // alloc8's realloc uses this to size the memcpy.

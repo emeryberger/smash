@@ -40,34 +40,48 @@ Three valuable scripts in `bench/`:
 
 **Cool-tail workload** (default `--mode=shim-smash`):
 ```
-long-lived (samples>5):  committed=7153 pages (28 MB),
-                         compressed=7116 pages (28 MB), ratio=99.5%
+long-lived (samples>5):  committed=7156 pages (28 MB),
+                         compressed=7103 pages (28 MB), ratio=99.3%
 ```
 
-**Perf workload, 8-iteration loop** (`-T 60 -c 2`, post hard-skip):
+**Perf workload, 8-iteration loop** (`-T 60 -c 2`, alloc-aware coldness +
+floor=10 default):
 ```
-median 5278 tps, range 5263–5341 (1.5% spread), 0 timeouts in 8 iters,
-0 compressions during workload (smash defers under sustained pressure)
+median 5110 tps, range 4956–5215 (5% spread), 0 timeouts in 8 iters,
+~4700 pages compressed per run (smash makes real progress AND stays stable).
 ```
 
-**Perf 5×5 comparison** (`--mode=compare --runs 5 --clients 2 --perf-duration 30`,
-re-measured 2026-05-09 with system load present):
-```
-config           runs    tps_med    tps_min    tps_max    Δ vs stock
-stock               5     7047.9     6835.3     7087.8         —
-stock+jemalloc      5     7071.1     6823.4     7081.2      +0.3%
-shim                5     6455.6     5902.4     6489.1      −8.4%
-shim+jemalloc       5     6794.1     6745.4     6886.8      −3.6%
-shim+smash          5     5269.4     5214.9     5274.8     −25.2%
-```
-First clean 5×5 with **zero timeouts** since we started chasing this. All
-five configs completed all five runs. Absolute TPS is lower than the
-earlier 11K runs because the box was carrying more background load this
-time — relative ordering is the more meaningful signal.
+The previous "stable" config (CPU-pressure floor multiplier + per-tick
+compress budget) achieved 0 timeouts but compressed 0 pages during perf —
+smash effectively turned off. The new approach gets both stability and
+compression, AND survives the cool-tail unchanged.
 
-`shim+jemalloc` within ~3 % of stock validates the *Reconsidering Custom Memory Allocation* (Berger/Zorn/McKinley, OOPSLA 2002) thesis on this codebase: removing palloc's pooling and dropping in jemalloc nearly recovers the loss.
+### What changed
 
-`shim+smash` perf TPS is conservative on this 2-CPU box because smash's malloc overhead is nontrivial AND the hard-skip prevents any compression at all. **Pending: re-test on a bigger VM** — with more cores the cap relaxes (cap ≥ kCompressorWorkers), the hard-skip is dormant, smash compresses normally, and we get back to the cool-tail-style 99 % per-backend numbers without sacrificing perf throughput.
+The CPU-pressure multiplier was the wrong axis. Replaced with two
+direct signals:
+
+1. **Alloc-aware coldness** — `Span::allocate()` resets `cold_count_` for
+   the page it just handed a chunk out of, plumbed via a new pointer
+   (`Span::cold_counts`) wired through `Slab::init` from `CompressorThread::coldCounts()`.
+   Pages still receiving allocations now never reach the cold-tick floor.
+2. **Default `cold_ticks_floor` raised 2 → 10** (`kColdTicksDefault`).
+   Gives the workload 10 s after the last allocation/access before a
+   page becomes eligible — long enough for the rc-backoff mechanism
+   to converge on read-only working set after the first thrash event.
+   Tests pin `SMASH_COLD_TIMEOUT_SEC=2` / `SMASH_COLD_TICKS=2` so unit-test
+   latency is unaffected.
+
+Removed:
+- `kCpuPressureFloorMultiplier` / `cpuPressureFloorMultiplier()`
+- `kPressureCompressBudget` per-tick budget machinery
+- `cpu_pressure_active_` flag (worker-count cap is the only remaining
+  CPU-pressure mechanism, and it's correct — that's a contention
+  question, not a coldness question).
+
+Per-page recompression backoff and per-bucket EMA bias are unchanged —
+they're orthogonal to the alloc-coldness signal and remain load-bearing
+for the read-only working-set case.
 
 ## Step 1 — confirm baseline state
 

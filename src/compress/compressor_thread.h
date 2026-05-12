@@ -79,10 +79,28 @@ class CompressorThread {
     DecompressedFn decompressed_fn_ = nullptr;
     void* decompressed_ctx_ = nullptr;
 
+    // Tier-upgrade telemetry: cumulative counts since process start.
+    // tier_upgrade_attempts_: every page eligible for upgrade we visited.
+    // tier_upgrade_success_:  upgrade actually wrote a smaller blob.
+    std::atomic<uint64_t> tier_upgrade_attempts_{0};
+    std::atomic<uint64_t> tier_upgrade_success_{0};
+
     // Per-page metadata (allocated from bootstrap, indexed by VmRegion page index)
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
     uint8_t* cold_count_ = nullptr;
+
+    // Per-page tier marker for tiered recompression.  0 = no blob (page in
+    // ACTIVE/COMPRESSING/etc.), 1 = fast-tier blob (LZ4 or zstd-1, eligible
+    // for upgrade), 2 = deep-tier blob (zstd-9 or ZSTD_DICT, terminal).
+    // Set when compressPage / recompressPage publishes a blob; checked in
+    // phase2 to find upgrade candidates without re-running compression.
+    enum TierLevel : uint8_t {
+        kTierNone = 0,
+        kTierFast = 1,
+        kTierDeep = 2,
+    };
+    uint8_t* page_tier_ = nullptr;
     // Per-page recompression count: bumped on every COMPRESSED → ACTIVE
     // fault, decayed in phase1Range when the page settles cold.  phase2Range
     // raises the effective cold-tick floor by 2^min(rc + bucket_bias, kMaxBackoffShift).
@@ -571,6 +589,39 @@ private:
         forEachLivePage(start, end, [&](size_t i) {
             if (cold_count_[i] < floor) return;
             PageState st = states_->get(i);
+
+            // Tiered recompression: COMPRESSED pages at the LZ4 tier
+            // (initial fast tier) that have stayed cold long enough get
+            // upgraded to zstd-9 for a better ratio.  cold_count_ keeps
+            // incrementing for COMPRESSED pages in phase1Range, so this
+            // threshold is reliable.
+            if constexpr (kTieredRecompression) {
+                if (st == PageState::COMPRESSED &&
+                    cold_count_[i] >= cfg.very_cold_ticks &&
+                    page_tier_ && page_tier_[i] == kTierFast) {
+                    tier_upgrade_attempts_.fetch_add(1,
+                        std::memory_order_relaxed);
+                    // Pick ZSTD_DICT if a dict is trained for this size
+                    // class, else plain ZSTD at deep level.
+                    uint8_t sc = lookupSizeClass(i);
+                    CompressAlgo target = CompressAlgo::ZSTD;
+                    if (engine_ && sc < kNumClasses &&
+                        engine_->hasDictionary(sc)) {
+                        target = CompressAlgo::ZSTD_DICT;
+                    }
+                    if (recompressPage(i, workers_[worker_id], target,
+                                       kZstdDeepLevel)) {
+                        tier_upgrade_success_.fetch_add(1,
+                            std::memory_order_relaxed);
+                    }
+                    // Regardless of upgrade outcome, this slot was visited
+                    // — no further work this tick for this page.
+                }
+                if (st == PageState::COMPRESSED || st == PageState::COMPRESSING)
+                    return;
+            } else if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) {
+                return;
+            }
             if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING)
                 return;
 
@@ -856,6 +907,9 @@ private:
 
         // Record compressed page info (with algo in top 2 bits)
         compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
+        if (page_tier_) {
+            page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
+        }
 
         states_->set(page_idx, PageState::COMPRESSED);
         locks_->unlock(page_idx);
@@ -870,6 +924,140 @@ private:
                                compressed_ctx_);
             }
         }
+        return true;
+    }
+
+    // Tiered recompression: take a COMPRESSED page and replace its blob
+    // with one produced by a (presumably stronger) algorithm.  Used for
+    // LZ4 → zstd-9 upgrades once a page has stayed cold long enough that
+    // the higher ratio of zstd-9 amortizes against its decomp cost.
+    //
+    // Locking contract matches compressPage: hold the per-page lock from
+    // before state transitions through to after the CompressedPageInfo
+    // publish.  Concurrent fault handlers either acquire the lock first
+    // (and we abort because state is no longer COMPRESSED) or wait
+    // (and see the freshly-published new blob).
+    //
+    // Returns true on a successful tier upgrade.
+    bool recompressPage(size_t page_idx, CompressWorker& worker,
+                        CompressAlgo target_algo, int target_zstd_level) {
+        locks_->lock(page_idx);
+
+        if (states_->get(page_idx) != PageState::COMPRESSED) {
+            // Faulted in by app between phase2 decision and our lock.
+            locks_->unlock(page_idx);
+            return false;
+        }
+
+        // Snapshot current blob info while still under lock.
+        CompressedPageInfo old_info = compressed_[page_idx];
+        CompressAlgo old_algo = old_info.algorithm();
+        size_t old_comp_size = old_info.compressedSize();
+        size_t old_alloc_size = old_info.alloc_size;
+        void* old_data = old_info.data;
+
+        // No-op if already at target tier.
+        if (old_algo == target_algo && target_algo != CompressAlgo::ZSTD_DICT) {
+            locks_->unlock(page_idx);
+            return false;
+        }
+
+        uint8_t sc = lookupSizeClass(page_idx);
+        uint8_t arena_id = 0;
+        bool have_span = lookupSpanInfo(page_idx, arena_id, sc);
+        size_t stats_idx = statsIndex(arena_id, sc);
+
+        // We own the blob now; mark state COMPRESSING so concurrent
+        // fault paths know the blob may be mid-flight (they wait on
+        // the lock we still hold).
+        states_->set(page_idx, PageState::COMPRESSING);
+
+        // Acquire a fault slot to borrow a DCtx for decompression.  The
+        // shared engine_->zstd_dctx_ isn't thread-safe across workers;
+        // fault slots have per-slot DCtx that we can reuse here.
+        int slot = -1;
+        while ((slot = acquireFaultSlot()) < 0) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield");
+#endif
+        }
+
+        size_t decomp_size = engine_->decompressWithDCtx(
+            fault_slots_[slot].dctx,
+            old_data, worker.page_buf,
+            old_comp_size, kPageSize,
+            old_algo, sc);
+        releaseFaultSlot(slot);
+
+        if (decomp_size != kPageSize) {
+            // Bad blob? Should be unreachable given prior successful compress.
+            states_->set(page_idx, PageState::COMPRESSED);
+            locks_->unlock(page_idx);
+            return false;
+        }
+
+        // Recompress with target algo.  Reuse compress_buf as output.
+        auto t0 = std::chrono::steady_clock::now();
+        size_t max_comp = CompressEngine::maxCompressedSizeAny(kPageSize);
+        size_t new_comp_size = worker.compress(
+            worker.page_buf, worker.compress_buf,
+            kPageSize, max_comp,
+            target_algo, sc, target_zstd_level, engine_);
+        auto t1 = std::chrono::steady_clock::now();
+        uint32_t elapsed_us = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+
+        // Reject if compression failed or doesn't deliver meaningful savings
+        // over the existing blob.  Threshold: new blob must be ≤ 80% of old.
+        // For LZ4 → zstd-9 on real workloads, expected new/old ratio is
+        // 0.5 (json) to 0.8 (kv), so the gate fires only on marginal cases.
+        size_t savings_gate = (old_comp_size * 4) / 5;
+        if (new_comp_size == 0 || new_comp_size > savings_gate) {
+            states_->set(page_idx, PageState::COMPRESSED);
+            locks_->unlock(page_idx);
+            // Stats: record the failed upgrade attempt's cost against the
+            // target tier so the ROI model learns this bucket doesn't reward
+            // deep-tier upgrades.
+            if (have_span && sc < kNumClasses) {
+                worker.sc_stats[stats_idx].recordCost(1, elapsed_us);
+            }
+            return false;
+        }
+
+        size_t new_alloc_size = 0;
+        void* new_data = store_->store(worker.compress_buf, new_comp_size,
+                                       &new_alloc_size, page_idx);
+        if (!new_data) {
+            states_->set(page_idx, PageState::COMPRESSED);
+            locks_->unlock(page_idx);
+            return false;
+        }
+
+        // Publish new blob.  Fault handler holds the same lock so this
+        // transition is invisible to it; once we release the lock, the
+        // fault handler reads compressed_[page_idx] under its own lock
+        // acquisition and sees the new blob.
+        compressed_[page_idx].set(new_data, new_comp_size, new_alloc_size,
+                                  target_algo);
+        if (page_tier_) page_tier_[page_idx] = kTierDeep;
+
+        states_->set(page_idx, PageState::COMPRESSED);
+        locks_->unlock(page_idx);
+
+        // Safe to release old blob now: lock was held while we overwrote
+        // the per-page CompressedPageInfo, so no concurrent fault path
+        // can still hold a reference to old_data.
+        store_->release(old_data, old_alloc_size, page_idx);
+
+        // Stats: target-tier success record.  Tier index 1 = deep in the
+        // current 2-tier scheme.
+        if (have_span && sc < kNumClasses) {
+            worker.sc_stats[stats_idx].record(new_comp_size, kPageSize);
+            worker.sc_stats[stats_idx].recordCost(1, elapsed_us);
+        }
+
         return true;
     }
 
@@ -1425,6 +1613,7 @@ public:
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
+        page_tier_ = bootstrapArray<uint8_t>(max_pages);
 
         // Per-bucket recompression EMA table (kNumArenas × kNumClasses entries).
         bucket_rc_ema_x256_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
@@ -1561,12 +1750,19 @@ public:
         }
         char ts[32] = {};
         vm::formatTimestamp(ts, sizeof(ts));
-        char buf[320];
+        uint64_t tier_attempts = self->tier_upgrade_attempts_.load(
+            std::memory_order_relaxed);
+        uint64_t tier_success = self->tier_upgrade_success_.load(
+            std::memory_order_relaxed);
+        char buf[384];
         int n = snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
-            "  compressing=%zu  compressed=%zu  empty=%zu\n",
+            "  compressing=%zu  compressed=%zu  empty=%zu"
+            "  tier_up=%llu/%llu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
-            empty);
+            empty,
+            (unsigned long long)tier_success,
+            (unsigned long long)tier_attempts);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
@@ -1640,6 +1836,7 @@ public:
             store_->release(compressed_[page_idx].data,
                            compressed_[page_idx].alloc_size, page_idx);
             compressed_[page_idx] = {};
+            if (page_tier_) page_tier_[page_idx] = kTierNone;
 
             states_->set(page_idx, PageState::ACTIVE);
             cold_count_[page_idx] = 0;

@@ -259,8 +259,29 @@ inline constexpr int kZstdFastLevel = 1;            // fast tier (replaces LZ4)
 inline constexpr int kZstdNormalLevel = 3;
 inline constexpr int kZstdDeepLevel = 9;
 
-// When true, use LZ4 as the fast compression tier (original behavior).
+// Tiered recompression (in development): when true, the compressor scans
+// COMPRESSED pages and upgrades fast-tier blobs (zstd-1 by default, LZ4
+// when SMASH_USE_LZ4) to deep-tier (zstd-9) once a page has stayed cold
+// past kVeryColdTicks.  Without this flag, the initial algorithm chosen
+// at compress time is final until the page is decompressed.
+//
+// Does NOT change the initial tier — see SMASH_USE_LZ4 for that.
+// See TIERED_RECOMPRESSION.md for design and measurements.
+#ifndef SMASH_NO_TIERED_RECOMPRESSION
+inline constexpr bool kTieredRecompression = true;
+#else
+inline constexpr bool kTieredRecompression = false;
+#endif
+
+// When true, use LZ4 as the fast compression tier (opt-in via SMASH_USE_LZ4).
 // When false (default), use zstd-1 as the fast tier for better ratios.
+//
+// We measured LZ4 initial + zstd-9 upgrade on memcached and Redis: peak
+// fill_rss is unchanged vs zstd-1 (the bottleneck isn't the algorithm),
+// and cool_rss costs ~9-33 MB vs zstd-1 due to whole-region waste from
+// "stranger" blobs that prevent draining.  Keep as opt-in; the
+// CompressStore freelist (this branch) makes the cost bounded when
+// users do opt in.
 #ifdef SMASH_USE_LZ4
 inline constexpr bool kUseLz4FastTier = true;
 #else

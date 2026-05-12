@@ -257,3 +257,28 @@ Bench_algo_compare on a single run showed zstd-3 with notably faster decomp (~50
 | zstd-3 | 315 | 728 | 17.2% | 374 | 854 |
 
 The earlier "fast decomp" advantage was an outlier (warmup/caching artifact). On clean runs zstd-3 is 1-15 % faster decomp at the cost of slower compress and slightly worse ratio. **Not a win — keep zstd-1.**
+
+### Side experiment — multi-page compression
+
+Question: would compressing N adjacent pages as one blob improve ratios enough to justify the per-fault decompression cost (a fault on any page in the group decompresses all N)?
+
+Sweep with group sizes 1, 2, 4, 8, 16, 32, 64 on homogeneous and heterogeneous (json/kv/sqlite interleaved) content. Standalone harness `/tmp/multipage_exp.cpp` for clean numbers:
+
+| Workload | zstd-1 1-page ratio | zstd-1 8-page ratio | Best improvement |
+|---|---|---|---|
+| homogeneous json | 15.06 % | 13.46 % | 10.6 % relative |
+| homogeneous sqlite | 10.89 % | 9.47 % | 13.0 % relative |
+| homogeneous kv | 33.29 % | 32.14 % | 3.5 % relative |
+| **heterogeneous (realistic)** | **19.71 %** | **19.44 %** | **1.4 % relative — null result** |
+
+Decompression latency per fault:
+
+| Workload | 1-page decomp | 8-page decomp (whole group) | per-fault multiplier |
+|---|---|---|---|
+| json | 3.63 µs | 16.3 µs | **4.5×** |
+| sqlite | 2.30 µs | 9.5 µs | 4.1× |
+| heterogeneous | 3.72 µs | 17.4 µs | 4.7× |
+
+(Per-page cost amortizes — 8 pages take ~half as long per byte as 1 page — but a fault decompresses the whole group, so wall-time per fault scales close to linearly with group size.)
+
+Real cache-server workloads have heterogeneous adjacency: pages in a slab class hold many items with different content. The "homogeneous" win (10-13 % at 8 pages) plateaus quickly and applies only to workloads with structurally-similar adjacent pages (e.g. sequentially-filled log files). Expected memcached impact: 1-3 % cool_rss improvement, 3-4× fault p99 increase. **Not worth the architectural cost** (~1 week to plumb group-aware blobs through CompressedPageInfo, fault handler, prefetch, etc.). Skipped.

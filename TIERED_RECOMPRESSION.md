@@ -233,3 +233,27 @@ The original Q2 hypothesis ("compressor throughput is the bottleneck") doesn't h
 - `kUseLz4FastTier` default flip. Keep `SMASH_USE_LZ4` as opt-in for users who want to experiment. With the freelist now in place, opting in costs ~33 MB cool_rss on memcached-class workloads instead of the previous 82 MB.
 
 This leaves the codebase with a real allocator improvement, a tier-upgrade mechanism that's a no-op at zstd-1→zstd-9 (5 % ratio gap, in noise), and the LZ4 option available behind a flag.
+
+### Side experiment — re-enabled dictionary training (kDictTrainSamples=16)
+
+Question asked: would per-size-class trained dictionaries pull cool_rss below the current ~17 % zstd-1 ratio?
+
+| Workload | no-dict baseline cool | with dict cool | delta |
+|---|---|---|---|
+| memcached (1M keys json) | 100.7 MB | 102.6 MB | +1.9 MB |
+| Redis (200K keys json) | 76.9 MB | 79.3 MB | +2.4 MB |
+
+Dict overhead (1.2 MB steady-state predicted; ~2-3 MB observed) costs more than the ratio improvement returns. **Not material on these workloads.** Reverted `kDictTrainSamples = 0`.
+
+Hypothesis: the JSON records used in these benches have shared field names but varied content; the dict captures the schema (~few hundred bytes of header structure) but most of each blob is the variable payload that doesn't dedup. For workloads with *highly* structured shared content (e.g., protobufs with fixed fields, log messages with shared templates), dicts could still win.
+
+### Side experiment — zstd-3 as fast tier
+
+Bench_algo_compare on a single run showed zstd-3 with notably faster decomp (~50 %) than zstd-1, suggesting it could improve fault latency. Re-measured on a clean run:
+
+| Algo | json comp | json decomp | json ratio | sqlite comp | sqlite decomp |
+|---|---|---|---|---|---|
+| zstd-1 | 340 | 716 | 16.7% | 438 | 901 |
+| zstd-3 | 315 | 728 | 17.2% | 374 | 854 |
+
+The earlier "fast decomp" advantage was an outlier (warmup/caching artifact). On clean runs zstd-3 is 1-15 % faster decomp at the cost of slower compress and slightly worse ratio. **Not a win — keep zstd-1.**

@@ -198,7 +198,7 @@ public:
             }
         }
         size_t start = next_page_.fetch_add(num_pages, std::memory_order_relaxed);
-        if (start + num_pages > total_pages_) {
+        if (start + num_pages > contig_pages_) {
             next_page_.fetch_sub(num_pages, std::memory_order_relaxed);
             return nullptr;
         }

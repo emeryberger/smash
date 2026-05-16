@@ -312,6 +312,22 @@ public:
 
     bool isTrackingMode() const { return tracking_mode_; }
 
+    // Reset decommit thread state after fork(). The thread doesn't exist in the
+    // child (Linux fork only clones the calling thread), so we must reset state
+    // so ensureDecommitThreadStarted() will restart it on first releasePages().
+    void resetDecommitThreadForFork() {
+        // Thread doesn't exist in child - don't try to join it
+        decommit_running_.store(false, std::memory_order_relaxed);
+        // Drain pending entries synchronously
+        DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
+        while (batch) {
+            DecommitEntry* next = batch->next;
+            processDecommitEntry(batch);
+            recycleDecommitEntry(batch);
+            batch = next;
+        }
+    }
+
     // ── Allocation (full mode only) ─────────────────────────────────────────
     void* allocatePages(size_t num_pages) {
         if (tracking_mode_) return nullptr;

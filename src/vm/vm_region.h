@@ -11,6 +11,8 @@
 
 #include <new>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "smash/config.h"
 #include "platform_mem.h"
 #include "page_state.h"
@@ -20,6 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <thread>
 
 namespace smash {
 
@@ -42,23 +45,153 @@ class VmRegion {
         size_t page_count;
         FreeRun* next;
     };
-    FreeRun* free_list_ = nullptr;
-    FreeRun* free_pool_ = nullptr;
-    Spinlock free_lock_;
 
-    FreeRun* newFreeRun() {
-        if (free_pool_) {
-            FreeRun* r = free_pool_;
-            free_pool_ = r->next;
+    // Sharded free lists to reduce contention under high thread counts.
+    // 64 shards = one per typical cache line, threads hash by ID.
+    static constexpr size_t kNumFreeShards = 64;
+    static constexpr size_t kFreeShardMask = kNumFreeShards - 1;
+
+    struct alignas(64) FreeShard {  // cache-line aligned
+        FreeRun* free_list = nullptr;
+        FreeRun* free_pool = nullptr;
+        Spinlock lock;
+    };
+    FreeShard shards_[kNumFreeShards];
+
+    static size_t getShardIdx() {
+        // Hash thread ID to shard. Cache per-thread for speed.
+        thread_local size_t idx = std::hash<std::thread::id>{}(
+            std::this_thread::get_id()) & kFreeShardMask;
+        return idx;
+    }
+
+    FreeRun* newFreeRun(FreeShard& shard) {
+        if (shard.free_pool) {
+            FreeRun* r = shard.free_pool;
+            shard.free_pool = r->next;
             return r;
         }
         return static_cast<FreeRun*>(
             BootstrapAlloc::instance().allocate(sizeof(FreeRun), alignof(FreeRun)));
     }
 
-    void recycleFreeRun(FreeRun* r) {
-        r->next = free_pool_;
-        free_pool_ = r;
+    void recycleFreeRun(FreeRun* r, FreeShard& shard) {
+        r->next = shard.free_pool;
+        shard.free_pool = r;
+    }
+
+    // ── Background decommit thread ──────────────────────────────────────────
+    // Two-phase release: releasePages() queues pages for decommit, background
+    // thread decommits them and THEN adds to free list. This ensures pages
+    // can't be reallocated before decommit completes (fixing the race condition).
+    struct DecommitEntry {
+        void* addr;
+        size_t num_pages;
+        size_t page_index;
+        size_t shard_idx;
+        DecommitEntry* next;
+    };
+
+    std::atomic<DecommitEntry*> decommit_head_{nullptr};
+    DecommitEntry* decommit_pool_ = nullptr;
+    Spinlock decommit_pool_lock_;
+    pthread_t decommit_thread_{};
+    std::atomic<bool> decommit_running_{false};
+
+    DecommitEntry* newDecommitEntry() {
+        LockGuard guard(decommit_pool_lock_);
+        if (decommit_pool_) {
+            DecommitEntry* e = decommit_pool_;
+            decommit_pool_ = e->next;
+            return e;
+        }
+        return static_cast<DecommitEntry*>(
+            BootstrapAlloc::instance().allocate(sizeof(DecommitEntry), alignof(DecommitEntry)));
+    }
+
+    void recycleDecommitEntry(DecommitEntry* e) {
+        LockGuard guard(decommit_pool_lock_);
+        e->next = decommit_pool_;
+        decommit_pool_ = e;
+    }
+
+    void queueForDecommit(void* addr, size_t num_pages, size_t page_index, size_t shard_idx) {
+        DecommitEntry* e = newDecommitEntry();
+        e->addr = addr;
+        e->num_pages = num_pages;
+        e->page_index = page_index;
+        e->shard_idx = shard_idx;
+        // Lock-free push to MPSC queue
+        DecommitEntry* head = decommit_head_.load(std::memory_order_relaxed);
+        do {
+            e->next = head;
+        } while (!decommit_head_.compare_exchange_weak(head, e,
+            std::memory_order_release, std::memory_order_relaxed));
+    }
+
+    void processDecommitEntry(DecommitEntry* e) {
+        // Decommit the pages
+        vm::decommitPages(e->addr, e->num_pages * kPageSize);
+
+        // NOW add to free list (safe - pages are decommitted)
+        FreeShard& shard = shards_[e->shard_idx];
+        FreeRun* run = newFreeRun(shard);
+        run->page_index = e->page_index;
+        run->page_count = e->num_pages;
+        {
+            LockGuard guard(shard.lock);
+            run->next = shard.free_list;
+            shard.free_list = run;
+        }
+    }
+
+    static void* decommitThreadEntry(void* arg) {
+        auto* self = static_cast<VmRegion*>(arg);
+        while (self->decommit_running_.load(std::memory_order_relaxed)) {
+            // Drain the queue
+            DecommitEntry* batch = self->decommit_head_.exchange(nullptr, std::memory_order_acquire);
+            if (batch) {
+                while (batch) {
+                    DecommitEntry* next = batch->next;
+                    self->processDecommitEntry(batch);
+                    self->recycleDecommitEntry(batch);
+                    batch = next;
+                }
+            } else {
+                usleep(100);  // 100µs - short sleep for responsiveness
+            }
+        }
+        return nullptr;
+    }
+
+    void startDecommitThread() {
+        if (tracking_mode_) return;
+        bool expected = false;
+        if (!decommit_running_.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return;
+        }
+        pthread_create(&decommit_thread_, nullptr, decommitThreadEntry, this);
+    }
+
+    void ensureDecommitThreadStarted() {
+        if (tracking_mode_) return;
+        if (decommit_running_.load(std::memory_order_relaxed)) return;
+        startDecommitThread();
+    }
+
+    void stopDecommitThread() {
+        if (!decommit_running_.load(std::memory_order_relaxed)) return;
+        decommit_running_.store(false, std::memory_order_release);
+        pthread_join(decommit_thread_, nullptr);
+        // Drain any remaining entries
+        DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
+        while (batch) {
+            DecommitEntry* next = batch->next;
+            processDecommitEntry(batch);
+            recycleDecommitEntry(batch);
+            batch = next;
+        }
     }
 
     // ── Tracking mode: hash map for arbitrary page addresses ────────────────
@@ -166,7 +299,15 @@ public:
         } else {
             page_to_span_ = static_cast<std::atomic<Span*>*>(m);
         }
+
+        // Decommit thread is started lazily on first releasePages() call
+        // to avoid reentrancy issues during early library initialization.
+
         return true;
+    }
+
+    ~VmRegion() {
+        stopDecommitThread();
     }
 
     bool isTrackingMode() const { return tracking_mode_; }
@@ -175,28 +316,56 @@ public:
     void* allocatePages(size_t num_pages) {
         if (tracking_mode_) return nullptr;
 
+        // Try this thread's shard first (low contention path)
+        size_t my_shard = getShardIdx();
+        FreeShard& shard = shards_[my_shard];
         {
-            LockGuard guard(free_lock_);
-            FreeRun** prev = &free_list_;
-            FreeRun* run = free_list_;
+            LockGuard guard(shard.lock);
+            FreeRun** prev = &shard.free_list;
+            FreeRun* run = shard.free_list;
             while (run) {
                 if (run->page_count >= num_pages) {
                     size_t page_idx = run->page_index;
                     if (run->page_count == num_pages) {
                         *prev = run->next;
-                        recycleFreeRun(run);
+                        recycleFreeRun(run, shard);
                     } else {
                         run->page_index += num_pages;
                         run->page_count -= num_pages;
                     }
-                    void* addr = base_ + page_idx * kPageSize;
-                    vm::commitPages(addr, num_pages * kPageSize);
-                    return addr;
+                    return base_ + page_idx * kPageSize;
                 }
                 prev = &run->next;
                 run = run->next;
             }
         }
+
+        // Try other shards round-robin
+        for (size_t i = 1; i < kNumFreeShards; ++i) {
+            FreeShard& other = shards_[(my_shard + i) & kFreeShardMask];
+            if (!other.lock.tryLock()) continue;  // skip contended shards
+            FreeRun** prev = &other.free_list;
+            FreeRun* run = other.free_list;
+            while (run) {
+                if (run->page_count >= num_pages) {
+                    size_t page_idx = run->page_index;
+                    if (run->page_count == num_pages) {
+                        *prev = run->next;
+                        recycleFreeRun(run, other);
+                    } else {
+                        run->page_index += num_pages;
+                        run->page_count -= num_pages;
+                    }
+                    other.lock.unlock();
+                    return base_ + page_idx * kPageSize;
+                }
+                prev = &run->next;
+                run = run->next;
+            }
+            other.lock.unlock();
+        }
+
+        // Bump allocate from fresh pages (lock-free)
         size_t start = next_page_.fetch_add(num_pages, std::memory_order_relaxed);
         if (start + num_pages > contig_pages_) {
             next_page_.fetch_sub(num_pages, std::memory_order_relaxed);
@@ -210,15 +379,16 @@ public:
     void releasePages(void* addr, size_t num_pages) {
         if (tracking_mode_) return;
 
-        vm::protectPages(addr, num_pages * kPageSize, false, false);
-        vm::decommitPages(addr, num_pages * kPageSize);
+        // Start decommit thread lazily on first release (avoids reentrancy
+        // during early library initialization when pthread_create might malloc).
+        ensureDecommitThreadStarted();
+
+        // Two-phase release: queue pages for background decommit. The background
+        // thread will decommit them and THEN add to free list. This ensures
+        // pages can't be reallocated before decommit completes.
         size_t page_idx = pageIndex(reinterpret_cast<uintptr_t>(addr));
-        FreeRun* run = newFreeRun();
-        run->page_index = page_idx;
-        run->page_count = num_pages;
-        LockGuard guard(free_lock_);
-        run->next = free_list_;
-        free_list_ = run;
+        size_t shard_idx = getShardIdx();
+        queueForDecommit(addr, num_pages, page_idx, shard_idx);
     }
 
     // ── Page tracking (compress-only mode) ──────────────────────────────────

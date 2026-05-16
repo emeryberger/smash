@@ -389,7 +389,8 @@ int main() {
     }
     if (!(fds[0].revents & POLLOUT)) {
         fprintf(stderr, "FAIL: poll() did not write revents into compressed "
-                "pollfd array (revents=0x%x)\n", fds[0].revents);
+                "pollfd array (poll_ret=%d, revents=0x%x, fd=%d, events=0x%x)\n",
+                poll_ret, fds[0].revents, fds[0].fd, fds[0].events);
         return 1;
     }
     close(sp[0]);

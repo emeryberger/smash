@@ -85,8 +85,10 @@ public:
         Span* span = newSpanDescriptor();
         span->initLarge(mem, size, num_pages);
 
-        LockGuard guard(lock_);
-        page_map_->setRange(reinterpret_cast<uintptr_t>(mem), num_pages, span);
+        // O(1) registration: only register the first page. The Span contains
+        // page_count so we can compute the full range from just the base.
+        // PageMap::set uses atomic stores internally - no external lock needed.
+        page_map_->set(reinterpret_cast<uintptr_t>(mem), span);
         return mem;
     }
 
@@ -94,10 +96,9 @@ public:
         void* base = span->base;
         size_t num_pages = span->page_count;
 
-        {
-            LockGuard guard(lock_);
-            page_map_->clearRange(reinterpret_cast<uintptr_t>(base), num_pages);
-        }
+        // O(1) clear: only clear the first page (matches O(1) registration).
+        // Must clear BEFORE releasing pages to prevent race with reallocation.
+        page_map_->set(reinterpret_cast<uintptr_t>(base), nullptr);
 
         if (vm_region_ && vm_region_->contains(reinterpret_cast<uintptr_t>(base))) {
             if (release_hook_) {

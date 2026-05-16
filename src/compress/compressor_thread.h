@@ -177,6 +177,18 @@ class CompressorThread {
         uint32_t cost_ema_x16[kTiers]{};
         uint8_t  cost_count[kTiers]{};
 
+        // UCB1-Tuned (Auer/Cesa-Bianchi/Fischer 2002) per-arm state for
+        // tier selection.  Reward is bytes-saved-per-microsecond, clamped
+        // to [0, kUcbRewardMaxBytesPerUs] and normalized to [0,1].  Mean
+        // and M2 (sum of squared deviations) are updated via Welford.
+        uint32_t arm_pulls[kTiers]{};
+        double   arm_mean[kTiers]{};
+        double   arm_m2[kTiers]{};
+        // Per-bucket selection counter.  Used by SMASH_UCB_FORCE_DEEP_EVERY
+        // to cycle deep-tier pulls without synchronizing the forcing across
+        // buckets (which would create a tick-aligned CPU spike).
+        uint32_t selections = 0;
+
         void record(size_t comp_size, size_t orig_size) {
             uint8_t r = 0;
             if (orig_size > 0 && comp_size < orig_size)
@@ -212,6 +224,42 @@ class CompressorThread {
             return cost_count[tier] >= 8
                 ? (cost_ema_x16[tier] + 8) / 16 : 0;
         }
+
+        // UCB reward update.  reward must be in [0,1].  Uses Welford so the
+        // posterior mean and variance stay numerically stable as pulls grow.
+        void recordReward(int tier, double reward) {
+            if (tier < 0 || tier >= kTiers) return;
+            if (reward < 0.0) reward = 0.0;
+            if (reward > 1.0) reward = 1.0;
+            uint32_t n = ++arm_pulls[tier];
+            double delta  = reward - arm_mean[tier];
+            arm_mean[tier] += delta / static_cast<double>(n);
+            double delta2 = reward - arm_mean[tier];
+            arm_m2[tier] += delta * delta2;
+        }
+    };
+
+    // ── Per-arena UCB arm aggregate ───────────────────────────────────────
+    // Aggregates (pulls, mean, m2) across all size classes within an arena
+    // for each tier.  Used as a warm-start prior when a per-bucket arm
+    // hasn't accumulated min_pulls yet — the arena aggregate is a
+    // meaningfully better estimate than the uniform prior because arena
+    // routing already groups call-sites with similar allocation patterns.
+    struct ArenaArmStats {
+        static constexpr int kTiers = SizeClassStats::kTiers;
+        uint32_t pulls[kTiers]{};
+        double   mean[kTiers]{};
+        double   m2[kTiers]{};
+        void recordReward(int tier, double reward) {
+            if (tier < 0 || tier >= kTiers) return;
+            if (reward < 0.0) reward = 0.0;
+            if (reward > 1.0) reward = 1.0;
+            uint32_t n = ++pulls[tier];
+            double delta  = reward - mean[tier];
+            mean[tier] += delta / static_cast<double>(n);
+            double delta2 = reward - mean[tier];
+            m2[tier] += delta * delta2;
+        }
     };
 
     // ── Per-worker compression state ──────────────────────────────────────
@@ -228,6 +276,9 @@ class CompressorThread {
         // arenas would wash out that homogeneity, so each arena gets its
         // own sliding window per size class.  Index via statsIndex(arena,sc).
         SizeClassStats sc_stats[kNumArenas * kNumClasses]{};
+        // Per-arena UCB aggregate used as warm-start prior under
+        // SMASH_UCB_WARMSTART=1.  Indexed by arena_id.
+        ArenaArmStats arena_arm[kNumArenas]{};
         size_t range_start = 0, range_end = 0;
 
         // Compress using worker's own contexts, shared engine's dictionaries
@@ -741,17 +792,80 @@ private:
             return false;
         }
 
-        // Pass the bucket's observed per-tier compression costs into the
-        // ROI model so it uses real workload data instead of synthetic
-        // calibration when available.
-        uint32_t observed_costs_us[2] = {0, 0};
-        if (have_span && sc < kNumClasses) {
-            observed_costs_us[0] = worker.sc_stats[stats_idx].observedCostUs(0);
-            observed_costs_us[1] = worker.sc_stats[stats_idx].observedCostUs(1);
+        // Tier selection: either ROI cost/benefit model or UCB1-Tuned bandit.
+        const auto& cfg = ROIConfig::instance();
+        const AlgoProfile* profile = nullptr;
+        int chosen_tier = -1;
+        if (cfg.use_ucb && cfg.num_profiles > 1) {
+            // Build per-arm view from this bucket's stats and the per-profile
+            // min_cold_ticks gate.  UCB sees the action space directly; the
+            // ROI model's calibrated cost estimates are unused.
+            uint32_t pulls[4] = {0,0,0,0};
+            double mean[4] = {0,0,0,0};
+            double m2[4]   = {0,0,0,0};
+            bool eligible[4] = {false,false,false,false};
+            auto& s = worker.sc_stats[stats_idx];
+            int n = cfg.num_profiles;
+            if (n > SizeClassStats::kTiers) n = SizeClassStats::kTiers;
+            for (int i = 0; i < n; ++i) {
+                pulls[i] = s.arm_pulls[i];
+                mean[i]  = s.arm_mean[i];
+                m2[i]    = s.arm_m2[i];
+                eligible[i] = (cold_count_[page_idx] >= cfg.profiles[i].min_cold_ticks);
+            }
+
+            // Force-deep override: every Nth selection in this bucket, if
+            // the deep arm is eligible and exists, force-pick it to keep the
+            // variance estimate of the deep tier live on heavy-tailed reward
+            // distributions.  Cycling per-bucket avoids tick-aligned spikes.
+            uint32_t sel_counter = ++s.selections;
+            int deep_idx = (n > 1) ? 1 : -1;
+            if (cfg.ucb_force_deep_every > 0 && deep_idx >= 0 &&
+                eligible[deep_idx] &&
+                (sel_counter % cfg.ucb_force_deep_every) == 0) {
+                chosen_tier = deep_idx;
+            } else if (cfg.ucb_warmstart && have_span) {
+                // Warm-start: pass the per-arena aggregate as a prior so
+                // under-explored bucket arms borrow strength from the arena
+                // rather than starting from a uniform posterior.
+                uint32_t pp[4] = {0,0,0,0};
+                double   pm[4] = {0,0,0,0};
+                double   pmm[4] = {0,0,0,0};
+                const auto& a = worker.arena_arm[arena_id];
+                int an = n < ArenaArmStats::kTiers ? n : ArenaArmStats::kTiers;
+                for (int i = 0; i < an; ++i) {
+                    pp[i] = a.pulls[i];
+                    pm[i] = a.mean[i];
+                    pmm[i] = a.m2[i];
+                }
+                chosen_tier = CompressionROI::selectTierUCB(
+                    pulls, mean, m2, eligible, n,
+                    cfg.ucb_min_pulls, cfg.ucb_variant,
+                    pp, pm, pmm);
+            } else {
+                chosen_tier = CompressionROI::selectTierUCB(
+                    pulls, mean, m2, eligible, n,
+                    cfg.ucb_min_pulls, cfg.ucb_variant);
+            }
+            if (chosen_tier >= 0) profile = &cfg.profiles[chosen_tier];
+        } else {
+            // Pass the bucket's observed per-tier compression costs into the
+            // ROI model so it uses real workload data instead of synthetic
+            // calibration when available.
+            uint32_t observed_costs_us[2] = {0, 0};
+            if (have_span && sc < kNumClasses) {
+                observed_costs_us[0] = worker.sc_stats[stats_idx].observedCostUs(0);
+                observed_costs_us[1] = worker.sc_stats[stats_idx].observedCostUs(1);
+            }
+            profile = CompressionROI::selectProfile(
+                cold_count_[page_idx], stats_count, stats_sum,
+                observed_costs_us);
+            if (profile) {
+                // Map back to a tier index (0=fast, 1=deep) so reward
+                // attribution lines up with the UCB path even when UCB is off.
+                chosen_tier = (profile == &cfg.profiles[0]) ? 0 : 1;
+            }
         }
-        const AlgoProfile* profile = CompressionROI::selectProfile(
-            cold_count_[page_idx], stats_count, stats_sum,
-            observed_costs_us);
         if (!profile) {
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
@@ -878,6 +992,14 @@ private:
                     comp_size ? comp_size : kPageSize, kPageSize);
                 int tier = is_fast_tier ? 0 : 1;
                 worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
+                // UCB reward: attribute zero reward to the *originally chosen*
+                // arm (its decision led here even after the fast→deep
+                // fallback path).  Failed-to-compress = zero bytes saved.
+                if (cfg.use_ucb && chosen_tier >= 0) {
+                    worker.sc_stats[stats_idx].recordReward(chosen_tier, 0.0);
+                    if (cfg.ucb_warmstart && arena_id < kNumArenas)
+                        worker.arena_arm[arena_id].recordReward(chosen_tier, 0.0);
+                }
             }
             vm::protectPages(page_addr, kPageSize, true, true);
             __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
@@ -903,6 +1025,17 @@ private:
             worker.sc_stats[stats_idx].record(comp_size, kPageSize);
             int tier = is_fast_tier ? 0 : 1;
             worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
+            // UCB reward: bytes_saved / compress_us, attributed to the
+            // originally chosen arm.  comp_elapsed_us covers the (possibly
+            // tier-fallback) work that the choice actually triggered, which
+            // is the cost the bandit should learn to avoid.
+            if (cfg.use_ucb && chosen_tier >= 0) {
+                double r = CompressionROI::ucbReward(
+                    comp_size, kPageSize, comp_elapsed_us);
+                worker.sc_stats[stats_idx].recordReward(chosen_tier, r);
+                if (cfg.ucb_warmstart && arena_id < kNumArenas)
+                    worker.arena_arm[arena_id].recordReward(chosen_tier, r);
+            }
         }
 
         // Record compressed page info (with algo in top 2 bits)

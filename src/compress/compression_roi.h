@@ -17,6 +17,7 @@
 #include <cstring>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <algorithm>
 
 #include <lz4.h>
@@ -24,6 +25,30 @@
 #include <zstd.h>
 
 namespace smash {
+
+// Reward-normalization constant for UCB1-Tuned tier selection.
+//
+// Reward = bytes_saved / compress_us.  We clamp to [0, kUcbRewardMaxBytesPerUs]
+// then divide by the max so the normalized reward is in [0,1] as required by
+// UCB1-Tuned.  The cap is set above the realistic max throughput of the fast
+// tier on a fully-compressible page (~10 KB/μs for LZ4 on zeros), giving
+// real-world rewards mostly in the lower half of [0,1] but never saturating.
+inline constexpr double kUcbRewardMaxBytesPerUs = 16384.0;
+
+// Minimum pulls per arm before UCB is used for selection.  Below this we
+// force-pull the under-explored arm.  Matches the standard "play each arm
+// once" UCB1 initialization, but with a small fixed budget so the
+// confidence-bound estimate isn't dominated by a single noisy sample.
+// Default; overridable via SMASH_UCB_MIN_PULLS.
+inline constexpr uint32_t kUcbMinPullsDefault = 4;
+
+// UCB variant selector.
+//   1 = UCB1-Tuned (Auer et al. 2002)
+//   2 = UCB-V      (Audibert/Munos/Szepesvári 2009)
+enum class UcbVariant : uint8_t {
+    UCB1_TUNED = 1,
+    UCB_V      = 2,
+};
 
 // --- Helper: read environment variables with defaults ---
 
@@ -131,6 +156,31 @@ struct ROIConfig {
     bool very_cold_ticks_overridden = false;
     bool initialized = false;
 
+    // UCB tier selection (opt-in via SMASH_UCB=1).  When true, the
+    // compressor uses per-(arena, size_class) bucket statistics to pick a
+    // tier via a multi-armed bandit instead of the cost/benefit ROI model.
+    // The shouldCompress() gate is still applied first.  Reward is
+    // normalized bytes-saved-per-microsecond (see kUcbRewardMaxBytesPerUs).
+    bool use_ucb = false;
+    // Which bandit formula to use.  See UcbVariant enum.
+    // SMASH_UCB_VARIANT (1 = UCB1-Tuned default, 2 = UCB-V).
+    UcbVariant ucb_variant = UcbVariant::UCB1_TUNED;
+    // Force-pull threshold per arm before the bandit formula kicks in.
+    // SMASH_UCB_MIN_PULLS overrides; useful for raising deep-tier exploration
+    // when the reward distribution is heavy-tailed (rare big wins).
+    uint32_t ucb_min_pulls = kUcbMinPullsDefault;
+    // Per-arena warm-start prior.  When true, an under-explored bucket arm
+    // (pulls < min_pulls) is blended with the corresponding arena-aggregate
+    // arm posterior so cold buckets don't have to re-discover the deep tier.
+    // SMASH_UCB_WARMSTART=1.
+    bool ucb_warmstart = false;
+    // Force-deep-every-N override.  Periodically pull the deep tier
+    // unconditionally to keep its variance estimate live on heavy-tailed
+    // reward distributions.  0 = disabled (default).  Per-bucket counter
+    // ensures the forcing is spread across buckets, not synchronized.
+    // SMASH_UCB_FORCE_DEEP_EVERY=N.
+    uint32_t ucb_force_deep_every = 0;
+
     static ROIConfig& instance() {
         static ROIConfig cfg;
         return cfg;
@@ -145,6 +195,18 @@ struct ROIConfig {
             roiEnvInt("SMASH_ROI_THRESHOLD", kRoiThresholdDefault));
         min_compress_ratio = roiEnvDouble("SMASH_MIN_COMPRESS_RATIO",
                                           kMinCompressRatio);
+        use_ucb = roiEnvInt("SMASH_UCB", 0) != 0;
+        int variant = roiEnvInt("SMASH_UCB_VARIANT",
+                                static_cast<int>(UcbVariant::UCB1_TUNED));
+        ucb_variant = (variant == 2) ? UcbVariant::UCB_V
+                                      : UcbVariant::UCB1_TUNED;
+        int mp = roiEnvInt("SMASH_UCB_MIN_PULLS",
+                           static_cast<int>(kUcbMinPullsDefault));
+        ucb_min_pulls = mp > 0 ? static_cast<uint32_t>(mp)
+                                : kUcbMinPullsDefault;
+        ucb_warmstart = roiEnvInt("SMASH_UCB_WARMSTART", 0) != 0;
+        int fd = roiEnvInt("SMASH_UCB_FORCE_DEEP_EVERY", 0);
+        ucb_force_deep_every = (fd > 0) ? static_cast<uint32_t>(fd) : 0;
 
         // SMASH_COLD_TIMEOUT_SEC is the primary time-space tradeoff dial.
         // It sets the idle time (in seconds) before a page is compressed.
@@ -616,6 +678,163 @@ inline const AlgoProfile* selectProfile(uint8_t cold_count,
         }
     }
     return best;
+}
+
+// UCB1-Tuned tier selection.
+//
+// Implements Auer/Cesa-Bianchi/Fischer 2002 §4 ("UCB1-Tuned"): for each arm
+// i with empirical reward mean x̄_i, sample variance s²_i, and pull count
+// n_i, choose the arm maximizing
+//
+//     x̄_i + sqrt( ln(n) / n_i  ·  min(1/4, V_i(n_i)) )
+//
+// where V_i(n_i) = s²_i + sqrt(2 ln(n) / n_i) is a per-arm
+// variance-aware exploration term and 1/4 is the worst-case variance for a
+// reward in [0,1].  The min() is what distinguishes UCB1-Tuned from plain
+// UCB1 — arms with low observed variance contract their bound faster.
+//
+// Inputs:
+//   pulls[i]     — number of times arm i has been pulled in this bucket
+//   mean[i]      — empirical reward mean (Welford running mean)
+//   m2[i]        — Welford M2 (sum of squared deviations)
+//   eligible[i]  — true if arm passes the per-profile min_cold_ticks gate
+//   num_arms     — length of arrays (must be ≥ 1, ≤ 4)
+//   min_pulls    — force-pull threshold per arm (typically 4-32)
+//   variant      — UCB1_TUNED or UCB_V
+//
+// Returns the index of the chosen arm, or -1 if no arms are eligible.
+// Forces a pull of any eligible arm with pulls < min_pulls before the
+// confidence-bound formula kicks in (otherwise the variance estimate is
+// meaningless on small n).
+//
+// UCB-V (Audibert/Munos/Szepesvári 2009, "Exploration-exploitation tradeoff
+// using variance estimates in multi-armed bandits") replaces the UCB1-Tuned
+// bound with
+//
+//     x̄_i + sqrt( 2 · s²_i · ln(n) / n_i ) + 3 · b · ln(n) / n_i
+//
+// where b is the reward range upper bound (1.0 here, since rewards are
+// normalized to [0,1]).  Compared to UCB1-Tuned, the second term decays
+// as ln(n)/n_i (linear in ln(n) over n_i) rather than sqrt(ln(n)/n_i),
+// which gives UCB-V a longer "exploration tail": low-pull arms hold a
+// larger bonus for longer, so rare-big-win arms (deep tier on highly
+// compressible workloads) get pulled more aggressively.
+inline int selectTierUCB(const uint32_t* pulls, const double* mean,
+                         const double* m2, const bool* eligible,
+                         int num_arms, uint32_t min_pulls,
+                         UcbVariant variant,
+                         const uint32_t* prior_pulls = nullptr,
+                         const double* prior_mean = nullptr,
+                         const double* prior_m2 = nullptr) {
+    if (num_arms <= 0) return -1;
+
+    // Optional warm-start: when the bucket arm is under-explored
+    // (pulls < min_pulls) and a non-empty arena prior exists, blend the two
+    // posteriors via additive Welford combine.  The prior is capped at
+    // (min_pulls - bucket_pulls) effective pulls so once the bucket has its
+    // own data the prior fades out quickly — this avoids letting a strong
+    // arena prior drown out a (legitimately) divergent bucket signal.
+    uint32_t eff_pulls[4];
+    double   eff_mean[4];
+    double   eff_m2[4];
+    bool have_prior = (prior_pulls && prior_mean && prior_m2);
+    for (int i = 0; i < num_arms; ++i) {
+        eff_pulls[i] = pulls[i];
+        eff_mean[i]  = mean[i];
+        eff_m2[i]    = m2[i];
+        if (!have_prior) continue;
+        if (pulls[i] >= min_pulls || prior_pulls[i] == 0) continue;
+        // Cap prior contribution.
+        uint32_t cap = (min_pulls > pulls[i]) ? (min_pulls - pulls[i]) : 0;
+        uint32_t p_n = prior_pulls[i] < cap ? prior_pulls[i] : cap;
+        if (p_n == 0) continue;
+        // Welford parallel combine (Chan/Golub/LeVeque): two streams with
+        // (n_a, μ_a, M2_a) and (n_b, μ_b, M2_b) merge to
+        //   n   = n_a + n_b
+        //   δ   = μ_b - μ_a
+        //   μ   = μ_a + δ · n_b / n
+        //   M2  = M2_a + M2_b + δ² · n_a · n_b / n
+        // Treat the bucket as stream A and the (capped) prior as stream B.
+        double n_a = static_cast<double>(pulls[i]);
+        double n_b = static_cast<double>(p_n);
+        // Scale prior's M2 down by the cap ratio so we keep its variance
+        // estimate proportional to the truncated pull count.
+        double scale = (prior_pulls[i] > 0)
+            ? n_b / static_cast<double>(prior_pulls[i]) : 0.0;
+        double m2_b  = prior_m2[i] * scale;
+        double total_n = n_a + n_b;
+        double delta   = prior_mean[i] - mean[i];
+        eff_pulls[i] = pulls[i] + p_n;
+        eff_mean[i]  = mean[i] + delta * n_b / total_n;
+        eff_m2[i]    = m2[i] + m2_b + delta * delta * n_a * n_b / total_n;
+    }
+
+    // Step 1: force-pull any under-explored eligible arm (uses raw bucket
+    // pull count, not effective — the prior is for *score*, not for
+    // skipping the explore phase).
+    int forced = -1;
+    uint32_t forced_pulls = min_pulls;
+    for (int i = 0; i < num_arms; ++i) {
+        if (!eligible[i]) continue;
+        if (pulls[i] < forced_pulls) {
+            forced = i;
+            forced_pulls = pulls[i];
+        }
+    }
+    if (forced >= 0) return forced;
+
+    // Step 2: total effective pulls across eligible arms (n in the UCB formula).
+    uint64_t total = 0;
+    for (int i = 0; i < num_arms; ++i)
+        if (eligible[i]) total += eff_pulls[i];
+    if (total == 0) {
+        for (int i = 0; i < num_arms; ++i)
+            if (eligible[i]) return i;
+        return -1;
+    }
+
+    double ln_n = std::log(static_cast<double>(total));
+    int best = -1;
+    double best_score = -1.0;
+    for (int i = 0; i < num_arms; ++i) {
+        if (!eligible[i] || eff_pulls[i] == 0) continue;
+        double n_i = static_cast<double>(eff_pulls[i]);
+        // Sample variance (Bessel-corrected when n>1, else 0).
+        double var = (eff_pulls[i] > 1) ? eff_m2[i] / (n_i - 1.0) : 0.0;
+
+        double bonus;
+        if (variant == UcbVariant::UCB_V) {
+            // UCB-V: 2 · s² · ln(n) / n_i  +  3 · b · ln(n) / n_i, b=1.
+            bonus = std::sqrt(2.0 * var * ln_n / n_i) +
+                    3.0 * ln_n / n_i;
+        } else {
+            // UCB1-Tuned default.
+            double v_i = var + std::sqrt(2.0 * ln_n / n_i);
+            if (v_i > 0.25) v_i = 0.25;
+            bonus = std::sqrt((ln_n / n_i) * v_i);
+        }
+        double score = eff_mean[i] + bonus;
+        if (score > best_score) {
+            best_score = score;
+            best = i;
+        }
+    }
+    return best;
+}
+
+// Compute a UCB reward in [0,1] from observed compression outcome.
+// reward = clamp(bytes_saved / compress_us, 0, kUcbRewardMaxBytesPerUs)
+//        / kUcbRewardMaxBytesPerUs
+// A page that fails to compress (or compresses larger) yields reward 0;
+// a maximally efficient page (huge savings, tiny CPU) saturates at 1.
+inline double ucbReward(size_t comp_size, size_t orig_size,
+                        uint32_t comp_us) {
+    if (comp_us == 0 || orig_size == 0 || comp_size >= orig_size) return 0.0;
+    double saved = static_cast<double>(orig_size - comp_size);
+    double bps = saved / static_cast<double>(comp_us);
+    if (bps <= 0.0) return 0.0;
+    if (bps >= kUcbRewardMaxBytesPerUs) return 1.0;
+    return bps / kUcbRewardMaxBytesPerUs;
 }
 
 // Back-compat wrapper: return just the algorithm.  When the winning

@@ -426,6 +426,8 @@ public:
     }
     void resetForFork() {
         if (!compression_inited_) return;
+        // Reset decommit thread first (it doesn't exist in child after fork)
+        vm_region_.resetDecommitThreadForFork();
         compressor_.resetForFork();
         compression_started_.store(false, std::memory_order_release);
         startCompression();
@@ -659,8 +661,11 @@ public:
             span = page_map_.get(addr);
         }
         if (!span) {
-            // Not a Smash-managed pointer. In large-only mode, small
-            // allocations were forwarded to system malloc.
+            // Not a Smash-managed pointer. In large-only mode, forward to
+            // system malloc (which handled small allocations).
+            // In full mode, don't forward - the pointer might be from an
+            // embedded allocator (e.g., Python 3.13's mimalloc) that we
+            // shouldn't interfere with.
             if (isLargeOnlyMode() && g_system_alloc.free)
                 g_system_alloc.free(ptr);
             return;

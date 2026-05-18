@@ -142,6 +142,76 @@ Filter rules: `mmap` is tracked only with `MAP_ANON | PROT_WRITE` (file-backed a
 
 This is **opt-in** because the registration path has not yet been validated for stability on Firefox-class workloads — see `smash-benchmarks/FIREFOX_STUDY.md` for context.
 
+### Runtime configuration (environment variables)
+
+All runtime behavior is controlled via `SMASH_*` environment variables read once at process start. Tuning constants live in `include/smash/config.h` (see "Configuration" below); env vars are how you override them without rebuilding.
+
+**Modes** — pick at most one, otherwise full mode:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMASH_MODE=compress_only` | unset | Track and compress pages without replacing malloc — for apps with their own allocator (jemalloc, tcmalloc, …). |
+| `SMASH_LARGE_ONLY=1` | unset | Pass small allocations (≤ 16 KB) to system malloc; only large allocations go through smash. Use with language runtimes that ship optimized small-object allocators (Python 3.13+ mimalloc, …). |
+| `SMASH_LARGE_ONLY_THRESHOLD=N` | 16384 | Override the small/large cutoff (bytes) when `SMASH_LARGE_ONLY=1`. |
+| `SMASH_TRACK_EXTERNAL=1` | unset | Register application-direct `mmap` / `mach_vm_allocate` results so the compressor sees them. Opt-in; see the External-Mapping section above. |
+
+**Compression decision** (ROI model):
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMASH_COLD_TIMEOUT_SEC=N` | 2 | Minimum cold-time floor (seconds) before fast-tier compression considered. CPU-pressure adaptive cap raises this on busy systems. |
+| `SMASH_COLD_TICKS=N` | 2 | Override the fast-tier cold-tick threshold directly (alternative to `SMASH_COLD_TIMEOUT_SEC`). |
+| `SMASH_VERY_COLD_TICKS=N` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile. `9999` disables the deep tier entirely (fast tier only). |
+| `SMASH_ROI_THRESHOLD=N` | 1024 | Bytes-saved-per-microsecond cutoff for the ROI model. |
+| `SMASH_MIN_COMPRESS_RATIO=F` | 0.75 | Reject compressed page unless `comp_size < F × original_size`. |
+| `SMASH_RECOMPRESS_BACKOFF=0` | 1 (active) | Disable per-bucket recompression-thrash back-off (ablation switch); phase 2 then ignores `recompress_count_` and bucket EMAs. |
+
+**Tier-selection bandit (opt-in, experimental):**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMASH_UCB=1` | unset | Replace the calibrated ROI model with a UCB1-Tuned bandit that picks fast vs deep tier per `(arena, size class)` from observed bytes-saved/µs. Default off — the in-process benches don't show enough per-bucket heterogeneity to differentiate it from ROI. |
+| `SMASH_UCB_VARIANT=N` | 0 | UCB variant selector (see `compression_roi.h`). |
+| `SMASH_UCB_MIN_PULLS=N` | 4 | Force-pulls per arm before the UCB formula kicks in. |
+| `SMASH_UCB_WARMSTART=1` | 0 | Seed UCB priors from the calibrated ROI estimates instead of cold-starting. |
+| `SMASH_UCB_FORCE_DEEP_EVERY=N` | 0 | Periodically force a deep-tier sample for exploration even when fast-tier dominates. |
+
+**Calibration** — startup compression-throughput benchmarks that feed the ROI model:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMASH_CALIBRATE=always\|never` | auto | Force or skip startup calibration. |
+| `SMASH_CALIBRATION_FILE=path` | unset | Cache calibration results to disk and reload on subsequent runs (much faster startup). |
+| `SMASH_FAST_COMP_MBS_HI/LO` | calibrated | Override fast-tier compression-rate estimate (MB/s) for high/low-compressibility pages. |
+| `SMASH_FAST_DECOMP_MBS_HI/LO` | calibrated | Override fast-tier decompression-rate estimate. |
+| `SMASH_DEEP_COMP_MBS_HI/LO` | calibrated | Override deep-tier (zstd-9) compression-rate estimate. |
+| `SMASH_DEEP_DECOMP_MBS_HI/LO` | calibrated | Override deep-tier decompression-rate estimate. |
+
+**Compressor thread / startup behavior:**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMASH_DEFER_PHASES_MS=N` | 0 | Skip Phase 2 (compress) + Phase 3 (monitor) for the first N ms after start. Useful for workloads that establish IPC channels at startup with buffers in smash-managed pages (Firefox sweet spot is 30000). |
+| `SMASH_NO_MONITOR=1` | unset | Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection. |
+| `SMASH_CPU_PRESSURE_CAP=0` | active | Disable the CPU-pressure cap on adaptive worker count. Default (active) caps `N = ⌈λ/μ⌉` so smash doesn't compete with a saturated app for cores. |
+| `SMASH_EAGER_ZERO=1` | unset | Memset newly-allocated buffers to zero on the malloc fast path instead of relying on the compressor thread's deferred zero-on-free pass. Trades throughput for correctness with callers that assume malloc returns zeroed memory (technically UB, but widely relied on). |
+
+**Diagnostics / observability:**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMASH_BANNER=1` | unset | Print a one-line banner at library-load time confirming `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` actually loaded libsmash. Useful for multi-process apps. |
+| `SMASH_STATS=1` | unset | Emit a stats line on every normal process exit (atexit). Inherited across `fork()`, so each child of a multi-process app prints its own line. `_exit()` and `SIGKILL` skip atexit by design. |
+| `SMASH_DEBUG=1` | unset | Emit a stats line every Nth tick during the run. Distinct from `SMASH_STATS` (atexit-only) — for watching live activity without chasing PIDs and `SIGUSR2`. |
+| `SIGUSR1` / `SIGUSR2` | — | (Not env vars; sending these signals to a smash-loaded process prints stats on demand.) |
+
+**macOS-specific:**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMASH_USE_MACH_EXCEPTIONS=1` | unset | Install task-level Mach exception ports for `EXC_BAD_ACCESS` with a dedicated handler thread. Lets smash intercept protection faults before they're converted to signals — required for Objective-C runtimes that swallow `SIGSEGV`. |
+| `SMASH_MACH_TRACE=1` | unset | One-line stderr trace per Mach exception (only meaningful with `SMASH_USE_MACH_EXCEPTIONS=1`). |
+
 ### Optional API
 
 Applications can provide hints for better compression behavior:
@@ -284,8 +354,8 @@ Key tuning constants in `include/smash/config.h`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `kCompressIntervalMs` | 1000 | Compression scan interval (ms) |
-| `kColdTicks` | 2 | Ticks without access before fast-tier compression considered |
-| `kVeryColdTicks` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile in the ROI model |
+| `kColdTicksDefault` | 10 | Ticks without access before fast-tier compression considered (override via `SMASH_COLD_TIMEOUT_SEC` or `SMASH_COLD_TICKS`) |
+| `kVeryColdTicks` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile in the ROI model (override via `SMASH_VERY_COLD_TICKS`) |
 | `kMinCompressRatio` | 0.75 | Only keep compressed if < 75% of original |
 | `kPrefetchWindow` | 2 | Pages prefetched in each direction on fault |
 | `kDictTrainSamples` | 0 | Pages before dictionary training (disabled by default) |

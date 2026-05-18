@@ -403,6 +403,32 @@ inline size_t largeOnlyThreshold() {
     return v;
 }
 
+// ── Deferred-reclaim mode ───────────────────────────────────────────────────
+// Set SMASH_DEFERRED_RECLAIM=1 to split compression into two phases:
+//   Phase A: compress a copy, keep page accessible (PROT_RW) → COMPRESSED_SHADOW
+//   Phase B: after N ticks of confirmed idleness, reclaim physical memory → COMPRESSED
+// This makes Smash compatible with systems that have uncoordinated background
+// threads (e.g. WiredTiger's eviction threads) that would crash on PROT_NONE.
+[[gnu::always_inline, gnu::hot]]
+inline bool isDeferredReclaimMode() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* env = getenv("SMASH_DEFERRED_RECLAIM");
+        v = (env && env[0] == '1') ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+
+inline int getDeferredReclaimDelay() {
+    static int ticks = []{
+        const char* env = getenv("SMASH_DEFERRED_RECLAIM_DELAY");
+        return (env && atoi(env) > 0) ? atoi(env) : 2;
+    }();
+    return ticks;
+}
+
 // ── Eager-zero mode ─────────────────────────────────────────────────────────
 // Set SMASH_EAGER_ZERO=1 to memset newly-allocated buffers to zero on the
 // malloc fast path, instead of relying on the compressor thread's deferred

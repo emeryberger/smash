@@ -44,7 +44,9 @@
 #include <signal.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <unistd.h>
+#include <malloc.h>
 
 // Recursion guard: if dlsym triggers one of our wrappers, skip the
 // dlsym attempt and let the wrapper fall through to raw syscall().
@@ -1175,5 +1177,109 @@ __asm__(".symver preadv_210,preadv@GLIBC_2.10");
 __asm__(".symver pwritev_210,pwritev@GLIBC_2.10");
 __asm__(".symver preadv2_226,preadv2@GLIBC_2.26");
 __asm__(".symver pwritev2_226,pwritev2@GLIBC_2.26");
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TBB scalable_allocator interposition
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Intel TBB (Thread Building Blocks) uses its own memory allocator that bypasses
+// malloc and allocates 64MB arenas directly via mmap. By interposing TBB's
+// scalable_malloc family, we redirect those allocations through smash's malloc,
+// making them eligible for compression.
+//
+// This is critical for walrus (neuronx-cc backend) which uses TBB and can have
+// 15-20GB of TBB-managed memory that would otherwise escape compression.
+//
+// Note: These symbols are weak to allow linking even when TBB is not present.
+// When TBB IS present and linked dynamically, LD_PRELOAD ensures our wrappers
+// take precedence.
+
+extern "C" {
+
+// Core allocation functions
+SMASH_VISIBLE void* scalable_malloc(size_t size) {
+    return malloc(size);
+}
+
+SMASH_VISIBLE void scalable_free(void* ptr) {
+    free(ptr);
+}
+
+SMASH_VISIBLE void* scalable_realloc(void* ptr, size_t size) {
+    return realloc(ptr, size);
+}
+
+SMASH_VISIBLE void* scalable_calloc(size_t nobj, size_t size) {
+    return calloc(nobj, size);
+}
+
+// Aligned allocation functions
+SMASH_VISIBLE int scalable_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    return posix_memalign(memptr, alignment, size);
+}
+
+SMASH_VISIBLE void* scalable_aligned_malloc(size_t size, size_t alignment) {
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+        return nullptr;
+    }
+    return ptr;
+}
+
+SMASH_VISIBLE void scalable_aligned_free(void* ptr) {
+    free(ptr);
+}
+
+SMASH_VISIBLE void* scalable_aligned_realloc(void* ptr, size_t size, size_t alignment) {
+    // TBB's aligned_realloc: allocate new, copy, free old
+    if (!ptr) {
+        return scalable_aligned_malloc(size, alignment);
+    }
+    if (size == 0) {
+        free(ptr);
+        return nullptr;
+    }
+    void* new_ptr = nullptr;
+    if (posix_memalign(&new_ptr, alignment, size) != 0) {
+        return nullptr;
+    }
+    // We don't know the old size, so we copy `size` bytes (safe if growing)
+    // For shrinking, this may read past end but won't write past new allocation
+    size_t old_size = malloc_usable_size(ptr);
+    size_t copy_size = (old_size < size) ? old_size : size;
+    memcpy(new_ptr, ptr, copy_size);
+    free(ptr);
+    return new_ptr;
+}
+
+// Size query
+SMASH_VISIBLE size_t scalable_msize(void* ptr) {
+    if (!ptr) return 0;
+    return malloc_usable_size(ptr);
+}
+
+// TBB memory pool allocation (route to regular malloc)
+// These are used by TBB's memory_pool<scalable_allocator>
+SMASH_VISIBLE void* pool_malloc(void* /*pool*/, size_t size) {
+    return malloc(size);
+}
+
+SMASH_VISIBLE void pool_free(void* /*pool*/, void* ptr) {
+    free(ptr);
+}
+
+SMASH_VISIBLE void* pool_realloc(void* /*pool*/, void* ptr, size_t size) {
+    return realloc(ptr, size);
+}
+
+SMASH_VISIBLE void* pool_aligned_malloc(void* /*pool*/, size_t size, size_t alignment) {
+    return scalable_aligned_malloc(size, alignment);
+}
+
+SMASH_VISIBLE void pool_aligned_free(void* /*pool*/, void* ptr) {
+    free(ptr);
+}
+
+} // extern "C"
 
 #endif // __linux__

@@ -163,6 +163,31 @@
     getrusage;
     prlimit64;
 
+    # TBB scalable_allocator interposition
+    # Allows Smash to manage TBB's memory allocations by intercepting its
+    # internal allocator calls (TBB uses these for its 64MB per-thread arenas)
+    scalable_malloc;
+    scalable_free;
+    scalable_realloc;
+    scalable_calloc;
+    scalable_posix_memalign;
+    scalable_aligned_malloc;
+    scalable_aligned_free;
+    scalable_aligned_realloc;
+    scalable_msize;
+
+    # TBB memory pool functions
+    pool_malloc;
+    pool_free;
+    pool_realloc;
+    pool_aligned_malloc;
+    pool_aligned_realloc;
+    pool_identify;
+    pool_msize;
+    pool_create_v1;
+    pool_destroy;
+    pool_reset;
+
   local:
     *;
 };

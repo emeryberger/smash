@@ -895,9 +895,11 @@ private:
         void* page_addr = vm_->pageAddress(page_idx);
 
         if (deferred) {
-            // Deferred mode: page stays PROT_RW. No protection changes.
-            // Possible torn read if page is written concurrently — Phase B
-            // detects this via content comparison and discards stale blobs.
+            // Deferred mode: ensure page is PROT_RW (may have been PROT_READ
+            // from Phase 3 monitoring). Restore before copy so background
+            // threads can't fault on this page while it's in SHADOW state.
+            if (st == PageState::ACTIVE_MONITORING)
+                vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
             __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
 #ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
             zeroFreeSlots(worker.page_buf, page_idx);

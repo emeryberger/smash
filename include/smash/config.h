@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 namespace smash {
 
@@ -20,11 +21,72 @@ inline constexpr int kNumClasses = 36;
 inline constexpr size_t kMinAlignment = 16;
 
 // ── Arenas ───────────────────────────────────────────────────────────────────
-#ifndef SMASH_NUM_ARENAS
-inline constexpr int kNumArenas = 4;  // must be power of 2
+// kMaxArenas is the compile-time upper bound for arena arrays.
+// Runtime arena count is determined by getNumArenas() based on CPU count.
+#ifndef SMASH_MAX_ARENAS
+inline constexpr int kMaxArenas = 128;  // max supported arenas (must be power of 2)
 #else
-inline constexpr int kNumArenas = SMASH_NUM_ARENAS;
+inline constexpr int kMaxArenas = SMASH_MAX_ARENAS;
 #endif
+
+// For backward compatibility, kNumArenas is now an alias for getNumArenas()
+// in most places. Code that needs the compile-time max should use kMaxArenas.
+#ifndef SMASH_NUM_ARENAS
+inline constexpr int kNumArenasDefault = 4;  // fallback if CPU detection fails
+#else
+inline constexpr int kNumArenasDefault = SMASH_NUM_ARENAS;
+#endif
+
+// Dynamic arena count based on CPU count using balls-to-bins analysis.
+// With n threads and m arenas, max load per arena ~ n/m + sqrt(2n*ln(m)/m).
+// For good load balancing, we want m ~ sqrt(n) * c where c ~ 2-4.
+// We use m = max(4, min(kMaxArenas, roundUpPow2(sqrt(ncpu) * 4))).
+[[gnu::always_inline]]
+inline int getNumArenas() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        // Check for explicit override first
+        const char* env = getenv("SMASH_NUM_ARENAS");
+        if (env && *env) {
+            int parsed = atoi(env);
+            if (parsed > 0 && parsed <= kMaxArenas) {
+                // Round up to power of 2
+                int p = 1;
+                while (p < parsed) p <<= 1;
+                v = (p <= kMaxArenas) ? p : kMaxArenas;
+                cached.store(v, std::memory_order_relaxed);
+                return v;
+            }
+        }
+        // Auto-scale based on CPU count
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu <= 0) ncpu = 4;
+        // m = sqrt(ncpu) * 4, rounded up to power of 2, clamped to [4, kMaxArenas]
+        // For ncpu=4: m=8, ncpu=16: m=16, ncpu=64: m=32, ncpu=192: m=64
+        double target = 4.0;
+        if (ncpu > 4) {
+            // Use sqrt(ncpu) * 4 for larger CPU counts
+            double sqrtn = 1.0;
+            for (int i = 0; i < 20 && sqrtn * sqrtn < ncpu; ++i) sqrtn += 0.5;
+            target = sqrtn * 4.0;
+        }
+        int m = 4;
+        while (m < target && m < kMaxArenas) m <<= 1;
+        v = m;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+
+// Arena mask for fast modulo (arenas must be power of 2)
+[[gnu::always_inline]]
+inline int getArenaMask() {
+    return getNumArenas() - 1;
+}
+
+// Legacy alias - compile-time arrays still need a constexpr size
+inline constexpr int kNumArenas = kMaxArenas;
 
 // ── Reference-behavior homogeneity knobs (Apr 2026 design memo) ─────────────
 //
@@ -45,7 +107,14 @@ inline constexpr uint32_t kColdArenaThreshold = 8;
 #else
 inline constexpr uint32_t kColdArenaThreshold = SMASH_COLD_ARENA_THRESHOLD;
 #endif
-inline constexpr int kTotalArenas = kColdArenaFeedback ? (kNumArenas * 2) : kNumArenas;
+// Compile-time max for array sizing (uses kMaxArenas, not runtime count)
+inline constexpr int kTotalArenas = kColdArenaFeedback ? (kMaxArenas * 2) : kMaxArenas;
+
+// Runtime total arena count (hot + cold if feedback enabled)
+[[gnu::always_inline]]
+inline int getTotalArenas() {
+    return kColdArenaFeedback ? (getNumArenas() * 2) : getNumArenas();
+}
 
 // C1: Per-page absolute cap on live objects.  The (1-q)^N argument for
 // page-cold probability bounds N (objects per page), not the fraction of

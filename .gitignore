@@ -1,2 +1,4 @@
 *.pem
 .claude/settings.local.json
+THOMPSON_SAMPLING.md
+tmp/

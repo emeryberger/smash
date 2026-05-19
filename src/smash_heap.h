@@ -176,6 +176,11 @@ class SmashHeap {
     std::atomic<uint32_t> decompress_count_[kNumArenas * kNumClasses]{};
     std::atomic<uint32_t> adaptive_cap_[kNumArenas * kNumClasses]{};
 
+    // Power-of-two-choices load counters. Per (arena, size_class) allocation
+    // count used to pick the less contended arena. Approximate - wrapping and
+    // relaxed atomics are fine since we only need relative comparison.
+    std::atomic<uint32_t> arena_alloc_count_[kNumArenas * kNumClasses]{};
+
     // Cohort measurement arrays (kMeasureCohorts only).  Per-page tracking
     // of first allocating thread ID and RA hash; a "mixed" flag per axis
     // flips when a second distinct value is seen.  Bootstrap-allocated once
@@ -219,13 +224,33 @@ class SmashHeap {
             h ^= static_cast<uintptr_t>(tid) * 0x9E3779B97F4A7C15ULL;
         }
         h ^= h >> 16;
-        uint8_t base = static_cast<uint8_t>(h & (kNumArenas - 1));
+
+        // Power of two choices: hash to two candidate arenas and pick the
+        // less contended one. This reduces max load from O(log n / log log n)
+        // to O(log log n) with n threads.
+        const int mask = getArenaMask();
+        uint8_t arena1 = static_cast<uint8_t>(h & mask);
+        uint8_t arena2 = static_cast<uint8_t>((h >> 8) & mask);
+        if (arena1 == arena2) {
+            arena2 = static_cast<uint8_t>((arena1 + 1) & mask);
+        }
+        // Pick arena with lower contention. Use per-arena allocation counter
+        // (relaxed load - approximate is fine for load balancing).
+        uint32_t load1 = arena_alloc_count_[arena1 * kNumClasses + sc]
+                             .load(std::memory_order_relaxed);
+        uint32_t load2 = arena_alloc_count_[arena2 * kNumClasses + sc]
+                             .load(std::memory_order_relaxed);
+        uint8_t base = (load1 <= load2) ? arena1 : arena2;
+
+        // Bump allocation counter for load balancing (wrapping is fine)
+        arena_alloc_count_[base * kNumClasses + sc]
+            .fetch_add(1, std::memory_order_relaxed);
 #endif
         if constexpr (kColdArenaFeedback) {
             // If compressor has flagged this (arena, sc) as cold-biased,
             // route to the cold sub-arena.
             if (cold_bias_[base * kNumClasses + sc].load(std::memory_order_relaxed))
-                return static_cast<uint8_t>(base + kNumArenas);
+                return static_cast<uint8_t>(base + getNumArenas());
         }
         return base;
     }
@@ -238,7 +263,7 @@ public:
     void onPageCompressed(uint8_t arena_id, uint8_t sc) {
         if constexpr (!kColdArenaFeedback && !kAdaptiveCap) return;
         if (sc >= kNumClasses) return;
-        uint8_t base = arena_id & (kNumArenas - 1);   // strip cold half
+        uint8_t base = arena_id & getArenaMask();   // strip cold half
         size_t idx = base * kNumClasses + sc;
         if constexpr (kColdArenaFeedback) {
             uint32_t prev = compress_count_[idx].fetch_add(1, std::memory_order_relaxed);
@@ -267,7 +292,7 @@ public:
     void onPageDecompressed(uint8_t arena_id, uint8_t sc) {
         if constexpr (!kAdaptiveCap) return;
         if (sc >= kNumClasses) return;
-        uint8_t base = arena_id & (kNumArenas - 1);
+        uint8_t base = arena_id & getArenaMask();
         size_t idx = base * kNumClasses + sc;
         decompress_count_[idx].fetch_add(1, std::memory_order_relaxed);
         recomputeAdaptiveCap(idx);
@@ -344,7 +369,7 @@ public:
     static uint32_t adaptiveCapQuery(void* ctx, uint8_t arena, uint8_t sc) {
         auto* self = static_cast<SmashHeap*>(ctx);
         if (sc >= kNumClasses) return 0;
-        uint8_t base = arena & (kNumArenas - 1);
+        uint8_t base = arena & getArenaMask();
         uint32_t raw = self->adaptive_cap_[base * kNumClasses + sc]
                            .load(std::memory_order_relaxed);
         if (raw == 0) return 0;
@@ -491,16 +516,18 @@ public:
             }
 
             if (!compress_only) {
-                for (int a = 0; a < kTotalArenas; ++a) {
-                    // Hot sub-arenas (a < kNumArenas): no per-page cap.
-                    // Cold sub-arenas (a >= kNumArenas, only when A3 on):
+                const int num_arenas = getNumArenas();
+                const int total_arenas = getTotalArenas();
+                for (int a = 0; a < total_arenas; ++a) {
+                    // Hot sub-arenas (a < num_arenas): no per-page cap.
+                    // Cold sub-arenas (a >= num_arenas, only when A3 on):
                     // apply kMaxSlotsPerPage to produce sparse pages.
                     // If A3 is off but kMaxSlotsPerPage > 0, the cap
                     // applies globally (ablation mode — measure C1 in
                     // isolation without the feedback loop).
                     uint32_t cap = 0;
                     if constexpr (kColdArenaFeedback) {
-                        if (a >= kNumArenas) cap = kMaxSlotsPerPage;
+                        if (a >= num_arenas) cap = kMaxSlotsPerPage;
                     } else {
                         cap = kMaxSlotsPerPage;
                     }
@@ -532,10 +559,12 @@ public:
         } else if (!compress_only) {
             // Fallback: Phase 1 mode (no compression).  No feedback loop
             // possible here, so still respect kUnderfillDenom for ablation.
-            for (int a = 0; a < kTotalArenas; ++a) {
+            const int num_arenas = getNumArenas();
+            const int total_arenas = getTotalArenas();
+            for (int a = 0; a < total_arenas; ++a) {
                 uint32_t cap = 0;
                 if constexpr (kColdArenaFeedback) {
-                    if (a >= kNumArenas) cap = kMaxSlotsPerPage;
+                    if (a >= num_arenas) cap = kMaxSlotsPerPage;
                 } else {
                     cap = kMaxSlotsPerPage;
                 }
@@ -767,13 +796,15 @@ public:
 
     void lock() {
         if (isCompressOnlyMode()) return;
-        for (int i = 0; i < kTotalArenas * kNumClasses; ++i) slabs_[i].lockSlab();
+        const int total = getTotalArenas() * kNumClasses;
+        for (int i = 0; i < total; ++i) slabs_[i].lockSlab();
         large_alloc_.lockAlloc();
     }
     void unlock() {
         if (isCompressOnlyMode()) return;
         large_alloc_.unlockAlloc();
-        for (int i = kTotalArenas * kNumClasses - 1; i >= 0; --i) slabs_[i].unlockSlab();
+        const int total = getTotalArenas() * kNumClasses;
+        for (int i = total - 1; i >= 0; --i) slabs_[i].unlockSlab();
     }
     void threadInit() {
         if (!isCompressOnlyMode()) {

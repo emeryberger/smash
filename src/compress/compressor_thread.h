@@ -107,6 +107,11 @@ class CompressorThread {
     // Saturating uint8_t — the bucket EMA captures values above ~6 anyway.
     uint8_t* recompress_count_ = nullptr;
 
+    // Deferred-reclaim mode: tick at which Phase A completed for each page.
+    // Non-zero only for pages in COMPRESSED_SHADOW state.
+    uint32_t* shadow_tick_ = nullptr;
+    uint32_t tick_counter_ = 0;
+
     // Per-(arena, size_class) recompression-rate signal. Single shared
     // table (not per-worker) so the fault handler can update it without
     // first finding the right worker. Relaxed atomics; tearing on the EMA
@@ -762,7 +767,13 @@ private:
     // ── Compress one page using worker's contexts ─────────────────────────
 
     bool compressPage(size_t page_idx, CompressWorker& worker) {
-        locks_->lock(page_idx);
+        const bool deferred = isDeferredReclaimMode();
+
+        if (deferred) {
+            if (!locks_->tryLock(page_idx)) return false;
+        } else {
+            locks_->lock(page_idx);
+        }
 
         // Verify still eligible
         PageState st = states_->get(page_idx);
@@ -881,35 +892,32 @@ private:
             algo = CompressAlgo::ZSTD_DICT;
         }
 
-        // Make page read-only to get a consistent snapshot
         void* page_addr = vm_->pageAddress(page_idx);
-        vm::protectPages(page_addr, kPageSize, true, false);  // PROT_READ
 
-        // Copy page data into worker's scratch buffer
-        __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
-
-        // Zero freed slots in scratch buffer before compression
+        if (deferred) {
+            // Deferred mode: ensure page is PROT_RW (may have been PROT_READ
+            // from Phase 3 monitoring). Restore before copy so background
+            // threads can't fault on this page while it's in SHADOW state.
+            if (st == PageState::ACTIVE_MONITORING)
+                vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
+            __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
 #ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
-        zeroFreeSlots(worker.page_buf, page_idx);
+            zeroFreeSlots(worker.page_buf, page_idx);
 #endif
+        } else {
+            // Standard mode: mprotect for consistent snapshot + physical reclaim
+            vm::protectPages(page_addr, kPageSize, true, false);  // PROT_READ
+            __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+#ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
+            zeroFreeSlots(worker.page_buf, page_idx);
+#endif
+            vm::decommitPages(page_addr, kPageSize);
+            vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
 
-        // Release physical backing while page is still accessible.
-        // On macOS, MADV_FREE_REUSABLE requires pages to be readable;
-        // on Linux, MADV_DONTNEED works regardless of protection.
-        vm::decommitPages(page_addr, kPageSize);
-
-        // Make page inaccessible
-        vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
-
-        // Check if we were preempted by a fault
-        // TLA+ model proves this is unreachable: compressor holds the lock
-        // during COMPRESSING, so no other thread can change the state.
-        if (states_->get(page_idx) != PageState::COMPRESSING) {
-            // Verified unreachable via TLA+ model checking and
-            // 576 benchmark runs with __builtin_trap() (zero crashes).
-            // Retained as defensive fallback.
-            locks_->unlock(page_idx);
-            return false;
+            if (states_->get(page_idx) != PageState::COMPRESSING) {
+                locks_->unlock(page_idx);
+                return false;
+            }
         }
 
         // Collect sample for dictionary training (page data in worker's buf)
@@ -992,17 +1000,16 @@ private:
                     comp_size ? comp_size : kPageSize, kPageSize);
                 int tier = is_fast_tier ? 0 : 1;
                 worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
-                // UCB reward: attribute zero reward to the *originally chosen*
-                // arm (its decision led here even after the fast→deep
-                // fallback path).  Failed-to-compress = zero bytes saved.
                 if (cfg.use_ucb && chosen_tier >= 0) {
                     worker.sc_stats[stats_idx].recordReward(chosen_tier, 0.0);
                     if (cfg.ucb_warmstart && arena_id < kNumArenas)
                         worker.arena_arm[arena_id].recordReward(chosen_tier, 0.0);
                 }
             }
-            vm::protectPages(page_addr, kPageSize, true, true);
-            __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+            if (!deferred) {
+                vm::protectPages(page_addr, kPageSize, true, true);
+                __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+            }
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             return false;
@@ -1012,8 +1019,10 @@ private:
         size_t alloc_size = 0;
         void* stored = store_->store(worker.compress_buf, comp_size, &alloc_size, page_idx);
         if (!stored) {
-            vm::protectPages(page_addr, kPageSize, true, true);
-            __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+            if (!deferred) {
+                vm::protectPages(page_addr, kPageSize, true, true);
+                __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+            }
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             return false;
@@ -1044,7 +1053,12 @@ private:
             page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
         }
 
-        states_->set(page_idx, PageState::COMPRESSED);
+        if (deferred) {
+            shadow_tick_[page_idx] = tick_counter_;
+            states_->set(page_idx, PageState::COMPRESSED_SHADOW);
+        } else {
+            states_->set(page_idx, PageState::COMPRESSED);
+        }
         locks_->unlock(page_idx);
 
         // A3 feedback: notify heap that a page from (span->arena_id, sc)
@@ -1354,11 +1368,90 @@ private:
         if (phase == 1) phase1Range(w.range_start, w.range_end);
         else if (phase == 2) phase2Range(worker_id, w.range_start, w.range_end);
         else if (phase == 3) phase3Range(w.range_start, w.range_end);
+        else if (phase == 4) reclaimShadowRange(w.range_start, w.range_end);
+    }
+
+    // ── Phase B: reclaim shadow pages ────────────────────────────────────
+    // For pages in COMPRESSED_SHADOW, verify content hasn't changed since
+    // Phase A, then reclaim physical memory (decommit + PROT_NONE).
+
+    void reclaimShadowRange(size_t start, size_t end) {
+        if (!shadow_tick_) return;
+        const int delay = getDeferredReclaimDelay();
+        const size_t num_chunks_range = (end - start + kChunkSize - 1) / kChunkSize;
+        size_t chunk_base = start / kChunkSize;
+
+        for (size_t c = 0; c < num_chunks_range; ++c) {
+            size_t ci = chunk_base + c;
+            if (ci >= num_chunks_) break;
+            uint64_t mask = live_chunks_[ci];
+            if (!mask) continue;
+            size_t page_base = ci * kChunkSize;
+
+            while (mask) {
+                int bit = __builtin_ctzll(mask);
+                mask &= mask - 1;
+                size_t i = page_base + bit;
+                if (i >= end) break;
+
+                if (states_->get(i) != PageState::COMPRESSED_SHADOW) continue;
+                uint32_t age = tick_counter_ - shadow_tick_[i];
+                if (age < static_cast<uint32_t>(delay)) continue;
+
+                if (!locks_->tryLock(i)) continue;
+                if (states_->get(i) != PageState::COMPRESSED_SHADOW) {
+                    locks_->unlock(i);
+                    continue;
+                }
+
+                // Verify page content matches the compressed blob.
+                // Decompress into a fault slot buffer and memcmp against live page.
+                void* page_addr = vm_->pageAddress(i);
+                int slot = acquireFaultSlot();
+                if (slot < 0) {
+                    locks_->unlock(i);
+                    continue;
+                }
+
+                CompressAlgo algo = compressed_[i].algorithm();
+                uint8_t sc = lookupSizeClass(i);
+                engine_->decompressWithDCtx(
+                    fault_slots_[slot].dctx,
+                    compressed_[i].data, fault_slots_[slot].buf,
+                    compressed_[i].compressedSize(), kPageSize,
+                    algo, sc);
+
+                bool content_matches =
+                    __builtin_memcmp(page_addr, fault_slots_[slot].buf, kPageSize) == 0;
+                releaseFaultSlot(slot);
+
+                if (!content_matches) {
+                    // Page was modified since Phase A — discard stale blob
+                    store_->release(compressed_[i].data,
+                                    compressed_[i].alloc_size, i);
+                    compressed_[i] = {};
+                    shadow_tick_[i] = 0;
+                    if (page_tier_) page_tier_[i] = kTierNone;
+                    cold_count_[i] = 0;
+                    states_->set(i, PageState::ACTIVE);
+                    locks_->unlock(i);
+                    continue;
+                }
+
+                // Content matches — safe to reclaim physical memory
+                vm::decommitPages(page_addr, kPageSize);
+                vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
+                shadow_tick_[i] = 0;
+                states_->set(i, PageState::COMPRESSED);
+                locks_->unlock(i);
+            }
+        }
     }
 
     // ── Tick ──────────────────────────────────────────────────────────────
 
     void tick() {
+        ++tick_counter_;
         if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
         // SMASH_DEFER_PHASES_MS=NNN: skip Phase 2 (compress) and Phase 3
@@ -1440,6 +1533,9 @@ private:
         }
 
         dispatch(1);  // Phase 1: access tracking
+
+        if (!defer_phases && isDeferredReclaimMode())
+            dispatch(4);  // Phase B: reclaim confirmed-cold shadow pages
 
         if (!defer_phases) dispatch(2);  // Phase 2: compression
         // Phase 3 mprotects ACTIVE pages to PROT_READ for write-fault tracking.
@@ -1746,6 +1842,8 @@ public:
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
+        if (isDeferredReclaimMode())
+            shadow_tick_ = bootstrapArray<uint32_t>(max_pages);
         page_tier_ = bootstrapArray<uint8_t>(max_pages);
 
         // Per-bucket recompression EMA table (kNumArenas × kNumClasses entries).
@@ -1871,7 +1969,7 @@ public:
         auto* self = s_stats_instance_;
         if (!self || !self->states_ || !self->vm_) return;
         size_t empty = 0, active = 0, monitor = 0, compressing = 0,
-               compressed = 0, total = self->vm_->committedPages();
+               compressed = 0, shadow = 0, total = self->vm_->committedPages();
         for (size_t i = 0; i < total; ++i) {
             switch (self->states_->get(i)) {
             case PageState::EMPTY: ++empty; break;
@@ -1879,6 +1977,7 @@ public:
             case PageState::ACTIVE_MONITORING: ++monitor; break;
             case PageState::COMPRESSING: ++compressing; break;
             case PageState::COMPRESSED: ++compressed; break;
+            case PageState::COMPRESSED_SHADOW: ++shadow; break;
             }
         }
         char ts[32] = {};
@@ -1890,10 +1989,10 @@ public:
         char buf[384];
         int n = snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
-            "  compressing=%zu  compressed=%zu  empty=%zu"
+            "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
-            empty,
+            shadow, empty,
             (unsigned long long)tier_success,
             (unsigned long long)tier_attempts);
         // Cast to void to silence -Wunused-result on glibc (write is
@@ -2053,6 +2152,25 @@ public:
             return true;
         }
 
+        case PageState::COMPRESSED_SHADOW: {
+            // Page was still accessible (PROT_RW or PROT_READ from Phase 3).
+            // Fault means Phase 3 set PROT_READ and a write occurred.
+            // Discard the shadow blob, restore to ACTIVE.
+            void* page_addr = vm_->pageAddress(page_idx);
+            vm::protectPages(page_addr, kPageSize, true, true);
+            store_->release(compressed_[page_idx].data,
+                            compressed_[page_idx].alloc_size, page_idx);
+            compressed_[page_idx] = {};
+            if (shadow_tick_) shadow_tick_[page_idx] = 0;
+            if (page_tier_) page_tier_[page_idx] = kTierNone;
+            cold_count_[page_idx] = 0;
+            if (recompress_count_[page_idx] < 255)
+                recompress_count_[page_idx]++;
+            states_->set(page_idx, PageState::ACTIVE);
+            locks_->unlock(page_idx);
+            return true;
+        }
+
         default:
             locks_->unlock(page_idx);
             return false;
@@ -2063,10 +2181,13 @@ public:
     void releaseCompressedPages(size_t start_page, size_t num_pages) {
         for (size_t i = start_page; i < start_page + num_pages; ++i) {
             locks_->lock(i);
-            if (states_->get(i) == PageState::COMPRESSED && compressed_[i].data) {
+            PageState st = states_->get(i);
+            if ((st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW)
+                && compressed_[i].data) {
                 store_->release(compressed_[i].data, compressed_[i].alloc_size, i);
                 compressed_[i] = {};
             }
+            if (shadow_tick_) shadow_tick_[i] = 0;
             states_->set(i, PageState::EMPTY);
             cold_count_[i] = 0;
             recompress_count_[i] = 0;

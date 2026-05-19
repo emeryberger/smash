@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <csignal>
 #include <cstdlib>
+#include "smash/config.h"
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -261,31 +262,41 @@ public:
 
     // Check if our signal handlers are still installed; reinstall if
     // overwritten. Called periodically from CompressorThread::tick().
-    // We deliberately reinstall **only SIGSEGV**, not SIGBUS. macOS
-    // delivers SIGBUS for KERN_PROTECTION_FAILURE on anonymous pages,
-    // but SpiderMonkey installs its own SIGBUS handler with proper
-    // chaining (see js/src/wasm/WasmSignalHandlers.cpp): when its
-    // handler doesn't recognize the trap as a wasm site, it forwards
-    // to its saved-prev handler — which is smash's, captured at install
-    // time. Re-installing SIGBUS would invert this chain and create a
-    // smash↔SpiderMonkey loop on faults outside both engines' regions.
+    // We deliberately reinstall **only SIGSEGV**, not SIGBUS — unless
+    // deferred-reclaim mode is active. macOS delivers SIGBUS for
+    // KERN_PROTECTION_FAILURE on anonymous pages. SpiderMonkey installs
+    // its own SIGBUS handler with proper chaining, so re-installing SIGBUS
+    // would invert that chain. But for MongoDB (deferred-reclaim target),
+    // MongoDB's SIGBUS handler does NOT chain — it aborts. So we must
+    // reclaim SIGBUS to handle page faults from PROT_NONE pages.
     void ensureInstalled() {
         if (!running_.load(std::memory_order_relaxed)) return;
 #ifdef __APPLE__
-        // In Mach mode, the task exception port is set once at start
-        // and the kernel keeps it until task teardown. Nothing to check.
         if (mach_mode_) return;
 #endif
 
         struct sigaction current{};
         sigaction(SIGSEGV, nullptr, &current);
-        if (current.sa_sigaction == signalHandler) return;  // Still ours
+        bool need_reinstall = (current.sa_sigaction != signalHandler);
+
+#ifdef __APPLE__
+        if (!need_reinstall && isDeferredReclaimMode()) {
+            sigaction(SIGBUS, nullptr, &current);
+            need_reinstall = (current.sa_sigaction != signalHandler);
+        }
+#endif
+
+        if (!need_reinstall) return;
 
         struct sigaction sa{};
         sa.sa_sigaction = signalHandler;
         sa.sa_flags = SA_SIGINFO | SA_NODEFER;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGSEGV, &sa, &old_sigsegv_);
+#ifdef __APPLE__
+        if (isDeferredReclaimMode())
+            sigaction(SIGBUS, &sa, &old_sigbus_);
+#endif
     }
 
     ~FaultHandler() { stop(); }

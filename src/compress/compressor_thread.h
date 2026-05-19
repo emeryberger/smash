@@ -1404,11 +1404,26 @@ private:
                     continue;
                 }
 
-                // Verify page content matches the compressed blob.
-                // Decompress into a fault slot buffer and memcmp against live page.
+                // Set PROT_READ to catch any concurrent writes during
+                // verification. A write between now and PROT_NONE would
+                // fault through the handler (COMPRESSED_SHADOW case),
+                // which discards the blob and restores ACTIVE. This
+                // closes the verify-to-reclaim race window.
                 void* page_addr = vm_->pageAddress(i);
+                vm::protectPages(page_addr, kPageSize, true, false);  // PROT_READ
+
+                // If the state was changed by a concurrent fault handler
+                // (write came in right as we set PROT_READ), abort.
+                if (states_->get(i) != PageState::COMPRESSED_SHADOW) {
+                    vm::protectPages(page_addr, kPageSize, true, true);
+                    locks_->unlock(i);
+                    continue;
+                }
+
+                // Verify page content matches the compressed blob.
                 int slot = acquireFaultSlot();
                 if (slot < 0) {
+                    vm::protectPages(page_addr, kPageSize, true, true);
                     locks_->unlock(i);
                     continue;
                 }
@@ -1426,19 +1441,22 @@ private:
                 releaseFaultSlot(slot);
 
                 if (!content_matches) {
-                    // Page was modified since Phase A — discard stale blob
+                    // Page was modified before we set PROT_READ — discard
                     store_->release(compressed_[i].data,
                                     compressed_[i].alloc_size, i);
                     compressed_[i] = {};
                     shadow_tick_[i] = 0;
                     if (page_tier_) page_tier_[i] = kTierNone;
                     cold_count_[i] = 0;
+                    vm::protectPages(page_addr, kPageSize, true, true);
                     states_->set(i, PageState::ACTIVE);
                     locks_->unlock(i);
                     continue;
                 }
 
-                // Content matches — safe to reclaim physical memory
+                // Content verified under PROT_READ — any write between
+                // the memcmp and now would have faulted (handler discards
+                // blob and sets ACTIVE). Safe to reclaim.
                 vm::decommitPages(page_addr, kPageSize);
                 vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
                 shadow_tick_[i] = 0;

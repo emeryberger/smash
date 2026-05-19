@@ -853,39 +853,48 @@ SMASH_VISIBLE ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
         buf, buflen);
 }
 
-// ── getcwd buffer hooks ─────────────────────────────────────────────────────
-// Function-pointer hook surface intended for alloc8's getcwd wrapper to
-// call into smash so we can warm+pin the destination buffer before the
-// kernel writes into it. alloc8's current Linux gnu_wrapper.cpp does not
-// yet call through these — getcwd buffers therefore aren't pinned in
-// today's build — but we still need the storage defined here so that
-// libsmash.so's LD_PRELOAD load doesn't fail with
-//   undefined symbol: xx_getcwd_finish_hook
-// when no other module in the process provides it. install_getcwd_hooks
-// (below) populates the pointers; an alloc8 update can later wire the
-// call sites without touching libsmash.so.
-using xx_getcwd_hook_fn = void(*)(void*, size_t);
-xx_getcwd_hook_fn xx_getcwd_prepare_hook = nullptr;
-xx_getcwd_hook_fn xx_getcwd_finish_hook  = nullptr;
+// ── getcwd wrapper ──────────────────────────────────────────────────────────
+// getcwd writes the current working directory path into a user-provided buffer.
+// Uses the standard EFAULT-retry pattern like other syscall wrappers.
 
-static void smash_getcwd_prepare(void* buf, size_t size) {
-    auto* vm = smash::g_smash_vm_region;
-    if (bufferInHeap(buf, size, vm)) {
-        smash::vm::warmPages(buf, size, vm);
+SMASH_VISIBLE char* getcwd(char* buf, size_t size) {
+    using fn_t = char*(*)(char*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, getcwd);
+
+    // If buf is NULL, glibc allocates a buffer internally - no warming needed
+    if (!buf) {
+        if (!real_getcwd) {
+            char tmp[4096];
+            if (syscall(SYS_getcwd, tmp, sizeof(tmp)) < 0) return nullptr;
+            return strdup(tmp);
+        }
+        return real_getcwd(buf, size);
     }
-}
-static void smash_getcwd_finish(void* /*buf*/, size_t /*size*/) {
-    // No-op: pin counters were removed in the EFAULT-retry refactor;
-    // the prepare-side warmPages above is sufficient since getcwd has
-    // no retry surface and the buffer is short-lived.
+
+    // Use standard retry pattern: call, on EFAULT walk pages, retry
+    auto* vm = smash::g_smash_vm_region;
+    auto do_getcwd = [&]() -> char* {
+        if (!real_getcwd) {
+            return (syscall(SYS_getcwd, buf, size) < 0) ? nullptr : buf;
+        }
+        return real_getcwd(buf, size);
+    };
+
+    char* ret = do_getcwd();
+    long backoff_ns = 1000;
+    for (int attempt = 0; ret == nullptr && errno == EFAULT && attempt < 8; ++attempt) {
+        if (vm && size) smash::vm::walkPagesForFault(buf, size, vm);
+        if (attempt > 0) {
+            struct timespec ts = {0, backoff_ns};
+            nanosleep(&ts, nullptr);
+            backoff_ns *= 2;
+        }
+        ret = do_getcwd();
+    }
+    return ret;
 }
 
-// Install hooks via a constructor that runs after alloc8 is initialized.
-__attribute__((constructor(200)))
-static void install_getcwd_hooks() {
-    xx_getcwd_prepare_hook = smash_getcwd_prepare;
-    xx_getcwd_finish_hook  = smash_getcwd_finish;
-}
+// Legacy getcwd hooks removed - the direct wrapper above handles everything.
 
 // ── Buffered I/O wrappers ───────────────────────────────────────────────────
 // glibc's fread/fgets/fgetc call __read() internally without going through

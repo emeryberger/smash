@@ -163,6 +163,9 @@
     getrusage;
     prlimit64;
 
+    # getcwd wrapper (buffer write from kernel)
+    getcwd;
+
     # TBB scalable_allocator interposition
     # Allows Smash to manage TBB's memory allocations by intercepting its
     # internal allocator calls (TBB uses these for its 64MB per-thread arenas)

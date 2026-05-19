@@ -2,6 +2,7 @@
 //
 // Tracks the lifecycle of every page in the VmRegion:
 //   EMPTY → ACTIVE → ACTIVE_MONITORING → COMPRESSING → COMPRESSED → ACTIVE
+//   Deferred-reclaim mode adds: COMPRESSING → COMPRESSED_SHADOW → COMPRESSED
 #pragma once
 
 #include "smash/config.h"
@@ -19,6 +20,7 @@ enum class PageState : uint8_t {
     COMPRESSED        = 2,  // Data compressed, page is PROT_NONE
     COMPRESSING       = 3,  // Compressor thread is working on this page
     ACTIVE_MONITORING = 4,  // PROT_READ for write-fault access tracking
+    COMPRESSED_SHADOW = 5,  // Compressed copy stored; page still PROT_RW (deferred reclaim)
 };
 
 class PageStateTable {

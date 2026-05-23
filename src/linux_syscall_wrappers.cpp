@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
+#include <limits.h>
 #include <malloc.h>
 
 // Recursion guard: if dlsym triggers one of our wrappers, skip the
@@ -861,18 +862,41 @@ SMASH_VISIBLE char* getcwd(char* buf, size_t size) {
     using fn_t = char*(*)(char*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, getcwd);
 
-    // If buf is NULL, glibc allocates a buffer internally - no warming needed
+    // For the buf==NULL case, glibc allocates a buffer internally that may
+    // land in a smash-managed page. The kernel can't take a SIGSEGV when
+    // copy_to_user hits a protected page during the syscall — it returns
+    // EFAULT instead. Without a buf to walk, we can't proactively warm.
+    //
+    // Workaround: use a stack buffer ourselves, then strdup the result so
+    // the C++ filesystem layer's getcwd(NULL,0) idiom keeps working. The
+    // stack page is already PROT_RW and unmanaged by smash. Apply the
+    // standard EFAULT-retry pattern in case the stack itself is somehow
+    // protected (shouldn't happen, but harmless).
+    auto* vm = smash::g_smash_vm_region;
     if (!buf) {
-        if (!real_getcwd) {
-            char tmp[4096];
-            if (syscall(SYS_getcwd, tmp, sizeof(tmp)) < 0) return nullptr;
-            return strdup(tmp);
+        char tmp[PATH_MAX];
+        auto do_getcwd_tmp = [&]() -> char* {
+            if (!real_getcwd) {
+                return (syscall(SYS_getcwd, tmp, sizeof(tmp)) < 0) ? nullptr : tmp;
+            }
+            return real_getcwd(tmp, sizeof(tmp));
+        };
+        char* ret = do_getcwd_tmp();
+        long backoff_ns = 1000;
+        for (int attempt = 0; ret == nullptr && errno == EFAULT && attempt < 8; ++attempt) {
+            if (vm) smash::vm::walkPagesForFault(tmp, sizeof(tmp), vm);
+            if (attempt > 0) {
+                struct timespec ts = {0, backoff_ns};
+                nanosleep(&ts, nullptr);
+                backoff_ns *= 2;
+            }
+            ret = do_getcwd_tmp();
         }
-        return real_getcwd(buf, size);
+        if (!ret) return nullptr;
+        return strdup(ret);
     }
 
-    // Use standard retry pattern: call, on EFAULT walk pages, retry
-    auto* vm = smash::g_smash_vm_region;
+    // Standard retry pattern when caller supplied a buffer.
     auto do_getcwd = [&]() -> char* {
         if (!real_getcwd) {
             return (syscall(SYS_getcwd, buf, size) < 0) ? nullptr : buf;

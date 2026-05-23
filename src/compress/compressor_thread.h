@@ -759,7 +759,21 @@ private:
             // the page. (Identified via TLA+ model checking.)
             if (states_->transition(i, PageState::ACTIVE,
                                        PageState::ACTIVE_MONITORING)) {
-                vm::protectPages(vm_->pageAddress(i), kPageSize, true, false);
+                // The CAS only sets state. The mprotect happens in a
+                // separate atomic step. Between them, another compressor
+                // worker can grab the page (CAS ACTIVE_MONITORING →
+                // COMPRESSING in phase2), compress it, and set state =
+                // COMPRESSED with PROT_NONE. If we then unconditionally
+                // mprotect PROT_READ here, we corrupt the COMPRESSED
+                // page's protection — fault handler stops being able to
+                // catch accesses. Re-check state immediately before
+                // mprotect; if the page is no longer ACTIVE_MONITORING,
+                // someone else owns it now and we leave protection alone.
+                // (Bug surfaced by extending the TLA+ model to multiple
+                //  compressor workers in 2026-05-22.)
+                if (states_->get(i) == PageState::ACTIVE_MONITORING) {
+                    vm::protectPages(vm_->pageAddress(i), kPageSize, true, false);
+                }
             }
         });
     }
@@ -2049,6 +2063,16 @@ public:
         if (!vm_->contains(addr)) return false;
 
         size_t page_idx = vm_->pageIndex(addr);
+
+        // Reentrancy guard. compressPage / recompressPage hold the
+        // per-page lock while doing memcpy after PROT_READ. If the
+        // memcpy SIGSEGVs on the same thread (TLB inconsistency or an
+        // underlying smash state-machine bug), the signal handler
+        // runs on that same thread; calling locks_->lock(page_idx)
+        // would self-deadlock on the non-recursive spinlock.  Detect
+        // and bail so the SIGSEGV propagates with a real backtrace.
+        if (locks_->heldByThisThread(page_idx)) return false;
+
         locks_->lock(page_idx);
 
         PageState st = states_->get(page_idx);

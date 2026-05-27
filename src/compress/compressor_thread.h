@@ -26,7 +26,9 @@
 #include "../vm/fault_handler.h"
 #include "../vm/syscall_compat.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <pthread.h>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +36,13 @@
 #include <cstring>
 #include <unistd.h>
 #include <dirent.h>
+#if defined(__linux__)
+#include <sys/uio.h>          // process_vm_readv
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>      // SYS_membarrier
+#include <linux/membarrier.h> // MEMBARRIER_CMD_*
+#endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
@@ -48,6 +57,123 @@
 #endif
 
 namespace smash {
+
+// ── Optional remote-core store-drain barrier ───────────────────────────────
+// SMASH_PROT_READ_BARRIER=1 enables a syscall after mprotect(PROT_READ)
+// (and before the snapshot memcpy) that forces all other application threads
+// to drain their store buffers. Without this, an in-flight store on a remote
+// core can retire after the local mprotect IPI ack but before the store buffer
+// is drained, leaving the snapshot reading stale bytes — and a later
+// decompress-on-fault silently reverts the writer's update.
+//
+// On Linux ≥ 4.14 we use membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, …),
+// which IPIs every other thread of this process and waits for them to issue
+// a full barrier before returning. Cost: ~5–20 µs per call; we amortize by
+// only calling once per chunked PROT_READ run. On non-Linux it's a no-op.
+//
+// Registration (MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) happens lazily on
+// first use; if registration or the syscall fails we fall back to a local
+// __sync_synchronize and disable further attempts.
+[[gnu::always_inline]]
+inline bool protReadBarrierEnabled() {
+    static const bool enabled = []{
+        const char* v = std::getenv("SMASH_PROT_READ_BARRIER");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+// Drain remote-core store buffers so any in-flight store from a writer
+// thread is forced to retire (or fault, if its target page is already
+// PROT_NONE). Used between mprotect(PROT_NONE) and madvise(DONTNEED) to
+// close the post-snapshot TLB-lag store-loss window. This is correctness,
+// not perf — the syscall is mandatory under FixAv. Linux only; macOS
+// fallback is a local fence (incomplete; see project notes).
+inline void membarrierSyncCore() {
+#if defined(__linux__) && defined(SYS_membarrier)
+    static std::atomic<int> state{0};  // 0=unknown, 1=ok, -1=disabled
+    int s = state.load(std::memory_order_relaxed);
+    if (s < 0) { __sync_synchronize(); return; }
+    if (s == 0) {
+        long r = syscall(SYS_membarrier,
+                         MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0);
+        if (r != 0) {
+            state.store(-1, std::memory_order_relaxed);
+            __sync_synchronize();
+            return;
+        }
+        state.store(1, std::memory_order_relaxed);
+    }
+    long r = syscall(SYS_membarrier,
+                     MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0);
+    if (r != 0) {
+        state.store(-1, std::memory_order_relaxed);
+        __sync_synchronize();
+    }
+#else
+    __sync_synchronize();
+#endif
+}
+
+inline void protReadBarrier() {
+    // Env-gated wrapper around the unconditional core. SMASH_PROT_READ_BARRIER
+    // controls only whether protect-read sites pay the syscall; FixAv's
+    // mprotect(PROT_NONE)→madvise sequence calls membarrierSyncCore directly
+    // because that one is correctness-mandatory, not opt-in.
+    if (!protReadBarrierEnabled()) return;
+    membarrierSyncCore();
+}
+
+// FixAv: verify-then-flip ordering — snapshot under PROT_READ → compress →
+// snapshot-verify → state=COMPRESSED → mprotect(PROT_NONE) → membarrier →
+// madvise(DONTNEED). Setting PROT_NONE before madvise prevents readers from
+// observing a DROPPED+RO page (kernel zero-faults). Membarrier drains
+// in-flight stores; those that retire after PROT_NONE fault visibly and the
+// fault handler decompresses. Snapshot-verify (always-on under FixAv) closes
+// the residual writer race where a store retires inside the snapshot window.
+// SMASH_FIXAV=1 enables the new ordering and the unconditional verify; off
+// keeps legacy behavior so we can validate before flipping the default.
+[[gnu::always_inline]]
+inline bool fixavEnabled() {
+    static const bool enabled = []{
+        const char* v = std::getenv("SMASH_FIXAV");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+// Deferred madvise: decouple mprotect(PROT_NONE) from madvise(DONTNEED) by
+// a temporal gap. mprotect runs immediately to give us fault-driven
+// decompression; madvise is queued and only runs once the page has stayed
+// quiescent (no fault) for kDeferredMadviseTicks ticks. Closes the residual
+// SMASH_COLD_TIMEOUT_SEC=1 corruption where in-flight loads from a stale
+// TLB observed a (PROT_*, DROPPED) page and saw kernel-zero-faulted bytes.
+[[gnu::always_inline]]
+inline bool deferMadviseEnabled() {
+    // Default ON: 9/9 PASS at SMASH_COLD_TIMEOUT_SEC ∈ {1,5,10} on
+    // test7_full closes the residual mprotect→madvise corruption surface
+    // (in-flight loads with stale TLB observing DROPPED pages). Set
+    // SMASH_DEFER_MADVISE=0 to revert to the legacy immediate-madvise path
+    // for diagnostic comparison.
+    static const bool enabled = []{
+        const char* v = std::getenv("SMASH_DEFER_MADVISE");
+        if (v) return v[0] == '1';
+        return true;
+    }();
+    return enabled;
+}
+
+inline uint32_t deferMadviseTicks() {
+    static const uint32_t ticks = []() -> uint32_t {
+        const char* v = std::getenv("SMASH_DEFER_MADVISE_TICKS");
+        if (v) {
+            int n = std::atoi(v);
+            if (n > 0 && n < 100000) return static_cast<uint32_t>(n);
+        }
+        return 50;  // ~500ms at 10ms tick rate
+    }();
+    return ticks;
+}
 
 class CompressorThread {
     // ── Shared state ──────────────────────────────────────────────────────
@@ -85,6 +211,14 @@ class CompressorThread {
     std::atomic<uint64_t> tier_upgrade_attempts_{0};
     std::atomic<uint64_t> tier_upgrade_success_{0};
 
+    // SMASH_SNAPSHOT_VERIFY telemetry. Counts of page snapshots that were
+    // re-read after the snapshot memcpy. *_fails_ increments when the
+    // re-read differs from the snapshot — a store retired in our window
+    // and we abandoned the attempt. *_passes_ increments when the re-read
+    // matches and we proceed.
+    std::atomic<uint64_t> snapshot_verify_fails_{0};
+    std::atomic<uint64_t> snapshot_verify_passes_{0};
+
     // Per-page metadata (allocated from bootstrap, indexed by VmRegion page index)
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
@@ -99,6 +233,13 @@ class CompressorThread {
         kTierNone = 0,
         kTierFast = 1,
         kTierDeep = 2,
+        // Tried upgrading from fast to deep tier but the result wasn't
+        // ≥20% smaller. Phase 2 skips these in subsequent ticks so we
+        // don't redo the (decompress-then-recompress) work every tick
+        // for zero benefit. On long compiles (test7_full ~6 min, where
+        // very_cold_ticks=60 fires multiple times per page) this saves
+        // serious wall time.
+        kTierFastTried = 3,
     };
     uint8_t* page_tier_ = nullptr;
     // Per-page recompression count: bumped on every COMPRESSED → ACTIVE
@@ -110,15 +251,54 @@ class CompressorThread {
     // Deferred-reclaim mode: tick at which Phase A completed for each page.
     // Non-zero only for pages in COMPRESSED_SHADOW state.
     uint32_t* shadow_tick_ = nullptr;
+
+    // Deferred-madvise queue (SMASH_DEFER_MADVISE=1). Allocated alongside
+    // the other per-page arrays. deferred_pending_[i]=true means page i is
+    // COMPRESSED+PROT_NONE+still-backed and waiting for the sweeper to drop
+    // backing pages once the TTL expires. deferred_queue_tick_[i] is the
+    // tick at which compressPage queued the page; the sweeper compares
+    // tick_counter_ - deferred_queue_tick_[i] against kDeferredMadviseTicks.
+    // Ordering invariant: state must transition to COMPRESSED BEFORE the
+    // pending bit is set; any state transition out of COMPRESSED clears
+    // the bit FIRST so the sweeper never madvise's a non-COMPRESSED page.
+    std::atomic<bool>* deferred_pending_ = nullptr;
+    uint32_t* deferred_queue_tick_ = nullptr;
+
     uint32_t tick_counter_ = 0;
+    int phase3_idle_ticks_ = 0;  // P2.1 selective Phase 3 skip
+    long vma_count_cached_ = 0;   // VMA-cap guard: refreshed every N ticks
+
+    // ── Time-budget machinery (SMASH_TIME_BUDGET_PCT) ────────────────────
+    // start_steady_time_ is captured at start() and used to compute the
+    // available compress budget as elapsed × pct/100. budget_recompute_period_
+    // controls how often recomputeMarginalEfficiency runs (every N ticks);
+    // 8 keeps the work cheap (~144 buckets sorted) while still tracking
+    // workload phase changes.
+    std::chrono::steady_clock::time_point start_steady_time_{};
+    static constexpr int kBudgetRecomputeEveryTicks = 8;
+
+    // Soft-dirty access tracking (Linux). When SMASH_SOFTDIRTY=1 we replace
+    // Phase 3's mprotect(PROT_READ)-based write detection with kernel-side
+    // soft-dirty bit tracking via /proc/self/clear_refs + /proc/self/pagemap.
+    // Wins:
+    //   - No VMA fragmentation (mprotect creates one VMA boundary per
+    //     transitioning page; soft-dirty has no VMA cost).
+    //   - No SIGSEGV-per-write overhead (kernel just sets a PTE bit).
+    //   - One syscall per tick to clear vs N mprotect calls.
+    // Cost: ~8 bytes per page in pagemap read at tick start, all-process
+    // soft-dirty wipe at tick end (kernel does it lazily by zapping PTEs).
+    int clear_refs_fd_ = -1;
+    int pagemap_fd_ = -1;
 
     // Per-(arena, size_class) recompression-rate signal. Single shared
     // table (not per-worker) so the fault handler can update it without
     // first finding the right worker. Relaxed atomics; tearing on the EMA
-    // is acceptable.  Indexed by `arena * kNumClasses + size_class`.
+    // is acceptable.  Indexed by `arena * kTotalBucketsPerArena + bucket`,
+    // where bucket is in [0, kNumClasses) for slab pages or
+    // [kNumClasses, kTotalBucketsPerArena) for large-alloc page-count buckets.
     std::atomic<uint16_t>* bucket_rc_ema_x256_ = nullptr;  // ×256 fixed-point
     std::atomic<uint8_t>*  bucket_rc_count_ = nullptr;     // sample count, capped 64
-    static constexpr size_t kBucketTableLen = kNumArenas * kNumClasses;
+    static constexpr size_t kBucketTableLen = kNumArenas * kTotalBucketsPerArena;
 
     // Cohort measurement (kMeasureCohorts).  Points to SmashHeap's CohortPage
     // array — opaque here to avoid circular include.  Layout matches
@@ -242,6 +422,105 @@ class CompressorThread {
             double delta2 = reward - arm_mean[tier];
             arm_m2[tier] += delta * delta2;
         }
+
+        // ── Profile persistence (P3) ─────────────────────────────────────
+        // Compact 16-byte serialized form, suitable for SMASH_PROFILE_FILE.
+        // Decision hint: 0 = unknown, 1 = always-skip, 2 = fast-only,
+        //                3 = deep-default. Set by load() based on observed
+        // history; checked in phase2Range to short-circuit pages from
+        // historically-uncompressible buckets.
+        struct Persist {
+            uint8_t  count;
+            uint8_t  decision_hint;
+            uint16_t sum;                 // ratio EMA proxy
+            uint16_t cost_ema_x16_t0;     // saturated to u16
+            uint16_t cost_ema_x16_t1;
+            uint8_t  cost_count_t0;
+            uint8_t  cost_count_t1;
+            // Repurposed first 2 of 6 pad bytes for the budget machinery.
+            // Older v1 files set these to zero, which deserialize() treats
+            // as "no efficiency carried over" — safe.
+            uint16_t efficiency_x256;
+            uint8_t  pad[4];
+        };
+        static_assert(sizeof(Persist) == 16, "Persist record must be 16 bytes");
+
+        void serialize(Persist* out) const {
+            out->count = count;
+            // Decision hint heuristic:
+            //  - if mean ratio is very low (<5%): always-skip
+            //  - if deep-tier cost ≥ 4× fast-tier cost AND ratio modest: fast-only
+            //  - else: unknown
+            uint8_t hint = 0;
+            if (count >= 8) {
+                uint16_t mean_x256 = (count > 0) ? (sum * 256u / count) : 0;
+                if (mean_x256 < 13) {  // <5% saved on average
+                    hint = 1;
+                } else if (cost_count[0] >= 4 && cost_count[1] >= 4 &&
+                           cost_ema_x16[1] >= 4 * cost_ema_x16[0] &&
+                           mean_x256 < 64) {  // <25% savings + deep is 4×
+                    hint = 2;
+                }
+            }
+            out->decision_hint = hint;
+            out->sum = sum;
+            out->cost_ema_x16_t0 = cost_ema_x16[0] > 65535u ? 65535u
+                : static_cast<uint16_t>(cost_ema_x16[0]);
+            out->cost_ema_x16_t1 = cost_ema_x16[1] > 65535u ? 65535u
+                : static_cast<uint16_t>(cost_ema_x16[1]);
+            out->cost_count_t0 = cost_count[0];
+            out->cost_count_t1 = cost_count[1];
+            out->efficiency_x256 = efficiency_x256;
+            for (int i = 0; i < 4; ++i) out->pad[i] = 0;
+        }
+
+        void deserialize(const Persist& in) {
+            // Apply with halved count so old data fades fast if workload
+            // changed; new observations dominate after ~kWindow/2 records.
+            count = in.count > kWindow ? kWindow : (in.count / 2);
+            // Reconstruct ratios as a single-bucket histogram using the mean
+            // — we don't preserve the per-sample distribution. Sufficient for
+            // ROI which only consults sum/count.
+            sum = (count > 0) ? (in.sum * count / std::max<uint8_t>(in.count, 1)) : 0;
+            head = 0;
+            uint8_t mean_r = (count > 0) ? static_cast<uint8_t>(sum / count) : 0;
+            for (int i = 0; i < count; ++i) ratios[i] = mean_r;
+            cost_ema_x16[0] = in.cost_ema_x16_t0;
+            cost_ema_x16[1] = in.cost_ema_x16_t1;
+            cost_count[0] = in.cost_count_t0 / 2;
+            cost_count[1] = in.cost_count_t1 / 2;
+            // Carry budget efficiency across runs as a warm-start hint;
+            // recomputeMarginalEfficiency overwrites this once enough fresh
+            // data accumulates. Old v1 files store 0 here → treated as
+            // EXPLORE on first recompute, which matches cold-start.
+            efficiency_x256 = in.efficiency_x256;
+        }
+
+        // Decision hint cached on the live struct after deserialize, so
+        // phase2Range can short-circuit without re-running the heuristic.
+        uint8_t persist_hint = 0;
+
+        // ── Time-budget machinery (SMASH_TIME_BUDGET_PCT) ────────────────
+        // Cumulative bytes saved (orig − compressed) across the bucket, and
+        // cumulative microseconds spent compressing+decompressing. Updated
+        // from compressPage success path (compress thread) and from the
+        // fault decompress path (application thread); std::atomic so the
+        // cross-thread updates are well-defined. Relaxed ordering — these
+        // are advisory counters consumed by the periodic recompute.
+        std::atomic<uint64_t> bytes_saved_total{0};
+        std::atomic<uint64_t> time_cost_total_us{0};
+        // efficiency = bytes_saved / time_cost_us, in fixed-point ×256.
+        // Recomputed once per N ticks by recomputeMarginalEfficiency.
+        uint16_t efficiency_x256 = 0;
+        // Runtime budget decision: 0=EXPLORE (force-compress while count<8),
+        // 1=COMPRESS, 2=SKIP. Distinct from `persist_hint` (legacy persisted
+        // always-skip flag) so the two checks compose without aliasing.
+        enum BudgetHint : uint8_t {
+            kBudgetExplore  = 0,
+            kBudgetCompress = 1,
+            kBudgetSkip     = 2,
+        };
+        uint8_t budget_decision_hint = 0;  // == kBudgetExplore
     };
 
     // ── Per-arena UCB arm aggregate ───────────────────────────────────────
@@ -276,15 +555,29 @@ class CompressorThread {
         void* page_buf = nullptr;
         void* compress_buf = nullptr;
         void* compress_buf2 = nullptr;  // second buffer for dict try-both experiment
-        // ROI stats indexed by (arena_id, size_class).  Arena routing
-        // produces structurally-homogeneous pages; aggregating stats across
-        // arenas would wash out that homogeneity, so each arena gets its
-        // own sliding window per size class.  Index via statsIndex(arena,sc).
-        SizeClassStats sc_stats[kNumArenas * kNumClasses]{};
+        // ROI stats indexed by (arena_id, bucket).  Arena routing produces
+        // structurally-homogeneous pages; aggregating stats across arenas
+        // would wash out that homogeneity, so each arena gets its own
+        // sliding window per bucket.  Bucket is the slab size_class for
+        // small allocs or kNumClasses + log2(page_count) for large allocs;
+        // index via statsIndex(arena, bucket).
+        SizeClassStats sc_stats[kNumArenas * kTotalBucketsPerArena]{};
         // Per-arena UCB aggregate used as warm-start prior under
         // SMASH_UCB_WARMSTART=1.  Indexed by arena_id.
         ArenaArmStats arena_arm[kNumArenas]{};
         size_t range_start = 0, range_end = 0;
+
+        // Pending PROT_NONE batch. compressPage finishes per-page work
+        // and stores compressed blob, but defers the
+        // (decommit + mprotect(PROT_NONE)) to a chunked flush at the
+        // end of phase2Range to slash VMA fragmentation. Pending pages
+        // are in state COMPRESSED but still PROT_READ with original
+        // contents (writes fault → handleFault → decompress; reads
+        // return correct stale data which is fine because content
+        // matches the compressed blob).
+        static constexpr size_t kPendingProtCap = 256;
+        size_t pending_pn_pages[kPendingProtCap];
+        size_t pending_pn_count = 0;
 
         // Compress using worker's own contexts, shared engine's dictionaries
         size_t compress(const void* src, void* dst, size_t src_size,
@@ -402,6 +695,16 @@ public:
         active_workers_ = kCompressorWorkers;
         work_gen_.store(0, std::memory_order_release);
         current_phase_ = 0;
+        // /proc/self/{clear_refs,pagemap} fds inherited from the parent
+        // refer to the parent's pid-namespace entries — the kernel
+        // resolves /proc/self at open(2) time, not on every read. After
+        // fork(), our fds still point at the parent's PTE table. Close
+        // them so ensureSoftDirtyFds() re-opens the child's correctly
+        // on the first tick post-fork.
+#ifdef __linux__
+        if (clear_refs_fd_ >= 0) { close(clear_refs_fd_); clear_refs_fd_ = -1; }
+        if (pagemap_fd_ >= 0)    { close(pagemap_fd_);    pagemap_fd_ = -1; }
+#endif
     }
 private:
 
@@ -450,8 +753,12 @@ private:
         return span->size_class;
     }
 
-    // Read both arena_id and size_class in a single page-map lookup.
-    // Returns false on unmapped pages.
+    // Read both arena_id and the bucket index in a single page-map lookup.
+    // For slab spans, bucket == span->size_class. For large-alloc spans,
+    // bucket == largeSizeClass(span->page_count) — slots in the
+    // [kNumClasses, kTotalBucketsPerArena) range. Returns false on unmapped
+    // pages. Naming kept as `sc` so existing callers compile unchanged; the
+    // value is "bucket" semantically, not raw size_class.
     bool lookupSpanInfo(size_t page_idx, uint8_t& arena_id, uint8_t& sc) {
         arena_id = 0; sc = 0;
         if (!page_map_) return false;
@@ -459,13 +766,18 @@ private:
         Span* span = page_map_->get(reinterpret_cast<uintptr_t>(addr));
         if (!span) return false;
         arena_id = span->arena_id;
-        sc = span->size_class;
+        if (span->is_large) {
+            sc = largeSizeClass(span->page_count);
+        } else {
+            sc = span->size_class;
+        }
         return true;
     }
 
-    // Index into the per-(arena, size-class) ROI stats array.
+    // Index into the per-(arena, bucket) ROI stats array. `sc` is the
+    // unified bucket index in [0, kTotalBucketsPerArena).
     static inline size_t statsIndex(uint8_t arena_id, uint8_t sc) {
-        return static_cast<size_t>(arena_id) * kNumClasses +
+        return static_cast<size_t>(arena_id) * kTotalBucketsPerArena +
                static_cast<size_t>(sc);
     }
 
@@ -681,6 +993,43 @@ private:
             if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING)
                 return;
 
+            // P3: persisted profile fast-path skip. If a prior run marked
+            // this (arena, size_class) bucket as ALWAYS_SKIP (mean ratio
+            // < 5%), don't even attempt compression — saves the per-page
+            // lock acquisition + state CAS + ROI evaluation.
+            //
+            // SMASH_TIME_BUDGET_PCT: same short-circuit, driven by the
+            // marginal-efficiency recompute. budget_decision_hint == SKIP
+            // means this bucket fell below the budget cutoff. The check is
+            // a single byte load before the per-page lock acquisition, so
+            // rejected buckets cost ~zero.
+            if (page_map_) {
+                void* page_addr_p = vm_->pageAddress(i);
+                Span* sp_p = page_map_->get(reinterpret_cast<uintptr_t>(page_addr_p));
+                if (sp_p) {
+                    // Unified bucket: slab span uses size_class, large span
+                    // uses log2(page_count) slot above kNumClasses. Drops the
+                    // legacy is_large gate so large allocs are budget-managed
+                    // — load-bearing for SMASH_LARGE_ONLY workloads where
+                    // every compressed page is large.
+                    uint8_t sc_p = sp_p->is_large
+                        ? largeSizeClass(sp_p->page_count)
+                        : sp_p->size_class;
+                    if (sc_p < kTotalBucketsPerArena) {
+                        size_t bidx_p = statsIndex(sp_p->arena_id, sc_p);
+                        if (bidx_p < kBucketTableLen) {
+                            auto& bs = workers_[worker_id].sc_stats[bidx_p];
+                            if (bs.budget_decision_hint == SizeClassStats::kBudgetSkip) {
+                                return;
+                            }
+                            if (bs.persist_hint == 1) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Recompression-thrash gate. Pages that have been faulted back
             // from COMPRESSED before, or that live in a (arena, size_class)
             // bucket whose pages are doing the same, must stay idle longer
@@ -697,19 +1046,23 @@ private:
                 if (page_map_) {
                     void* page_addr = vm_->pageAddress(i);
                     Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
-                    if (sp && !sp->is_large && sp->size_class < kNumClasses) {
-                        size_t bidx = static_cast<size_t>(sp->arena_id) * kNumClasses
-                                    + sp->size_class;
-                        if (bidx < kBucketTableLen) {
-                            // Bucket bias: a single recompress event in this
-                            // (arena, size_class) bucket gives bias=1 to fresh
-                            // pages in the same bucket — they get a longer
-                            // initial cold window without needing to thrash
-                            // themselves first. Threshold=256 ≈ "one full rc
-                            // sample" with α=1/4 EMA.
-                            uint16_t ema = bucket_rc_ema_x256_[bidx].load(
-                                std::memory_order_relaxed);
-                            if (ema >= kBucketRcBiasThreshold_x256) bucket_bias = 1;
+                    if (sp) {
+                        uint8_t sc_b = sp->is_large
+                            ? largeSizeClass(sp->page_count)
+                            : sp->size_class;
+                        if (sc_b < kTotalBucketsPerArena) {
+                            size_t bidx = statsIndex(sp->arena_id, sc_b);
+                            if (bidx < kBucketTableLen) {
+                                // Bucket bias: a single recompress event in this
+                                // (arena, bucket) gives bias=1 to fresh pages in
+                                // the same bucket — they get a longer initial
+                                // cold window without needing to thrash themselves
+                                // first. Threshold=256 ≈ "one full rc sample"
+                                // with α=1/4 EMA.
+                                uint16_t ema = bucket_rc_ema_x256_[bidx].load(
+                                    std::memory_order_relaxed);
+                                if (ema >= kBucketRcBiasThreshold_x256) bucket_bias = 1;
+                            }
                         }
                     }
                 }
@@ -732,50 +1085,295 @@ private:
                 worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
                 if (compressPage(i, workers_[worker_id])) {
                     worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
+                    // Periodic mid-range flush so the pending list
+                    // doesn't get too long and so the cap is never hit
+                    // inside a hot inner loop.
+                    if (workers_[worker_id].pending_pn_count >=
+                        CompressWorker::kPendingProtCap / 2) {
+                        flushPhase2PendingProt(worker_id);
+                    }
                 }
             }
         });
+        // End-of-range flush.
+        flushPhase2PendingProt(worker_id);
+    }
+
+    // Apply chunked (decommit + mprotect PROT_NONE) to a worker's
+    // accumulated list of just-COMPRESSED pages. Pages are sorted by
+    // index then runs of consecutive indices are coalesced into a
+    // single mprotect call. Since state is already COMPRESSED and we
+    // hold no per-page lock here, we re-check the state for each page
+    // and skip any that have transitioned (e.g. handleFault decompressed
+    // them in the gap). For pages that are still COMPRESSED, we set
+    // PROT_NONE; if mprotect fails (VMA cap), fall back to remapPages
+    // which replaces the mapping atomically.
+    void flushPhase2PendingProt(int worker_id) {
+        auto& w = workers_[worker_id];
+        if (w.pending_pn_count == 0) return;
+        // Sort by page index ascending. Insertion sort suffices — the
+        // list is small (at most kPendingProtCap entries) and on hot
+        // paths the original order is mostly already sorted.
+        for (size_t i = 1; i < w.pending_pn_count; ++i) {
+            size_t key = w.pending_pn_pages[i];
+            size_t j = i;
+            while (j > 0 && w.pending_pn_pages[j - 1] > key) {
+                w.pending_pn_pages[j] = w.pending_pn_pages[j - 1];
+                --j;
+            }
+            w.pending_pn_pages[j] = key;
+        }
+        // Coalesce consecutive runs.
+        size_t i = 0;
+        while (i < w.pending_pn_count) {
+            size_t run_start_page = w.pending_pn_pages[i];
+            size_t run_end_page = run_start_page + 1;
+            size_t j = i + 1;
+            while (j < w.pending_pn_count &&
+                   w.pending_pn_pages[j] == run_end_page &&
+                   (run_end_page - run_start_page) < kProtectChunkPages) {
+                ++run_end_page;
+                ++j;
+            }
+            // Acquire all per-page locks across the run in ascending
+            // order. Holding the locks ensures handleFault (which also
+            // uses these locks) cannot transition COMPRESSED → ACTIVE
+            // mid-batch. Without this, the batch would decommit pages
+            // that just got decompressed by an app fault — corruption
+            // exposed as F139/F134/BIR-verifier failures on big HLOs.
+            for (size_t k = run_start_page; k < run_end_page; ++k) {
+                locks_->lock(k);
+            }
+            // Re-check state under lock; partition the run.
+            bool all_compressed = true;
+            for (size_t k = run_start_page; k < run_end_page; ++k) {
+                if (states_->get(k) != PageState::COMPRESSED) {
+                    all_compressed = false;
+                    break;
+                }
+            }
+            void* run_addr = vm_->pageAddress(run_start_page);
+            size_t run_bytes = (run_end_page - run_start_page) * kPageSize;
+            if (fixavEnabled()) {
+                // FixAv: PROT_NONE → membarrier (once per run) → madvise.
+                // Inverting the legacy decommit-then-protect sequence closes
+                // the bug-class-2 (NoReadOfZeroForLiveData) window: a reader
+                // on a remote core can't observe a DROPPED+RO page, because
+                // by the time madvise drops the backing the page is already
+                // PROT_NONE so any access faults and the handler decompresses.
+                if (all_compressed) {
+                    if (!vm::protectPages(run_addr, run_bytes, false, false)) {
+                        if (!vm::remapPages(run_addr, run_bytes, false, false)) {
+                            for (size_t k = run_start_page; k < run_end_page; ++k) {
+                                void* a = vm_->pageAddress(k);
+                                if (!vm::protectPages(a, kPageSize, false, false))
+                                    vm::remapPages(a, kPageSize, false, false);
+                            }
+                        }
+                    }
+                    membarrierSyncCore();
+                    vm::decommitPages(run_addr, run_bytes);
+                } else {
+                    bool any_protected = false;
+                    for (size_t k = run_start_page; k < run_end_page; ++k) {
+                        if (states_->get(k) != PageState::COMPRESSED) continue;
+                        void* a = vm_->pageAddress(k);
+                        if (!vm::protectPages(a, kPageSize, false, false)) {
+                            if (!vm::remapPages(a, kPageSize, false, false))
+                                continue;
+                        }
+                        any_protected = true;
+                    }
+                    if (any_protected) membarrierSyncCore();
+                    for (size_t k = run_start_page; k < run_end_page; ++k) {
+                        if (states_->get(k) != PageState::COMPRESSED) continue;
+                        vm::decommitPages(vm_->pageAddress(k), kPageSize);
+                    }
+                }
+            } else if (all_compressed) {
+                if (deferMadviseEnabled()) {
+                    // Deferred-madvise: mprotect first, sweeper drops backing.
+                    if (!vm::protectPages(run_addr, run_bytes, false, false)) {
+                        if (!vm::remapPages(run_addr, run_bytes, false, false)) {
+                            for (size_t k = run_start_page; k < run_end_page; ++k) {
+                                void* a = vm_->pageAddress(k);
+                                if (!vm::protectPages(a, kPageSize, false, false))
+                                    vm::remapPages(a, kPageSize, false, false);
+                            }
+                        }
+                    }
+                    for (size_t k = run_start_page; k < run_end_page; ++k) {
+                        deferMadvise(k);
+                    }
+                } else {
+                    vm::decommitPages(run_addr, run_bytes);
+                    if (!vm::protectPages(run_addr, run_bytes, false, false)) {
+                        if (!vm::remapPages(run_addr, run_bytes, false, false)) {
+                            for (size_t k = run_start_page; k < run_end_page; ++k) {
+                                void* a = vm_->pageAddress(k);
+                                if (!vm::protectPages(a, kPageSize, false, false))
+                                    vm::remapPages(a, kPageSize, false, false);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (size_t k = run_start_page; k < run_end_page; ++k) {
+                    if (states_->get(k) != PageState::COMPRESSED) continue;
+                    void* a = vm_->pageAddress(k);
+                    if (deferMadviseEnabled()) {
+                        if (!vm::protectPages(a, kPageSize, false, false))
+                            vm::remapPages(a, kPageSize, false, false);
+                        deferMadvise(k);
+                    } else {
+                        vm::decommitPages(a, kPageSize);
+                        if (!vm::protectPages(a, kPageSize, false, false))
+                            vm::remapPages(a, kPageSize, false, false);
+                    }
+                }
+            }
+            for (size_t k = run_start_page; k < run_end_page; ++k) {
+                locks_->unlock(k);
+            }
+            i = j;
+        }
+        w.pending_pn_count = 0;
     }
 
     // Escalate a PROT_READ-monitored page to PROT_NONE (deep monitoring).
     // Any access (read or write) will now trigger the fault handler.
+    //
+    // Race avoidance: another worker can be inside compressPage between
+    // its protectPages(PROT_READ) and its memcpy of page_addr at the
+    // moment we get here. If we mprotect PROT_NONE without holding the
+    // per-page lock, the compressor thread that holds it SIGSEGVs on its
+    // own memcpy. handleFault detects self-recursion via the reentrancy
+    // guard and bails, the SIGSEGV chains to SIG_DFL, and the process
+    // dies. So acquire the lock and re-verify state before mprotecting.
     void escalateToDeepMonitoring(size_t page_idx) {
-        void* page_addr = vm_->pageAddress(page_idx);
-        vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
+        locks_->lock(page_idx);
+        if (states_->get(page_idx) == PageState::ACTIVE_MONITORING) {
+            void* page_addr = vm_->pageAddress(page_idx);
+            vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
+        }
+        locks_->unlock(page_idx);
     }
 
     // Phase 3: Set up access monitoring for remaining active pages.
+    //
+    // Chunked: scan the worker's range for maximal runs of contiguous
+    // ACTIVE pages, batch the per-page lock acquisitions, do ONE mprotect
+    // call for the whole run. This is the principal lever to keep VMA
+    // count under /proc/sys/vm/max_map_count on long compiles — per-page
+    // mprotect creates one VMA boundary per page, which on multi-GB
+    // workloads (e.g. neuron-cc cut_batch-norm-training_33 with ~1M
+    // pages compressed) blows past 65530 boundaries and starts failing
+    // mprotect() with ENOMEM.
+    //
+    // Chunk cap (kProtectChunkPages) is the max pages per mprotect call.
+    // Larger = fewer VMAs but more lock contention. 64 is a good default:
+    // 64 × 4 KiB = 256 KiB per chunk, ~16K chunks for 1M pages, well
+    // under the VMA cap.
     //
     // Syscalls touching a transiently PROT_READ page get EFAULT instead of
     // a SIGSEGV; the wrapper's retryWithDecompress loop catches that, walks
     // the buffer pages (which DOES go through the fault handler), and
     // retries. The bounded retry budget (8) outlasts a compressor tick.
-    void phase3Range(size_t start, size_t end) {
-        forEachLivePage(start, end, [&](size_t i) {
-            // CAS: only transition ACTIVE → ACTIVE_MONITORING.
-            // Avoids TOCTOU race where releaseCompressedPages() sets
-            // a page to EMPTY between our read and write — without CAS,
-            // we would overwrite EMPTY with ACTIVE_MONITORING, leaking
-            // the page. (Identified via TLA+ model checking.)
-            if (states_->transition(i, PageState::ACTIVE,
-                                       PageState::ACTIVE_MONITORING)) {
-                // The CAS only sets state. The mprotect happens in a
-                // separate atomic step. Between them, another compressor
-                // worker can grab the page (CAS ACTIVE_MONITORING →
-                // COMPRESSING in phase2), compress it, and set state =
-                // COMPRESSED with PROT_NONE. If we then unconditionally
-                // mprotect PROT_READ here, we corrupt the COMPRESSED
-                // page's protection — fault handler stops being able to
-                // catch accesses. Re-check state immediately before
-                // mprotect; if the page is no longer ACTIVE_MONITORING,
-                // someone else owns it now and we leave protection alone.
-                // (Bug surfaced by extending the TLA+ model to multiple
-                //  compressor workers in 2026-05-22.)
-                if (states_->get(i) == PageState::ACTIVE_MONITORING) {
-                    vm::protectPages(vm_->pageAddress(i), kPageSize, true, false);
+    // Maximum pages per chunked mprotect call. Larger = fewer VMA splits
+    // but longer lock-hold per chunk (more contention with handleFault).
+    // 16 (= 64 KiB chunks) keeps lock-hold under a few µs and still
+    // reduces VMA count by ~16× vs per-page.
+    static constexpr size_t kProtectChunkPages = 16;
+
+    // Flush an accumulated run of CAS-succeeded pages with a single
+    // chunked mprotect(PROT_READ). Acquires per-page locks in ascending
+    // order; if any page's state changed (CAS won, then someone else
+    // raced in, e.g. compressPage), falls back to per-page mprotect for
+    // the survivors so we don't write PROT_READ over a COMPRESSING page.
+    void flushPhase3Run(size_t run_start, size_t run_end) {
+        if (run_end <= run_start) return;
+        for (size_t k = run_start; k < run_end; ++k) locks_->lock(k);
+        bool all_ok = true;
+        for (size_t k = run_start; k < run_end; ++k) {
+            if (states_->get(k) != PageState::ACTIVE_MONITORING) {
+                all_ok = false;
+                break;
+            }
+        }
+        if (all_ok) {
+            void* run_addr = vm_->pageAddress(run_start);
+            if (!vm::protectPages(run_addr, (run_end - run_start) * kPageSize,
+                                  true, false)) {
+                // mprotect failed (typically ENOMEM at vm.max_map_count).
+                // Revert state to ACTIVE for all pages — without
+                // PROT_READ, we can't observe writes, so monitoring is
+                // a lie. Keeping state ACTIVE_MONITORING would cause
+                // compressPage to think the page is monitored when it
+                // isn't, leading to torn-snapshot corruption when
+                // compression proceeds.
+                for (size_t k = run_start; k < run_end; ++k) {
+                    states_->set(k, PageState::ACTIVE);
+                }
+            } else {
+                // See compressPage: the mprotect IPI ack does not drain
+                // remote store buffers. A monitor transition followed by
+                // immediate compression in the same tick can otherwise
+                // capture a torn snapshot.
+                protReadBarrier();
+            }
+        } else {
+            bool any_ok = false;
+            for (size_t k = run_start; k < run_end; ++k) {
+                if (states_->get(k) == PageState::ACTIVE_MONITORING) {
+                    if (!vm::protectPages(vm_->pageAddress(k), kPageSize,
+                                          true, false)) {
+                        states_->set(k, PageState::ACTIVE);
+                    } else {
+                        any_ok = true;
+                    }
                 }
             }
+            if (any_ok) protReadBarrier();
+        }
+        for (size_t k = run_start; k < run_end; ++k) locks_->unlock(k);
+    }
+
+    void phase3Range(size_t start, size_t end) {
+        // Use forEachLivePage to skip empty pages. For each live page,
+        // CAS to ACTIVE_MONITORING; accumulate a run of consecutive
+        // successes and flush via a single mprotect when the run breaks
+        // (non-contiguous page index, CAS failure, or chunk size cap).
+        size_t run_start = ~size_t{0};
+        size_t run_end = 0;
+        forEachLivePage(start, end, [&](size_t i) {
+            if (!states_->transition(i, PageState::ACTIVE,
+                                        PageState::ACTIVE_MONITORING)) {
+                // Run breaks here — flush whatever we accumulated.
+                if (run_end > run_start && run_start != ~size_t{0}) {
+                    flushPhase3Run(run_start, run_end);
+                }
+                run_start = ~size_t{0};
+                run_end = 0;
+                return;
+            }
+            // CAS succeeded. Extend the run if contiguous and under cap.
+            if (run_start == ~size_t{0}) {
+                run_start = i;
+                run_end = i + 1;
+            } else if (i == run_end &&
+                       (run_end - run_start) < kProtectChunkPages) {
+                run_end = i + 1;
+            } else {
+                // Discontinuity or cap reached. Flush previous run then
+                // start fresh from i.
+                flushPhase3Run(run_start, run_end);
+                run_start = i;
+                run_end = i + 1;
+            }
         });
+        if (run_end > run_start && run_start != ~size_t{0}) {
+            flushPhase3Run(run_start, run_end);
+        }
     }
 
     // ── Compress one page using worker's contexts ─────────────────────────
@@ -805,9 +1403,9 @@ private:
         uint8_t arena_id = 0, sc = 0;
         bool have_span = lookupSpanInfo(page_idx, arena_id, sc);
         size_t stats_idx = statsIndex(arena_id, sc);
-        uint8_t stats_count = (have_span && sc < kNumClasses)
+        uint8_t stats_count = (have_span && sc < kTotalBucketsPerArena)
             ? worker.sc_stats[stats_idx].count : 0;
-        uint16_t stats_sum = (have_span && sc < kNumClasses)
+        uint16_t stats_sum = (have_span && sc < kTotalBucketsPerArena)
             ? worker.sc_stats[stats_idx].sum : 0;
 
         if (!CompressionROI::shouldCompress(cold_count_[page_idx],
@@ -878,7 +1476,7 @@ private:
             // ROI model so it uses real workload data instead of synthetic
             // calibration when available.
             uint32_t observed_costs_us[2] = {0, 0};
-            if (have_span && sc < kNumClasses) {
+            if (have_span && sc < kTotalBucketsPerArena) {
                 observed_costs_us[0] = worker.sc_stats[stats_idx].observedCostUs(0);
                 observed_costs_us[1] = worker.sc_stats[stats_idx].observedCostUs(1);
             }
@@ -900,9 +1498,11 @@ private:
         int zstd_level = profile->zstd_level;
         bool is_fast_tier = (zstd_level != 0 && zstd_level != kZstdDeepLevel)
                           || (algo == CompressAlgo::LZ4);
-        // Prefer dictionary for deep-tier zstd if trained.
+        // Prefer dictionary for deep-tier zstd if trained. Dictionaries are
+        // keyed by real slab size_class only — large-alloc buckets sit above
+        // kNumClasses and bypass the dict path.
         if (algo == CompressAlgo::ZSTD && zstd_level == kZstdDeepLevel &&
-            engine_ && engine_->hasDictionary(sc)) {
+            engine_ && sc < kNumClasses && engine_->hasDictionary(sc)) {
             algo = CompressAlgo::ZSTD_DICT;
         }
 
@@ -919,14 +1519,95 @@ private:
             zeroFreeSlots(worker.page_buf, page_idx);
 #endif
         } else {
-            // Standard mode: mprotect for consistent snapshot + physical reclaim
+            // Standard mode. Make the page readable: it may be PROT_READ
+            // (Phase 3 monitoring) or PROT_NONE (deep monitoring).
             vm::protectPages(page_addr, kPageSize, true, false);  // PROT_READ
+            // Force any in-flight stores on remote cores to retire before
+            // we snapshot. mprotect's IPI ack does NOT guarantee the
+            // remote store buffers have drained; without this barrier,
+            // a writer mid-store on another core can have its write
+            // silently rolled back when the page is later
+            // decompress-on-fault restored from this snapshot. Gated by
+            // SMASH_PROT_READ_BARRIER to keep perf-default unchanged.
+            // Under FixAv the barrier is correctness-mandatory; the
+            // legacy env-gate becomes a no-op when SMASH_FIXAV is set.
+            if (fixavEnabled()) membarrierSyncCore();
+            else protReadBarrier();
+            // Fast path: user-space memcpy. We hold the per-page lock
+            // and just set PROT_READ; concurrent app accesses block in
+            // handleFault on the same lock. Only fall back to
+            // process_vm_readv (which converts faults to EFAULT instead
+            // of SIGSEGV) if the SMASH_SAFE_MEMCPY=1 env knob is set,
+            // for diagnostic / paranoid use. The previous default of
+            // process_vm_readv added ~3 µs syscall overhead per page,
+            // which on 28K pages = ~85 ms of pure syscall time per
+            // tick — measurably worse wall time on
+            // cut_reshape_8298.
+            static const bool safe_memcpy = []{
+                const char* v = std::getenv("SMASH_SAFE_MEMCPY");
+                return v && v[0] == '1';
+            }();
+#ifdef __linux__
+            if (safe_memcpy) {
+                struct iovec local_iov{worker.page_buf, kPageSize};
+                struct iovec remote_iov{page_addr, kPageSize};
+                ssize_t got = process_vm_readv(getpid(), &local_iov, 1,
+                                               &remote_iov, 1, 0);
+                if (got != static_cast<ssize_t>(kPageSize)) {
+                    vm::protectPages(page_addr, kPageSize, true, true);
+                    states_->set(page_idx, PageState::ACTIVE);
+                    locks_->unlock(page_idx);
+                    return false;
+                }
+            } else {
+                __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+            }
+#else
             __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+#endif
+            // SMASH_SNAPSHOT_VERIFY=1: defends against post-snapshot store
+            // retirement. After mprotect(PROT_READ) + (optional) membarrier,
+            // a writer's store that was issued under PROT_RW can still
+            // retire AFTER our snapshot completes (the store was legal at
+            // issue time, the wbuf is just draining late). When such a
+            // store retires before mprotect(PROT_NONE) but after the
+            // snapshot memcpy, our snapshot is stale: a later
+            // decompress-on-fault will silently roll back the writer's
+            // update. We re-read the page (still PROT_READ, lock still
+            // held) and compare against the snapshot. If they differ, a
+            // store retired in our window — abandon this attempt, restore
+            // PROT_RW, reset state to ACTIVE; next tick can retry.
+            static const bool snapshot_verify = []{
+                const char* v = std::getenv("SMASH_SNAPSHOT_VERIFY");
+                return v && v[0] == '1';
+            }();
+            // Snapshot-verify is correctness-mandatory under FixAv (it is the
+            // sole defense against a writer's store retiring inside our
+            // PROT_READ window). The legacy SMASH_SNAPSHOT_VERIFY env var
+            // remains as an independent opt-in for non-FixAv runs.
+            if (snapshot_verify || fixavEnabled()) {
+                alignas(64) uint8_t verify_buf[kPageSize];
+                __builtin_memcpy(verify_buf, page_addr, kPageSize);
+                if (__builtin_memcmp(verify_buf, worker.page_buf, kPageSize) != 0) {
+                    snapshot_verify_fails_.fetch_add(1, std::memory_order_relaxed);
+                    vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
+                    states_->set(page_idx, PageState::ACTIVE);
+                    locks_->unlock(page_idx);
+                    return false;
+                }
+                snapshot_verify_passes_.fetch_add(1, std::memory_order_relaxed);
+            }
 #ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
             zeroFreeSlots(worker.page_buf, page_idx);
 #endif
-            vm::decommitPages(page_addr, kPageSize);
-            vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
+            // P2 chunked: defer both the decommit and the mprotect to
+            // the batch flush at end of phase2Range. The page sits at
+            // PROT_READ with original contents. App reads return correct
+            // data (matches the compressed blob); app writes fault →
+            // handleFault → state COMPRESSED → decompress + restore.
+            // The end-of-phase batch chunked-mprotects (PROT_NONE) and
+            // chunked-decommits runs of contiguous still-COMPRESSED
+            // pages, reducing VMA boundaries by ~kProtectChunkPages×.
 
             if (states_->get(page_idx) != PageState::COMPRESSING) {
                 locks_->unlock(page_idx);
@@ -1009,11 +1690,15 @@ private:
         if (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio)) {
             // Not worth compressing; record poor ratio and cost for the
             // tier we actually ran, then restore the page.
-            if (have_span && sc < kNumClasses) {
+            if (have_span && sc < kTotalBucketsPerArena) {
                 worker.sc_stats[stats_idx].record(
                     comp_size ? comp_size : kPageSize, kPageSize);
                 int tier = is_fast_tier ? 0 : 1;
                 worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
+                // Time-budget: failed-compress cost still counts against
+                // the budget (we did spend cycles). bytes_saved unchanged.
+                worker.sc_stats[stats_idx].time_cost_total_us.fetch_add(
+                    comp_elapsed_us, std::memory_order_relaxed);
                 if (cfg.use_ucb && chosen_tier >= 0) {
                     worker.sc_stats[stats_idx].recordReward(chosen_tier, 0.0);
                     if (cfg.ucb_warmstart && arena_id < kNumArenas)
@@ -1021,7 +1706,9 @@ private:
                 }
             }
             if (!deferred) {
-                vm::protectPages(page_addr, kPageSize, true, true);
+                if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                    vm::remapPages(page_addr, kPageSize, true, true);
+                }
                 __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
             }
             states_->set(page_idx, PageState::ACTIVE);
@@ -1034,7 +1721,9 @@ private:
         void* stored = store_->store(worker.compress_buf, comp_size, &alloc_size, page_idx);
         if (!stored) {
             if (!deferred) {
-                vm::protectPages(page_addr, kPageSize, true, true);
+                if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                    vm::remapPages(page_addr, kPageSize, true, true);
+                }
                 __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
             }
             states_->set(page_idx, PageState::ACTIVE);
@@ -1043,11 +1732,21 @@ private:
         }
 
         // Record successful compression ratio and observed cost in the
-        // per-(arena, sc) bucket so future ROI decisions use real data.
-        if (have_span && sc < kNumClasses) {
+        // per-(arena, bucket) bucket so future ROI decisions use real data.
+        if (have_span && sc < kTotalBucketsPerArena) {
             worker.sc_stats[stats_idx].record(comp_size, kPageSize);
             int tier = is_fast_tier ? 0 : 1;
             worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
+            // Time-budget: bytes saved this page = (kPageSize - comp_size).
+            // Cost is the wall time we spent. Both are cumulative since
+            // process start; recomputeMarginalEfficiency reads them and
+            // computes per-bucket bytes/µs.
+            size_t saved = (comp_size < kPageSize)
+                ? (kPageSize - comp_size) : 0;
+            worker.sc_stats[stats_idx].bytes_saved_total.fetch_add(
+                saved, std::memory_order_relaxed);
+            worker.sc_stats[stats_idx].time_cost_total_us.fetch_add(
+                comp_elapsed_us, std::memory_order_relaxed);
             // UCB reward: bytes_saved / compress_us, attributed to the
             // originally chosen arm.  comp_elapsed_us covers the (possibly
             // tier-fallback) work that the choice actually triggered, which
@@ -1071,7 +1770,81 @@ private:
             shadow_tick_[page_idx] = tick_counter_;
             states_->set(page_idx, PageState::COMPRESSED_SHADOW);
         } else {
-            states_->set(page_idx, PageState::COMPRESSED);
+            // P2 chunking knob: SMASH_P2_CHUNK=1 enables the batched
+            // (decommit + mprotect PROT_NONE) path; default off until we
+            // verify it's strictly correctness-preserving on neuron-cc.
+            static const bool p2_chunk = []{
+                const char* v = std::getenv("SMASH_P2_CHUNK");
+                return v && v[0] == '1';
+            }();
+            if (p2_chunk) {
+                states_->set(page_idx, PageState::COMPRESSED);
+                if (worker.pending_pn_count < CompressWorker::kPendingProtCap) {
+                    worker.pending_pn_pages[worker.pending_pn_count++] = page_idx;
+                } else {
+                    vm::decommitPages(page_addr, kPageSize);
+                    if (!vm::protectPages(page_addr, kPageSize, false, false)) {
+                        vm::remapPages(page_addr, kPageSize, false, false);
+                    }
+                }
+            } else if (fixavEnabled()) {
+                // FixAv: PROT_NONE BEFORE madvise so readers/writers fault
+                // before they can observe a DROPPED+RO page (kernel would
+                // otherwise zero-fault, returning zeros for live data).
+                // Membarrier drains in-flight stores; any store that
+                // retires after mprotect(PROT_NONE) faults visibly and the
+                // fault handler decompresses normally.
+                if (!vm::protectPages(page_addr, kPageSize, false, false)) {
+                    if (!vm::remapPages(page_addr, kPageSize, false, false)) {
+                        if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                            vm::remapPages(page_addr, kPageSize, true, true);
+                        }
+                        __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+                        states_->set(page_idx, PageState::ACTIVE);
+                        locks_->unlock(page_idx);
+                        return false;
+                    }
+                }
+                states_->set(page_idx, PageState::COMPRESSED);
+                membarrierSyncCore();
+                vm::decommitPages(page_addr, kPageSize);
+            } else if (deferMadviseEnabled()) {
+                // Deferred-madvise: mprotect(PROT_NONE) immediately to gain
+                // fault-driven decompression, but defer madvise(DONTNEED)
+                // to the per-tick sweeper. Closes the corruption surface
+                // where in-flight loads with stale TLB observed a
+                // (PROT_*, DROPPED) page and saw kernel-zero-fault bytes.
+                if (!vm::protectPages(page_addr, kPageSize, false, false)) {
+                    if (!vm::remapPages(page_addr, kPageSize, false, false)) {
+                        if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                            vm::remapPages(page_addr, kPageSize, true, true);
+                        }
+                        __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+                        states_->set(page_idx, PageState::ACTIVE);
+                        locks_->unlock(page_idx);
+                        return false;
+                    }
+                }
+                // State must transition to COMPRESSED BEFORE the pending
+                // bit is set; otherwise the sweeper could race and observe
+                // pending+ACTIVE.
+                states_->set(page_idx, PageState::COMPRESSED);
+                deferMadvise(page_idx);
+            } else {
+                vm::decommitPages(page_addr, kPageSize);
+                if (!vm::protectPages(page_addr, kPageSize, false, false)) {
+                    if (!vm::remapPages(page_addr, kPageSize, false, false)) {
+                        if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                            vm::remapPages(page_addr, kPageSize, true, true);
+                        }
+                        __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+                        states_->set(page_idx, PageState::ACTIVE);
+                        locks_->unlock(page_idx);
+                        return false;
+                    }
+                }
+                states_->set(page_idx, PageState::COMPRESSED);
+            }
         }
         locks_->unlock(page_idx);
 
@@ -1119,6 +1892,9 @@ private:
 
         // No-op if already at target tier.
         if (old_algo == target_algo && target_algo != CompressAlgo::ZSTD_DICT) {
+            // Already at deep tier — promote tier marker so phase 2
+            // skips this page next tick.
+            if (page_tier_) page_tier_[page_idx] = kTierDeep;
             locks_->unlock(page_idx);
             return false;
         }
@@ -1177,11 +1953,14 @@ private:
         size_t savings_gate = (old_comp_size * 4) / 5;
         if (new_comp_size == 0 || new_comp_size > savings_gate) {
             states_->set(page_idx, PageState::COMPRESSED);
+            // Mark this page as having tried the upgrade so phase 2
+            // doesn't keep retrying every tick (dominant wall-time
+            // consumer on neuron-cc cut_batch-norm-training_33: 250K
+            // upgrade attempts/tick × ~50µs each = 12.5 s/tick burned
+            // on retries that always fail).
+            if (page_tier_) page_tier_[page_idx] = kTierFastTried;
             locks_->unlock(page_idx);
-            // Stats: record the failed upgrade attempt's cost against the
-            // target tier so the ROI model learns this bucket doesn't reward
-            // deep-tier upgrades.
-            if (have_span && sc < kNumClasses) {
+            if (have_span && sc < kTotalBucketsPerArena) {
                 worker.sc_stats[stats_idx].recordCost(1, elapsed_us);
             }
             return false;
@@ -1214,7 +1993,7 @@ private:
 
         // Stats: target-tier success record.  Tier index 1 = deep in the
         // current 2-tier scheme.
-        if (have_span && sc < kNumClasses) {
+        if (have_span && sc < kTotalBucketsPerArena) {
             worker.sc_stats[stats_idx].record(new_comp_size, kPageSize);
             worker.sc_stats[stats_idx].recordCost(1, elapsed_us);
         }
@@ -1227,18 +2006,24 @@ private:
 
     void collectDictSample(size_t /*page_idx*/, uint8_t sc, void* page_buf) {
         if (sc >= kNumClasses) return;
+        const int target_samples = getDictTrainSamples();
+        if (target_samples <= 0) return;  // dict training disabled
         auto& dt = dict_train_[sc];
         if (dt.trained) return;
+        // hasDictionary already covers warm-loaded dicts — re-collecting
+        // samples for those would be wasted work (engine already has a
+        // CDict installed and trainDictionary would refuse).
+        if (engine_->hasDictionary(sc)) { dt.trained = true; return; }
         if (trainedDictCount() >= kMaxDictClasses) return;
 
         // Lazy-allocate sample buffers (double-checked locking)
         if (!dt.allocated) {
             LockGuard guard(dt.alloc_lock);
             if (!dt.allocated) {
-                size_t buf_size = static_cast<size_t>(kDictTrainSamples) * kPageSize;
+                size_t buf_size = static_cast<size_t>(target_samples) * kPageSize;
                 dt.sample_data = static_cast<char*>(
                     BootstrapAlloc::instance().allocate(buf_size, kPageSize));
-                dt.sample_sizes = bootstrapArray<size_t>(kDictTrainSamples);
+                dt.sample_sizes = bootstrapArray<size_t>(target_samples);
                 if (!dt.sample_data || !dt.sample_sizes) {
                     dt.trained = true;  // Prevent retries
                     return;
@@ -1249,7 +2034,7 @@ private:
 
         // Atomically claim a sample slot
         uint16_t slot = dt.num_samples.fetch_add(1, std::memory_order_acq_rel);
-        if (slot >= kDictTrainSamples) return;  // already full
+        if (slot >= static_cast<uint16_t>(target_samples)) return;  // already full
 
         size_t offset = static_cast<size_t>(slot) * kPageSize;
         __builtin_memcpy(dt.sample_data + offset, page_buf, kPageSize);
@@ -1264,13 +2049,15 @@ private:
     }
 
     void trainDictionaries() {
+        const int target_samples = getDictTrainSamples();
+        if (target_samples <= 0) return;
         if (trainedDictCount() >= kMaxDictClasses) return;
 
         for (int sc = 0; sc < kNumClasses; ++sc) {
             auto& dt = dict_train_[sc];
             if (dt.trained) continue;
             uint16_t samples = dt.num_samples.load(std::memory_order_acquire);
-            if (samples < kDictTrainSamples) continue;
+            if (samples < static_cast<uint16_t>(target_samples)) continue;
             dt.trained = engine_->trainDictionary(
                 sc, dt.sample_data, dt.sample_sizes, samples);
             if (!dt.trained) dt.trained = true;
@@ -1471,12 +2258,328 @@ private:
                 // Content verified under PROT_READ — any write between
                 // the memcmp and now would have faulted (handler discards
                 // blob and sets ACTIVE). Safe to reclaim.
-                vm::decommitPages(page_addr, kPageSize);
-                vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
-                shadow_tick_[i] = 0;
-                states_->set(i, PageState::COMPRESSED);
+                if (fixavEnabled()) {
+                    // FixAv: PROT_NONE → membarrier → madvise so a remote
+                    // reader can never observe a DROPPED+RO page (the
+                    // mprotect IPI shoots down the TLB; any post-madvise
+                    // access faults visibly and the handler decompresses).
+                    vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
+                    shadow_tick_[i] = 0;
+                    states_->set(i, PageState::COMPRESSED);
+                    membarrierSyncCore();
+                    vm::decommitPages(page_addr, kPageSize);
+                } else {
+                    vm::decommitPages(page_addr, kPageSize);
+                    vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
+                    shadow_tick_[i] = 0;
+                    states_->set(i, PageState::COMPRESSED);
+                }
                 locks_->unlock(i);
             }
+        }
+    }
+
+    // ── Soft-dirty access tracking (Linux only) ───────────────────────────
+    //
+    // Replaces Phase 3 mprotect-based write monitoring. Pros:
+    //  - Kernel sets the soft-dirty PTE bit on every write at no fault cost.
+    //  - No VMA fragmentation (mprotect creates one VMA boundary per page;
+    //    soft-dirty has no VMA cost). Critical for big workloads that
+    //    otherwise hit /proc/sys/vm/max_map_count = 65530.
+    //  - One syscall per tick to clear, vs N mprotect calls.
+    //
+    // Cost:
+    //  - Bulk /proc/self/pagemap read at tick start: 8 bytes per page in
+    //    our region. For 1M pages that's an 8 MiB sequential read; the
+    //    kernel can stream this from the page-table walk fast.
+    //  - One write to /proc/self/clear_refs at tick end. The kernel
+    //    soft-clears all anonymous PTEs in the process; not just ours.
+    //    Side effect: a brief PTE-zap stall, similar in magnitude to the
+    //    mprotect-storm we're replacing but bounded to a single syscall.
+    //
+    // Enabled by SMASH_SOFTDIRTY=1.
+    static bool isSoftDirtyEnabled() {
+        static const int on = []{
+            const char* v = std::getenv("SMASH_SOFTDIRTY");
+            return (v && v[0] == '1') ? 1 : 0;
+        }();
+        return on != 0;
+    }
+
+    // Open the soft-dirty fds lazily once. Returns false if the kernel
+    // doesn't have soft-dirty support (e.g. not Linux, or pagemap denied).
+    bool ensureSoftDirtyFds() {
+#ifdef __linux__
+        if (clear_refs_fd_ < 0) {
+            clear_refs_fd_ = open("/proc/self/clear_refs", O_WRONLY | O_CLOEXEC);
+            if (clear_refs_fd_ < 0) return false;
+        }
+        if (pagemap_fd_ < 0) {
+            pagemap_fd_ = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+            if (pagemap_fd_ < 0) return false;
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // Read pagemap entries for the smash region [start, end) and OR the
+    // soft-dirty bit (PTE bit 55, exposed in pagemap bit 55) into
+    // accessed_[i]. Reads in a single bulk pread; no syscall per page.
+    void readSoftDirty(size_t start, size_t end) {
+#ifdef __linux__
+        if (pagemap_fd_ < 0 || end <= start) return;
+        if (!vm_) return;
+        constexpr size_t kBatchPages = 4096;  // 32 KiB pagemap reads
+        uint64_t buf[kBatchPages];
+        size_t i = start;
+        while (i < end) {
+            size_t batch = end - i;
+            if (batch > kBatchPages) batch = kBatchPages;
+            void* pa = vm_->pageAddress(i);
+            uint64_t pfn_off =
+                (reinterpret_cast<uintptr_t>(pa) / kPageSize) *
+                sizeof(uint64_t);
+            ssize_t got = pread(pagemap_fd_, buf,
+                                batch * sizeof(uint64_t), pfn_off);
+            if (got <= 0) break;
+            size_t got_pages = static_cast<size_t>(got) / sizeof(uint64_t);
+            for (size_t k = 0; k < got_pages; ++k) {
+                // pagemap bit 55 = PTE soft-dirty. We only care about
+                // pages we still consider live.
+                if (buf[k] & (1ULL << 55)) {
+                    accessed_[i + k].store(true,
+                        std::memory_order_relaxed);
+                }
+            }
+            i += got_pages;
+            if (got_pages < batch) break;
+        }
+#else
+        (void)start; (void)end;
+#endif
+    }
+
+    // Clear soft-dirty for the entire process. One syscall.
+    void clearSoftDirty() {
+#ifdef __linux__
+        if (clear_refs_fd_ < 0) return;
+        // "4\n" — see Documentation/admin-guide/mm/soft-dirty.rst.
+        const char buf[3] = {'4', '\n', 0};
+        (void)!write(clear_refs_fd_, buf, 2);
+#endif
+    }
+
+    // ── Time-budget marginal-efficiency recompute ─────────────────────────
+    //
+    // Walks every (arena, size_class) bucket aggregated across workers and
+    // sets `budget_decision_hint` to one of {EXPLORE, COMPRESS, SKIP} per
+    // the SMASH_TIME_BUDGET_PCT design (TIME_BUDGET.md):
+    //
+    //   - count < 8                          → EXPLORE (always compress)
+    //   - SMASH_TIME_BUDGET_PCT unset / 100  → COMPRESS (no skip; legacy)
+    //   - otherwise: rank buckets by efficiency desc; admit while
+    //     cumulative time_cost ≤ pct × elapsed_wall_us; reject the rest.
+    //
+    // Cost: O(B log B) where B = kNumArenas * kTotalBucketsPerArena ≤ ~5600
+    // (kMaxArenas=128 × (kNumClasses=36 + kNumLargeClasses=8)). With
+    // kBudgetRecomputeEveryTicks=8 (one second cadence at 1Hz tick) the
+    // amortized overhead is well under 1% even on the slowest machines.
+    void recomputeMarginalEfficiency() {
+        int budget_pct = getTimeBudgetPct();
+        const size_t total = static_cast<size_t>(kNumArenas) * kTotalBucketsPerArena;
+
+        // Aggregate per-bucket counters across workers. Worker 0 is the
+        // canonical sink for cross-thread updates (fault decompress path),
+        // but worker N's compressPage writes to its own slot — sum them.
+        struct BucketAgg {
+            uint32_t bidx;
+            uint32_t count;
+            uint64_t bytes_saved;
+            uint64_t time_cost_us;
+            uint32_t efficiency_x256;  // bytes_saved/time_cost × 256, saturated
+        };
+        // Bucket count is bounded; allocate from bootstrap once and reuse.
+        // Simplest: stack-allocate up to a reasonable cap. kMaxArenas *
+        // kTotalBucketsPerArena = 128 * 44 = 5632 entries × 32 B = 176 KB
+        // — too big for stack. Use a static-thread-local heap-bootstrapped
+        // buffer since this only runs on the coordinator thread.
+        static BucketAgg* aggs = nullptr;
+        if (!aggs) {
+            aggs = bootstrapArray<BucketAgg>(total);
+        }
+
+        for (size_t i = 0; i < total; ++i) {
+            uint32_t cnt = 0;
+            uint64_t bs = 0, tc = 0;
+            for (int w = 0; w < kMaxCompressorWorkers; ++w) {
+                auto& s = workers_[w].sc_stats[i];
+                cnt += s.count;
+                bs += s.bytes_saved_total.load(std::memory_order_relaxed);
+                tc += s.time_cost_total_us.load(std::memory_order_relaxed);
+            }
+            uint32_t eff_x256 = 0;
+            // Treat zero time_cost as "no signal" — let exploration keep going.
+            if (tc > 0) {
+                uint64_t e = (bs * 256ULL) / tc;
+                eff_x256 = (e > 0xFFFFu) ? 0xFFFFu : static_cast<uint32_t>(e);
+            }
+            aggs[i] = BucketAgg{static_cast<uint32_t>(i), cnt, bs, tc, eff_x256};
+        }
+
+        // Publish efficiency_x256 to every worker's view of each bucket so
+        // saveProfileFile can persist a sane warm-start hint.
+        for (size_t i = 0; i < total; ++i) {
+            for (int w = 0; w < kMaxCompressorWorkers; ++w) {
+                workers_[w].sc_stats[i].efficiency_x256 =
+                    static_cast<uint16_t>(aggs[i].efficiency_x256);
+            }
+        }
+
+        // Default decision when budget knob is unset: COMPRESS for every
+        // bucket past exploration. Keeps behavior unchanged from legacy.
+        auto setHint = [&](size_t i, uint8_t hint) {
+            for (int w = 0; w < kMaxCompressorWorkers; ++w)
+                workers_[w].sc_stats[i].budget_decision_hint = hint;
+        };
+
+        if (budget_pct < 0 || budget_pct >= 100) {
+            for (size_t i = 0; i < total; ++i) {
+                uint8_t hint = (aggs[i].count < 8)
+                    ? SizeClassStats::kBudgetExplore
+                    : SizeClassStats::kBudgetCompress;
+                setHint(i, hint);
+            }
+            return;
+        }
+
+        // Available compress budget = elapsed_wall_us × pct / 100.
+        auto now = std::chrono::steady_clock::now();
+        uint64_t elapsed_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                now - start_steady_time_).count());
+        // Avoid degenerate boot-up cases where elapsed is zero.
+        if (elapsed_us < 1000) elapsed_us = 1000;
+        uint64_t available_us =
+            (elapsed_us * static_cast<uint64_t>(budget_pct)) / 100ULL;
+
+        // Rank buckets with count >= 8 by efficiency desc. Buckets with
+        // count < 8 are EXPLORE (always-compress) and don't enter the sort.
+        // Use a flat in-place insertion sort: B ≤ ~4600 and only the
+        // count >= 8 subset participates, so we expect << 1k entries.
+        // Re-purpose `aggs` as the sort buffer by partitioning in-place.
+        size_t n_rank = 0;
+        for (size_t i = 0; i < total; ++i) {
+            if (aggs[i].count >= 8) {
+                if (n_rank != i) std::swap(aggs[n_rank], aggs[i]);
+                ++n_rank;
+            }
+        }
+        // Stable partial sort by efficiency desc on aggs[0..n_rank).
+        // std::sort with a comparator is fine — coordinator thread, not
+        // a hot path.
+        std::sort(aggs, aggs + n_rank, [](const BucketAgg& a, const BucketAgg& b) {
+            return a.efficiency_x256 > b.efficiency_x256;
+        });
+
+        uint64_t budget_used = 0;
+        size_t n_compress = 0, n_skip = 0;
+        // Accept while cumulative time fits the budget. Buckets with no
+        // observed time_cost (tc=0) are admitted for free — they'll either
+        // compress productively (and accumulate cost in future ticks) or
+        // turn out hot and fail fast.
+        for (size_t k = 0; k < n_rank; ++k) {
+            uint64_t inc = aggs[k].time_cost_us;
+            if (budget_used + inc <= available_us) {
+                budget_used += inc;
+                setHint(aggs[k].bidx, SizeClassStats::kBudgetCompress);
+                ++n_compress;
+            } else {
+                setHint(aggs[k].bidx, SizeClassStats::kBudgetSkip);
+                ++n_skip;
+            }
+        }
+        // Optional one-line summary to stderr per recompute under SMASH_DEBUG=1.
+        // Splits the count into slab vs large-alloc buckets so we can see at
+        // a glance whether the gating is firing on large allocs (the case
+        // for SMASH_LARGE_ONLY workloads).
+        if (s_debug_enabled_) {
+            size_t n_compress_lg = 0, n_skip_lg = 0, n_explore_lg = 0;
+            size_t n_rank_lg = 0;
+            for (size_t i = 0; i < total; ++i) {
+                size_t bucket_in_arena = i % kTotalBucketsPerArena;
+                if (bucket_in_arena < kNumClasses) continue;  // slab bucket
+                uint8_t hint = workers_[0].sc_stats[i].budget_decision_hint;
+                if (workers_[0].sc_stats[i].count >= 8) ++n_rank_lg;
+                if (hint == SizeClassStats::kBudgetCompress) ++n_compress_lg;
+                else if (hint == SizeClassStats::kBudgetSkip) ++n_skip_lg;
+                else ++n_explore_lg;
+            }
+            char dbg[300];
+            int dn = snprintf(dbg, sizeof(dbg),
+                "[smash budget] tick=%u pct=%d elapsed_us=%llu avail_us=%llu "
+                "buckets=%zu (%dx%d) n_rank=%zu compress=%zu skip=%zu explore=%zu "
+                "large(rank=%zu compress=%zu skip=%zu explore=%zu)\n",
+                tick_counter_, budget_pct,
+                (unsigned long long)elapsed_us,
+                (unsigned long long)available_us,
+                total, kNumArenas, kTotalBucketsPerArena,
+                n_rank, n_compress, n_skip, total - n_rank,
+                n_rank_lg, n_compress_lg, n_skip_lg, n_explore_lg);
+            if (dn > 0) (void)!write(2, dbg, (size_t)dn);
+        }
+        // Buckets that didn't make the rank cut (count < 8) are EXPLORE.
+        // They sit at the tail of `aggs` after the partition.
+        for (size_t k = n_rank; k < total; ++k) {
+            setHint(aggs[k].bidx, SizeClassStats::kBudgetExplore);
+        }
+    }
+
+    // ── Deferred madvise helpers ──────────────────────────────────────────
+
+    // Queue a just-COMPRESSED page for deferred madvise. Caller MUST have
+    // already transitioned state to COMPRESSED (the bit is consumed under
+    // the per-page lock by the sweeper, which double-checks state before
+    // dropping backing).
+    [[gnu::always_inline]]
+    inline void deferMadvise(size_t page_idx) {
+        deferred_queue_tick_[page_idx] = tick_counter_;
+        deferred_pending_[page_idx].store(true, std::memory_order_release);
+    }
+
+    // Sweep the deferred-madvise queue. Called once per tick at the END of
+    // tick(). For each pending page whose TTL has elapsed and whose state
+    // is still COMPRESSED, drop the backing pages with madvise(DONTNEED).
+    // The per-page lock provides ordering against handleFault and
+    // releaseCompressedPages, both of which clear the pending bit BEFORE
+    // any state transition out of COMPRESSED.
+    void sweepDeferredMadvise() {
+        if (!deferMadviseEnabled() || !deferred_pending_) return;
+        const uint32_t now = tick_counter_;
+        const uint32_t ttl = deferMadviseTicks();
+        const size_t total = vm_->committedPages();
+        for (size_t i = 0; i < total; ++i) {
+            if (!deferred_pending_[i].load(std::memory_order_acquire)) continue;
+            if (now - deferred_queue_tick_[i] < ttl) continue;
+            if (!locks_->tryLock(i)) continue;  // contended — try next tick
+            if (!deferred_pending_[i].load(std::memory_order_acquire)) {
+                locks_->unlock(i);
+                continue;
+            }
+            if (states_->get(i) != PageState::COMPRESSED) {
+                // State moved without clearing the bit — defensively reset.
+                deferred_pending_[i].store(false, std::memory_order_release);
+                locks_->unlock(i);
+                continue;
+            }
+            // Page is COMPRESSED+PROT_NONE+BACKED, has been for >= ttl
+            // ticks, and no concurrent fault has touched it. Safe to drop
+            // backing: any user touch would have faulted the COMPRESSED
+            // state and cleared the bit.
+            deferred_pending_[i].store(false, std::memory_order_release);
+            vm::decommitPages(vm_->pageAddress(i), kPageSize);
+            locks_->unlock(i);
         }
     }
 
@@ -1486,6 +2589,13 @@ private:
         ++tick_counter_;
         if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
+        // Time-budget recompute is cheap (~144-4600 buckets sorted) and only
+        // runs every kBudgetRecomputeEveryTicks ticks. When the budget knob
+        // is unset this still runs but the inner loop short-circuits to the
+        // legacy "all buckets COMPRESS" branch — so cost stays negligible.
+        if ((tick_counter_ % kBudgetRecomputeEveryTicks) == 0) {
+            recomputeMarginalEfficiency();
+        }
         // SMASH_DEFER_PHASES_MS=NNN: skip Phase 2 (compress) and Phase 3
         // (monitor PROT_READ) for the first NNN ms after start(). Useful
         // for workloads that establish IPC channels at startup with
@@ -1503,6 +2613,45 @@ private:
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - start_time).count();
             defer_phases = (elapsed_ms < defer_ms);
+        }
+
+        // VMA-cap guard. Each compressed page creates at least one VMA
+        // boundary in /proc/self/maps; Linux's vm.max_map_count (default
+        // 65530) caps total VMAs in a process. When we get within
+        // kVmaSafetyMargin of the cap, mprotect starts failing with
+        // ENOMEM, which has caused data corruption in walrus on big
+        // HLOs (cut_batch-norm-training_33). Skip Phase 2 (compress) and
+        // Phase 3 (PROT_READ monitor) entirely when we're close — better
+        // to lose RSS savings than corrupt the host application.
+        //
+        // Re-check every kVmaCheckEveryNTicks ticks; this is a cheap
+        // /proc read but we don't need it every second.
+        static const long max_map_count = []{
+            FILE* f = fopen("/proc/sys/vm/max_map_count", "r");
+            if (!f) return 65530L;
+            long n = 65530;
+            (void)fscanf(f, "%ld", &n);
+            fclose(f);
+            return n;
+        }();
+        constexpr long kVmaSafetyMargin = 8192;       // 8K VMA headroom
+        constexpr int kVmaCheckEveryNTicks = 4;
+        if ((tick_counter_ % kVmaCheckEveryNTicks) == 0) {
+            FILE* f = fopen("/proc/self/maps", "r");
+            if (f) {
+                long n = 0;
+                char buf[4096];
+                while (fgets(buf, sizeof(buf), f)) ++n;
+                fclose(f);
+                vma_count_cached_ = n;
+            }
+        }
+        if (vma_count_cached_ + kVmaSafetyMargin >= max_map_count) {
+            // Can't safely fragment more VMAs — defer compression for
+            // the remainder of this tick. Phase 1 (access tracking)
+            // still runs so when VMA budget recovers (via in-flight
+            // fault handlers reclaiming pages) we resume.
+            defer_phases = true;
         }
         // Re-claim SIGUSR2 each tick so Firefox / other runtimes that
         // also install a SIGUSR2 handler can't permanently displace ours.
@@ -1564,6 +2713,13 @@ private:
             workers_[0].range_end = committed;
         }
 
+        // Soft-dirty: bulk-read kernel-tracked write bits into accessed_
+        // BEFORE Phase 1 consumes them, then clear for the next tick.
+        bool softdirty = isSoftDirtyEnabled() && ensureSoftDirtyFds();
+        if (softdirty) {
+            readSoftDirty(0, committed);
+        }
+
         dispatch(1);  // Phase 1: access tracking
 
         if (!defer_phases && isDeferredReclaimMode())
@@ -1580,7 +2736,47 @@ private:
             const char* v = std::getenv("SMASH_NO_MONITOR");
             return v && v[0] == '1';
         }();
-        if (!no_monitor && !defer_phases) dispatch(3);  // Phase 3: monitoring
+        // Selective Phase 3 skip: if many recent ticks all reported
+        // 0 pages eligible AND 0 compressed, Phase 3 monitoring just
+        // creates VMA-fragmenting mprotect storms with no payoff
+        // (workload is steady-RW; monitoring won't help). Skip until
+        // we hit a re-probe boundary so we don't go permanently blind.
+        // Disabled by default (=0); user opt-in via SMASH_PHASE3_SKIP_THRESHOLD.
+        static const int phase3_skip_thresh = []{
+            const char* v = std::getenv("SMASH_PHASE3_SKIP_THRESHOLD");
+            return v ? atoi(v) : 0;
+        }();
+        bool skip_phase3 = false;
+        if (phase3_skip_thresh > 0) {
+            uint64_t total_compressed = 0;
+            uint64_t total_eligible = 0;
+            for (int w = 0; w < nw; ++w) {
+                total_compressed += worker_pages_compressed_[w].load(
+                    std::memory_order_relaxed);
+                total_eligible += worker_pages_eligible_[w].load(
+                    std::memory_order_relaxed);
+            }
+            if (total_compressed == 0 && total_eligible == 0) {
+                ++phase3_idle_ticks_;
+                if (phase3_idle_ticks_ > phase3_skip_thresh &&
+                    (phase3_idle_ticks_ % phase3_skip_thresh) != 0) {
+                    skip_phase3 = true;
+                }
+            } else {
+                phase3_idle_ticks_ = 0;
+            }
+        }
+        // Phase 3 is replaced entirely when soft-dirty is enabled — the
+        // kernel does the write tracking for us via PTE bits, no
+        // mprotect storm needed.
+        if (!no_monitor && !defer_phases && !skip_phase3 && !softdirty) {
+            dispatch(3);  // Phase 3: monitoring
+        }
+        if (softdirty) {
+            // End-of-tick clear so app writes during the next tick get
+            // freshly tracked. One syscall, no per-page cost.
+            clearSoftDirty();
+        }
 
         // ── Adaptive worker scaling ──────────────────────────────────────
         // Measure this tick's workload and throughput, update EMAs, and
@@ -1590,6 +2786,11 @@ private:
         if constexpr (kMeasureCohorts) tallyCohorts(committed);
 
         trainDictionaries();
+
+        // Drain any deferred-madvise queue entries whose TTL has elapsed.
+        // Runs after all phase work so the sweeper observes the freshly
+        // queued pages from this tick at full TTL on the next pass.
+        sweepDeferredMadvise();
     }
 
     // Adapt active worker count using Little's Law (see class comment above).
@@ -1877,6 +3078,10 @@ public:
         if (isDeferredReclaimMode())
             shadow_tick_ = bootstrapArray<uint32_t>(max_pages);
         page_tier_ = bootstrapArray<uint8_t>(max_pages);
+        // Always allocate; sweeper short-circuits on the env knob anyway,
+        // and unconditional init keeps pointer-null checks out of fault path.
+        deferred_pending_ = bootstrapArray<std::atomic<bool>>(max_pages);
+        deferred_queue_tick_ = bootstrapArray<uint32_t>(max_pages);
 
         // Per-bucket recompression EMA table (kNumArenas × kNumClasses entries).
         bucket_rc_ema_x256_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
@@ -1937,8 +3142,177 @@ public:
         cohort_pages_len_ = len;
     }
 
+    // ── Profile persistence (P3) ─────────────────────────────────────────
+    // SMASH_PROFILE_FILE=<path>: path to a binary file used to persist
+    // per-bucket compression statistics across runs. On start() we load
+    // the file (if it exists and has the right version); on stop() we
+    // write a fresh snapshot atomically via rename(2). Buckets marked
+    // ALWAYS_SKIP short-circuit phase2 immediately, eliminating ROI cost
+    // and per-page lock acquisitions for known-uncompressible buckets.
+    static constexpr uint32_t kProfileMagic = 0x53503031u;  // "SP01"
+    // v3 added large-allocation pseudo size-classes (kNumLargeClasses entries
+    // beyond kNumClasses), so the on-disk record array length grew from
+    // kNumArenas*kNumClasses to kNumArenas*kTotalBucketsPerArena.
+    // v4 appends a per-size-class dictionary section so warm-mode runs can
+    // skip the (~50–200 ms) ZDICT_trainFromBuffer step. Older v1/v2/v3 files
+    // are silently rejected by loadProfileFile (header version mismatch),
+    // matching the existing pattern for stale persisted profiles.
+    static constexpr uint32_t kProfileVersion = 4;
+
+    // Sentinel size_class value marking the end of the dictionary section.
+    // 255 was chosen because real size_class values are well below
+    // kTotalBucketsPerArena (≈ 44), so 255 is a safe out-of-band marker.
+    static constexpr uint8_t kDictSectionEnd = 255;
+    // Hard cap on a single dict's serialized size. Matches kDictCapacity
+    // (16 KiB), the same upper bound enforced by trainDictionary.
+    static constexpr uint32_t kMaxDictBytes = 64 * 1024;
+
+    struct ProfileHeader {
+        uint32_t magic;
+        uint32_t version;
+        uint16_t num_arenas;
+        // Total bucket count per arena (kTotalBucketsPerArena). Field name
+        // kept as num_classes for ABI compatibility with older headers; the
+        // version bump distinguishes v2/v3/v4 layouts.
+        uint16_t num_classes;
+        uint32_t reserved;
+    };
+
+    static const char* profileFilePath() {
+        static const char* p = []{
+            const char* v = getenv("SMASH_PROFILE_FILE");
+            return (v && v[0]) ? v : nullptr;
+        }();
+        return p;
+    }
+
+    // Whether to persist the profile + dict at exit. SMASH_PROFILE_FILE_RW
+    // implies SAVE; SMASH_PROFILE_FILE_SAVE controls it explicitly. Default
+    // off so warm-only runs (the common case in production) don't overwrite
+    // a carefully-trained file with their short-run observations.
+    static bool shouldSaveProfile() {
+        return getProfileFileSave() || getProfileFileRW();
+    }
+
+    void loadProfileFile() {
+        const char* path = profileFilePath();
+        if (!path) return;
+        FILE* f = fopen(path, "rb");
+        if (!f) return;
+        ProfileHeader hdr{};
+        if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+            hdr.magic != kProfileMagic ||
+            hdr.version != kProfileVersion ||
+            hdr.num_arenas != kNumArenas ||
+            hdr.num_classes != kTotalBucketsPerArena) {
+            fclose(f);
+            return;
+        }
+        size_t total = static_cast<size_t>(kNumArenas) * kTotalBucketsPerArena;
+        for (size_t i = 0; i < total; ++i) {
+            SizeClassStats::Persist rec{};
+            if (fread(&rec, sizeof(rec), 1, f) != 1) {
+                // Truncated profile section — accept what we read so far,
+                // skip dict section. Cold-start the rest.
+                fclose(f);
+                return;
+            }
+            for (int w = 0; w < kMaxCompressorWorkers; ++w) {
+                workers_[w].sc_stats[i].deserialize(rec);
+                workers_[w].sc_stats[i].persist_hint = rec.decision_hint;
+            }
+        }
+
+        // Optional dictionary section. Each record is
+        //   u8 size_class
+        //   u32 dict_size
+        //   <dict_size bytes>
+        // terminated by size_class == kDictSectionEnd. A truncated tail is
+        // not fatal — we treat it the same as "no more dicts" and exit.
+        // Stack buffer keeps us off bootstrap on the load-only fast path.
+        uint8_t dict_buf[kMaxDictBytes];
+        for (;;) {
+            uint8_t sc = 0;
+            if (fread(&sc, sizeof(sc), 1, f) != 1) break;
+            if (sc == kDictSectionEnd) break;
+            uint32_t dsize = 0;
+            if (fread(&dsize, sizeof(dsize), 1, f) != 1) break;
+            if (dsize == 0 || dsize > kMaxDictBytes || sc >= kNumClasses) {
+                // Bad record — abort dict-load but leave already-loaded
+                // dicts in place. Don't propagate the error: the profile
+                // section was usable and we already have a partial load.
+                break;
+            }
+            if (fread(dict_buf, dsize, 1, f) != 1) break;
+            if (engine_) {
+                engine_->setDictionary(sc, dict_buf, dsize);
+                // Mark dict_train_ as already trained so the cold-start
+                // sample-collection path is skipped for this size class.
+                if (sc < kNumClasses) dict_train_[sc].trained = true;
+            }
+        }
+        fclose(f);
+    }
+
+    void saveProfileFile() {
+        if (!shouldSaveProfile()) return;
+        const char* path = profileFilePath();
+        if (!path) return;
+        // Aggregate across workers: take the worker with the highest count
+        // for each bucket as authoritative (workers see disjoint pages, so
+        // one worker typically owns the bucket's ratio history).
+        size_t total = static_cast<size_t>(kNumArenas) * kTotalBucketsPerArena;
+        char tmp[1024];
+        snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+        FILE* f = fopen(tmp, "wb");
+        if (!f) return;
+        ProfileHeader hdr{kProfileMagic, kProfileVersion,
+                          static_cast<uint16_t>(kNumArenas),
+                          static_cast<uint16_t>(kTotalBucketsPerArena), 0};
+        fwrite(&hdr, sizeof(hdr), 1, f);
+        for (size_t i = 0; i < total; ++i) {
+            int best = 0;
+            for (int w = 1; w < kMaxCompressorWorkers; ++w) {
+                if (workers_[w].sc_stats[i].count >
+                    workers_[best].sc_stats[i].count) best = w;
+            }
+            SizeClassStats::Persist rec{};
+            workers_[best].sc_stats[i].serialize(&rec);
+            fwrite(&rec, sizeof(rec), 1, f);
+        }
+
+        // Dictionary section (v4). Skipping the section is fine: the
+        // sentinel is the only thing v4 readers require to find EOF before
+        // returning, and a missing-dict-section is then equivalent to
+        // "no dictionaries trained" — which is exactly the case if the
+        // process never hit kDictTrainSamples.
+        if (engine_) {
+            for (int sc = 0; sc < kNumClasses; ++sc) {
+                if (!engine_->hasDictionary(static_cast<uint8_t>(sc)))
+                    continue;
+                const void* db = engine_->dictBytes(static_cast<uint8_t>(sc));
+                size_t ds = engine_->dictSize(static_cast<uint8_t>(sc));
+                if (!db || ds == 0 || ds > kMaxDictBytes) continue;
+                uint8_t sc8 = static_cast<uint8_t>(sc);
+                uint32_t ds32 = static_cast<uint32_t>(ds);
+                fwrite(&sc8, sizeof(sc8), 1, f);
+                fwrite(&ds32, sizeof(ds32), 1, f);
+                fwrite(db, ds, 1, f);
+            }
+        }
+        uint8_t end = kDictSectionEnd;
+        fwrite(&end, sizeof(end), 1, f);
+
+        fclose(f);
+        rename(tmp, path);
+    }
+
     void start() {
         running_.store(true, std::memory_order_release);
+        start_steady_time_ = std::chrono::steady_clock::now();
+
+        // P3: load persisted bucket stats before any tick fires.
+        loadProfileFile();
 
         // SIGUSR2 stats dump: walk page-state table, write a one-line summary
         // to stderr. Lets us observe whether smash is actually compressing
@@ -1962,6 +3336,21 @@ public:
                 if (s_stats_instance_) sigusr1Handler(0);
             });
         }
+
+        // Register an atexit handler to join the coordinator + helper
+        // threads on normal process exit. Without this, the threads spin
+        // in their `running_.load()` loops indefinitely after main()
+        // returns and the host process can't exit cleanly (observed on
+        // walrus_driver post-compile: state=I, no work to do, alive
+        // 500+s). stop() is idempotent — guarded by `running_.load()` —
+        // so it's safe to call multiple times and safe to inherit across
+        // fork. atexit registers in LIFO order, so this runs before the
+        // SMASH_STATS handler above; that's fine, stats only walks the
+        // page-state table and doesn't depend on the threads being live.
+        s_stop_instance_ = this;
+        std::atexit([]() {
+            if (s_stop_instance_) s_stop_instance_->stop();
+        });
 
         // SMASH_DEBUG=1: emit a banner now (compressor came up) and a
         // stats line every Nth tick during the run. Distinct from
@@ -1995,6 +3384,7 @@ public:
     }
 
     static inline CompressorThread* s_stats_instance_ = nullptr;
+    static inline CompressorThread* s_stop_instance_ = nullptr;
     static inline bool s_debug_enabled_ = false;
 
     static void sigusr1Handler(int) {
@@ -2033,12 +3423,81 @@ public:
         if (n > 0) (void)!write(2, buf, (size_t)n);
     }
 
+    // Walk every page; for COMPRESSED / COMPRESSED_SHADOW pages,
+    // decompress the blob back into the page and restore PROT_RW; for
+    // ACTIVE_MONITORING pages, just restore PROT_RW. After this every
+    // smash-managed page is plain anonymous RW memory, so any
+    // post-shutdown access (CPython's __cxa_finalize, TLS destructors,
+    // mimalloc cleanup, etc.) sees ordinary memory and doesn't fault.
+    //
+    // This must run BEFORE we join compressor threads (we still need
+    // the per-page lock infrastructure) and BEFORE we uninstall the
+    // fault handler (decompression here doesn't fault, but we want to
+    // be defensive — a fault during drain wouldn't be a no-op).
+    void drainAllForShutdown() {
+        if (!vm_ || !states_ || !locks_ || !engine_ || !store_) return;
+        size_t committed = vm_->committedPages();
+        for (size_t i = 0; i < committed; ++i) {
+            // tryLock to skip pages held by an in-flight tick we just
+            // told to stop; the coordinator will exit and we'll re-walk
+            // those after the join.
+            if (!locks_->tryLock(i)) continue;
+            PageState st = states_->get(i);
+            void* page_addr = vm_->pageAddress(i);
+            if (st == PageState::COMPRESSED ||
+                st == PageState::COMPRESSED_SHADOW) {
+                CompressAlgo algo = compressed_[i].algorithm();
+                uint8_t sc = lookupSizeClass(i);
+                int slot = -1;
+                while ((slot = acquireFaultSlot()) < 0) {
+#if defined(__x86_64__)
+                    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                    asm volatile("yield");
+#endif
+                }
+                engine_->decompressWithDCtx(
+                    fault_slots_[slot].dctx,
+                    compressed_[i].data, fault_slots_[slot].buf,
+                    compressed_[i].compressedSize(), kPageSize, algo, sc);
+                if (!vm::commitPages(page_addr, kPageSize)) {
+                    vm::remapPages(page_addr, kPageSize, true, true);
+                }
+                __builtin_memcpy(page_addr, fault_slots_[slot].buf, kPageSize);
+                releaseFaultSlot(slot);
+                store_->release(compressed_[i].data,
+                                compressed_[i].alloc_size, i);
+                compressed_[i] = {};
+                if (page_tier_) page_tier_[i] = kTierNone;
+                states_->set(i, PageState::ACTIVE);
+            } else if (st == PageState::ACTIVE_MONITORING) {
+                if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                    vm::remapPages(page_addr, kPageSize, true, true);
+                }
+                states_->set(i, PageState::ACTIVE);
+            }
+            locks_->unlock(i);
+        }
+    }
+
     void stop() {
         if (!running_.load(std::memory_order_relaxed)) return;
         running_.store(false, std::memory_order_release);
         pthread_join(coord_thread_, nullptr);
         for (int i = 0; i < helpers_created_; ++i)
             pthread_join(helper_threads_[i], nullptr);
+        // After threads are joined, drain compressed pages back to RW so
+        // post-shutdown faults (CPython __cxa_finalize, TLS destructors,
+        // mimalloc cleanup) hit ordinary memory instead of our about-to-
+        // be-uninstalled signal handler.
+        drainAllForShutdown();
+        // P3: write the profile file so future runs benefit from this
+        // run's per-bucket ratio + cost observations.
+        saveProfileFile();
+        // Uninstall SIGSEGV/SIGBUS handlers; any further faults take the
+        // original disposition (SIG_DFL → terminate, the right behaviour
+        // for a real heap-use-after-free in the host application).
+        if (fault_handler_) fault_handler_->stop();
     }
 
     // Manually trigger one compression tick (for testing/manual control)
@@ -2079,6 +3538,13 @@ public:
 
         switch (st) {
         case PageState::COMPRESSED: {
+            // Clear deferred-madvise pending BEFORE the state transitions
+            // out of COMPRESSED. The per-page lock is held; the sweeper
+            // tryLock+recheck will observe the cleared bit (or skip the
+            // page entirely because state is no longer COMPRESSED).
+            if (deferred_pending_) {
+                deferred_pending_[page_idx].store(false, std::memory_order_release);
+            }
             void* page_addr = vm_->pageAddress(page_idx);
             CompressAlgo algo = compressed_[page_idx].algorithm();
             uint8_t sc = lookupSizeClass(page_idx);
@@ -2095,14 +3561,29 @@ public:
 #endif
             }
 
-            // Decompress using per-slot DCtx (no data race)
+            // Decompress using per-slot DCtx (no data race). Time it for
+            // the budget machinery — refault cost is part of the bucket's
+            // amortized time per compressed page.
+            auto dec_t0 = std::chrono::steady_clock::now();
             engine_->decompressWithDCtx(
                 fault_slots_[slot].dctx,
                 compressed_[page_idx].data, fault_slots_[slot].buf,
                 compressed_[page_idx].compressedSize(), kPageSize,
                 algo, sc);
+            auto dec_t1 = std::chrono::steady_clock::now();
+            uint32_t dec_us = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    dec_t1 - dec_t0).count());
 
-            vm::commitPages(page_addr, kPageSize);
+            // Restore the page to PROT_RW. mprotect can fail with ENOMEM
+            // if the per-page VMA splits have us at vm.max_map_count;
+            // remapPages replaces the mapping atomically (which also
+            // re-merges adjacent VMAs in many cases) and never grows the
+            // VMA count. This is the recovery path for long compiles
+            // that have accumulated thousands of compressed-page VMAs.
+            if (!vm::commitPages(page_addr, kPageSize)) {
+                vm::remapPages(page_addr, kPageSize, true, true);
+            }
             __builtin_memcpy(page_addr, fault_slots_[slot].buf, kPageSize);
             releaseFaultSlot(slot);
 
@@ -2132,26 +3613,43 @@ public:
             // update — do both in one Span fetch.
             if (page_map_) {
                 Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
-                if (sp && !sp->is_large && sp->size_class < kNumClasses) {
-                    if (decompressed_fn_) {
+                if (sp) {
+                    // Slab-only feedback (decompressed_fn_ keys on real
+                    // slab size_class for the heap's adaptive-cap tables).
+                    if (decompressed_fn_ && !sp->is_large &&
+                        sp->size_class < kNumClasses) {
                         decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
                                          decompressed_ctx_);
                     }
-                    size_t bidx = static_cast<size_t>(sp->arena_id) * kNumClasses
-                                + sp->size_class;
-                    if (bidx < kBucketTableLen) {
-                        // EMA α=1/4, ×256 fixed-point. Relaxed atomics; tearing
-                        // on the EMA is acceptable.
-                        uint16_t old = bucket_rc_ema_x256_[bidx].load(std::memory_order_relaxed);
-                        uint16_t sample_x256 = static_cast<uint16_t>(prev_rc + 1) * 256;
-                        uint8_t cnt = bucket_rc_count_[bidx].load(std::memory_order_relaxed);
-                        uint16_t neu = (cnt == 0)
-                            ? sample_x256
-                            : static_cast<uint16_t>(static_cast<int32_t>(old)
-                                + (static_cast<int32_t>(sample_x256) - static_cast<int32_t>(old)) / 4);
-                        bucket_rc_ema_x256_[bidx].store(neu, std::memory_order_relaxed);
-                        if (cnt < 64)
-                            bucket_rc_count_[bidx].store(cnt + 1, std::memory_order_relaxed);
+                    // Unified bucket for the rc-ema and time-budget tables —
+                    // large allocs land in the kNumClasses+log2(pages) slot.
+                    uint8_t sc_b = sp->is_large
+                        ? largeSizeClass(sp->page_count)
+                        : sp->size_class;
+                    if (sc_b < kTotalBucketsPerArena) {
+                        size_t bidx = statsIndex(sp->arena_id, sc_b);
+                        if (bidx < kBucketTableLen) {
+                            // EMA α=1/4, ×256 fixed-point. Relaxed atomics; tearing
+                            // on the EMA is acceptable.
+                            uint16_t old = bucket_rc_ema_x256_[bidx].load(std::memory_order_relaxed);
+                            uint16_t sample_x256 = static_cast<uint16_t>(prev_rc + 1) * 256;
+                            uint8_t cnt = bucket_rc_count_[bidx].load(std::memory_order_relaxed);
+                            uint16_t neu = (cnt == 0)
+                                ? sample_x256
+                                : static_cast<uint16_t>(static_cast<int32_t>(old)
+                                    + (static_cast<int32_t>(sample_x256) - static_cast<int32_t>(old)) / 4);
+                            bucket_rc_ema_x256_[bidx].store(neu, std::memory_order_relaxed);
+                            if (cnt < 64)
+                                bucket_rc_count_[bidx].store(cnt + 1, std::memory_order_relaxed);
+
+                            // Time-budget: charge decompress wall-time against
+                            // the bucket. Worker 0 is the canonical sink since
+                            // we can't know which worker compressed this page.
+                            // recomputeMarginalEfficiency aggregates across
+                            // workers, so it doesn't matter where we land.
+                            workers_[0].sc_stats[bidx].time_cost_total_us.fetch_add(
+                                dec_us, std::memory_order_relaxed);
+                        }
                     }
                 }
             }
@@ -2169,7 +3667,9 @@ public:
             // 576 benchmark runs with __builtin_trap() (zero crashes).
             // Retained as defensive fallback.
             void* page_addr = vm_->pageAddress(page_idx);
-            vm::commitPages(page_addr, kPageSize);
+            if (!vm::commitPages(page_addr, kPageSize)) {
+                vm::remapPages(page_addr, kPageSize, true, true);
+            }
             states_->set(page_idx, PageState::ACTIVE);
             cold_count_[page_idx] = 0;
             locks_->unlock(page_idx);
@@ -2178,7 +3678,9 @@ public:
 
         case PageState::ACTIVE_MONITORING: {
             void* page_addr = vm_->pageAddress(page_idx);
-            vm::protectPages(page_addr, kPageSize, true, true);
+            if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                vm::remapPages(page_addr, kPageSize, true, true);
+            }
             accessed_[page_idx].store(true, std::memory_order_relaxed);
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
@@ -2189,7 +3691,9 @@ public:
             // Race: Phase 3's batched mprotect(PROT_READ) can overwrite a
             // per-page PROT_RW restoration done by a concurrent fault handler.
             void* page_addr = vm_->pageAddress(page_idx);
-            vm::protectPages(page_addr, kPageSize, true, true);
+            if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                vm::remapPages(page_addr, kPageSize, true, true);
+            }
             locks_->unlock(page_idx);
             return true;
         }
@@ -2223,6 +3727,13 @@ public:
     void releaseCompressedPages(size_t start_page, size_t num_pages) {
         for (size_t i = start_page; i < start_page + num_pages; ++i) {
             locks_->lock(i);
+            // Clear deferred-madvise pending BEFORE the state transitions
+            // away from COMPRESSED. Sweeper double-checks state under the
+            // per-page lock; this just makes the bit consistent with the
+            // observed state.
+            if (deferred_pending_) {
+                deferred_pending_[i].store(false, std::memory_order_release);
+            }
             PageState st = states_->get(i);
             if ((st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW)
                 && compressed_[i].data) {

@@ -60,6 +60,17 @@ if(APPLE)
 endif()
 add_test(NAME test_dictionary COMMAND test_dictionary)
 
+# Profile + dictionary persistence test (needs LZ4 + zstd). Validates the
+# v4 SMASH_PROFILE_FILE format roundtrip — train, save, load, verify dict
+# is usable — plus corrupt-file rejection.
+add_executable(test_profile_dict_persistence test_profile_dict_persistence.cpp)
+target_include_directories(test_profile_dict_persistence PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
+target_link_libraries(test_profile_dict_persistence PRIVATE alloc8::headers lz4_static libzstd_static)
+if(APPLE)
+  target_compile_options(test_profile_dict_persistence PRIVATE -ftls-model=initial-exec)
+endif()
+add_test(NAME test_profile_dict_persistence COMMAND test_profile_dict_persistence)
+
 # Prefetch test (needs LZ4 + zstd)
 add_executable(test_prefetch test_prefetch.cpp)
 target_include_directories(test_prefetch PRIVATE ${SMASH_TEST_INCLUDE_DIRS})

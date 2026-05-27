@@ -1313,6 +1313,121 @@ SMASH_VISIBLE void pool_aligned_free(void* /*pool*/, void* ptr) {
     free(ptr);
 }
 
+// ── execve / execvp ─────────────────────────────────────────────────────────
+//
+// execve() doesn't return on success, so we can't use the EFAULT-retry
+// pattern. Instead we proactively warm every smash-managed page that
+// could appear in argv/envp strings, then call the real syscall.
+//
+// Production trigger: subprocess.run(['/path/to/binary', ...]) from
+// Python under full smash, where the path string ended up in a
+// smash-managed page that got compressed before subprocess fork+exec.
+// Without this wrapper, execve returns EFAULT and Python surfaces it
+// as `[Errno 14] Bad address: '<path>'`.
+
+static inline void warm_str(const char* s) {
+    auto* vm = smash::g_smash_vm_region;
+    if (!vm || !s) return;
+    if (!vm->contains(reinterpret_cast<uintptr_t>(s))) return;
+    // Walk the string until NUL, touching each page.
+    smash::vm::warmPages(s, strlen(s) + 1, vm);
+}
+
+static inline void warm_argv(char* const* arr) {
+    if (!arr) return;
+    auto* vm = smash::g_smash_vm_region;
+    if (!vm) return;
+    // Touch the array itself (pointers).
+    size_t n = 0;
+    while (arr[n]) ++n;
+    if (n > 0) {
+        smash::vm::warmPages(arr, (n + 1) * sizeof(char*), vm);
+    }
+    for (size_t i = 0; i < n; ++i) warm_str(arr[i]);
+}
+
+SMASH_VISIBLE int execve(const char* pathname, char* const argv[], char* const envp[]) {
+    using fn_t = int(*)(const char*, char* const[], char* const[]);
+    SMASH_LAZY_RESOLVE(fn_t, execve);
+    warm_str(pathname);
+    warm_argv(argv);
+    warm_argv(envp);
+    if (std::getenv("SMASH_TRACE_EXEC")) {
+        const char* msg = "[smash exec] execve called\n";
+        (void)!write(2, msg, strlen(msg));
+    }
+    if (!real_execve) return syscall(SYS_execve, pathname, argv, envp);
+    return real_execve(pathname, argv, envp);
+}
+
+SMASH_VISIBLE int execv(const char* pathname, char* const argv[]) {
+    using fn_t = int(*)(const char*, char* const[]);
+    SMASH_LAZY_RESOLVE(fn_t, execv);
+    if (std::getenv("SMASH_TRACE_EXEC")) {
+        const char* msg = "[smash exec] execv called\n";
+        (void)!write(2, msg, strlen(msg));
+    }
+    warm_str(pathname);
+    warm_argv(argv);
+    if (!real_execv) {
+        extern char **environ;
+        return syscall(SYS_execve, pathname, argv, environ);
+    }
+    return real_execv(pathname, argv);
+}
+
+SMASH_VISIBLE int execvp(const char* file, char* const argv[]) {
+    using fn_t = int(*)(const char*, char* const[]);
+    SMASH_LAZY_RESOLVE(fn_t, execvp);
+    warm_str(file);
+    warm_argv(argv);
+    if (!real_execvp) return -1;  // PATH search needs libc
+    return real_execvp(file, argv);
+}
+
+SMASH_VISIBLE int execvpe(const char* file, char* const argv[], char* const envp[]) {
+    using fn_t = int(*)(const char*, char* const[], char* const[]);
+    SMASH_LAZY_RESOLVE(fn_t, execvpe);
+    warm_str(file);
+    warm_argv(argv);
+    warm_argv(envp);
+    if (!real_execvpe) return -1;
+    return real_execvpe(file, argv, envp);
+}
+
+// posix_spawn / posix_spawnp — Python's subprocess uses these by default
+// since 3.8 when close_fds is True. Same warming pattern as execve.
+struct posix_spawn_file_actions_t_opaque;
+struct posix_spawnattr_t_opaque;
+
+SMASH_VISIBLE int posix_spawn(pid_t* pid, const char* path,
+                               const void* file_actions,
+                               const void* attrp,
+                               char* const argv[], char* const envp[]) {
+    using fn_t = int(*)(pid_t*, const char*, const void*, const void*,
+                        char* const[], char* const[]);
+    SMASH_LAZY_RESOLVE(fn_t, posix_spawn);
+    warm_str(path);
+    warm_argv(argv);
+    warm_argv(envp);
+    if (!real_posix_spawn) return ENOSYS;
+    return real_posix_spawn(pid, path, file_actions, attrp, argv, envp);
+}
+
+SMASH_VISIBLE int posix_spawnp(pid_t* pid, const char* file,
+                                const void* file_actions,
+                                const void* attrp,
+                                char* const argv[], char* const envp[]) {
+    using fn_t = int(*)(pid_t*, const char*, const void*, const void*,
+                        char* const[], char* const[]);
+    SMASH_LAZY_RESOLVE(fn_t, posix_spawnp);
+    warm_str(file);
+    warm_argv(argv);
+    warm_argv(envp);
+    if (!real_posix_spawnp) return ENOSYS;
+    return real_posix_spawnp(pid, file, file_actions, attrp, argv, envp);
+}
+
 } // extern "C"
 
 #endif // __linux__

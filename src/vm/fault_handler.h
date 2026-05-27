@@ -16,7 +16,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
+#include <execinfo.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include "smash/config.h"
 
 #ifdef __APPLE__
@@ -24,8 +30,6 @@
 #include <mach/exception_types.h>
 #include <mach/task.h>
 #include <pthread.h>
-#include <unistd.h>
-#include <cstdio>
 #endif
 
 namespace smash::vm {
@@ -53,9 +57,42 @@ class FaultHandler {
 
     static FaultHandler* instance_;
 
+    // Set when we've decided this signal terminates the process.
+    // ensureInstalled() checks it before re-arming our handler so the
+    // compressor's periodic re-install doesn't race with the
+    // sigaction(SIG_DFL) → raise() chain we use to propagate
+    // user-space-synthesized SIGSEGV/SIGBUS to the original
+    // disposition.
+    static inline std::atomic<bool> shutting_down_{false};
+
+    // Detect signals that were synthesized by user-space (raise(),
+    // pthread_kill(), kill(), tgkill()) rather than from a real memory
+    // fault. For these, info->si_code is non-positive (SI_USER=0,
+    // SI_TKILL=-6, SI_QUEUE=-1, etc.) and info->si_addr is not a real
+    // faulting address. POSIX guarantees positive si_code values are
+    // kernel-synchronous fault sources (SEGV_MAPERR=1, SEGV_ACCERR=2,
+    // BUS_ADRALN, etc.).
+    //
+    // For user-synthesized SIGSEGV/SIGBUS the correct chain action is
+    // "act as if smash hadn't installed a handler at all": uninstall
+    // ourselves and re-raise so the original disposition (often
+    // SIG_DFL → terminate, sometimes a Python C-level handler) takes
+    // over. Without this carve-out, a user-space raise(SIGSEGV)
+    // fed through smash's handler chains to whatever old_sigsegv_
+    // was — which on Linux+Python is SIG_DFL — and the chain logic
+    // works *most* of the time, but races with ensureInstalled() can
+    // re-arm our handler in the µs-window between signal(SIG_DFL)
+    // and raise(), producing an infinite loop.
+    //
+    // WalrusDriver.py:518 calls signal.raise_signal(-rc) on backend
+    // SIGSEGV exits, which is the production trigger for this path.
+    static bool isKernelFault(const siginfo_t* info) {
+        return info->si_code > 0;
+    }
+
     static void signalHandler(int sig, siginfo_t* info, void* ucontext) {
         int saved_errno = errno;
-        if (instance_ && instance_->callback_) {
+        if (isKernelFault(info) && instance_ && instance_->callback_) {
             uintptr_t addr = reinterpret_cast<uintptr_t>(info->si_addr);
             if (instance_->callback_(addr, instance_->callback_ctx_)) {
                 errno = saved_errno;
@@ -70,11 +107,78 @@ class FaultHandler {
         // instead of POSIX signal handlers. Tracked in FIREFOX_PLAN.md.
         struct sigaction* old = (sig == SIGSEGV)
             ? &instance_->old_sigsegv_ : &instance_->old_sigbus_;
+
+        // SMASH_SIGTRACE=1 — async-signal-safe one-line trace per chain.
+        const char* trace_env = std::getenv("SMASH_SIGTRACE");
+        if (trace_env && trace_env[0] == '1') {
+            char buf[160];
+            const char* kind = "?";
+            if (old->sa_flags & SA_SIGINFO) kind = "SA_SIGINFO";
+            else if (old->sa_handler == SIG_DFL) kind = "SIG_DFL";
+            else if (old->sa_handler == SIG_IGN) kind = "SIG_IGN";
+            else kind = "OTHER";
+            int n = snprintf(buf, sizeof(buf),
+                "[smash sig] sig=%d si_code=%d si_addr=%p chain_kind=%s flags=0x%x\n",
+                sig, info->si_code, info->si_addr, kind,
+                (unsigned)old->sa_flags);
+            if (n > 0) (void)!write(2, buf, (size_t)n);
+        }
+
+        // For non-kernel-synchronous faults (raise/kill/etc.) that we
+        // didn't handle, we MUST uninstall ourselves before returning;
+        // otherwise the kernel resumes the faulting instruction (the
+        // raise() syscall return), the caller's next instruction
+        // executes, and the user's intent (terminate the process) is
+        // silently dropped. By restoring the old sigaction and calling
+        // raise() ourselves, we let the original disposition fire.
+        if (!isKernelFault(info)) {
+            shutting_down_.store(true, std::memory_order_release);
+            sigaction(sig, old, nullptr);
+            raise(sig);
+            errno = saved_errno;
+            return;
+        }
+
+        // SMASH_DUMP_CRASH_BT=1 — dump a backtrace before terminating.
+        // Useful for diagnosing real segfaults that smash didn't handle
+        // (e.g. compiler crashes in app code under full smash mode).
+        // Only fires for kernel-fault SIGSEGV/SIGBUS that chain to
+        // SIG_DFL — i.e. the process is about to die anyway.
+        const char* bt_env = std::getenv("SMASH_DUMP_CRASH_BT");
+        bool want_bt = bt_env && bt_env[0] == '1' &&
+                       isKernelFault(info) &&
+                       !(old->sa_flags & SA_SIGINFO) &&
+                       old->sa_handler == SIG_DFL;
+        if (want_bt) {
+            char hdr[160];
+            int n = snprintf(hdr, sizeof(hdr),
+                "[smash crash] pid=%d tid=%d sig=%d si_code=%d si_addr=%p\n",
+                (int)getpid(), (int)syscall(SYS_gettid),
+                sig, info->si_code, info->si_addr);
+            if (n > 0) (void)!write(2, hdr, (size_t)n);
+            void* frames[64];
+            int nframes = backtrace(frames, 64);
+            backtrace_symbols_fd(frames, nframes, 2);
+        }
+
         if (old->sa_flags & SA_SIGINFO) {
             old->sa_sigaction(sig, info, ucontext);
         } else if (old->sa_handler == SIG_DFL) {
-            signal(sig, SIG_DFL);
+            shutting_down_.store(true, std::memory_order_release);
+            sigaction(sig, old, nullptr);
             raise(sig);
+        } else if (old->sa_handler == SIG_IGN) {
+            // Synchronous fault + caller asked to ignore = the
+            // faulting instruction would re-execute forever. Force
+            // SIG_DFL termination instead.
+            shutting_down_.store(true, std::memory_order_release);
+            struct sigaction dfl{};
+            dfl.sa_handler = SIG_DFL;
+            sigemptyset(&dfl.sa_mask);
+            sigaction(sig, &dfl, nullptr);
+            raise(sig);
+        } else {
+            old->sa_handler(sig);
         }
     }
 
@@ -271,6 +375,11 @@ public:
     // reclaim SIGBUS to handle page faults from PROT_NONE pages.
     void ensureInstalled() {
         if (!running_.load(std::memory_order_relaxed)) return;
+        // Don't fight the chained termination path. signalHandler sets
+        // this when it's restored SIG_DFL (or another disposition) and
+        // is on its way out via raise(); reinstalling our handler here
+        // would race the kernel's pending delivery and loop.
+        if (shutting_down_.load(std::memory_order_acquire)) return;
 #ifdef __APPLE__
         if (mach_mode_) return;
 #endif

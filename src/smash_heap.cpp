@@ -1258,3 +1258,17 @@ static void smash_register_atfork() {
                    smash_atfork_parent,
                    smash_atfork_child);
 }
+
+// High-priority destructor: runs BEFORE other destructors in
+// __cxa_finalize order (lower priority number = later registration =
+// runs first). Priority 101 puts this ahead of typical static-storage
+// destructors and Python's interpreter teardown C-side cleanup, so
+// compressed pages are drained back to PROT_RW while the compressor
+// machinery is still alive. Without this, CPython's interpreter shutdown
+// touches a still-COMPRESSED page, faults, the handler runs, decompresses
+// using stale state, and we crash with SIGSEGV (F139).
+__attribute__((destructor(101)))
+static void smash_shutdown_compressor() {
+    auto* heap = SmashRedirect::getHeap();
+    if (heap) heap->shutdownCompressor();
+}

@@ -20,6 +20,36 @@ inline constexpr size_t kMaxSmallSize = 16384;
 inline constexpr int kNumClasses = 36;
 inline constexpr size_t kMinAlignment = 16;
 
+// ── Large-allocation pseudo size-classes (compression-tracking only) ─────────
+// Slab pages hold many heterogeneous small objects, so per-bucket compression
+// signal is noisy. Large allocations are one slice of one buffer from one
+// call site, so the per-bucket signal is much cleaner and is therefore worth
+// tracking separately. Buckets are bytewise floor(log2(num_pages)) on the
+// span's page count, with the top bucket saturating; eight slots cover [1
+// page, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, >=128 pages]. With
+// kLargeAllocVmThreshold ~= 1 MiB, the meaningful slots are the last three;
+// the lower five just stay empty for most workloads.
+inline constexpr int kNumLargeClasses = 8;
+inline constexpr int kTotalBucketsPerArena = kNumClasses + kNumLargeClasses;
+
+// Floor of log2 for 32-bit unsigned.  Returns 0 for n==0 so callers don't
+// need a special case (large-alloc spans always have page_count >= 1, but be
+// defensive). __builtin_clz is undefined on 0.
+[[gnu::always_inline]]
+inline int log2FloorU32(uint32_t n) {
+    if (n <= 1) return 0;
+    return 31 - __builtin_clz(n);
+}
+
+// Map a large-allocation span's page count to a tracking bucket index in
+// [kNumClasses, kNumClasses + kNumLargeClasses). Saturates at the last slot.
+[[gnu::always_inline]]
+inline uint8_t largeSizeClass(uint32_t num_pages) {
+    int bucket = log2FloorU32(num_pages);
+    if (bucket >= kNumLargeClasses) bucket = kNumLargeClasses - 1;
+    return static_cast<uint8_t>(kNumClasses + bucket);
+}
+
 // ── Arenas ───────────────────────────────────────────────────────────────────
 // kMaxArenas is the compile-time upper bound for arena arrays.
 // Runtime arena count is determined by getNumArenas() based on CPU count.
@@ -174,10 +204,13 @@ inline constexpr uint32_t kAdaptiveCapMinSamples = SMASH_ADAPTIVE_CAP_MIN_SAMPLE
 // is bounded by kNumArenas: with 4 arenas, ~4 threads saturate the space
 // and the extra term is noise beyond that; consider raising kNumArenas
 // to 8 or 16 for heavier multi-threaded workloads.
-#ifdef SMASH_THREAD_ARENA_HASH
-inline constexpr bool kThreadArenaHash = true;
-#else
+// Default ON: TBB-heavy workloads (walrus has many parallel workers)
+// benefit from per-thread arena routing to spread slab-lock contention.
+// Negligible cost when off (one TLS lookup + xor per allocation).
+#if defined(SMASH_THREAD_ARENA_HASH) && SMASH_THREAD_ARENA_HASH == 0
 inline constexpr bool kThreadArenaHash = false;
+#else
+inline constexpr bool kThreadArenaHash = true;
 #endif
 
 // B1: Page-local batch refill.  When on, Slab::allocateBatch stops once
@@ -208,12 +241,21 @@ inline constexpr size_t kBootstrapExpandSize = 16 * 1024 * 1024;    // 16 MB
 inline constexpr int kBootstrapMaxRegions = 64;
 
 // ── Thread cache ─────────────────────────────────────────────────────────────
-// Doubled from 64/32 to halve the rate of slab-lock acquisitions on
-// pgbench-class workloads.  Per-thread memory cost: 64 size classes ×
-// 128 ptrs × 8 B = 64 KiB per thread (was 32 KiB).  Cool-tail RSS ratio
-// at 99.3 % is the gate — a per-thread 32 KiB inflation is negligible.
-inline constexpr int kThreadCacheMaxPerClass = 128;
-inline constexpr int kThreadCacheBatchSize = 64;
+// Doubled to 256/128 to halve slab-lock acquisitions on TBB-heavy
+// workloads (walrus has 8-12 worker threads compiling in parallel).
+// Per-thread memory cost: 64 size classes × 256 ptrs × 8 B = 128 KiB
+// per thread. With ≤16 TBB threads that's 2 MiB total — negligible
+// vs the 1+ GiB heap. Cool-tail RSS ratio at 99.3 % is the gate.
+#ifndef SMASH_THREAD_CACHE_MAX
+inline constexpr int kThreadCacheMaxPerClass = 256;
+#else
+inline constexpr int kThreadCacheMaxPerClass = SMASH_THREAD_CACHE_MAX;
+#endif
+#ifndef SMASH_THREAD_CACHE_BATCH
+inline constexpr int kThreadCacheBatchSize = 128;
+#else
+inline constexpr int kThreadCacheBatchSize = SMASH_THREAD_CACHE_BATCH;
+#endif
 
 // ── Page map ─────────────────────────────────────────────────────────────────
 // 48-bit virtual address space assumed
@@ -273,6 +315,42 @@ inline constexpr int kVeryColdTicks = 60;         // ~1 min → zstd deep
 inline constexpr int kVeryColdTicks = SMASH_VERY_COLD_TICKS;
 #endif
 
+// ── Time-budget knob (additive over legacy cold-tick gating) ────────────────
+//
+// SMASH_TIME_BUDGET_PCT=N (0..100). When set, the compressor recomputes a
+// marginal-efficiency threshold every N ticks and marks low-efficiency
+// (arena, size_class) buckets SKIP so phase 2 short-circuits before any
+// locking. Unset / 100 = unlimited (legacy behavior). 0 = no compression
+// after exploration completes.
+//
+// This knob is the future replacement for SMASH_COLD_TIMEOUT_SEC and friends;
+// for now it layers on top of them — buckets must satisfy the legacy
+// cold-tick floor AND not be SKIP-marked to be compressed. Cached once at
+// first read.
+//
+// Returns -1 when the env var is unset (caller should treat as legacy
+// behavior — no SKIP gating). Otherwise clamped to [0, 100].
+inline int getTimeBudgetPct() {
+    static std::atomic<int> cached{-2};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v == -2) [[unlikely]] {
+        const char* env = getenv("SMASH_TIME_BUDGET_PCT");
+        int parsed = -1;
+        if (env && *env) {
+            char* end = nullptr;
+            long n = strtol(env, &end, 10);
+            if (end != env) {
+                if (n < 0) n = 0;
+                if (n > 100) n = 100;
+                parsed = static_cast<int>(n);
+            }
+        }
+        cached.store(parsed, std::memory_order_relaxed);
+        v = parsed;
+    }
+    return v;
+}
+
 // ── Recompression-thrash back-off ──────────────────────────────────────────
 //
 // When a page is compressed and then immediately faulted back (compress →
@@ -314,11 +392,77 @@ inline constexpr int kBucketRcBiasThreshold_x256 = 256;
 #else
 inline constexpr int kBucketRcBiasThreshold_x256 = SMASH_RECOMPRESS_BUCKET_BIAS_X256;
 #endif
+// Compile-time default for dictionary training samples per size class.
+// Runtime override is SMASH_DICT_TRAIN_SAMPLES (see getDictTrainSamples()
+// below), which is the supported way to flip dict training on/off without
+// rebuilding. The constexpr stays available for the test_dictionary unit
+// test which selects sample sizes at compile time.
 #ifndef SMASH_DICT_TRAIN_SAMPLES
 inline constexpr int kDictTrainSamples = 0;       // disabled: dicts net-negative (see EXPERIMENTS.md)
 #else
 inline constexpr int kDictTrainSamples = SMASH_DICT_TRAIN_SAMPLES;
 #endif
+
+// Maximum supported dict-train sample buffer per size class. The runtime
+// SMASH_DICT_TRAIN_SAMPLES is clamped to this so a single misconfigured
+// process can't burn unbounded bootstrap memory (kMaxDictClasses *
+// kDictTrainSamplesMax * kPageSize ~ 8 * 256 * 16K = 32 MiB worst case).
+inline constexpr int kDictTrainSamplesMax = 256;
+
+// Runtime override for dict-train sample count. Returns 0 when unset OR
+// when kDictTrainSamples is compiled to 0 and the env var is unset (cold
+// default). When SMASH_DICT_TRAIN_SAMPLES is set, returns clamped value
+// in [1, kDictTrainSamplesMax]. Cached on first call.
+inline int getDictTrainSamples() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* env = getenv("SMASH_DICT_TRAIN_SAMPLES");
+        int parsed = kDictTrainSamples;
+        if (env && *env) {
+            char* end = nullptr;
+            long n = strtol(env, &end, 10);
+            if (end != env) {
+                if (n < 0) n = 0;
+                if (n > kDictTrainSamplesMax) n = kDictTrainSamplesMax;
+                parsed = static_cast<int>(n);
+            }
+        }
+        cached.store(parsed, std::memory_order_relaxed);
+        v = parsed;
+    }
+    return v;
+}
+
+// SMASH_PROFILE_FILE_SAVE=1: at process exit, write the merged profile +
+// dictionary table to SMASH_PROFILE_FILE. Default off so warm-mode runs
+// don't accidentally overwrite the trained file with their (noisier)
+// short-run observations.
+inline bool getProfileFileSave() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* env = getenv("SMASH_PROFILE_FILE_SAVE");
+        v = (env && env[0] == '1') ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+
+// SMASH_PROFILE_FILE_RW=1: load at start AND save at exit, equivalent to
+// setting SMASH_PROFILE_FILE_SAVE=1 alongside an existing profile file.
+// Convenience knob for "training" runs that should also re-absorb their
+// own previous output.
+inline bool getProfileFileRW() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* env = getenv("SMASH_PROFILE_FILE_RW");
+        v = (env && env[0] == '1') ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
 #ifndef SMASH_PREFETCH_WINDOW
 inline constexpr int kPrefetchWindow = 2;         // pages each direction on fault
 #else
@@ -395,8 +539,38 @@ inline constexpr size_t kLargeAllocVmThreshold = SMASH_LARGE_ALLOC_VM_THRESHOLD;
 #endif
 
 // ── Virtual memory region ────────────────────────────────────────────────────
-inline constexpr size_t kVmMaxPages = 1024 * 1024;  // 1M pages (~16GB on 16K pages)
+// Compile-time max. The runtime size is read from SMASH_VM_GIB at startup
+// and clamped to [256 MiB, kVmMaxPages*kPageSize]. We bump the compile-time
+// max to 64 GiB so workloads with large working sets (neuron-cc compiles
+// of multi-GB HLOs) don't exhaust the region and trigger malloc=NULL →
+// std::bad_alloc / LLVM "out of memory" errors.
+//
+// Memory cost per page in metadata (PageStateTable + PageLockTable +
+// page_to_span lookup): ~17 bytes. At 16M pages = 64 GiB region, that's
+// ~270 MiB of bootstrap/lazy-mapped metadata — negligible vs the heap
+// it tracks. The mmap reservation itself is virtual-only (MAP_NORESERVE),
+// so the actual RSS cost is committed-pages × kPageSize.
+inline constexpr size_t kVmMaxPages = 16 * 1024 * 1024;  // 16M pages
 inline constexpr size_t kVmRegionSize = kVmMaxPages * kPageSize;
+
+// Runtime override: SMASH_VM_GIB=N, default 16. Clamped to [0.25, kVmMaxPages*kPageSize/GiB].
+inline size_t getVmRegionSize() {
+    static std::atomic<size_t> cached{0};
+    size_t v = cached.load(std::memory_order_relaxed);
+    if (v != 0) return v;
+    constexpr size_t kGiB = 1ULL << 30;
+    size_t bytes = 16 * kGiB;
+    const char* env = getenv("SMASH_VM_GIB");
+    if (env) {
+        char* end = nullptr;
+        long long g = strtoll(env, &end, 10);
+        if (end != env && g > 0) bytes = static_cast<size_t>(g) * kGiB;
+    }
+    if (bytes < (kGiB / 4)) bytes = kGiB / 4;        // 256 MiB floor
+    if (bytes > kVmRegionSize) bytes = kVmRegionSize;
+    cached.store(bytes, std::memory_order_relaxed);
+    return bytes;
+}
 
 // ── Runtime mode detection ───────────────────────────────────────────────────
 // Set SMASH_MODE=compress_only to enable compress-only mode at runtime.

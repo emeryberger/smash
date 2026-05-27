@@ -457,6 +457,16 @@ public:
         compression_started_.store(false, std::memory_order_release);
         startCompression();
     }
+
+    // Stop compressor and drain compressed pages back to PROT_RW. Called
+    // from a high-priority destructor in smash_heap.cpp to run before
+    // CPython's __cxa_finalize, so any post-shutdown access to a smash
+    // page reads ordinary memory instead of faulting on PROT_NONE.
+    void shutdownCompressor() {
+        if (compression_inited_ && compression_started_.load(std::memory_order_acquire)) {
+            compressor_.stop();
+        }
+    }
 private:
 
     // Track allocation in compress-only mode
@@ -490,7 +500,7 @@ public:
         }
 
         // Try to init VmRegion for compression support
-        bool vm_ok = vm_region_.init(kVmRegionSize);
+        bool vm_ok = vm_region_.init(getVmRegionSize());
 
         if (vm_ok) {
             // Wire the radix tree to also publish span pointers into the

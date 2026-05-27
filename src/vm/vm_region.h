@@ -22,6 +22,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 namespace smash {
@@ -130,10 +132,22 @@ class VmRegion {
     }
 
     void processDecommitEntry(DecommitEntry* e) {
-        // Decommit the pages
+        // Restore PROT_RW on the range. A freed range may include pages
+        // smash compressed before the free (state COMPRESSED →
+        // mprotect PROT_NONE). Without this, allocatePages's freelist-pop
+        // path hands the still-PROT_NONE range back to the application,
+        // and the next access faults. The fault handler sees state=EMPTY
+        // (cleared by releaseHook in the free path) and bails — kernel
+        // delivers SIGSEGV. Manifests on workloads with many compressed
+        // pages followed by reuse of those addresses (e.g. test7_full
+        // walrus crash with "DenseMap node count imbalance" or null-deref
+        // in nlohmann::json::destroy).
+        vm::commitPages(e->addr, e->num_pages * kPageSize);
+
+        // Decommit the pages (release physical backing).
         vm::decommitPages(e->addr, e->num_pages * kPageSize);
 
-        // NOW add to free list (safe - pages are decommitted)
+        // NOW add to free list (safe - pages are decommitted and PROT_RW)
         FreeShard& shard = shards_[e->shard_idx];
         FreeRun* run = newFreeRun(shard);
         run->page_index = e->page_index;
@@ -394,6 +408,46 @@ public:
 
     void releasePages(void* addr, size_t num_pages) {
         if (tracking_mode_) return;
+
+        // SMASH_LANDMINES=1: synchronously mprotect(PROT_NONE) the freed range
+        // and log it. Pages are never returned to the free list, so any
+        // dangling pointer in the application surfaces as SIGSEGV at the
+        // exact dangling-read site (instead of corrupting later allocations
+        // or zero-filling silently). Compares to glibc/jemalloc which keep
+        // freed contents intact: this distinguishes "smash decommit causes
+        // crash" (landmines pass) from "app UAF" (landmines crash, with
+        // si_addr inside a logged range).
+        static const bool landmines = []{
+            const char* v = std::getenv("SMASH_LANDMINES");
+            return v && v[0] == '1';
+        }();
+        if (landmines) {
+            (void)::mprotect(addr, num_pages * kPageSize, PROT_NONE);
+            char buf[96];
+            int n = snprintf(buf, sizeof(buf),
+                "[smash landmine] free addr=%p npages=%zu range=[%p,%p)\n",
+                addr, num_pages, addr,
+                static_cast<char*>(addr) + num_pages * kPageSize);
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+            return;  // never reuse — fail loudly on dangling reuse
+        }
+
+        // SMASH_ZERO_FREE=1: synchronously zero (memset) the freed range AND
+        // allow normal reuse via the freelist. If walrus reads from freed
+        // memory between free() and a subsequent allocation, this is exactly
+        // what madvise(MADV_DONTNEED) does (zero on next access) but without
+        // any kernel involvement: the zero is immediate. If this crashes,
+        // walrus has a UAF that reads pre-free data. If it passes, the
+        // problem is something else in the madvise/reuse path (e.g. TLB
+        // shootdown timing, freelist coherency).
+        static const bool zero_free = []{
+            const char* v = std::getenv("SMASH_ZERO_FREE");
+            return v && v[0] == '1';
+        }();
+        if (zero_free) {
+            __builtin_memset(addr, 0, num_pages * kPageSize);
+            // fall through to normal queue+decommit+reuse path
+        }
 
         // Start decommit thread lazily on first release (avoids reentrancy
         // during early library initialization when pthread_create might malloc).

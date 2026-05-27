@@ -130,6 +130,26 @@ Single-trial Firefox 5-tab Wikipedia at 90 s (full smash + DEFER 30 s + all-proc
 
 The "compressed=266K pages = 4.2 GB" figure observed under tracking-on on Firefox is misleading: most of those are virtual-address-space artifacts (SpiderMonkey + Skia reserve large `MAP_ANON` ranges that never fault in; the compressor processes zero pages to ~30-byte buffers). A correct Firefox-RSS measurement needs virt-vs-RSS reconciliation in the SIGUSR2 stats handler before claiming any Firefox win.
 
+## Production Configuration
+
+For applications with concurrent threads and significant slab/small-object traffic (e.g., neuron-cc, walrus C++ backend), the production-supported configuration is:
+
+```
+LD_PRELOAD=/path/to/libsmash.so PYTHONMALLOC=malloc SMASH_LARGE_ONLY=1
+```
+
+Full mode (without `SMASH_LARGE_ONLY=1`) is **experimental** and currently has unresolved data-corruption races on workloads where many threads concurrently access slab-managed objects under aggressive compression timing. The corruption manifests as walrus C++ STL container destructor crashes (`std::_Rb_tree_increment` reading null at small offsets), nanobind refcount mismatches, and similar "reading zero where structured data should be" signatures. Verified deterministic at moderate cold-timeout values on neuron-cc test7_full and batchnorm_33.
+
+Large-only mode bypasses this entirely by leaving slab/small allocations to the system malloc and only managing allocations ≥ 16 KB. Verified 9/9 PASS at `SMASH_COLD_TIMEOUT_SEC ∈ {1, 5, 10}` on neuron-cc test7_full (largest HLO, 9.3 MB) post the `SMASH_DEFER_MADVISE` correctness fix.
+
+The other knob that's load-bearing for correctness:
+
+```
+SMASH_DEFER_MADVISE=1   # default ON; do not disable in production
+```
+
+Defers `madvise(MADV_DONTNEED)` to a per-tick sweeper that only runs after a page has been quiescent for `SMASH_DEFER_MADVISE_TICKS=N` ticks (default 50, ≈500 ms). Closes a separate corruption race where in-flight loads/stores from a writer's stale TLB observed a recently-DROPPED page and saw zeros.
+
 ## Large-Only Mode (`SMASH_LARGE_ONLY=1`)
 
 For applications with their own small-object allocator (e.g., Python 3.13+ uses mimalloc), set `SMASH_LARGE_ONLY=1` to only manage large allocations (> `kMaxSmallSize` = 16KB):
@@ -363,7 +383,9 @@ Key constants in `include/smash/config.h`:
 - `kLargeAllocVmThreshold = 1MB`: Only large allocs above this go in VmRegion
 
 Runtime environment variables:
-- `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc
+- `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc. Production-supported config for concurrent workloads
+- `SMASH_DEFER_MADVISE=1`: Default ON. Defers `madvise(MADV_DONTNEED)` to a per-tick sweeper after `SMASH_DEFER_MADVISE_TICKS` quiescent ticks (default 50). Load-bearing for correctness; do not disable in production
+- `SMASH_DEFER_MADVISE_TICKS=N`: Number of ticks (default 50, ≈500 ms) a page must be quiescent before sweeper madvises it
 - `SMASH_MODE=compress_only`: Compress-only mode — track pages without replacing malloc
 - `SMASH_TRACK_EXTERNAL=1`: Register application-direct `mmap` / `mach_vm_allocate` results so the compressor sees them. Opt-in (see "External-Mapping Tracking" above)
 - `SMASH_DEFER_PHASES_MS=N`: Skip Phase 2 (compress) + Phase 3 (monitor) for the first N ms after start. Useful for workloads that establish IPC channels at startup with buffers in smash-managed pages (Firefox sweet spot is 30000)

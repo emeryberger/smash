@@ -166,6 +166,20 @@
     # getcwd wrapper (buffer write from kernel)
     getcwd;
 
+    # execve / execv* — pre-warm argv/envp pages before exec, so the
+    # kernel can read them after the new image takes over (these are
+    # one-shot syscalls; no EFAULT-retry possible).
+    execve;
+    execv;
+    execvp;
+    execvpe;
+
+    # posix_spawn / posix_spawnp — Python 3.8+'s subprocess module uses
+    # these (default when close_fds=True) instead of fork+exec. Same
+    # warm-then-call pattern as execve.
+    posix_spawn;
+    posix_spawnp;
+
     # TBB scalable_allocator interposition
     # Allows Smash to manage TBB's memory allocations by intercepting its
     # internal allocator calls (TBB uses these for its 64MB per-thread arenas)

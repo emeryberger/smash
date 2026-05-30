@@ -39,7 +39,7 @@ public:
         release_ctx_ = hook_ctx;
     }
 
-    void* allocate(size_t size, size_t alignment) {
+    void* allocate(size_t size, size_t alignment, uint8_t arena_id = 0) {
         if (alignment < kPageSize) alignment = kPageSize;
 
         // Round size up to page boundary
@@ -83,7 +83,7 @@ public:
         if (!mem) return nullptr;
 
         Span* span = newSpanDescriptor();
-        span->initLarge(mem, size, num_pages);
+        span->initLarge(mem, size, num_pages, arena_id);
 
         // O(1) registration: only register the first page. The Span contains
         // page_count so we can compute the full range from just the base.

@@ -196,12 +196,12 @@ struct Span {
     }
 
     // Initialize a large allocation span
-    void initLarge(void* base_, size_t size, uint32_t pages) {
+    void initLarge(void* base_, size_t size, uint32_t pages, uint8_t arena = 0) {
         base = base_;
         page_count = pages;
         size_class = kNumClasses;
         is_large = true;
-        arena_id = 0;
+        arena_id = arena;
         object_size = 0;
         full_capacity = 0;
         current_cap_per_page = 0;

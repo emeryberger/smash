@@ -3610,6 +3610,105 @@ public:
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
         if (n > 0) (void)!write(2, buf, (size_t)n);
+
+        // SMASH_BUCKET_STATS=1: dump per-(arena, size_class) stats
+        static const bool bucket_stats = []{
+            const char* v = std::getenv("SMASH_BUCKET_STATS");
+            return v && v[0] == '1';
+        }();
+        if (bucket_stats) {
+            dumpBucketStats();
+        }
+    }
+
+    // Dump per-(arena, size_class) bucket compressibility and coldness stats.
+    // Output format: one line per bucket with samples, sorted by sample count.
+    // Columns: arena, sc, obj_size, samples, ratio%, compress, decompress, thrash%
+    static void dumpBucketStats() {
+        auto* self = s_stats_instance_;
+        if (!self) return;
+
+        // Aggregate across workers: take worker with max count per bucket
+        struct BucketSummary {
+            uint8_t arena;
+            uint8_t sc;
+            size_t obj_size;
+            uint8_t count;
+            uint16_t ratio_sum;  // sum of ratios (divide by count for mean)
+            uint32_t compress_count;
+            uint32_t decompress_count;
+        };
+        constexpr size_t kMaxBuckets = kNumArenas * kTotalBucketsPerArena;
+        BucketSummary summaries[kMaxBuckets];
+        size_t num_summaries = 0;
+
+        for (int arena = 0; arena < kNumArenas; ++arena) {
+            for (int sc = 0; sc < static_cast<int>(kTotalBucketsPerArena); ++sc) {
+                size_t idx = statsIndex(static_cast<uint8_t>(arena),
+                                        static_cast<uint8_t>(sc));
+                // Find worker with most samples
+                int best_w = 0;
+                for (int w = 1; w < kMaxCompressorWorkers; ++w) {
+                    if (self->workers_[w].sc_stats[idx].count >
+                        self->workers_[best_w].sc_stats[idx].count) {
+                        best_w = w;
+                    }
+                }
+                const auto& s = self->workers_[best_w].sc_stats[idx];
+                if (s.count == 0) continue;  // skip empty buckets
+
+                // Sum compress/decompress across all workers
+                uint32_t cc = 0, dc = 0;
+                for (int w = 0; w < kMaxCompressorWorkers; ++w) {
+                    cc += self->workers_[w].sc_stats[idx].compress_count
+                              .load(std::memory_order_relaxed);
+                    dc += self->workers_[w].sc_stats[idx].decompress_count
+                              .load(std::memory_order_relaxed);
+                }
+
+                size_t obj_size = sc < kNumClasses
+                    ? kSizeClasses[sc].size
+                    : (1ULL << (sc - kNumClasses + 14));
+                BucketSummary bs;
+                bs.arena = static_cast<uint8_t>(arena);
+                bs.sc = static_cast<uint8_t>(sc);
+                bs.obj_size = obj_size;
+                bs.count = s.count;
+                bs.ratio_sum = s.sum;
+                bs.compress_count = cc;
+                bs.decompress_count = dc;
+                summaries[num_summaries++] = bs;
+            }
+        }
+
+        // Sort by sample count descending (simple insertion sort)
+        for (size_t i = 1; i < num_summaries; ++i) {
+            auto key = summaries[i];
+            size_t j = i;
+            while (j > 0 && summaries[j-1].count < key.count) {
+                summaries[j] = summaries[j-1];
+                --j;
+            }
+            summaries[j] = key;
+        }
+
+        // Header
+        const char* hdr = "[smash bucket] arena  sc  obj_size  samples  ratio%  compress  decompress  thrash%\n";
+        (void)!write(2, hdr, strlen(hdr));
+
+        // Dump each bucket
+        for (size_t i = 0; i < num_summaries; ++i) {
+            const auto& b = summaries[i];
+            double mean_ratio = b.count > 0 ? (b.ratio_sum * 100.0 / 255.0 / b.count) : 0;
+            double thrash_pct = b.compress_count > 0
+                ? (b.decompress_count * 100.0 / b.compress_count) : 0;
+            char line[160];
+            int n = snprintf(line, sizeof(line),
+                "[smash bucket] %5d %3d %9zu %8u %6.1f%% %9u %11u %7.1f%%\n",
+                b.arena, b.sc, b.obj_size, b.count, mean_ratio,
+                b.compress_count, b.decompress_count, thrash_pct);
+            if (n > 0) (void)!write(2, line, (size_t)n);
+        }
     }
 
     // Walk every page; for COMPRESSED / COMPRESSED_SHADOW pages,

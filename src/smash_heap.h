@@ -230,7 +230,7 @@ class SmashHeap {
     static constexpr size_t kStableBucketCacheSize = 4096;
     static constexpr size_t kStableBucketCacheMask = kStableBucketCacheSize - 1;
     struct alignas(16) StableBucketEntry {
-        uintptr_t ra_page;      // (ra >> 12), 0 = empty
+        uintptr_t ra;           // full return address as cache key
         uint32_t stable_hash;   // precomputed ASLR-stable hash
         uint32_t pad;
     };
@@ -242,21 +242,20 @@ class SmashHeap {
     // per slot assumption - collisions just cause re-lookup).
     [[gnu::always_inline]]
     uint32_t stableCallsiteHash(uintptr_t ra) {
-        uintptr_t ra_page = ra >> 12;
-        size_t slot = (ra_page * 0x9E3779B97F4A7C15ULL) & kStableBucketCacheMask;
+        size_t slot = (ra * 0x9E3779B97F4A7C15ULL) & kStableBucketCacheMask;
 
         // Fast path: direct cache hit (no atomics, just plain loads)
         StableBucketEntry& e = stable_bucket_cache_[slot];
-        if (e.ra_page == ra_page) [[likely]] {
+        if (e.ra == ra) [[likely]] {
             return e.stable_hash;
         }
 
         // Slow path: cache miss, call dladdr and populate
-        return stableCallsiteHashSlow(ra, ra_page, slot);
+        return stableCallsiteHashSlow(ra, slot);
     }
 
     [[gnu::noinline]]
-    uint32_t stableCallsiteHashSlow(uintptr_t ra, uintptr_t ra_page, size_t slot) {
+    uint32_t stableCallsiteHashSlow(uintptr_t ra, size_t slot) {
         Dl_info info{};
         uint32_t hash = 0;
         if (dladdr(reinterpret_cast<void*>(ra), &info) && info.dli_fbase) {
@@ -270,7 +269,7 @@ class SmashHeap {
 
         // Store in cache (direct-mapped, overwrites any existing entry)
         stable_bucket_cache_[slot].stable_hash = hash;
-        stable_bucket_cache_[slot].ra_page = ra_page;  // Write key last
+        stable_bucket_cache_[slot].ra = ra;  // Write key last
         return hash;
     }
 
@@ -352,6 +351,35 @@ class SmashHeap {
                 return static_cast<uint8_t>(base + getNumArenas());
         }
         return base;
+    }
+
+    // Arena routing for large allocations. Uses the ASLR-stable return address
+    // hash from the original call site. The return address is resolved via
+    // dladdr to get the offset within the shared object, which is stable
+    // across process restarts (enabling profile reuse).
+    //
+    // Takes caller_ra as parameter since this is called from mallocSlow, not
+    // directly from the application - we need the address captured at the
+    // malloc() entry point.
+    uint8_t callsiteArenaForLarge(uintptr_t caller_ra) {
+#ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
+        (void)caller_ra;
+        return 0;
+#else
+        uint32_t stable_ra = stableCallsiteHash(caller_ra);
+
+        // Simple hash of the stable return address
+        uintptr_t h = static_cast<uintptr_t>(stable_ra);
+        if constexpr (kThreadArenaHash) {
+            static std::atomic<uint32_t> next_tid{0};
+            thread_local uint32_t tid = next_tid.fetch_add(1, std::memory_order_relaxed);
+            h ^= static_cast<uintptr_t>(tid) * 0x9E3779B97F4A7C15ULL;
+        }
+        h ^= h >> 16;
+
+        const int mask = getArenaMask();
+        return static_cast<uint8_t>(h & mask);
+#endif
     }
 
 public:
@@ -758,7 +786,7 @@ public:
     // noinline+cold so the fast-path body stays small and the prologue
     // can be a single register save pair.
     [[gnu::noinline, gnu::cold]]
-    void* mallocSlow(size_t size) {
+    void* mallocSlow(size_t size, uintptr_t caller_ra = 0) {
         // SMASH_PASSTHROUGH=1: pass ALL allocations to system malloc.
         if (isPassthroughMode() && g_system_alloc.malloc) {
             return g_system_alloc.malloc(size);
@@ -793,8 +821,8 @@ public:
             if (!ptr) ptr = tc->refill(sc, &slab(callsiteArena(sc), sc));
             if constexpr (kMeasureCohorts) {
                 if (ptr) {
-                    uintptr_t ra = reinterpret_cast<uintptr_t>(
-                        __builtin_return_address(0));
+                    uintptr_t ra = caller_ra ? caller_ra :
+                        reinterpret_cast<uintptr_t>(__builtin_return_address(0));
                     uint32_t ra32 = static_cast<uint32_t>(ra ^ (ra >> 32));
                     stampCohort(ptr, ra32);
                 }
@@ -803,7 +831,11 @@ public:
                 __builtin_memset(ptr, 0, classSize(sc));
             return ptr;
         }
-        void* ptr = large_alloc_.allocate(size, kMinAlignment);
+        // For large allocations, use the caller's return address for arena routing
+        uintptr_t ra_for_arena = caller_ra ? caller_ra :
+            reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        uint8_t arena = callsiteArenaForLarge(ra_for_arena);
+        void* ptr = large_alloc_.allocate(size, kMinAlignment, arena);
         if (!ptr) {
             char dbg[128];
             int n = std::snprintf(dbg, sizeof(dbg),
@@ -826,7 +858,9 @@ public:
                 if (void* ptr = tc->allocate(sc)) [[likely]] return ptr;
             }
         }
-        return mallocSlow(size);
+        // Capture caller's return address for arena routing in slow path
+        uintptr_t caller_ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        return mallocSlow(size, caller_ra);
     }
 
     void free(void* ptr) {
@@ -894,7 +928,9 @@ public:
             // If system posix_memalign not available, fall through to smash's allocator
         }
         if (alignment <= kMinAlignment) return this->malloc(size);
-        return large_alloc_.allocate(size, alignment);
+        uintptr_t caller_ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        uint8_t arena = callsiteArenaForLarge(caller_ra);
+        return large_alloc_.allocate(size, alignment, arena);
     }
 
     void* calloc(size_t count, size_t size) {

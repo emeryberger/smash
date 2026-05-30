@@ -21,6 +21,11 @@
 #include "../core/page_map.h"
 #include "../util/spinlock.h"
 
+namespace smash {
+// Forward declaration - defined in smash_heap.cpp
+extern std::atomic<bool> g_smash_skip_external_tracking;
+}
+
 #include <csignal>
 #include <cstdio>
 #include "../vm/fault_handler.h"
@@ -441,7 +446,11 @@ class CompressorThread {
             // Older v1 files set these to zero, which deserialize() treats
             // as "no efficiency carried over" — safe.
             uint16_t efficiency_x256;
-            uint8_t  pad[4];
+            // v6: thrash rate and best tier for profile-driven optimization
+            uint8_t  thrash_rate;         // 0-255: recompress events / compress events
+            uint8_t  best_tier;           // 0=LZ4, 1=zstd, 255=unknown
+            uint8_t  stable_cold;         // 1=pages stay cold, can skip observation
+            uint8_t  pad;
         };
         static_assert(sizeof(Persist) == 16, "Persist record must be 16 bytes");
 
@@ -471,7 +480,25 @@ class CompressorThread {
             out->cost_count_t0 = cost_count[0];
             out->cost_count_t1 = cost_count[1];
             out->efficiency_x256 = efficiency_x256;
-            for (int i = 0; i < 4; ++i) out->pad[i] = 0;
+
+            // v6: thrash rate and tier selection
+            uint32_t cc = compress_count.load(std::memory_order_relaxed);
+            uint32_t dc = decompress_count.load(std::memory_order_relaxed);
+            // thrash_rate: fraction of compressions that got decompressed (0-255)
+            out->thrash_rate = (cc > 0) ? static_cast<uint8_t>(
+                std::min<uint32_t>(255, dc * 255 / cc)) : 0;
+            // best_tier: pick tier with more pulls (has been explored more)
+            // If one tier dominates (>2x pulls), use it; else unknown
+            if (arm_pulls[0] > 2 * arm_pulls[1] + 4) {
+                out->best_tier = 0;  // LZ4
+            } else if (arm_pulls[1] > 2 * arm_pulls[0] + 4) {
+                out->best_tier = 1;  // zstd
+            } else {
+                out->best_tier = 255;  // unknown
+            }
+            // stable_cold: thrash rate < 10% means pages stay cold
+            out->stable_cold = (cc >= 8 && out->thrash_rate < 26) ? 1 : 0;
+            out->pad = 0;
         }
 
         void deserialize(const Persist& in) {
@@ -494,6 +521,9 @@ class CompressorThread {
             // data accumulates. Old v1 files store 0 here → treated as
             // EXPLORE on first recompute, which matches cold-start.
             efficiency_x256 = in.efficiency_x256;
+            // v6: load stable_cold and best_tier for profile-driven optimization
+            profile_stable_cold = in.stable_cold;
+            profile_best_tier = in.best_tier;
         }
 
         // Decision hint cached on the live struct after deserialize, so
@@ -521,6 +551,13 @@ class CompressorThread {
             kBudgetSkip     = 2,
         };
         uint8_t budget_decision_hint = 0;  // == kBudgetExplore
+
+        // v6 profile: thrash tracking for profile-driven cold detection
+        std::atomic<uint32_t> compress_count{0};   // successful compressions
+        std::atomic<uint32_t> decompress_count{0}; // fault-triggered decompressions
+        // Loaded from profile: if stable_cold=1, skip cold observation period
+        uint8_t profile_stable_cold = 0;
+        uint8_t profile_best_tier = 255;  // 255=unknown, 0=LZ4, 1=zstd
     };
 
     // ── Per-arena UCB arm aggregate ───────────────────────────────────────
@@ -645,6 +682,14 @@ class CompressorThread {
     std::atomic<uint64_t> dict_loss_count_{0};   // dict larger than plain zstd
     std::atomic<uint64_t> dict_tie_count_{0};    // equal size
     std::atomic<int64_t>  dict_total_delta_{0};  // sum of (plain_size - dict_size), positive = dict wins
+
+    // ── External page profile tracking ────────────────────────────────────
+    // Tracks whether ANY external page thrashed (recompress_count > 0) during
+    // this process. Set on first external page decompression. When profile is
+    // saved, this flag is persisted. On load, if the flag is set, we skip ALL
+    // external pages for compression (they were hot in the prior run).
+    std::atomic<bool> external_pages_hot_{false};
+    bool external_pages_hot_from_profile_{false};
 
     // ── Thread management ─────────────────────────────────────────────────
     pthread_t coord_thread_{};
@@ -776,6 +821,9 @@ private:
 
     // Index into the per-(arena, bucket) ROI stats array. `sc` is the
     // unified bucket index in [0, kTotalBucketsPerArena).
+    // Note: arena_id is now ASLR-resilient (computed via stableCallsiteHash
+    // in SmashHeap::callsiteArena), so profile data keyed by (arena_id, sc)
+    // is stable across runs.
     static inline size_t statsIndex(uint8_t arena_id, uint8_t sc) {
         return static_cast<size_t>(arena_id) * kTotalBucketsPerArena +
                static_cast<size_t>(sc);
@@ -816,6 +864,7 @@ private:
     void zeroFreeSlots(void* page_buf, size_t page_idx) {
         if (!page_map_) return;
         void* page_addr = vm_->pageAddress(page_idx);
+        if (!page_addr) return;  // External page untracked
         Span* span = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
         if (!span || span->is_large || span->object_size == 0) return;
 
@@ -1028,6 +1077,37 @@ private:
                         }
                     }
                 }
+            } else {
+                // External page (no Span). Check profile first: if a prior run
+                // recorded that external pages were hot, skip ALL external pages.
+                const size_t contig_pages = vm_->contigPages();
+                if (i >= contig_pages) {
+                    // Profile-driven skip: external pages were hot in prior run.
+                    if (external_pages_hot_from_profile_) return;
+                    // Once burned, twice shy: if page thrashed THIS run, skip it.
+                    if (recompress_count_[i] > 0) return;
+                }
+            }
+
+            // v6 profile: if bucket is stable_cold (low thrash rate in prior
+            // run), use reduced floor — pages from this allocation site stay
+            // cold, so we don't need to re-prove it.
+            uint32_t profile_floor = floor;
+            if (page_map_) {
+                void* page_addr_pf = vm_->pageAddress(i);
+                Span* sp_pf = page_map_->get(reinterpret_cast<uintptr_t>(page_addr_pf));
+                if (sp_pf) {
+                    uint8_t sc_pf = sp_pf->is_large
+                        ? largeSizeClass(sp_pf->page_count)
+                        : sp_pf->size_class;
+                    if (sc_pf < kTotalBucketsPerArena) {
+                        size_t bidx_pf = statsIndex(sp_pf->arena_id, sc_pf);
+                        if (bidx_pf < kBucketTableLen &&
+                            workers_[worker_id].sc_stats[bidx_pf].profile_stable_cold) {
+                            profile_floor = std::max(1u, floor / 4);
+                        }
+                    }
+                }
             }
 
             // Recompression-thrash gate. Pages that have been faulted back
@@ -1039,7 +1119,7 @@ private:
             // Looked up via the span so we also pick up the new-page bias
             // from the per-bucket EMA — fresh pages from a known-thrashy
             // call site inherit the wait without needing their own history.
-            uint32_t eff_floor = floor;
+            uint32_t eff_floor = profile_floor;
             if (backoff_enabled) {
                 uint8_t rc = recompress_count_[i];
                 uint8_t bucket_bias = 0;
@@ -1068,19 +1148,19 @@ private:
                 }
                 uint32_t shift32 = static_cast<uint32_t>(rc) + bucket_bias;
                 if (shift32 > kMaxBackoffShift) shift32 = kMaxBackoffShift;
-                uint64_t wide_floor = static_cast<uint64_t>(floor) << shift32;
+                uint64_t wide_floor = static_cast<uint64_t>(profile_floor) << shift32;
                 if (wide_floor > kMaxEffectiveFloorTicks)
                     wide_floor = kMaxEffectiveFloorTicks;
                 eff_floor = static_cast<uint32_t>(wide_floor);
             }
 
-            if (cold_count_[i] == floor && st == PageState::ACTIVE_MONITORING) {
+            if (cold_count_[i] == profile_floor && st == PageState::ACTIVE_MONITORING) {
                 // Always escalate to deep monitoring at the BASE floor —
                 // this just changes protection, not compression. It gives
                 // the compressor more accurate access info for thrashy
                 // pages (which we won't compress anyway until eff_floor).
                 escalateToDeepMonitoring(i);
-            } else if (cold_count_[i] > floor && cold_count_[i] >= eff_floor) {
+            } else if (cold_count_[i] > profile_floor && cold_count_[i] >= eff_floor) {
                 // Page is eligible for compression — count it
                 worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
                 if (compressPage(i, workers_[worker_id])) {
@@ -1302,7 +1382,7 @@ private:
         }
         if (all_ok) {
             void* run_addr = vm_->pageAddress(run_start);
-            if (!vm::protectPages(run_addr, (run_end - run_start) * kPageSize,
+            if (!run_addr || !vm::protectPages(run_addr, (run_end - run_start) * kPageSize,
                                   true, false)) {
                 // mprotect failed (typically ENOMEM at vm.max_map_count).
                 // Revert state to ACTIVE for all pages — without
@@ -1325,7 +1405,8 @@ private:
             bool any_ok = false;
             for (size_t k = run_start; k < run_end; ++k) {
                 if (states_->get(k) == PageState::ACTIVE_MONITORING) {
-                    if (!vm::protectPages(vm_->pageAddress(k), kPageSize,
+                    void* page_addr = vm_->pageAddress(k);
+                    if (!page_addr || !vm::protectPages(page_addr, kPageSize,
                                           true, false)) {
                         states_->set(k, PageState::ACTIVE);
                     } else {
@@ -1345,7 +1426,14 @@ private:
         // (non-contiguous page index, CAS failure, or chunk size cap).
         size_t run_start = ~size_t{0};
         size_t run_end = 0;
+        // Get contig_pages count to identify external pages
+        const size_t contig_pages = vm_->contigPages();
         forEachLivePage(start, end, [&](size_t i) {
+            // Skip external pages — they're tracked for compression but
+            // monitoring them (PROT_READ) interferes with application use.
+            // External pages have indices >= contig_pages.
+            if (i >= contig_pages) return;
+
             if (!states_->transition(i, PageState::ACTIVE,
                                         PageState::ACTIVE_MONITORING)) {
                 // Run breaks here — flush whatever we accumulated.
@@ -1419,6 +1507,14 @@ private:
         const auto& cfg = ROIConfig::instance();
         const AlgoProfile* profile = nullptr;
         int chosen_tier = -1;
+
+        // v6 profile: use persisted best_tier as warm-start hint when we
+        // don't have enough data yet. Only applies when UCB is active.
+        uint8_t profile_best_tier = 255;
+        if (have_span && sc < kTotalBucketsPerArena) {
+            profile_best_tier = worker.sc_stats[stats_idx].profile_best_tier;
+        }
+
         if (cfg.use_ucb && cfg.num_profiles > 1) {
             // Build per-arm view from this bucket's stats and the per-profile
             // min_cold_ticks gate.  UCB sees the action space directly; the
@@ -1470,6 +1566,12 @@ private:
                     pulls, mean, m2, eligible, n,
                     cfg.ucb_min_pulls, cfg.ucb_variant);
             }
+            // v6 profile: if UCB chose nothing but we have a profiled best tier
+            // from a prior run, use it as a warm-start (skip exploration phase).
+            if (chosen_tier < 0 && profile_best_tier < static_cast<uint8_t>(n) &&
+                eligible[profile_best_tier]) {
+                chosen_tier = static_cast<int>(profile_best_tier);
+            }
             if (chosen_tier >= 0) profile = &cfg.profiles[chosen_tier];
         } else {
             // Pass the bucket's observed per-tier compression costs into the
@@ -1507,6 +1609,12 @@ private:
         }
 
         void* page_addr = vm_->pageAddress(page_idx);
+        // External pages may have been untracked between state check and here
+        if (!page_addr) {
+            states_->set(page_idx, PageState::EMPTY);
+            locks_->unlock(page_idx);
+            return false;
+        }
 
         if (deferred) {
             // Deferred mode: ensure page is PROT_RW (may have been PROT_READ
@@ -1764,6 +1872,10 @@ private:
         compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
         if (page_tier_) {
             page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
+        }
+        // v6 profile: track compression count for thrash rate calculation
+        if (have_span && sc < kTotalBucketsPerArena) {
+            worker.sc_stats[stats_idx].compress_count.fetch_add(1, std::memory_order_relaxed);
         }
 
         if (deferred) {
@@ -2058,8 +2170,10 @@ private:
             if (dt.trained) continue;
             uint16_t samples = dt.num_samples.load(std::memory_order_acquire);
             if (samples < static_cast<uint16_t>(target_samples)) continue;
+            // Cap samples to target_samples to avoid passing bad count to ZDICT
+            uint16_t actual_samples = std::min(samples, static_cast<uint16_t>(target_samples));
             dt.trained = engine_->trainDictionary(
-                sc, dt.sample_data, dt.sample_sizes, samples);
+                sc, dt.sample_data, dt.sample_sizes, actual_samples);
             if (!dt.trained) dt.trained = true;
             if (trainedDictCount() >= kMaxDictClasses) return;
         }
@@ -2211,6 +2325,11 @@ private:
                 // which discards the blob and restores ACTIVE. This
                 // closes the verify-to-reclaim race window.
                 void* page_addr = vm_->pageAddress(i);
+                if (!page_addr) {
+                    states_->set(i, PageState::EMPTY);
+                    locks_->unlock(i);
+                    continue;
+                }
                 vm::protectPages(page_addr, kPageSize, true, false);  // PROT_READ
 
                 // If the state was changed by a concurrent fault handler
@@ -2331,13 +2450,18 @@ private:
 #ifdef __linux__
         if (pagemap_fd_ < 0 || end <= start) return;
         if (!vm_) return;
+        const size_t contig_pages = vm_->contigPages();
         constexpr size_t kBatchPages = 4096;  // 32 KiB pagemap reads
         uint64_t buf[kBatchPages];
+
+        // Phase 1: Contiguous arena pages (can read in bulk)
+        size_t contig_end = (end < contig_pages) ? end : contig_pages;
         size_t i = start;
-        while (i < end) {
-            size_t batch = end - i;
+        while (i < contig_end) {
+            size_t batch = contig_end - i;
             if (batch > kBatchPages) batch = kBatchPages;
             void* pa = vm_->pageAddress(i);
+            if (!pa) { ++i; continue; }
             uint64_t pfn_off =
                 (reinterpret_cast<uintptr_t>(pa) / kPageSize) *
                 sizeof(uint64_t);
@@ -2346,15 +2470,39 @@ private:
             if (got <= 0) break;
             size_t got_pages = static_cast<size_t>(got) / sizeof(uint64_t);
             for (size_t k = 0; k < got_pages; ++k) {
-                // pagemap bit 55 = PTE soft-dirty. We only care about
-                // pages we still consider live.
                 if (buf[k] & (1ULL << 55)) {
-                    accessed_[i + k].store(true,
-                        std::memory_order_relaxed);
+                    accessed_[i + k].store(true, std::memory_order_relaxed);
                 }
             }
             i += got_pages;
             if (got_pages < batch) break;
+        }
+
+        // Phase 2: External pages (non-contiguous, must read individually)
+        // External pages are at indices [contig_pages, end). Each has its own
+        // virtual address from a separate mmap, so we can't batch-read pagemap.
+        //
+        // Skip if profile says external pages are hot — we won't compress them
+        // anyway, so there's no point reading 130K pagemap entries per tick.
+        if (external_pages_hot_from_profile_) {
+            // Mark all external pages as accessed so phase2 skips them
+            for (i = contig_pages; i < end; ++i) {
+                accessed_[i].store(true, std::memory_order_relaxed);
+            }
+        } else {
+            if (start < contig_pages) start = contig_pages;
+            for (i = start; i < end; ++i) {
+                void* pa = vm_->pageAddress(i);
+                if (!pa) continue;
+                uint64_t pfn_off =
+                    (reinterpret_cast<uintptr_t>(pa) / kPageSize) *
+                    sizeof(uint64_t);
+                uint64_t entry = 0;
+                ssize_t got = pread(pagemap_fd_, &entry, sizeof(entry), pfn_off);
+                if (got == sizeof(entry) && (entry & (1ULL << 55))) {
+                    accessed_[i].store(true, std::memory_order_relaxed);
+                }
+            }
         }
 #else
         (void)start; (void)end;
@@ -2578,7 +2726,8 @@ private:
             // backing: any user touch would have faulted the COMPRESSED
             // state and cleared the bit.
             deferred_pending_[i].store(false, std::memory_order_release);
-            vm::decommitPages(vm_->pageAddress(i), kPageSize);
+            void* page_addr = vm_->pageAddress(i);
+            if (page_addr) vm::decommitPages(page_addr, kPageSize);
             locks_->unlock(i);
         }
     }
@@ -2687,6 +2836,14 @@ private:
 
         size_t committed = vm_->committedPages();
         if (committed == 0) return;
+
+        // If profile says external pages are hot, limit compressor scope to
+        // contiguous pages only. This avoids iterating 130K+ external pages
+        // every tick when we know they won't be compressed anyway.
+        if (external_pages_hot_from_profile_) {
+            size_t contig = vm_->contigPages();
+            if (contig < committed) committed = contig;
+        }
 
         // Rebuild chunk bitmap
         rebuildChunkBitmap(committed);
@@ -3007,7 +3164,15 @@ private:
     static void* coordEntry(void* arg) {
         auto* self = static_cast<CompressorThread*>(arg);
         while (self->running_.load(std::memory_order_relaxed)) {
-            usleep(kCompressIntervalMs * 1000);
+            // Sleep in 10ms intervals, checking running_ flag each time.
+            // This keeps the tick interval at kCompressIntervalMs (1 second)
+            // while allowing fast shutdown response (~10ms worst case).
+            constexpr int kSleepIntervalMs = 10;
+            for (int slept = 0;
+                 slept < kCompressIntervalMs && self->running_.load(std::memory_order_relaxed);
+                 slept += kSleepIntervalMs) {
+                usleep(kSleepIntervalMs * 1000);
+            }
             if (!self->running_.load(std::memory_order_relaxed)) break;
             // Skip the tick if a fork is in progress. The atfork prepare
             // handler set paused_ and is waiting for in_tick_ to be 0;
@@ -3154,10 +3319,13 @@ public:
     // beyond kNumClasses), so the on-disk record array length grew from
     // kNumArenas*kNumClasses to kNumArenas*kTotalBucketsPerArena.
     // v4 appends a per-size-class dictionary section so warm-mode runs can
-    // skip the (~50–200 ms) ZDICT_trainFromBuffer step. Older v1/v2/v3 files
-    // are silently rejected by loadProfileFile (header version mismatch),
-    // matching the existing pattern for stale persisted profiles.
-    static constexpr uint32_t kProfileVersion = 4;
+    // skip the (~50–200 ms) ZDICT_trainFromBuffer step.
+    // v5 adds external_pages_hot flag in header.flags to skip external mmap
+    // pages that thrashed in a prior profiling run.
+    // Older v1/v2/v3/v4 files are silently rejected by loadProfileFile
+    // (header version mismatch), matching the existing pattern for stale
+    // persisted profiles.
+    static constexpr uint32_t kProfileVersion = 6;
 
     // Sentinel size_class value marking the end of the dictionary section.
     // 255 was chosen because real size_class values are well below
@@ -3175,8 +3343,11 @@ public:
         // kept as num_classes for ABI compatibility with older headers; the
         // version bump distinguishes v2/v3/v4 layouts.
         uint16_t num_classes;
-        uint32_t reserved;
+        // Flags: bit 0 = external_pages_hot (external mmap pages thrashed
+        // during the profiling run, so skip them in future runs).
+        uint32_t flags;
     };
+    static constexpr uint32_t kProfileFlagExternalHot = 1;
 
     static const char* profileFilePath() {
         static const char* p = []{
@@ -3207,6 +3378,13 @@ public:
             hdr.num_classes != kTotalBucketsPerArena) {
             fclose(f);
             return;
+        }
+        // Load external_pages_hot flag from profile
+        if (hdr.flags & kProfileFlagExternalHot) {
+            external_pages_hot_from_profile_ = true;
+            // Also set the global flag so mmap interposers skip tracking
+            g_smash_skip_external_tracking.store(true, std::memory_order_release);
+            fprintf(stderr, "[smash] profile loaded: external_pages_hot=true\n");
         }
         size_t total = static_cast<size_t>(kNumArenas) * kTotalBucketsPerArena;
         for (size_t i = 0; i < total; ++i) {
@@ -3266,9 +3444,13 @@ public:
         snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
         FILE* f = fopen(tmp, "wb");
         if (!f) return;
+        uint32_t flags = 0;
+        if (external_pages_hot_.load(std::memory_order_relaxed)) {
+            flags |= kProfileFlagExternalHot;
+        }
         ProfileHeader hdr{kProfileMagic, kProfileVersion,
                           static_cast<uint16_t>(kNumArenas),
-                          static_cast<uint16_t>(kTotalBucketsPerArena), 0};
+                          static_cast<uint16_t>(kTotalBucketsPerArena), flags};
         fwrite(&hdr, sizeof(hdr), 1, f);
         for (size_t i = 0; i < total; ++i) {
             int best = 0;
@@ -3347,10 +3529,17 @@ public:
         // fork. atexit registers in LIFO order, so this runs before the
         // SMASH_STATS handler above; that's fine, stats only walks the
         // page-state table and doesn't depend on the threads being live.
-        s_stop_instance_ = this;
-        std::atexit([]() {
-            if (s_stop_instance_) s_stop_instance_->stop();
-        });
+        //
+        // SMASH_NO_ATEXIT=1: Skip atexit registration for debugging. The
+        // compressor threads will be orphaned on exit, which is fine for
+        // testing atexit-ordering hypotheses (process exits via _exit anyway).
+        const char* no_atexit = std::getenv("SMASH_NO_ATEXIT");
+        if (!no_atexit || no_atexit[0] != '1') {
+            s_stop_instance_ = this;
+            std::atexit([]() {
+                if (s_stop_instance_) s_stop_instance_->stop();
+            });
+        }
 
         // SMASH_DEBUG=1: emit a banner now (compressor came up) and a
         // stats line every Nth tick during the run. Distinct from
@@ -3481,23 +3670,52 @@ public:
     }
 
     void stop() {
-        if (!running_.load(std::memory_order_relaxed)) return;
+        // Shutdown tracing for debugging (SMASH_SHUTDOWN_TRACE=1)
+        static const bool trace = []{
+            const char* v = std::getenv("SMASH_SHUTDOWN_TRACE");
+            return v && v[0] == '1';
+        }();
+        auto trace_msg = [](const char* msg) {
+            if (!trace) return;
+            char buf[120];
+            char ts[32] = {};
+            vm::formatTimestamp(ts, sizeof(ts));
+            int n = snprintf(buf, sizeof(buf), "[smash shutdown] [%s] %s pid=%d\n", ts, msg, (int)getpid());
+            if (n > 0) (void)!write(2, buf, (size_t)n);
+        };
+
+        trace_msg("stop() called");
+        if (!running_.load(std::memory_order_relaxed)) {
+            trace_msg("not running, returning early");
+            return;
+        }
+        trace_msg("setting running=false");
         running_.store(false, std::memory_order_release);
+        trace_msg("joining coord_thread...");
         pthread_join(coord_thread_, nullptr);
+        trace_msg("coord_thread joined");
+        trace_msg("joining helper threads...");
         for (int i = 0; i < helpers_created_; ++i)
             pthread_join(helper_threads_[i], nullptr);
+        trace_msg("all helpers joined");
         // After threads are joined, drain compressed pages back to RW so
         // post-shutdown faults (CPython __cxa_finalize, TLS destructors,
         // mimalloc cleanup) hit ordinary memory instead of our about-to-
         // be-uninstalled signal handler.
+        trace_msg("draining compressed pages...");
         drainAllForShutdown();
+        trace_msg("drain complete");
         // P3: write the profile file so future runs benefit from this
         // run's per-bucket ratio + cost observations.
+        trace_msg("saving profile...");
         saveProfileFile();
+        trace_msg("profile saved");
         // Uninstall SIGSEGV/SIGBUS handlers; any further faults take the
         // original disposition (SIG_DFL → terminate, the right behaviour
         // for a real heap-use-after-free in the host application).
+        trace_msg("stopping fault handler...");
         if (fault_handler_) fault_handler_->stop();
+        trace_msg("stop() complete");
     }
 
     // Manually trigger one compression tick (for testing/manual control)
@@ -3611,6 +3829,12 @@ public:
             //
             // Same lookup gives us (arena, size_class) for the bucket EMA
             // update — do both in one Span fetch.
+            bool is_external = page_idx >= vm_->contigPages();
+            if (is_external) {
+                // External page thrashed — mark for profile persistence so
+                // future runs skip external pages entirely.
+                external_pages_hot_.store(true, std::memory_order_relaxed);
+            }
             if (page_map_) {
                 Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
                 if (sp) {
@@ -3649,6 +3873,9 @@ public:
                             // workers, so it doesn't matter where we land.
                             workers_[0].sc_stats[bidx].time_cost_total_us.fetch_add(
                                 dec_us, std::memory_order_relaxed);
+                            // v6 profile: track decompression for thrash rate
+                            workers_[0].sc_stats[bidx].decompress_count.fetch_add(
+                                1, std::memory_order_relaxed);
                         }
                     }
                 }

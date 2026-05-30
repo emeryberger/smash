@@ -234,6 +234,11 @@ class VmRegion {
     // Full-mode external-page bookkeeping. The contiguous arena uses
     // next_page_ for its bump pointer (indices 0..kVmMaxPages-1); this
     // counter assigns external indices starting at kVmMaxPages.
+    // external_slot_next_: monotonically incremented to reserve a slot
+    // external_count_: only incremented after the slot is fully populated
+    //                  (address written). committedPages() reads this, so
+    //                  the compressor won't iterate to slots-in-progress.
+    std::atomic<size_t> external_slot_next_{0};
     std::atomic<size_t> external_count_{0};
 
     // Flat direct page-index → Span* table. Sized to total_pages_ entries
@@ -520,11 +525,22 @@ public:
                 uintptr_t expected = 0;
                 if (track_hash_[s].key.compare_exchange_strong(
                         expected, key, std::memory_order_acq_rel)) {
-                    size_t local = external_count_.fetch_add(1, std::memory_order_relaxed);
-                    if (local >= kTrackMaxPages) return 0;
+                    // Reserve a slot first (use relaxed since we control visibility)
+                    size_t local = external_slot_next_.fetch_add(1, std::memory_order_relaxed);
+                    if (local >= kTrackMaxPages) {
+                        // No more slots available
+                        return 0;
+                    }
                     size_t idx = contig_pages_ + local;
+                    // Write address before publishing.
                     track_reverse_[local] = page_addr;
                     track_hash_[s].idx.store(idx, std::memory_order_release);
+                    // Only increment external_count_ AFTER everything is set.
+                    // This is what committedPages() reads, so the compressor
+                    // won't iterate to this index until the address is valid.
+                    // Use release so the address write is visible before the
+                    // count increment.
+                    external_count_.fetch_add(1, std::memory_order_release);
                     return idx;
                 }
                 if (track_hash_[s].key.load(std::memory_order_relaxed) == key)
@@ -578,13 +594,17 @@ public:
     void* pageAddress(size_t index) const {
         if (tracking_mode_) {
             if (index == 0 || index >= total_pages_) return nullptr;
-            return reinterpret_cast<void*>(track_reverse_[index]);
+            uintptr_t addr = track_reverse_[index];
+            return addr ? reinterpret_cast<void*>(addr) : nullptr;
         }
         // Full mode
         if (index < contig_pages_) return base_ + index * kPageSize;
         size_t local = index - contig_pages_;
         if (local >= kTrackMaxPages) return nullptr;
-        return reinterpret_cast<void*>(track_reverse_[local]);
+        // track_reverse_[local] may be 0 if the slot was reserved but the
+        // address hasn't been written yet (race with trackExternalPage).
+        uintptr_t addr = track_reverse_[local];
+        return addr ? reinterpret_cast<void*>(addr) : nullptr;
     }
 
     // ── Flat page-index → Span* table ───────────────────────────────────────

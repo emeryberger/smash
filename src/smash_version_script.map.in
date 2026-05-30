@@ -112,6 +112,12 @@
     epoll_wait;
     epoll_pwait;
 
+    # mmap/munmap interposition for SMASH_TRACK_EXTERNAL
+    mmap;
+    mmap64;
+    munmap;
+    mremap;
+
     # fstat / stat family — glibc remaps fstat → fstat64 with
     # _FILE_OFFSET_BITS=64 (Ubuntu C++ default); glibc < 2.33 routes through
     # __fxstat / __xstat / __lxstat / __fxstatat (and _64 variants). Cover
@@ -205,6 +211,11 @@
     pool_destroy;
     pool_reset;
 
+    # TBB cache_aligned_allocate interposition (C++ mangled names)
+    # These are called by TBB's cache_aligned_allocator template
+    _ZN3tbb6detail2r122cache_aligned_allocateEm;
+    _ZN3tbb6detail2r124cache_aligned_deallocateEPv;
+
   local:
     *;
 };
@@ -271,3 +282,58 @@ GLIBC_2.33 {
     fstatat_233;
     fstatat64_233;
 } @SMASH_GLIBC_BASE_VERSION@;
+
+# C++ operator new/delete with libstdc++ versioning
+# libBIR.so and other walrus libraries request these versions, not GLIBC_2.2.5.
+# Without these, LD_PRELOAD interposition fails to capture C++ allocations,
+# and walrus's statically-linked tcmalloc wins → cross-allocator corruption.
+# The wrapper functions (*_GLIBCXX_3_4, *_CXXABI_1_3_*) are defined in
+# linux_syscall_wrappers.cpp with .symver directives to create versioned aliases.
+GLIBCXX_3.4 {
+  global:
+    _Znwm;
+    _Znam;
+    _ZdlPv;
+    _ZdaPv;
+    _ZnwmRKSt9nothrow_t;
+    _ZnamRKSt9nothrow_t;
+    _ZdlPvRKSt9nothrow_t;
+    _ZdaPvRKSt9nothrow_t;
+    # Wrapper functions that will be aliased via .symver
+    _Znwm_GLIBCXX_3_4;
+    _Znam_GLIBCXX_3_4;
+    _ZdlPv_GLIBCXX_3_4;
+    _ZdaPv_GLIBCXX_3_4;
+    _ZnwmRKSt9nothrow_t_GLIBCXX_3_4;
+    _ZnamRKSt9nothrow_t_GLIBCXX_3_4;
+    _ZdlPvRKSt9nothrow_t_GLIBCXX_3_4;
+    _ZdaPvRKSt9nothrow_t_GLIBCXX_3_4;
+} @SMASH_GLIBC_BASE_VERSION@;
+
+CXXABI_1.3.9 {
+  global:
+    _ZdlPvm;
+    _ZdaPvm;
+    _ZdlPvm_CXXABI_1_3_9;
+    _ZdaPvm_CXXABI_1_3_9;
+} GLIBCXX_3.4;
+
+CXXABI_1.3.11 {
+  global:
+    _ZnwmSt11align_val_t;
+    _ZnamSt11align_val_t;
+    _ZdlPvSt11align_val_t;
+    _ZdaPvSt11align_val_t;
+    _ZdlPvmSt11align_val_t;
+    _ZdaPvmSt11align_val_t;
+    _ZnwmSt11align_val_tRKSt9nothrow_t;
+    _ZnamSt11align_val_tRKSt9nothrow_t;
+    _ZnwmSt11align_val_t_CXXABI_1_3_11;
+    _ZnamSt11align_val_t_CXXABI_1_3_11;
+    _ZdlPvSt11align_val_t_CXXABI_1_3_11;
+    _ZdaPvSt11align_val_t_CXXABI_1_3_11;
+    _ZdlPvmSt11align_val_t_CXXABI_1_3_11;
+    _ZdaPvmSt11align_val_t_CXXABI_1_3_11;
+    _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11;
+    _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11;
+} CXXABI_1.3.9;

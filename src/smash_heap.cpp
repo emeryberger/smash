@@ -145,6 +145,9 @@ smash::VmRegion* smash::g_smash_vm_region = nullptr;
 // gate every state mutation on this being non-null.
 smash::PageStateTable* smash::g_smash_page_states_for_external = nullptr;
 
+// Profile-driven skip flag for external page tracking.
+std::atomic<bool> smash::g_smash_skip_external_tracking{false};
+
 // TLS for the malloc fast path.  initial-exec model: libsmash is always
 // LD_PRELOAD'd, so its TLS block is part of the program's startup TLS
 // reservation, and accesses use a direct tpidr_el0 + offset load instead
@@ -1200,7 +1203,15 @@ volatile int xxthread_created_flag = 0;
 }
 
 using SmashRedirect = alloc8::HeapRedirect<smash::SmashHeap>;
+
+// When SMASH_NO_THREAD_HOOKS_BUILD is defined (via -D), use ALLOC8_REDIRECT
+// which doesn't register xxthread_init/xxthread_cleanup. This avoids alloc8's
+// pthread_create interposition which can cause crashes during process shutdown.
+#ifdef SMASH_NO_THREAD_HOOKS_BUILD
+ALLOC8_REDIRECT(SmashRedirect);
+#else
 ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);
+#endif
 
 // ── Start compressor from constructor ─────────────────────────────────────────
 // On macOS, threadInit() requires two calls before starting compression (to
@@ -1213,6 +1224,7 @@ ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);
 // the >= 1 guard, ensuring compression starts even for non-ObjC programs
 // (e.g. Python via DYLD_INSERT_LIBRARIES) and single-threaded programs.
 // On Linux, the same applies: no threads are created during LD_PRELOAD init.
+#ifndef SMASH_NO_THREAD_HOOKS_BUILD
 __attribute__((constructor(201)))  // After alloc8 pthread hooks init (200)
 static void smash_start_main_thread() {
     xxthread_init();
@@ -1221,6 +1233,7 @@ static void smash_start_main_thread() {
     xxthread_init();
 #endif
 }
+#endif  // SMASH_NO_THREAD_HOOKS_BUILD
 
 // ── Restart the compressor after fork() ──────────────────────────────────────
 // Linux fork() only clones the calling thread, so the compressor's coordinator

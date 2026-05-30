@@ -132,11 +132,24 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(_SMASH_COMMON_SOURCES ${ALLOC8_COMMON_SOURCES})
 endif()
 
+# Option to disable thread hooks (workaround for walrus crash)
+option(SMASH_NO_THREAD_HOOKS "Disable alloc8 pthread interposition" OFF)
+
+if(SMASH_NO_THREAD_HOOKS)
+  set(_SMASH_THREAD_SOURCES "")
+  set(_SMASH_THREAD_DEFINE "SMASH_NO_THREAD_HOOKS_BUILD")
+  message(STATUS "Thread hooks DISABLED")
+else()
+  set(_SMASH_THREAD_SOURCES ${ALLOC8_THREAD_SOURCES})
+  set(_SMASH_THREAD_DEFINE "")
+  message(STATUS "Thread hooks enabled")
+endif()
+
 add_library(smash SHARED
   src/smash_heap.cpp
   src/linux_syscall_wrappers.cpp
   ${ALLOC8_INTERPOSE_SOURCES}
-  ${ALLOC8_THREAD_SOURCES}
+  ${_SMASH_THREAD_SOURCES}
   ${_SMASH_COMMON_SOURCES}
 )
 
@@ -165,6 +178,11 @@ else()
   target_link_libraries(smash PRIVATE alloc8::interpose)
 endif()
 target_link_libraries(smash PRIVATE lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
+
+# Add thread hooks define if disabled
+if(SMASH_NO_THREAD_HOOKS)
+  target_compile_definitions(smash PRIVATE SMASH_NO_THREAD_HOOKS_BUILD)
+endif()
 
 set_target_properties(smash PROPERTIES
   OUTPUT_NAME "smash"

@@ -39,6 +39,7 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/xattr.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -54,6 +55,12 @@
 // This is safe because during early init no pages are compressed.
 static std::atomic<bool> g_resolving_syscalls{false};
 
+// Global disable: SMASH_NO_SYSCALL_WRAP=1 makes all wrappers pass-through
+static const bool g_syscall_wrap_disabled = [] {
+    const char* v = std::getenv("SMASH_NO_SYSCALL_WRAP");
+    return v && v[0] == '1';
+}();
+
 // Lazy-resolve a real function pointer via dlsym(RTLD_NEXT).
 // If we're in a dlsym recursion, leaves the pointer as nullptr
 // so the caller falls through to its raw syscall() path.
@@ -66,6 +73,10 @@ static std::atomic<bool> g_resolving_syscalls{false};
             g_resolving_syscalls.store(false, std::memory_order_relaxed); \
         } \
     }
+
+// Passthrough macro: if syscall wrapping disabled or real not resolved, call through
+#define SMASH_PASSTHROUGH_IF_DISABLED(name, ...) \
+    if (g_syscall_wrap_disabled && real_##name) return real_##name(__VA_ARGS__)
 
 // Check if ANY part of a buffer range is in Smash-managed memory.
 // Only return true if the buffer actually needs warming.
@@ -95,6 +106,7 @@ SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, read);
     if (!real_read) return syscall(SYS_read, fd, buf, count);
+    SMASH_PASSTHROUGH_IF_DISABLED(read, fd, buf, count);
     return smash::vm::retryWith1Buf(
         [&] { return real_read(fd, buf, count); },
         buf, count);
@@ -104,6 +116,7 @@ SMASH_VISIBLE ssize_t write(int fd, const void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, const void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, write);
     if (!real_write) return syscall(SYS_write, fd, buf, count);
+    SMASH_PASSTHROUGH_IF_DISABLED(write, fd, buf, count);
     return smash::vm::retryWith1Buf(
         [&] { return real_write(fd, buf, count); },
         buf, count);
@@ -1140,28 +1153,35 @@ inline bool externalTrackingEnabledLinux() {
 inline void registerLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {
     if (!vm || !base || !len) return;
     if (!externalTrackingEnabledLinux()) return;
+    // Profile-driven skip: if we already know external pages are hot from a
+    // prior run, skip the O(pages) registration loop entirely.
+    if (smash::g_smash_skip_external_tracking.load(std::memory_order_acquire)) return;
+    // Safety check: page_states must be initialized
+    if (!smash::g_smash_page_states_for_external) return;
+
     auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
     auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
                & ~(uintptr_t{smash::kPageSize} - 1);
     for (uintptr_t p = start; p < end; p += smash::kPageSize) {
         size_t idx = vm->trackExternalPage(p);
         if (idx == 0) continue;
-        if (smash::g_smash_page_states_for_external)
-            smash::g_smash_page_states_for_external->set(idx, smash::PageState::ACTIVE);
+        smash::g_smash_page_states_for_external->set(idx, smash::PageState::ACTIVE);
     }
 }
 
 inline void deregisterLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {
     if (!vm || !base || !len) return;
     if (!externalTrackingEnabledLinux()) return;
+    // Safety check: page_states must be initialized
+    if (!smash::g_smash_page_states_for_external) return;
+
     auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
     auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
                & ~(uintptr_t{smash::kPageSize} - 1);
     for (uintptr_t p = start; p < end; p += smash::kPageSize) {
         size_t idx = vm->pageIndex(p);
         if (idx == 0) continue;
-        if (smash::g_smash_page_states_for_external)
-            smash::g_smash_page_states_for_external->set(idx, smash::PageState::EMPTY);
+        smash::g_smash_page_states_for_external->set(idx, smash::PageState::EMPTY);
         vm->untrackExternalPage(p);
     }
 }
@@ -1189,6 +1209,65 @@ SMASH_VISIBLE int munmap(void* addr, size_t len) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && addr && len) deregisterLinuxExternalRange(vm, addr, len);
     return real_munmap(addr, len);
+}
+
+// mmap64 is the LFS (Large File Support) version used internally by glibc
+SMASH_VISIBLE void* mmap64(void* addr, size_t len, int prot, int flags, int fd, off64_t offset) {
+    using fn_t = void*(*)(void*, size_t, int, int, int, off64_t);
+    SMASH_LAZY_RESOLVE(fn_t, mmap64);
+    if (!real_mmap64) return MAP_FAILED;
+    void* ret = real_mmap64(addr, len, prot, flags, fd, offset);
+    if (ret == MAP_FAILED) return ret;
+    bool anon = (flags & MAP_ANONYMOUS) != 0;
+    bool writable = (prot & PROT_WRITE) != 0;
+    if (!anon || !writable || len == 0) return ret;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm) registerLinuxExternalRange(vm, ret, len);
+    return ret;
+}
+
+// mremap can grow/move mappings — track new range, untrack old if moved
+SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int flags, ...) {
+    using fn_t = void*(*)(void*, size_t, size_t, int, ...);
+    SMASH_LAZY_RESOLVE(fn_t, mremap);
+    if (!real_mremap) return MAP_FAILED;
+
+    void* new_addr = nullptr;
+    if (flags & MREMAP_FIXED) {
+        va_list ap;
+        va_start(ap, flags);
+        new_addr = va_arg(ap, void*);
+        va_end(ap);
+    }
+
+    void* ret;
+    if (flags & MREMAP_FIXED) {
+        ret = real_mremap(old_addr, old_size, new_size, flags, new_addr);
+    } else {
+        ret = real_mremap(old_addr, old_size, new_size, flags);
+    }
+
+    if (ret == MAP_FAILED) return ret;
+
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && externalTrackingEnabledLinux()) {
+        // If mapping moved (ret != old_addr), untrack old and track new
+        if (ret != old_addr) {
+            deregisterLinuxExternalRange(vm, old_addr, old_size);
+            registerLinuxExternalRange(vm, ret, new_size);
+        } else if (new_size > old_size) {
+            // Grew in place — track additional pages
+            registerLinuxExternalRange(vm,
+                reinterpret_cast<char*>(ret) + old_size,
+                new_size - old_size);
+        } else if (new_size < old_size) {
+            // Shrunk — untrack removed pages
+            deregisterLinuxExternalRange(vm,
+                reinterpret_cast<char*>(ret) + new_size,
+                old_size - new_size);
+        }
+    }
+    return ret;
 }
 
 } // extern "C"
@@ -1227,10 +1306,16 @@ __asm__(".symver pwritev2_226,pwritev2@GLIBC_2.26");
 // When TBB IS present and linked dynamically, LD_PRELOAD ensures our wrappers
 // take precedence.
 
+// TBB interposition call counters (for debugging)
+static std::atomic<uint64_t> g_scalable_malloc_count{0};
+static std::atomic<uint64_t> g_scalable_malloc_bytes{0};
+
 extern "C" {
 
 // Core allocation functions
 SMASH_VISIBLE void* scalable_malloc(size_t size) {
+    g_scalable_malloc_count.fetch_add(1, std::memory_order_relaxed);
+    g_scalable_malloc_bytes.fetch_add(size, std::memory_order_relaxed);
     return malloc(size);
 }
 
@@ -1312,6 +1397,53 @@ SMASH_VISIBLE void* pool_aligned_malloc(void* /*pool*/, size_t size, size_t alig
 SMASH_VISIBLE void pool_aligned_free(void* /*pool*/, void* ptr) {
     free(ptr);
 }
+
+// TBB cache_aligned_allocate interposition counters
+static std::atomic<uint64_t> g_cache_aligned_count{0};
+static std::atomic<uint64_t> g_cache_aligned_bytes{0};
+
+}  // extern "C"
+
+// Report TBB interposition stats at process exit
+namespace {
+void reportTbbStatsAtExit() {
+    uint64_t sc_count = g_scalable_malloc_count.load(std::memory_order_relaxed);
+    uint64_t sc_bytes = g_scalable_malloc_bytes.load(std::memory_order_relaxed);
+    uint64_t ca_count = g_cache_aligned_count.load(std::memory_order_relaxed);
+    uint64_t ca_bytes = g_cache_aligned_bytes.load(std::memory_order_relaxed);
+    if ((sc_count > 0 || ca_count > 0) && std::getenv("SMASH_STATS")) {
+        fprintf(stderr, "[smash tbb] scalable_malloc: %lu calls, %.1f MB | "
+                "cache_aligned: %lu calls, %.1f MB\n",
+                (unsigned long)sc_count, sc_bytes / (1024.0 * 1024.0),
+                (unsigned long)ca_count, ca_bytes / (1024.0 * 1024.0));
+    }
+}
+
+struct TbbStatsRegistrar {
+    TbbStatsRegistrar() { std::atexit(reportTbbStatsAtExit); }
+} g_tbb_stats_registrar;
+}  // namespace
+
+// TBB cache_aligned_allocate interposition
+// TBB's internal allocator uses this for cache-aligned memory
+namespace tbb { namespace detail { namespace r1 {
+SMASH_VISIBLE void* cache_aligned_allocate(std::size_t size) {
+    g_cache_aligned_count.fetch_add(1, std::memory_order_relaxed);
+    g_cache_aligned_bytes.fetch_add(size, std::memory_order_relaxed);
+    // Allocate with cache line alignment (typically 64 bytes)
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, 64, size) != 0) {
+        return nullptr;
+    }
+    return ptr;
+}
+
+SMASH_VISIBLE void cache_aligned_deallocate(void* ptr) {
+    free(ptr);
+}
+}}}  // namespace tbb::detail::r1
+
+extern "C" {
 
 // ── execve / execvp ─────────────────────────────────────────────────────────
 //
@@ -1429,5 +1561,109 @@ SMASH_VISIBLE int posix_spawnp(pid_t* pid, const char* file,
 }
 
 } // extern "C"
+
+// ─── C++ OPERATOR NEW/DELETE VERSIONED ALIASES ─────────────────────────────────
+// libBIR.so and other walrus libraries request operator new/delete with
+// GLIBCXX_3.4 and CXXABI_1.3.x symbol versions, not GLIBC_2.2.5.
+// Without these versioned aliases, LD_PRELOAD fails to capture C++ allocations,
+// and walrus's statically-linked tcmalloc wins the symbol resolution.
+// Result: allocations through smash, deallocations through tcmalloc → crash.
+//
+// We create aliases for the GLIBCXX/CXXABI-versioned symbols that call
+// alloc8's xxmalloc/xxfree directly (NOT through the operator symbols, which
+// would create infinite recursion via PLT).
+
+// External declarations for alloc8's core allocation functions
+extern "C" {
+extern void* xxmalloc(size_t);
+extern void  xxfree(void*);
+extern void  xxfree_sized(void*, size_t);
+extern void  xxfree_aligned_sized(void*, size_t, size_t);
+extern void* xxmemalign(size_t, size_t);
+}
+
+// Aliased wrapper functions for GLIBCXX_3.4 versions
+// These directly call xxmalloc/xxfree, matching alloc8's operator new/delete
+extern "C" {
+SMASH_VISIBLE void* _Znwm_GLIBCXX_3_4(size_t sz) {
+    void* ptr = xxmalloc(sz);
+    if (!ptr) throw std::bad_alloc();
+    return ptr;
+}
+SMASH_VISIBLE void* _Znam_GLIBCXX_3_4(size_t sz) {
+    void* ptr = xxmalloc(sz);
+    if (!ptr) throw std::bad_alloc();
+    return ptr;
+}
+SMASH_VISIBLE void  _ZdlPv_GLIBCXX_3_4(void* p)  { if (p) xxfree(p); }
+SMASH_VISIBLE void  _ZdaPv_GLIBCXX_3_4(void* p)  { if (p) xxfree(p); }
+SMASH_VISIBLE void* _ZnwmRKSt9nothrow_t_GLIBCXX_3_4(size_t sz, const void*)
+    { return xxmalloc(sz); }
+SMASH_VISIBLE void* _ZnamRKSt9nothrow_t_GLIBCXX_3_4(size_t sz, const void*)
+    { return xxmalloc(sz); }
+SMASH_VISIBLE void  _ZdlPvRKSt9nothrow_t_GLIBCXX_3_4(void* p, const void*)
+    { if (p) xxfree(p); }
+SMASH_VISIBLE void  _ZdaPvRKSt9nothrow_t_GLIBCXX_3_4(void* p, const void*)
+    { if (p) xxfree(p); }
+}
+
+// CXXABI_1.3.9 versions (sized delete)
+extern "C" {
+SMASH_VISIBLE void _ZdlPvm_CXXABI_1_3_9(void* p, size_t sz)  { if (p) xxfree_sized(p, sz); }
+SMASH_VISIBLE void _ZdaPvm_CXXABI_1_3_9(void* p, size_t sz)  { if (p) xxfree_sized(p, sz); }
+}
+
+// CXXABI_1.3.11 versions (aligned)
+extern "C" {
+SMASH_VISIBLE void* _ZnwmSt11align_val_t_CXXABI_1_3_11(size_t sz, size_t al) {
+    void* ptr = xxmemalign(al, sz);
+    if (!ptr) throw std::bad_alloc();
+    return ptr;
+}
+SMASH_VISIBLE void* _ZnamSt11align_val_t_CXXABI_1_3_11(size_t sz, size_t al) {
+    void* ptr = xxmemalign(al, sz);
+    if (!ptr) throw std::bad_alloc();
+    return ptr;
+}
+SMASH_VISIBLE void  _ZdlPvSt11align_val_t_CXXABI_1_3_11(void* p, size_t)
+    { if (p) xxfree(p); }
+SMASH_VISIBLE void  _ZdaPvSt11align_val_t_CXXABI_1_3_11(void* p, size_t)
+    { if (p) xxfree(p); }
+SMASH_VISIBLE void  _ZdlPvmSt11align_val_t_CXXABI_1_3_11(void* p, size_t sz, size_t al)
+    { if (p) xxfree_aligned_sized(p, al, sz); }
+SMASH_VISIBLE void  _ZdaPvmSt11align_val_t_CXXABI_1_3_11(void* p, size_t sz, size_t al)
+    { if (p) xxfree_aligned_sized(p, al, sz); }
+SMASH_VISIBLE void* _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(
+        size_t sz, size_t al, const void*)
+    { return xxmemalign(al, sz); }
+SMASH_VISIBLE void* _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(
+        size_t sz, size_t al, const void*)
+    { return xxmemalign(al, sz); }
+}
+
+// .symver directives create versioned symbol aliases.
+// Use single @ for non-default versions (so we don't conflict with alloc8's
+// GLIBC_2.2.5 versions). The dynamic linker will still match these when
+// a caller requests the specific version (e.g., _Znwm@GLIBCXX_3.4).
+__asm__(".symver _Znwm_GLIBCXX_3_4,_Znwm@GLIBCXX_3.4");
+__asm__(".symver _Znam_GLIBCXX_3_4,_Znam@GLIBCXX_3.4");
+__asm__(".symver _ZdlPv_GLIBCXX_3_4,_ZdlPv@GLIBCXX_3.4");
+__asm__(".symver _ZdaPv_GLIBCXX_3_4,_ZdaPv@GLIBCXX_3.4");
+__asm__(".symver _ZnwmRKSt9nothrow_t_GLIBCXX_3_4,_ZnwmRKSt9nothrow_t@GLIBCXX_3.4");
+__asm__(".symver _ZnamRKSt9nothrow_t_GLIBCXX_3_4,_ZnamRKSt9nothrow_t@GLIBCXX_3.4");
+__asm__(".symver _ZdlPvRKSt9nothrow_t_GLIBCXX_3_4,_ZdlPvRKSt9nothrow_t@GLIBCXX_3.4");
+__asm__(".symver _ZdaPvRKSt9nothrow_t_GLIBCXX_3_4,_ZdaPvRKSt9nothrow_t@GLIBCXX_3.4");
+
+__asm__(".symver _ZdlPvm_CXXABI_1_3_9,_ZdlPvm@CXXABI_1.3.9");
+__asm__(".symver _ZdaPvm_CXXABI_1_3_9,_ZdaPvm@CXXABI_1.3.9");
+
+__asm__(".symver _ZnwmSt11align_val_t_CXXABI_1_3_11,_ZnwmSt11align_val_t@CXXABI_1.3.11");
+__asm__(".symver _ZnamSt11align_val_t_CXXABI_1_3_11,_ZnamSt11align_val_t@CXXABI_1.3.11");
+__asm__(".symver _ZdlPvSt11align_val_t_CXXABI_1_3_11,_ZdlPvSt11align_val_t@CXXABI_1.3.11");
+__asm__(".symver _ZdaPvSt11align_val_t_CXXABI_1_3_11,_ZdaPvSt11align_val_t@CXXABI_1.3.11");
+__asm__(".symver _ZdlPvmSt11align_val_t_CXXABI_1_3_11,_ZdlPvmSt11align_val_t@CXXABI_1.3.11");
+__asm__(".symver _ZdaPvmSt11align_val_t_CXXABI_1_3_11,_ZdaPvmSt11align_val_t@CXXABI_1.3.11");
+__asm__(".symver _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11,_ZnwmSt11align_val_tRKSt9nothrow_t@CXXABI_1.3.11");
+__asm__(".symver _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11,_ZnamSt11align_val_tRKSt9nothrow_t@CXXABI_1.3.11");
 
 #endif // __linux__

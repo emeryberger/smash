@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include <chrono>
 #include "smash/config.h"
 #include "core/bootstrap_alloc.h"
 #include "core/size_classes.h"
@@ -41,6 +42,12 @@ extern VmRegion* g_smash_vm_region;
 // Same lifetime contract as g_smash_vm_region.
 extern PageStateTable* g_smash_page_states_for_external;
 
+// Profile-driven skip flag for external page tracking. Set by the
+// compressor when loading a profile that marks external pages as hot.
+// When true, mmap interposers skip the per-page tracking loop entirely,
+// avoiding the O(pages) overhead for each TBB arena allocation.
+extern std::atomic<bool> g_smash_skip_external_tracking;
+
 // TLS variables on the malloc fast path are declared extern at namespace
 // scope with tls_model("initial-exec"), and defined in smash_heap.cpp.
 // libsmash is always loaded via LD_PRELOAD (so its TLS block is part of
@@ -57,16 +64,30 @@ extern __attribute__((tls_model("initial-exec")))
 [[gnu::always_inline]]
 inline ThreadCache*& currentThreadCache() { return g_thread_cache; }
 
+// SMASH_PASSTHROUGH=1: smash passes all malloc/free to system allocator.
+// Used to isolate whether issues are caused by smash's allocation logic
+// or just by having the library loaded at all.
+[[gnu::always_inline]]
+inline bool isPassthroughMode() {
+    static const bool passthrough = [] {
+        const char* v = std::getenv("SMASH_PASSTHROUGH");
+        return v && v[0] == '1';
+    }();
+    return passthrough;
+}
+
 // One-shot cache of "full mode" (= not compress-only, not large-only, no
-// eager-zero).  If any of those env-var modes is on, the malloc fast path
-// has to bypass to the slow path; if none, the fast path is safe.
+// eager-zero, not passthrough).  If any of those env-var modes is on, the
+// malloc fast path has to bypass to the slow path; if none, the fast path
+// is safe.
 [[gnu::always_inline]]
 inline bool fullMallocPath() {
     int s = g_full_mode_cached;
     if (s < 0) [[unlikely]] {
         s = (!isCompressOnlyMode()
           && !isLargeOnlyMode()
-          && !isEagerZeroMode()) ? 1 : 0;
+          && !isEagerZeroMode()
+          && !isPassthroughMode()) ? 1 : 0;
         g_full_mode_cached = s;
     }
     return s == 1;
@@ -197,6 +218,62 @@ class SmashHeap {
     LargeAlloc large_alloc_;
     PageMap page_map_;
 
+    // ── ASLR-resilient call-site hash cache ─────────────────────────────────
+    // Maps (return_address >> 12) -> stable offset within shared object.
+    // dladdr() is expensive (~12ns), so we cache results. The cache is
+    // direct-mapped for minimal overhead on the hot path (~2ns vs 0.5ns for
+    // the original hash).
+    //
+    // Design: 4096 entries, direct-mapped by (ra >> 12) hash. Each entry
+    // stores the full ra_page key + precomputed stable hash. On collision,
+    // we just recompute (rare - most programs have <1000 unique call sites).
+    static constexpr size_t kStableBucketCacheSize = 4096;
+    static constexpr size_t kStableBucketCacheMask = kStableBucketCacheSize - 1;
+    struct alignas(16) StableBucketEntry {
+        uintptr_t ra_page;      // (ra >> 12), 0 = empty
+        uint32_t stable_hash;   // precomputed ASLR-stable hash
+        uint32_t pad;
+    };
+    StableBucketEntry stable_bucket_cache_[kStableBucketCacheSize]{};
+
+    // Compute ASLR-resilient hash for a return address.
+    // Uses dladdr() to get offset within shared object, caches result.
+    // Hot path: single cache lookup with no atomics (ok for single-writer
+    // per slot assumption - collisions just cause re-lookup).
+    [[gnu::always_inline]]
+    uint32_t stableCallsiteHash(uintptr_t ra) {
+        uintptr_t ra_page = ra >> 12;
+        size_t slot = (ra_page * 0x9E3779B97F4A7C15ULL) & kStableBucketCacheMask;
+
+        // Fast path: direct cache hit (no atomics, just plain loads)
+        StableBucketEntry& e = stable_bucket_cache_[slot];
+        if (e.ra_page == ra_page) [[likely]] {
+            return e.stable_hash;
+        }
+
+        // Slow path: cache miss, call dladdr and populate
+        return stableCallsiteHashSlow(ra, ra_page, slot);
+    }
+
+    [[gnu::noinline]]
+    uint32_t stableCallsiteHashSlow(uintptr_t ra, uintptr_t ra_page, size_t slot) {
+        Dl_info info{};
+        uint32_t hash = 0;
+        if (dladdr(reinterpret_cast<void*>(ra), &info) && info.dli_fbase) {
+            uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+            uintptr_t offset = ra - base;
+            hash = static_cast<uint32_t>(offset ^ (offset >> 16));
+        } else {
+            // dladdr failed - use low 20 bits as fallback
+            hash = static_cast<uint32_t>(ra & 0xFFFFF);
+        }
+
+        // Store in cache (direct-mapped, overwrites any existing entry)
+        stable_bucket_cache_[slot].stable_hash = hash;
+        stable_bucket_cache_[slot].ra_page = ra_page;  // Write key last
+        return hash;
+    }
+
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
     uint8_t callsiteArena(uint8_t sc) {
@@ -204,18 +281,40 @@ class SmashHeap {
         uint8_t base = 0;
 #else
         // LLAMA-style stack hash [Maas et al., ASPLOS 2020]:
-        // hash(return_address, stack_height, object_size).
+        // hash(return_address, stack_depth, object_size).
         //
         // Return address (depth 0) identifies the immediate call site.
-        // Stack height (via __builtin_frame_address(0), safe at depth 0)
-        // distinguishes calls through different wrapper chains that share
-        // the same immediate call site.  Size class adds object-type
-        // context.  This replaces the prior __builtin_return_address(1)
-        // approach, which required frame-pointer walking and triggered
-        // -Wframe-address warnings.
+        // Stack depth distinguishes calls through different wrapper chains
+        // that share the same immediate call site.
+        //
+        // ASLR-resilient: we use stableCallsiteHash() which resolves the
+        // return address to an offset within its shared object via dladdr(),
+        // with caching to avoid repeated lookups.
+        //
+        // Stack depth stability: we compute (stack_base - frame_addr) / 16KB
+        // to get a coarse depth bucket. This is stable across runs because
+        // the stack grows down from a consistent base (pthread-allocated
+        // stack top) and the distance represents call depth, not absolute
+        // address. The /16KB quantization absorbs minor variations in frame
+        // sizes between runs.
         uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-        uintptr_t sh = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-        uintptr_t h = ra ^ (sh >> 4) ^ static_cast<uintptr_t>(sc);
+        uint32_t stable_ra = stableCallsiteHash(ra);
+
+        // Compute stable stack depth bucket. Thread stacks grow downward
+        // from a fixed base. We use the distance from a sentinel (first
+        // allocation's frame) as an approximation of stack depth.
+        static thread_local uintptr_t stack_base = 0;
+        uintptr_t frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+        if (stack_base == 0 || frame > stack_base) {
+            stack_base = frame;  // reset on new thread or deeper call
+        }
+        // Depth bucket: (base - frame) / 16KB, truncated to 8 bits
+        uint8_t depth_bucket = static_cast<uint8_t>(
+            ((stack_base - frame) >> 14) & 0xFF);
+
+        uintptr_t h = static_cast<uintptr_t>(stable_ra) ^
+                      (static_cast<uintptr_t>(depth_bucket) << 8) ^
+                      static_cast<uintptr_t>(sc);
         if constexpr (kThreadArenaHash) {
             // Thread-local monotonic id (A2-lite).  Multiplied by a
             // large odd constant so the low bits mix well into h.
@@ -413,6 +512,14 @@ private:
         bool expected = false;
         if (!compression_started_.compare_exchange_strong(expected, true))
             return;
+        // SMASH_NO_COMPRESSOR=1: Skip starting compression threads entirely.
+        // Smash still works as a malloc replacement, but no pages get compressed.
+        // Useful for isolating whether the compressor threads cause shutdown issues.
+        static const bool no_compressor = [] {
+            const char* v = std::getenv("SMASH_NO_COMPRESSOR");
+            return v && v[0] == '1';
+        }();
+        if (no_compressor) return;
         fault_handler_.start(faultCallback, this);
         compressor_.start();
     }
@@ -493,14 +600,31 @@ private:
 
 public:
     SmashHeap() {
+        // Debug timing
+        static const bool time_init = [] {
+            const char* v = std::getenv("SMASH_TIME_INIT");
+            return v && v[0] == '1';
+        }();
+        auto t0 = std::chrono::high_resolution_clock::now();
+        auto log_time = [&](const char* label) {
+            if (!time_init) return;
+            auto now = std::chrono::high_resolution_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count();
+            fprintf(stderr, "[smash init] %s: %ld us\n", label, us);
+            t0 = now;
+        };
+
         bool compress_only = isCompressOnlyMode();
+        log_time("mode_check");
 
         if (!compress_only) {
             page_map_.init();
         }
+        log_time("page_map_init");
 
         // Try to init VmRegion for compression support
         bool vm_ok = vm_region_.init(getVmRegionSize());
+        log_time("vm_region_init");
 
         if (vm_ok) {
             // Wire the radix tree to also publish span pointers into the
@@ -509,13 +633,19 @@ public:
             if (!compress_only) {
                 page_map_.attachVmRegion(&vm_region_);
             }
+            log_time("attach_vm");
             page_states_.init(vm_region_.totalPages());
+            log_time("page_states_init");
             page_locks_.init(vm_region_.totalPages());
+            log_time("page_locks_init");
             compress_store_.init();
+            log_time("compress_store_init");
             compress_engine_.init();
+            log_time("compress_engine_init");
             compressor_.init(&vm_region_, &page_states_, &page_locks_,
                              &compress_store_, &compress_engine_,
                              compress_only ? nullptr : &page_map_, &fault_handler_);
+            log_time("compressor_init");
             // A3: register the cold-arena feedback hook (no-op when
             // SMASH_COLD_ARENA_FEEDBACK is off — onPageCompressed early-returns).
             if (!compress_only && (kColdArenaFeedback || kAdaptiveCap)) {
@@ -555,6 +685,7 @@ public:
                     }
                 }
             }
+            log_time("slabs_init");
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
             g_smash_page_states_for_external = &page_states_;
@@ -594,6 +725,8 @@ public:
                 large_alloc_.init(&page_map_);
             }
         }
+        log_time("large_alloc_init");
+        log_time("TOTAL_CONSTRUCTOR");
     }
 
     ThreadCache* getOrCreateThreadCache() {
@@ -626,6 +759,11 @@ public:
     // can be a single register save pair.
     [[gnu::noinline, gnu::cold]]
     void* mallocSlow(size_t size) {
+        // SMASH_PASSTHROUGH=1: pass ALL allocations to system malloc.
+        if (isPassthroughMode() && g_system_alloc.malloc) {
+            return g_system_alloc.malloc(size);
+        }
+
         if (isCompressOnlyMode()) {
             // During early init, g_system_alloc may not be resolved yet
             if (!g_system_alloc.malloc) return nullptr;
@@ -640,7 +778,12 @@ public:
         // to system malloc. Default threshold is kMaxSmallSize (16 KB) —
         // overridable via SMASH_LARGE_ONLY_THRESHOLD env var.
         if (isLargeOnlyMode() && size <= largeOnlyThreshold()) {
+            // Lazy-resolve system malloc if not done yet (can happen during
+            // very early init before our constructor runs).
+            if (!g_system_alloc.malloc) g_system_alloc.resolve();
             if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
+            // If system malloc couldn't be resolved (during very early init before
+            // dlsym is available), fall through to smash's slab allocator.
         }
 
         uint8_t sc = sizeToClass(size);
@@ -661,6 +804,12 @@ public:
             return ptr;
         }
         void* ptr = large_alloc_.allocate(size, kMinAlignment);
+        if (!ptr) {
+            char dbg[128];
+            int n = std::snprintf(dbg, sizeof(dbg),
+                "[smash debug] large_alloc_.allocate(%zu) returned NULL\n", size);
+            (void)::write(STDERR_FILENO, dbg, n);
+        }
         if (ptr && isEagerZeroMode()) __builtin_memset(ptr, 0, size);
         return ptr;
     }
@@ -683,6 +832,12 @@ public:
     void free(void* ptr) {
         if (!ptr) return;
         if (BootstrapAlloc::instance().owns(ptr)) return;
+
+        // SMASH_PASSTHROUGH=1: pass all frees to system malloc
+        if (isPassthroughMode()) {
+            if (g_system_alloc.free) g_system_alloc.free(ptr);
+            return;
+        }
 
         if (isCompressOnlyMode()) {
             if (g_system_alloc.free) g_system_alloc.free(ptr);
@@ -728,11 +883,15 @@ public:
 
         if (size == 0) size = 1;
         // Large-only: small aligned allocs go to system allocator
-        if (isLargeOnlyMode() && size <= largeOnlyThreshold() && g_system_alloc.posix_memalign) {
-            void* ptr = nullptr;
-            if (g_system_alloc.posix_memalign(&ptr, alignment, size) == 0)
-                return ptr;
-            return nullptr;
+        if (isLargeOnlyMode() && size <= largeOnlyThreshold()) {
+            // Lazy-resolve if needed
+            if (!g_system_alloc.posix_memalign) g_system_alloc.resolve();
+            if (g_system_alloc.posix_memalign) {
+                void* ptr = nullptr;
+                if (g_system_alloc.posix_memalign(&ptr, alignment, size) == 0)
+                    return ptr;
+            }
+            // If system posix_memalign not available, fall through to smash's allocator
         }
         if (alignment <= kMinAlignment) return this->malloc(size);
         return large_alloc_.allocate(size, alignment);
@@ -816,7 +975,18 @@ public:
         const int total = getTotalArenas() * kNumClasses;
         for (int i = total - 1; i >= 0; --i) slabs_[i].unlockSlab();
     }
+    // SMASH_NO_THREAD_HOOKS=1: disable all thread lifecycle hooks.
+    // Useful for debugging crashes that occur during thread exit.
+    static bool noThreadHooks() {
+        static const bool no_hooks = [] {
+            const char* v = std::getenv("SMASH_NO_THREAD_HOOKS");
+            return v && v[0] == '1';
+        }();
+        return no_hooks;
+    }
+
     void threadInit() {
+        if (noThreadHooks()) return;
         if (!isCompressOnlyMode()) {
             getOrCreateThreadCache();
         }
@@ -836,6 +1006,7 @@ public:
         }
     }
     void threadCleanup() {
+        if (noThreadHooks()) return;
         if (isCompressOnlyMode()) return;
         ThreadCache*& tc = currentThreadCache();
         if (tc) { tc->drainAll(slabs_, &page_map_); returnThreadCache(tc); tc = nullptr; }

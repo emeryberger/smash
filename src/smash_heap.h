@@ -167,6 +167,23 @@ struct SystemAllocFns {
         realloc = reinterpret_cast<ReallocFn>(dlsym(RTLD_NEXT, "realloc"));
         posix_memalign = reinterpret_cast<MemalignFn>(dlsym(RTLD_NEXT, "posix_memalign"));
         malloc_size = reinterpret_cast<MallocSizeFn>(dlsym(RTLD_NEXT, "malloc_usable_size"));
+
+        // SMASH_DEBUG_RESOLVE=1: verify dlsym returned glibc's malloc, not our
+        // own. This catches the case where the dynamic linker still resolves
+        // RTLD_NEXT to libsmash itself (which would cause infinite recursion or
+        // silent passthrough no-ops).
+        if (std::getenv("SMASH_DEBUG_RESOLVE")) {
+            char buf[256];
+            Dl_info info{};
+            if (malloc && dladdr(reinterpret_cast<void*>(malloc), &info)) {
+                int n = snprintf(buf, sizeof(buf),
+                    "[smash debug] system malloc resolved to %s\n",
+                    info.dli_fname ? info.dli_fname : "?");
+                if (n > 0) (void)!::write(2, buf, (size_t)n);
+            } else {
+                (void)!::write(2, "[smash debug] system malloc NOT resolved\n", 41);
+            }
+        }
 #endif
     }
 };
@@ -797,8 +814,13 @@ public:
     [[gnu::noinline, gnu::cold]]
     void* mallocSlow(size_t size, uintptr_t caller_ra = 0) {
         // SMASH_PASSTHROUGH=1: pass ALL allocations to system malloc.
-        if (isPassthroughMode() && g_system_alloc.malloc) {
-            return g_system_alloc.malloc(size);
+        // Lazy-resolve if needed so we never fall through to smash's heap —
+        // a smash-allocated pointer leaking into passthrough mode causes
+        // "invalid pointer" aborts when realloc/free reach the system.
+        if (isPassthroughMode()) {
+            if (!g_system_alloc.malloc) g_system_alloc.resolve();
+            if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
+            return nullptr;
         }
 
         if (isCompressOnlyMode()) {
@@ -876,8 +898,25 @@ public:
         if (!ptr) return;
         if (BootstrapAlloc::instance().owns(ptr)) return;
 
-        // SMASH_PASSTHROUGH=1: pass all frees to system malloc
+        // SMASH_PASSTHROUGH=1: pass all frees to system malloc, except for
+        // pointers that smash itself allocated during early init (before
+        // g_system_alloc was resolvable). Those need smash's free path.
         if (isPassthroughMode()) {
+            uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+            Span* sp = vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()
+                ? vm_region_.getSpan(vm_region_.contigPageIndex(addr))
+                : page_map_.get(addr);
+            if (sp) {
+                // Smash-owned pointer slipped in before passthrough was active.
+                if (sp->is_large) { large_alloc_.deallocate(sp); return; }
+                ThreadCache* tc = getOrCreateThreadCache();
+                if (!tc->deallocate(sp->size_class, ptr)) {
+                    tc->drain(sp->size_class, slabs_, &page_map_);
+                    tc->deallocate(sp->size_class, ptr);
+                }
+                return;
+            }
+            if (!g_system_alloc.free) g_system_alloc.resolve();
             if (g_system_alloc.free) g_system_alloc.free(ptr);
             return;
         }
@@ -914,6 +953,17 @@ public:
     }
 
     void* memalign(size_t alignment, size_t size) {
+        // SMASH_PASSTHROUGH=1: pass aligned allocations to system allocator.
+        if (isPassthroughMode()) {
+            if (!g_system_alloc.posix_memalign) g_system_alloc.resolve();
+            if (g_system_alloc.posix_memalign) {
+                void* ptr = nullptr;
+                if (g_system_alloc.posix_memalign(&ptr, alignment, size) == 0)
+                    return ptr;
+            }
+            return nullptr;
+        }
+
         if (isCompressOnlyMode()) {
             if (!g_system_alloc.posix_memalign) return nullptr;
             void* ptr = nullptr;
@@ -943,6 +993,12 @@ public:
     }
 
     void* calloc(size_t count, size_t size) {
+        // SMASH_PASSTHROUGH=1: pass calloc to system allocator.
+        if (isPassthroughMode()) {
+            if (!g_system_alloc.calloc) g_system_alloc.resolve();
+            if (g_system_alloc.calloc) return g_system_alloc.calloc(count, size);
+            return nullptr;
+        }
         if (isCompressOnlyMode()) {
             if (!g_system_alloc.calloc) return nullptr;
             void* ptr = g_system_alloc.calloc(count, size);
@@ -960,6 +1016,34 @@ public:
     }
 
     void* realloc(void* old_ptr, size_t size) {
+        // SMASH_PASSTHROUGH=1: pass realloc to system allocator, except for
+        // pointers smash itself allocated during early init.
+        if (isPassthroughMode()) {
+            if (old_ptr) {
+                uintptr_t addr = reinterpret_cast<uintptr_t>(old_ptr);
+                Span* sp = vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()
+                    ? vm_region_.getSpan(vm_region_.contigPageIndex(addr))
+                    : page_map_.get(addr);
+                if (sp) {
+                    // Smash-owned: copy to a system-malloc buffer and free old.
+                    if (size == 0) { this->free(old_ptr); return nullptr; }
+                    if (!g_system_alloc.malloc) g_system_alloc.resolve();
+                    if (!g_system_alloc.malloc) return nullptr;
+                    void* new_ptr = g_system_alloc.malloc(size);
+                    if (new_ptr) {
+                        size_t old_size = sp->is_large ? sp->large_size
+                                                       : classSize(sp->size_class);
+                        __builtin_memcpy(new_ptr, old_ptr,
+                                         old_size < size ? old_size : size);
+                        this->free(old_ptr);
+                    }
+                    return new_ptr;
+                }
+            }
+            if (!g_system_alloc.realloc) g_system_alloc.resolve();
+            if (g_system_alloc.realloc) return g_system_alloc.realloc(old_ptr, size);
+            return nullptr;
+        }
         if (isCompressOnlyMode()) {
             if (!g_system_alloc.realloc) return nullptr;
             void* ptr = g_system_alloc.realloc(old_ptr, size);
@@ -981,6 +1065,13 @@ public:
     size_t getSize(void* ptr) {
         if (!ptr) return 0;
         if (BootstrapAlloc::instance().owns(ptr)) return 0;
+
+        // SMASH_PASSTHROUGH=1: ask system allocator for the size.
+        if (isPassthroughMode()) {
+            if (!g_system_alloc.malloc_size) g_system_alloc.resolve();
+            if (g_system_alloc.malloc_size) return g_system_alloc.malloc_size(ptr);
+            return 0;
+        }
 
         if (isCompressOnlyMode()) {
             return 0;  // Can't determine size for system allocations

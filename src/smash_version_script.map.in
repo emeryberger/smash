@@ -211,10 +211,16 @@
     pool_destroy;
     pool_reset;
 
-    # TBB cache_aligned_allocate interposition (C++ mangled names)
-    # These are called by TBB's cache_aligned_allocator template
-    _ZN3tbb6detail2r122cache_aligned_allocateEm;
-    _ZN3tbb6detail2r124cache_aligned_deallocateEPv;
+    # TBB cache_aligned_allocate interposition: REMOVED.
+    # libtbb dispatches its allocate/deallocate through internal function-pointer
+    # handlers. Interposing only the public symbols catches cross-DSO calls but
+    # not TBB-internal calls; the resulting alloc/free mismatch corrupts the heap
+    # ("double free or corruption (out)" / "munmap_chunk(): invalid pointer" in
+    # neuron-cc Tensorizer subprocesses). Letting TBB use its own allocator is
+    # safer; we lose visibility into TBB allocations but they're not the bulk of
+    # neuron-cc's footprint. (See linux_syscall_wrappers.cpp for matching removal.)
+    # _ZN3tbb6detail2r122cache_aligned_allocateEm;
+    # _ZN3tbb6detail2r124cache_aligned_deallocateEPv;
 
   local:
     *;

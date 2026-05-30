@@ -1398,10 +1398,6 @@ SMASH_VISIBLE void pool_aligned_free(void* /*pool*/, void* ptr) {
     free(ptr);
 }
 
-// TBB cache_aligned_allocate interposition counters
-static std::atomic<uint64_t> g_cache_aligned_count{0};
-static std::atomic<uint64_t> g_cache_aligned_bytes{0};
-
 }  // extern "C"
 
 // Report TBB interposition stats at process exit
@@ -1409,13 +1405,9 @@ namespace {
 void reportTbbStatsAtExit() {
     uint64_t sc_count = g_scalable_malloc_count.load(std::memory_order_relaxed);
     uint64_t sc_bytes = g_scalable_malloc_bytes.load(std::memory_order_relaxed);
-    uint64_t ca_count = g_cache_aligned_count.load(std::memory_order_relaxed);
-    uint64_t ca_bytes = g_cache_aligned_bytes.load(std::memory_order_relaxed);
-    if ((sc_count > 0 || ca_count > 0) && std::getenv("SMASH_STATS")) {
-        fprintf(stderr, "[smash tbb] scalable_malloc: %lu calls, %.1f MB | "
-                "cache_aligned: %lu calls, %.1f MB\n",
-                (unsigned long)sc_count, sc_bytes / (1024.0 * 1024.0),
-                (unsigned long)ca_count, ca_bytes / (1024.0 * 1024.0));
+    if (sc_count > 0 && std::getenv("SMASH_STATS")) {
+        fprintf(stderr, "[smash tbb] scalable_malloc: %lu calls, %.1f MB\n",
+                (unsigned long)sc_count, sc_bytes / (1024.0 * 1024.0));
     }
 }
 
@@ -1424,24 +1416,17 @@ struct TbbStatsRegistrar {
 } g_tbb_stats_registrar;
 }  // namespace
 
-// TBB cache_aligned_allocate interposition
-// TBB's internal allocator uses this for cache-aligned memory
-namespace tbb { namespace detail { namespace r1 {
-SMASH_VISIBLE void* cache_aligned_allocate(std::size_t size) {
-    g_cache_aligned_count.fetch_add(1, std::memory_order_relaxed);
-    g_cache_aligned_bytes.fetch_add(size, std::memory_order_relaxed);
-    // Allocate with cache line alignment (typically 64 bytes)
-    void* ptr = nullptr;
-    if (posix_memalign(&ptr, 64, size) != 0) {
-        return nullptr;
-    }
-    return ptr;
-}
-
-SMASH_VISIBLE void cache_aligned_deallocate(void* ptr) {
-    free(ptr);
-}
-}}}  // namespace tbb::detail::r1
+// TBB cache_aligned_{allocate,deallocate} interposition: REMOVED.
+// libtbb dispatches its allocate/deallocate through internal function-pointer
+// handlers (`cache_aligned_allocate_handler`, `cache_aligned_deallocate_handler`).
+// LD_PRELOAD interposes the public symbols only, which catches cross-DSO calls
+// (libwalrus -> libtbb) but NOT libtbb-internal calls (which jump directly
+// through the handler pointers in libtbb's data segment). The resulting
+// allocate/deallocate-via-different-allocator mismatch corrupts the heap with
+// "double free or corruption (out)" / "munmap_chunk(): invalid pointer" inside
+// neuron-cc's Tensorizer subprocesses. Letting TBB manage its own cache-aligned
+// allocations is the only safe option — we lose visibility into a few hundred
+// MB of TBB-internal memory but gain correctness.
 
 extern "C" {
 

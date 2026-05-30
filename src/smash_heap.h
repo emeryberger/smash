@@ -16,6 +16,7 @@
 #include "compress/compress_engine.h"
 #include "compress/compressor_thread.h"
 #include "util/bitops.h"
+#include "util/safe_printf.h"  // allocation-free snprintf for malloc-path diagnostics
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
@@ -176,7 +177,7 @@ struct SystemAllocFns {
             char buf[256];
             Dl_info info{};
             if (malloc && dladdr(reinterpret_cast<void*>(malloc), &info)) {
-                int n = snprintf(buf, sizeof(buf),
+                int n = smash::safe_snprintf(buf, sizeof(buf),
                     "[smash debug] system malloc resolved to %s\n",
                     info.dli_fname ? info.dli_fname : "?");
                 if (n > 0) (void)!::write(2, buf, (size_t)n);
@@ -869,9 +870,9 @@ public:
         void* ptr = large_alloc_.allocate(size, kMinAlignment, arena);
         if (!ptr) {
             char dbg[128];
-            int n = std::snprintf(dbg, sizeof(dbg),
+            int n = smash::safe_snprintf(dbg, sizeof(dbg),
                 "[smash debug] large_alloc_.allocate(%zu) returned NULL\n", size);
-            (void)::write(STDERR_FILENO, dbg, n);
+            if (n > 0) (void)::write(STDERR_FILENO, dbg, n);
         }
         if (ptr && isEagerZeroMode()) __builtin_memset(ptr, 0, size);
         return ptr;

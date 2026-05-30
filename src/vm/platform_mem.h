@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cerrno>
+#include "../util/safe_printf.h"  // allocation-free snprintf
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -113,7 +114,7 @@ inline bool protectPages(void* addr, size_t size, bool read, bool write) {
     }();
     if (trace) {
         char buf[160];
-        int n = snprintf(buf, sizeof(buf),
+        int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash mprotect-fail] addr=%p size=%zu prot=%d errno=%d\n",
             addr, size, prot, err);
         if (n > 0) (void)!::write(2, buf, (size_t)n);

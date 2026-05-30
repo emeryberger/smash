@@ -20,6 +20,7 @@
 #include "../core/bootstrap_alloc.h"
 #include "../core/page_map.h"
 #include "../util/spinlock.h"
+#include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
 namespace smash {
 // Forward declaration - defined in smash_heap.cpp
@@ -2665,7 +2666,7 @@ private:
                 else ++n_explore_lg;
             }
             char dbg[300];
-            int dn = snprintf(dbg, sizeof(dbg),
+            int dn = smash::safe_snprintf(dbg, sizeof(dbg),
                 "[smash budget] tick=%u pct=%d elapsed_us=%llu avail_us=%llu "
                 "buckets=%zu (%dx%d) n_rank=%zu compress=%zu skip=%zu explore=%zu "
                 "large(rank=%zu compress=%zu skip=%zu explore=%zu)\n",
@@ -3551,7 +3552,7 @@ public:
             char ts[32] = {};
             vm::formatTimestamp(ts, sizeof(ts));
             char buf[200];
-            int n = snprintf(buf, sizeof(buf),
+            int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash debug] [%s] compressor start pid=%d workers=%d\n",
                 ts, (int)getpid(), kCompressorWorkers);
             if (n > 0) (void)!write(2, buf, (size_t)n);
@@ -3598,7 +3599,7 @@ public:
         uint64_t tier_success = self->tier_upgrade_success_.load(
             std::memory_order_relaxed);
         char buf[384];
-        int n = snprintf(buf, sizeof(buf),
+        int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu\n",
@@ -3703,7 +3704,7 @@ public:
             double thrash_pct = b.compress_count > 0
                 ? (b.decompress_count * 100.0 / b.compress_count) : 0;
             char line[160];
-            int n = snprintf(line, sizeof(line),
+            int n = smash::safe_snprintf(line, sizeof(line),
                 "[smash bucket] %5d %3d %9zu %8u %6.1f%% %9u %11u %7.1f%%\n",
                 b.arena, b.sc, b.obj_size, b.count, mean_ratio,
                 b.compress_count, b.decompress_count, thrash_pct);
@@ -3779,7 +3780,7 @@ public:
             char buf[120];
             char ts[32] = {};
             vm::formatTimestamp(ts, sizeof(ts));
-            int n = snprintf(buf, sizeof(buf), "[smash shutdown] [%s] %s pid=%d\n", ts, msg, (int)getpid());
+            int n = smash::safe_snprintf(buf, sizeof(buf), "[smash shutdown] [%s] %s pid=%d\n", ts, msg, (int)getpid());
             if (n > 0) (void)!write(2, buf, (size_t)n);
         };
 

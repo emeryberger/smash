@@ -24,6 +24,7 @@
 #include <sys/syscall.h>
 #endif
 #include "smash/config.h"
+#include "../util/safe_printf.h"  // signal-handler-safe snprintf
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -117,7 +118,7 @@ class FaultHandler {
             else if (old->sa_handler == SIG_DFL) kind = "SIG_DFL";
             else if (old->sa_handler == SIG_IGN) kind = "SIG_IGN";
             else kind = "OTHER";
-            int n = snprintf(buf, sizeof(buf),
+            int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash sig] sig=%d si_code=%d si_addr=%p chain_kind=%s flags=0x%x\n",
                 sig, info->si_code, info->si_addr, kind,
                 (unsigned)old->sa_flags);
@@ -151,7 +152,7 @@ class FaultHandler {
                        old->sa_handler == SIG_DFL;
         if (want_bt) {
             char hdr[160];
-            int n = snprintf(hdr, sizeof(hdr),
+            int n = smash::safe_snprintf(hdr, sizeof(hdr),
                 "[smash crash] pid=%d tid=%d sig=%d si_code=%d si_addr=%p\n",
                 (int)getpid(), (int)syscall(SYS_gettid),
                 sig, info->si_code, info->si_addr);
@@ -239,7 +240,7 @@ class FaultHandler {
             }();
             if (trace) {
                 char buf[128];
-                int n = snprintf(buf, sizeof(buf),
+                int n = smash::safe_snprintf(buf, sizeof(buf),
                     "[smash mach] exc=%d code=[%llx,%llx] handled=%d\n",
                     req.body.exception,
                     (unsigned long long)req.body.code[0],

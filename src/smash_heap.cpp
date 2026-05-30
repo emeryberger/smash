@@ -32,6 +32,15 @@
 
 std::atomic<int> smash::g_thread_init_count{0};
 
+// mpaland/printf requires _putchar() to satisfy printf_() / vprintf_() which
+// are referenced unconditionally inside printf.cpp. We never call those
+// stdout-facing forms (we only use snprintf_/vsnprintf_ via safe_printf.h),
+// so this implementation is a stub: write the byte to stderr through write(2)
+// without going through stdio.
+extern "C" void _putchar(char c) {
+    (void)::write(STDERR_FILENO, &c, 1);
+}
+
 // ── System allocator function pointers for compress-only mode ───────────────
 smash::SystemAllocFns smash::g_system_alloc;
 

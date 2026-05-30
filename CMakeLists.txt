@@ -88,6 +88,21 @@ else()
   FetchContent_MakeAvailable(alloc8)
 endif()
 
+# ── emeryberger/printf — allocation-free printf/snprintf ────────────────────
+# Standard glibc snprintf may call malloc internally (for large field widths
+# or when %g/%a paths grow scratch buffers). Inside the malloc fast path,
+# fault handlers, or compressor threads, that recursion can deadlock or
+# overflow the stack. We compile this header-then-included library directly
+# into libsmash and #include "printf.h" wherever we format diagnostic output
+# from those paths.
+FetchContent_Declare(
+  printf
+  GIT_REPOSITORY https://github.com/emeryberger/printf.git
+  GIT_TAG        master
+  GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(printf)
+
 # ── LZ4 compression library ──────────────────────────────────────────────────
 FetchContent_Declare(
   lz4
@@ -148,10 +163,12 @@ endif()
 add_library(smash SHARED
   src/smash_heap.cpp
   src/linux_syscall_wrappers.cpp
+  ${printf_SOURCE_DIR}/printf.cpp
   ${ALLOC8_INTERPOSE_SOURCES}
   ${_SMASH_THREAD_SOURCES}
   ${_SMASH_COMMON_SOURCES}
 )
+target_include_directories(smash PRIVATE ${printf_SOURCE_DIR})
 
 # Linux syscall wrappers need default visibility for LD_PRELOAD interposition.
 # The global -fvisibility=hidden flag hides them otherwise.
@@ -223,6 +240,7 @@ endif()
 add_library(smash_noopt SHARED
   src/smash_heap.cpp
   src/linux_syscall_wrappers.cpp
+  ${printf_SOURCE_DIR}/printf.cpp
   ${ALLOC8_INTERPOSE_SOURCES}
   ${ALLOC8_THREAD_SOURCES}
   ${_SMASH_COMMON_SOURCES}
@@ -231,6 +249,7 @@ add_library(smash_noopt SHARED
 target_include_directories(smash_noopt PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${printf_SOURCE_DIR}
 )
 
 # On Linux, use custom version script (same as smash target)
@@ -269,11 +288,13 @@ endif()
 add_library(smash_compress_only SHARED
   src/compress_only/co_interpose_mac.cpp
   src/compress_only/co_interpose_linux.cpp
+  ${printf_SOURCE_DIR}/printf.cpp
 )
 
 target_include_directories(smash_compress_only PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${printf_SOURCE_DIR}
 )
 
 # Only needs alloc8 headers (for platform.h), NOT the interpose machinery

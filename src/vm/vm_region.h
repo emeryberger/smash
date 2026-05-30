@@ -429,7 +429,7 @@ public:
         if (landmines) {
             (void)::mprotect(addr, num_pages * kPageSize, PROT_NONE);
             char buf[96];
-            int n = snprintf(buf, sizeof(buf),
+            int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash landmine] free addr=%p npages=%zu range=[%p,%p)\n",
                 addr, num_pages, addr,
                 static_cast<char*>(addr) + num_pages * kPageSize);

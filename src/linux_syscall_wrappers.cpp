@@ -1406,8 +1406,14 @@ void reportTbbStatsAtExit() {
     uint64_t sc_count = g_scalable_malloc_count.load(std::memory_order_relaxed);
     uint64_t sc_bytes = g_scalable_malloc_bytes.load(std::memory_order_relaxed);
     if (sc_count > 0 && std::getenv("SMASH_STATS")) {
-        fprintf(stderr, "[smash tbb] scalable_malloc: %lu calls, %.1f MB\n",
-                (unsigned long)sc_count, sc_bytes / (1024.0 * 1024.0));
+        // Use safe_snprintf + write(2): glibc's fprintf can call malloc
+        // for stream lock acquisition, and atexit can fire after the
+        // allocator is in a quiescing state where that recurses.
+        char buf[160];
+        int n = smash::safe_snprintf(buf, sizeof(buf),
+            "[smash tbb] scalable_malloc: %lu calls, %.1f MB\n",
+            (unsigned long)sc_count, sc_bytes / (1024.0 * 1024.0));
+        if (n > 0) (void)!::write(2, buf, (size_t)n);
     }
 }
 

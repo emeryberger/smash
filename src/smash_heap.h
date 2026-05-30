@@ -197,10 +197,12 @@ class SmashHeap {
     std::atomic<uint32_t> decompress_count_[kNumArenas * kNumClasses]{};
     std::atomic<uint32_t> adaptive_cap_[kNumArenas * kNumClasses]{};
 
+#ifdef SMASH_POWER_OF_TWO_CHOICES
     // Power-of-two-choices load counters. Per (arena, size_class) allocation
     // count used to pick the less contended arena. Approximate - wrapping and
     // relaxed atomics are fine since we only need relative comparison.
     std::atomic<uint32_t> arena_alloc_count_[kNumArenas * kNumClasses]{};
+#endif
 
     // Cohort measurement arrays (kMeasureCohorts only).  Per-page tracking
     // of first allocating thread ID and RA hash; a "mixed" flag per axis
@@ -323,26 +325,33 @@ class SmashHeap {
         }
         h ^= h >> 16;
 
-        // Power of two choices: hash to two candidate arenas and pick the
-        // less contended one. This reduces max load from O(log n / log log n)
-        // to O(log log n) with n threads.
+        // Deterministic arena assignment: same call site always maps to same
+        // arena. This maximizes compression homogeneity by keeping allocations
+        // from the same origin together. We have enough arenas (scaled by CPU
+        // count) to avoid contention without load balancing.
         const int mask = getArenaMask();
-        uint8_t arena1 = static_cast<uint8_t>(h & mask);
+        uint8_t base = static_cast<uint8_t>(h & mask);
+
+#ifdef SMASH_POWER_OF_TWO_CHOICES
+        // Power of two choices (disabled by default): hash to two candidate
+        // arenas and pick the less contended one. This reduces max load from
+        // O(log n / log log n) to O(log log n) with n threads, but spreads
+        // allocations from the same call site across arenas, hurting
+        // compression homogeneity. Enable with -DSMASH_POWER_OF_TWO_CHOICES
+        // if contention is a bigger concern than compression ratio.
+        uint8_t arena1 = base;
         uint8_t arena2 = static_cast<uint8_t>((h >> 8) & mask);
         if (arena1 == arena2) {
             arena2 = static_cast<uint8_t>((arena1 + 1) & mask);
         }
-        // Pick arena with lower contention. Use per-arena allocation counter
-        // (relaxed load - approximate is fine for load balancing).
         uint32_t load1 = arena_alloc_count_[arena1 * kNumClasses + sc]
                              .load(std::memory_order_relaxed);
         uint32_t load2 = arena_alloc_count_[arena2 * kNumClasses + sc]
                              .load(std::memory_order_relaxed);
-        uint8_t base = (load1 <= load2) ? arena1 : arena2;
-
-        // Bump allocation counter for load balancing (wrapping is fine)
+        base = (load1 <= load2) ? arena1 : arena2;
         arena_alloc_count_[base * kNumClasses + sc]
             .fetch_add(1, std::memory_order_relaxed);
+#endif
 #endif
         if constexpr (kColdArenaFeedback) {
             // If compressor has flagged this (arena, sc) as cold-biased,

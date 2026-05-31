@@ -938,13 +938,18 @@ public:
             span = page_map_.get(addr);
         }
         if (!span) {
-            // Not a Smash-managed pointer. In large-only mode, forward to
-            // system malloc (which handled small allocations).
-            // In full mode, don't forward - the pointer might be from an
-            // embedded allocator (e.g., Python 3.13's mimalloc) that we
-            // shouldn't interfere with.
-            if (isLargeOnlyMode() && g_system_alloc.free)
-                g_system_alloc.free(ptr);
+            // Not a Smash-managed pointer. Forward to the system allocator.
+            // On Linux this matters in full mode too: alloc8's strong-alias
+            // overrides bind malloc/free at link time, so any allocation the
+            // dynamic linker / libstdc++ static initializers / glibc helpers
+            // make BEFORE SmashHeap's singleton finishes constructing comes
+            // back to us as a foreign pointer when freed. Silently dropping
+            // it leaks the chunk and (worse) breaks realloc semantics —
+            // realloc() falls back to malloc+memcpy(getSize()=0)+free(), so
+            // dropping the old block leaves stale data live and corrupts
+            // glibc's heap on the next free of the original.
+            if (!g_system_alloc.free) g_system_alloc.resolve();
+            if (g_system_alloc.free) g_system_alloc.free(ptr);
             return;
         }
         if (span->is_large) { large_alloc_.deallocate(span); return; }
@@ -1051,10 +1056,23 @@ public:
             trackAllocation(ptr, size);
             return ptr;
         }
-        // In full mode, alloc8 handles realloc
+        // Full mode: if old_ptr is foreign, forward the whole call to system
+        // realloc. We can't do the malloc+memcpy+free dance ourselves because
+        // we don't know the old block's size — getSize() returns 0 for
+        // foreign pointers and any answer we make up corrupts the data.
         if (!old_ptr) return this->malloc(size);
         if (size == 0) { this->free(old_ptr); return nullptr; }
-        size_t old_size = getSize(old_ptr);
+        uintptr_t addr = reinterpret_cast<uintptr_t>(old_ptr);
+        Span* sp = vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()
+            ? vm_region_.getSpan(vm_region_.contigPageIndex(addr))
+            : page_map_.get(addr);
+        if (!sp) {
+            if (!g_system_alloc.realloc) g_system_alloc.resolve();
+            if (g_system_alloc.realloc) return g_system_alloc.realloc(old_ptr, size);
+            return nullptr;
+        }
+        size_t old_size = sp->is_large ? sp->large_size
+                                       : classSize(sp->size_class);
         void* new_ptr = this->malloc(size);
         if (new_ptr) {
             __builtin_memcpy(new_ptr, old_ptr, old_size < size ? old_size : size);
@@ -1090,10 +1108,14 @@ public:
             span = page_map_.get(addr);
         }
         if (!span) {
-            // In large-only mode, query system allocator for size.
-            // alloc8's realloc uses this to size the memcpy.
-            if (isLargeOnlyMode() && g_system_alloc.malloc_size)
-                return g_system_alloc.malloc_size(ptr);
+            // Query the system allocator for foreign pointers (allocations
+            // made before SmashHeap was ready, or via paths we don't see).
+            // Returning 0 here lies to alloc8's realloc fallback —
+            // memcpy(new, old, 0) leaves the new buffer uninitialized and
+            // free(old) silently drops it, the classic recipe for
+            // "double free / munmap_chunk: invalid pointer" later.
+            if (!g_system_alloc.malloc_size) g_system_alloc.resolve();
+            if (g_system_alloc.malloc_size) return g_system_alloc.malloc_size(ptr);
             return 0;
         }
         if (span->is_large) return span->large_size;

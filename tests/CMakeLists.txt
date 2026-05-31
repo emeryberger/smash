@@ -51,9 +51,11 @@ endif()
 add_test(NAME test_compression COMMAND test_compression)
 # Drive the compressor through ticks deterministically — bypass the
 # CPU-pressure hard-skip and floor multiplier with an explicit
-# cold-ticks override.
+# cold-ticks override. Also pin SMASH_SOFTDIRTY=0 because this test
+# directly checks Phase-3 PROT_READ states (ACTIVE_MONITORING) which
+# don't exist under the soft-dirty path.
 set_tests_properties(test_compression PROPERTIES
-  ENVIRONMENT "SMASH_COLD_TICKS=2")
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0")
 
 # Dictionary training test (needs LZ4 + zstd)
 add_executable(test_dictionary test_dictionary.cpp ${printf_SOURCE_DIR}/printf.cpp)
@@ -83,8 +85,9 @@ if(APPLE)
   target_compile_options(test_prefetch PRIVATE -ftls-model=initial-exec)
 endif()
 add_test(NAME test_prefetch COMMAND test_prefetch)
+# Pin SMASH_SOFTDIRTY=0 — test directly drives PROT_READ-based Phase 3.
 set_tests_properties(test_prefetch PROPERTIES
-  ENVIRONMENT "SMASH_COLD_TICKS=2")
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0")
 
 # Contention test (needs LZ4 + zstd + smash_heap.cpp)
 add_executable(test_contention
@@ -228,6 +231,12 @@ else()
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
       "SMASH_COLD_TIMEOUT_SEC=1"
+      # SMASH_SOFTDIRTY=0: this test relies on the deterministic
+      # PROT_READ Phase-3 timing to drive the buffer to COMPRESSED
+      # before the syscall. Soft-dirty's pagemap-read sees the
+      # initial-fault writes for one extra tick, missing the test's
+      # 3 s window.
+      "SMASH_SOFTDIRTY=0"
       $<TARGET_FILE:syscall_efault_test>
   )
 endif()

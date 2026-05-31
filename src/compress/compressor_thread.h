@@ -2417,11 +2417,25 @@ private:
     //    Side effect: a brief PTE-zap stall, similar in magnitude to the
     //    mprotect-storm we're replacing but bounded to a single syscall.
     //
-    // Enabled by SMASH_SOFTDIRTY=1.
+    // Default ON on Linux. Disabled by `SMASH_SOFTDIRTY=0` for the
+    // crossover cases (very sparse writes on small heaps where the
+    // pagemap-read fixed cost dominates) or for sandboxes where
+    // /proc/self/pagemap isn't openable. Microbenchmark
+    // (bench/bench_softdirty_vs_protread.cpp): soft-dirty wins 2-11x
+    // on workloads with >0.5% write density, and entirely avoids the
+    // VMA-explosion hazard (vm.max_map_count=65530) that the per-page
+    // mprotect-on-fault path produces.
     static bool isSoftDirtyEnabled() {
         static const int on = []{
             const char* v = std::getenv("SMASH_SOFTDIRTY");
-            return (v && v[0] == '1') ? 1 : 0;
+            // Default: enabled on Linux, opt-out via SMASH_SOFTDIRTY=0.
+#ifdef __linux__
+            if (!v) return 1;
+            return (v[0] == '0') ? 0 : 1;
+#else
+            (void)v;
+            return 0;
+#endif
         }();
         return on != 0;
     }

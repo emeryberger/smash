@@ -138,9 +138,18 @@ For applications with concurrent threads and significant slab/small-object traff
 LD_PRELOAD=/path/to/libsmash.so PYTHONMALLOC=malloc SMASH_LARGE_ONLY=1
 ```
 
-Full mode (without `SMASH_LARGE_ONLY=1`) is **experimental** and currently has unresolved data-corruption races on workloads where many threads concurrently access slab-managed objects under aggressive compression timing. The corruption manifests as walrus C++ STL container destructor crashes (`std::_Rb_tree_increment` reading null at small offsets), nanobind refcount mismatches, and similar "reading zero where structured data should be" signatures. Verified deterministic at moderate cold-timeout values on neuron-cc test7_full and batchnorm_33.
+Full mode (without `SMASH_LARGE_ONLY=1`) is **experimental** and still crashes on neuron-cc — but the diagnosis has moved on from the original "concurrent slab race" hypothesis. Status as of 2026-05-31:
+
+- The crash is **deterministic** in Tensorizer / hlo2penguin and consistently surfaces in `isl_id_free` (islpy) with `free(): invalid size` / `double free or corruption (out)` / `munmap_chunk(): invalid pointer`.
+- Stack trace (captured via `smash_work/probe/abort_trace.so`) goes glibc `free` → `_int_free` → `malloc_printerr` → `abort`. Smash's interposer is *not on the stack*. The user has reported the same `isl_id_free` abort under jemalloc and tcmalloc as well, before smash existed.
+- **It is not a smash interposition gap for islpy specifically.** Audited every glibc allocator symbol `_isl.cpython-313-x86_64-linux-gnu.so` imports (`malloc`, `calloc`, `realloc`, `free`, `strdup`, `qsort`, plus printf-family) — every one is interposed by smash through alloc8's strong-symbol aliases. `isl_calloc_or_die` calls `calloc@plt` (smash); `isl_id_alloc` calls `strdup@plt` (smash) for `id->name`; `isl_id_free` calls `free@plt` for both.
+- **It is not a slab/page_map race in smash.** That hypothesis was the original write-up but doesn't fit two facts: (1) the same crash predates smash on the same workload under different allocators; (2) running with `SMASH_TRACE_FOREIGN_FREE=1` on the failing run reports zero foreign-pointer frees from `isl_id_free`, so smash's interposer correctly recognises every isl pointer as smash-owned and never reaches the glibc-forward path.
+- The earlier `tmp/islpy/isl_nofree.patch` (deletes both `free` calls in `isl_id_free`) is a workaround that masks the symptom by leaking the strings; it is not a fix and points away from the real cause. Open question: what makes glibc's free abort on a `free@plt` call site that should resolve to smash's interposer? Candidates we have NOT yet ruled out: a Python extension or libpython init code rebinding the PLT slot (e.g., `dlopen` flag combinations, lazy-binding ordering, libstdc++'s `__static_initialization_and_destruction` pulling `_isl.so`'s `free@plt` fixup before LD_PRELOAD takes effect for that DSO).
 
 Large-only mode bypasses this entirely by leaving slab/small allocations to the system malloc and only managing allocations ≥ 16 KB. Verified 9/9 PASS at `SMASH_COLD_TIMEOUT_SEC ∈ {1, 5, 10}` on neuron-cc test7_full (largest HLO, 9.3 MB) post the `SMASH_DEFER_MADVISE` correctness fix.
+
+Diagnostic env vars added 2026-05-31:
+- `SMASH_TRACE_FOREIGN_FREE=1` — log the first 32 frees that smash receives for pointers it does not recognise (i.e., where it is about to forward to `g_system_alloc.free`). Includes return address + caller DSO. Zero-overhead in steady state.
 
 The other knob that's load-bearing for correctness:
 

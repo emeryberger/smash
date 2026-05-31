@@ -949,6 +949,32 @@ public:
             // dropping the old block leaves stale data live and corrupts
             // glibc's heap on the next free of the original.
             if (!g_system_alloc.free) g_system_alloc.resolve();
+            // Diagnostic: SMASH_TRACE_FOREIGN_FREE=1 prints the first N
+            // foreign-pointer frees and where they likely came from. Costs
+            // nothing in steady state (one branch).
+            static int trace_foreign = []{
+                const char* v = std::getenv("SMASH_TRACE_FOREIGN_FREE");
+                return (v && v[0] == '1') ? 1 : 0;
+            }();
+            if (trace_foreign) [[unlikely]] {
+                static std::atomic<int> printed{0};
+                int n = printed.fetch_add(1, std::memory_order_relaxed);
+                if (n < 32) {
+                    char buf[160];
+                    Dl_info info{};
+                    void* ra = __builtin_return_address(0);
+                    const char* fname = "?";
+                    if (ra && dladdr(ra, &info) && info.dli_fname) fname = info.dli_fname;
+                    int len = smash::safe_snprintf(buf, sizeof(buf),
+                        "[smash foreign-free] ptr=%p ra=%p in=%s "
+                        "vm_lo=%p vm_hi=%p\n",
+                        ptr, ra, fname,
+                        reinterpret_cast<void*>(vm_region_.base()),
+                        reinterpret_cast<void*>(vm_region_.base()
+                            + vm_region_.contigPages() * kPageSize));
+                    if (len > 0) (void)!::write(2, buf, (size_t)len);
+                }
+            }
             if (g_system_alloc.free) g_system_alloc.free(ptr);
             return;
         }

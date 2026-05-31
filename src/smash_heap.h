@@ -899,6 +899,25 @@ public:
         if (!ptr) return;
         if (BootstrapAlloc::instance().owns(ptr)) return;
 
+        // SMASH_COUNT_FREE=1: count every free entry. If we see the
+        // process abort in glibc free with this counter at zero or
+        // far below the malloc count, the call is bypassing our
+        // interposer entirely.
+        static const bool count_free = []{
+            const char* v = std::getenv("SMASH_COUNT_FREE");
+            return v && v[0] == '1';
+        }();
+        if (count_free) [[unlikely]] {
+            static std::atomic<uint64_t> n{0};
+            uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((c & 0xFFFFF) == 0) {  // every ~1M
+                char buf[64];
+                int len = smash::safe_snprintf(buf, sizeof(buf),
+                    "[smash free count] %lu\n", (unsigned long)c);
+                if (len > 0) (void)!::write(2, buf, (size_t)len);
+            }
+        }
+
         // SMASH_PASSTHROUGH=1: pass all frees to system malloc, except for
         // pointers that smash itself allocated during early init (before
         // g_system_alloc was resolvable). Those need smash's free path.

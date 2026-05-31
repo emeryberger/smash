@@ -138,18 +138,36 @@ For applications with concurrent threads and significant slab/small-object traff
 LD_PRELOAD=/path/to/libsmash.so PYTHONMALLOC=malloc SMASH_LARGE_ONLY=1
 ```
 
-Full mode (without `SMASH_LARGE_ONLY=1`) is **experimental** and still crashes on neuron-cc — but the diagnosis has moved on from the original "concurrent slab race" hypothesis. Status as of 2026-05-31:
+Full mode (without `SMASH_LARGE_ONLY=1`) is **experimental**. Status as of 2026-05-31:
 
-- The crash is **deterministic** in Tensorizer / hlo2penguin and consistently surfaces in `isl_id_free` (islpy) with `free(): invalid size` / `double free or corruption (out)` / `munmap_chunk(): invalid pointer`.
-- Stack trace (captured via `smash_work/probe/abort_trace.so`) goes glibc `free` → `_int_free` → `malloc_printerr` → `abort`. Smash's interposer is *not on the stack*. The user has reported the same `isl_id_free` abort under jemalloc and tcmalloc as well, before smash existed.
-- **It is not a smash interposition gap for islpy specifically.** Audited every glibc allocator symbol `_isl.cpython-313-x86_64-linux-gnu.so` imports (`malloc`, `calloc`, `realloc`, `free`, `strdup`, `qsort`, plus printf-family) — every one is interposed by smash through alloc8's strong-symbol aliases. `isl_calloc_or_die` calls `calloc@plt` (smash); `isl_id_alloc` calls `strdup@plt` (smash) for `id->name`; `isl_id_free` calls `free@plt` for both.
-- **It is not a slab/page_map race in smash.** That hypothesis was the original write-up but doesn't fit two facts: (1) the same crash predates smash on the same workload under different allocators; (2) running with `SMASH_TRACE_FOREIGN_FREE=1` on the failing run reports zero foreign-pointer frees from `isl_id_free`, so smash's interposer correctly recognises every isl pointer as smash-owned and never reaches the glibc-forward path.
-- The earlier `tmp/islpy/isl_nofree.patch` (deletes both `free` calls in `isl_id_free`) is a workaround that masks the symptom by leaking the strings; it is not a fix and points away from the real cause. Open question: what makes glibc's free abort on a `free@plt` call site that should resolve to smash's interposer? Candidates we have NOT yet ruled out: a Python extension or libpython init code rebinding the PLT slot (e.g., `dlopen` flag combinations, lazy-binding ordering, libstdc++'s `__static_initialization_and_destruction` pulling `_isl.so`'s `free@plt` fixup before LD_PRELOAD takes effect for that DSO).
+**The "isl_id_free aborts in glibc free" failure is a neuron-cc bug, not a smash bug.** Root cause located in `neuronxcc/driver/JobRegistry.py:51`:
 
-Large-only mode bypasses this entirely by leaving slab/small allocations to the system malloc and only managing allocations ≥ 16 KB. Verified 9/9 PASS at `SMASH_COLD_TIMEOUT_SEC ∈ {1, 5, 10}` on neuron-cc test7_full (largest HLO, 9.3 MB) post the `SMASH_DEFER_MADVISE` correctness fix.
+```python
+sys.setdlopenflags(original_flags | os.RTLD_DEEPBIND)
+```
 
-Diagnostic env vars added 2026-05-31:
+That line was added to work around a TVM/LLVM symbol clash (TVM has since been deleted; the comment in the source admits it). With `RTLD_DEEPBIND`, the dynamic linker resolves the freshly-dlopen'd DSO's relocations against **its own symbol scope first**, before any LD_PRELOAD libraries. So `_isl.so`'s `free@plt` slot binds to `/lib64/libc.so.6 :: free` rather than to the LD_PRELOADed allocator's free. Same buffer was allocated through smash (or jemalloc/tcmalloc) via `strdup@plt` / `calloc@plt`, then freed through libc's free → glibc reads what it thinks is its own chunk header → "free(): invalid size" / "double free" / "munmap_chunk(): invalid pointer".
+
+Verified empirically (2026-05-31) using `tools/free_probe.c` (a tiny LD_PRELOAD probe that walks the dynamic linker structures to read the actual GOT slot for `free@plt` in each loaded DSO):
+
+- Standalone Python + jemalloc: `_isl.so :: free@plt -> jemalloc :: free` ✓
+- Same with smash: `_isl.so :: free@plt -> libsmash :: free` ✓
+- Inside neuron-cc's job-import path (after JobRegistry sets DEEPBIND): `_isl.so :: free@plt -> /lib64/libc.so.6 :: free` ✗ — bypasses every LD_PRELOAD allocator.
+
+This explains why the original CLAUDE.md text talked about a "slab race in smash" — it's not. The same failure mode reproduces under jemalloc with no smash code involved at all, and it was happening to neuron-cc with non-glibc allocators long before smash existed.
+
+**The fix is in `JobRegistry.__getJobFactory`**: gate the `RTLD_DEEPBIND` behind `SMASH_KEEP_DEEPBIND=1` (or just delete it; TVM is gone). One-line change in neuron-cc, not in smash. Until that lands, full smash mode on neuron-cc continues to fail.
+
+Other findings, less load-bearing:
+- Smash's interposers DO cover every allocator symbol `_isl.so` imports (audited via `nm -D --undefined-only`): `malloc`, `calloc`, `realloc`, `free`, `strdup`, plus the printf and qsort families that internally go through `*@plt`. No interposition gap.
+- After the JobRegistry fix removes DEEPBIND, the islpy crash disappears, but a *different* failure surfaces — child workers in `parallelCompileSubGraphs` (concurrent.futures ProcessPoolExecutor) terminate without a captured signal. That's unrelated to islpy and looks like a fork/compressor-thread interaction; track separately.
+
+Large-only mode bypasses both issues by leaving slab/small allocations to the system malloc and only managing allocations ≥ 16 KB. Verified 9/9 PASS at `SMASH_COLD_TIMEOUT_SEC ∈ {1, 5, 10}` on neuron-cc test7_full (largest HLO, 9.3 MB) post the `SMASH_DEFER_MADVISE` correctness fix.
+
+Diagnostics added 2026-05-31:
 - `SMASH_TRACE_FOREIGN_FREE=1` — log the first 32 frees that smash receives for pointers it does not recognise (i.e., where it is about to forward to `g_system_alloc.free`). Includes return address + caller DSO. Zero-overhead in steady state.
+- `SMASH_COUNT_FREE=1` — count every free entry, log the count every ~1M frees. Useful for confirming the interposer is actually on the call path.
+- `tools/free_probe.c` — standalone LD_PRELOAD probe that, post-`dlopen`, dumps the runtime target of `free@plt` for `_isl.so` / `libwalrus` / `libsmash`. Build with `gcc -shared -fPIC -O0 -o free_probe.so tools/free_probe.c -ldl`. Use as the second LD_PRELOAD entry: `LD_PRELOAD=libsmash.so:free_probe.so python3 …`.
 
 The other knob that's load-bearing for correctness:
 

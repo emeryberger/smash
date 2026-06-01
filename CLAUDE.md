@@ -158,11 +158,17 @@ This explains why the original CLAUDE.md text talked about a "slab race in smash
 
 **The fix is in `JobRegistry.__getJobFactory`**: drop the `RTLD_DEEPBIND` (TVM is gone) and gate the old behaviour behind `NEURON_KEEP_DEEPBIND=1` for anyone who still needs it. One-line change in neuron-cc, not in smash. After applying, the islpy crash disappears.
 
-After the DEEPBIND fix, full mode hits a SECOND blocker: **`hlo2penguin` is a 154 MiB Bazel-built binary that statically links its own gperftools tcmalloc**. Verified 2026-06-01 via `nm`: contains `_GLOBAL__sub_I_tcmalloc.cc`, `tc_get_sysalloc_override`, `tcmalloc::STLPageHeapAllocator`. `LD_PRELOAD=libsmash.so` cannot interpose statically-linked malloc/free symbols — those are resolved at link time from the binary's own object files, never going through the PLT.
+After the DEEPBIND fix, full mode hits a SECOND blocker: **`libwalrus.so` exports its own tcmalloc-built `malloc`/`free`/`calloc`/`realloc`** as strong global symbols. Verified 2026-06-01 via `nm` + `objdump -R`:
 
-So the hlo2penguin process runs with mixed allocators: tcmalloc for its own internal allocations, smash for cross-DSO calls (libstdc++ symbols, etc.). Mismatched alloc/free pairs across the two allocators surface as `tcmalloc.cc:333] Attempt to free invalid pointer` (2026-06-01 captured signature with `SMASH_LARGE_ALLOC_VM_THRESHOLD=65536`).
+- `libwalrus.so` defines `T malloc` at `0x17c76c0`, `T free` at `0x17c58c0`, etc., as **non-versioned strong globals** (`@@Base`, not `@@GLIBC_*`).
+- The full `tcmalloc::` C++ namespace appears in defined symbols: `tcmalloc::ThreadCache::BecomeIdle`, `tcmalloc::DLL_Remove`, `tcmalloc::Span`, etc.
+- libwalrus is loaded by hlo2penguin and by other neuron-cc binaries that link `-lwalrus`.
 
-Real fix: rebuild hlo2penguin without `-l tcmalloc` (or use `--whole-archive`/`--no-whole-archive` to drop the static tcmalloc archive). That's a one-line change in neuron-cc's Bazel `cc_binary` for hlo2penguin, NOT in smash.
+(My earlier write-up incorrectly attributed this to `hlo2penguin` itself — that binary is *clean*, with 7191 `call malloc@plt` sites and `R_X86_64_JUMP_SLOT  malloc@GLIBC_2.2.5` relocations. The static tcmalloc lives in libwalrus.so.)
+
+When libwalrus is loaded into a process that ALSO has `LD_PRELOAD=libsmash.so`, the dynamic linker resolves `malloc` from whichever DSO appears first in the symbol search order. With LD_PRELOAD smash should win — but for *intra-libwalrus* calls to `malloc`, the linker may bind directly to the local strong definition (especially under `-Bsymbolic` or RTLD_DEEPBIND combinations). And anything libwalrus allocates via its built-in tcmalloc has a tcmalloc chunk header that smash's free won't accept (and vice versa). Mismatched pairs surface as `src/tcmalloc.cc:333] Attempt to free invalid pointer` (signature captured 2026-06-01 with `SMASH_LARGE_ALLOC_VM_THRESHOLD=65536`).
+
+Real fix: rebuild libwalrus.so without statically-linked tcmalloc, OR rebuild it with `-Wl,-Bsymbolic-functions` removed and ensure tcmalloc symbols are weak/not-exported so LD_PRELOAD wins. That's a CMake change in neuron-cc, not in smash.
 
 Diagnostic for this class of bug: `tools/death_trace.c` catches every fatal signal AND every `_exit()`/`_Exit()` with non-zero status. Build with `gcc -O0 -fPIC -shared -o death_trace.so tools/death_trace.c -ldl`. Use as the second LD_PRELOAD entry. Was needed because the worker was leaving via `_exit(1)`, not abort, so `abort_trace.so` saw nothing.
 

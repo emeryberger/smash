@@ -156,7 +156,7 @@ Verified empirically (2026-05-31) using `tools/free_probe.c` (a tiny LD_PRELOAD 
 
 This explains why the original CLAUDE.md text talked about a "slab race in smash" — it's not. The same failure mode reproduces under jemalloc with no smash code involved at all, and it was happening to neuron-cc with non-glibc allocators long before smash existed.
 
-**The fix is in `JobRegistry.__getJobFactory`**: gate the `RTLD_DEEPBIND` behind `SMASH_KEEP_DEEPBIND=1` (or just delete it; TVM is gone). One-line change in neuron-cc, not in smash. Until that lands, full smash mode on neuron-cc continues to fail.
+**The fix is in `JobRegistry.__getJobFactory`**: drop the `RTLD_DEEPBIND` (TVM is gone) and gate the old behaviour behind `NEURON_KEEP_DEEPBIND=1` for anyone who still needs it. One-line change in neuron-cc, not in smash. After applying, the islpy crash disappears.
 
 Other findings, less load-bearing:
 - Smash's interposers DO cover every allocator symbol `_isl.so` imports (audited via `nm -D --undefined-only`): `malloc`, `calloc`, `realloc`, `free`, `strdup`, plus the printf and qsort families that internally go through `*@plt`. No interposition gap.

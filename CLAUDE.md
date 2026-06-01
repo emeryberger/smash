@@ -158,6 +158,14 @@ This explains why the original CLAUDE.md text talked about a "slab race in smash
 
 **The fix is in `JobRegistry.__getJobFactory`**: drop the `RTLD_DEEPBIND` (TVM is gone) and gate the old behaviour behind `NEURON_KEEP_DEEPBIND=1` for anyone who still needs it. One-line change in neuron-cc, not in smash. After applying, the islpy crash disappears.
 
+After the DEEPBIND fix, full mode hits a SECOND blocker: **`hlo2penguin` is a 154 MiB Bazel-built binary that statically links its own gperftools tcmalloc**. Verified 2026-06-01 via `nm`: contains `_GLOBAL__sub_I_tcmalloc.cc`, `tc_get_sysalloc_override`, `tcmalloc::STLPageHeapAllocator`. `LD_PRELOAD=libsmash.so` cannot interpose statically-linked malloc/free symbols — those are resolved at link time from the binary's own object files, never going through the PLT.
+
+So the hlo2penguin process runs with mixed allocators: tcmalloc for its own internal allocations, smash for cross-DSO calls (libstdc++ symbols, etc.). Mismatched alloc/free pairs across the two allocators surface as `tcmalloc.cc:333] Attempt to free invalid pointer` (2026-06-01 captured signature with `SMASH_LARGE_ALLOC_VM_THRESHOLD=65536`).
+
+Real fix: rebuild hlo2penguin without `-l tcmalloc` (or use `--whole-archive`/`--no-whole-archive` to drop the static tcmalloc archive). That's a one-line change in neuron-cc's Bazel `cc_binary` for hlo2penguin, NOT in smash.
+
+Diagnostic for this class of bug: `tools/death_trace.c` catches every fatal signal AND every `_exit()`/`_Exit()` with non-zero status. Build with `gcc -O0 -fPIC -shared -o death_trace.so tools/death_trace.c -ldl`. Use as the second LD_PRELOAD entry. Was needed because the worker was leaving via `_exit(1)`, not abort, so `abort_trace.so` saw nothing.
+
 Other findings, less load-bearing:
 - Smash's interposers DO cover every allocator symbol `_isl.so` imports (audited via `nm -D --undefined-only`): `malloc`, `calloc`, `realloc`, `free`, `strdup`, plus the printf and qsort families that internally go through `*@plt`. No interposition gap.
 - After the JobRegistry fix removes DEEPBIND, the islpy crash disappears, but a *different* failure surfaces — child workers in `parallelCompileSubGraphs` (concurrent.futures ProcessPoolExecutor) terminate without a captured signal. That's unrelated to islpy and looks like a fork/compressor-thread interaction; track separately.

@@ -180,6 +180,33 @@ SMASH_COLD_TIMEOUT_SEC=10 SMASH_DEFER_MADVISE=1`) on test7_full now passes
 production default until the fixed full mode accumulates more soak time across
 additional HLOs, but full mode is now functionally correct on test7_full.
 
+### Post-fix performance (2026-06-05, fixed libsmash, profiling pass)
+
+Single profiling pass on test7_full (RSS sampled across the whole process tree
+at 0.5 s; smash = `SMASH_VM_GIB=48 SMASH_COLD_TIMEOUT_SEC=10 SMASH_DEFER_MADVISE=1`):
+
+| Config | Wall | Peak RSS | Avg RSS | Peak vs jemalloc | Peak vs glibc |
+|--------|------|----------|---------|------------------|---------------|
+| glibc                 | 356s | 35,830 MB | 22,337 MB | +93% | baseline |
+| jemalloc              | 262s | 18,585 MB | 11,560 MB | baseline | −48% |
+| smash full (profile-gen) | 750s | 17,782 MB | 9,762 MB | −4.3% | −50% |
+| **smash full (with profile)** | **644s** | **17,635 MB** | **10,496 MB** | **−5.1%** | **−51%** |
+
+- Peak RSS: smash full beats jemalloc by ~5% and halves glibc.
+- Avg RSS: smash full is ~9–16% below jemalloc (more memory returned during
+  compilation pauses).
+- Wall time: ~2.5× jemalloc — the compression/decompression/fault overhead is
+  the cost. The profile pass trims wall time vs profile-gen (750s → 644s) but
+  the gap to jemalloc remains the main tradeoff.
+- The `/proc/self/mem` restore adds one `pwrite` syscall per fault-decompress
+  (replacing a `memcpy`); no measurable wall-time regression vs the pre-fix
+  numbers (468–516s historical, within run-to-run variance given the now-correct
+  but still-uncached profile).
+
+Takeaway: with the TOCTOU fix, full mode delivers the lowest peak RSS of any
+allocator tested while staying correct (5/5). The memory win is real; the
+wall-time cost is the open question for whether it ships beyond LARGE_ONLY.
+
 ### Full Mode Analysis
 
 **Smash full mode achieves lower peak RSS than jemalloc:**

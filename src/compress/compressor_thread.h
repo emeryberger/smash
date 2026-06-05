@@ -1275,6 +1275,7 @@ private:
             w.pending_pn_pages[j] = key;
         }
         // Coalesce consecutive runs.
+        const size_t chunk_cap = protectChunkPages();
         size_t i = 0;
         while (i < w.pending_pn_count) {
             size_t run_start_page = w.pending_pn_pages[i];
@@ -1282,7 +1283,7 @@ private:
             size_t j = i + 1;
             while (j < w.pending_pn_count &&
                    w.pending_pn_pages[j] == run_end_page &&
-                   (run_end_page - run_start_page) < kProtectChunkPages) {
+                   (run_end_page - run_start_page) < chunk_cap) {
                 ++run_end_page;
                 ++j;
             }
@@ -1430,11 +1431,25 @@ private:
     // a SIGSEGV; the wrapper's retryWithDecompress loop catches that, walks
     // the buffer pages (which DOES go through the fault handler), and
     // retries. The bounded retry budget (8) outlasts a compressor tick.
-    // Maximum pages per chunked mprotect call. Larger = fewer VMA splits
-    // but longer lock-hold per chunk (more contention with handleFault).
-    // 16 (= 64 KiB chunks) keeps lock-hold under a few µs and still
-    // reduces VMA count by ~16× vs per-page.
-    static constexpr size_t kProtectChunkPages = 16;
+    // Maximum pages per chunked mprotect call. Larger = fewer TLB-shootdown
+    // IPIs and VMA splits, but longer per-chunk lock-hold (more contention
+    // with handleFault). Default 16 (= 64 KiB). Runtime-tunable via
+    // SMASH_PROTECT_CHUNK_PAGES so the IPI/lock-hold tradeoff can be swept
+    // without a rebuild; clamped to [1, kPendingProtCap].
+    static size_t protectChunkPages() {
+        static const size_t v = []() -> size_t {
+            const char* e = std::getenv("SMASH_PROTECT_CHUNK_PAGES");
+            if (e) {
+                long n = atol(e);
+                if (n >= 1 && n <= static_cast<long>(CompressWorker::kPendingProtCap))
+                    return static_cast<size_t>(n);
+            }
+            return kProtectChunkPagesDefault;
+        }();
+        return v;
+    }
+    static constexpr size_t kProtectChunkPagesDefault = 16;
+    static constexpr size_t kProtectChunkPages = 16;  // legacy alias (escalate path)
 
     // Flush an accumulated run of CAS-succeeded pages with a single
     // chunked mprotect(PROT_READ). Acquires per-page locks in ascending

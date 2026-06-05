@@ -271,6 +271,41 @@ Smash holds the lowest peak AND avg RSS across all chunk sizes. The wall-time
 gap to jemalloc remains (compression is CPU work the baseline doesn't do), but
 the profile-merge and P2_CHUNK wins removed ~20% of smash's *own* overhead.
 
+> ⚠️ **The RSS numbers above are an over-count — see the cgroup re-measurement
+> below, which overturns the memory claim.**
+
+### Memory re-measured with mstat / cgroup v2 (2026-06-05) — corrects the record
+
+The "lowest RSS" claims above came from **summing `/proc/<pid>/status` VmRSS
+across the process tree**, which **double-counts pages shared between processes**
+(libwalrus, libsmash, Python, shared file mmaps) — and it over-counts the
+many-process baseline differently from smash. Re-measured with
+[mstat](https://github.com/bpowers/mstat), which reports the cgroup v2
+`memory.current` of the whole process tree (shared pages counted once, the true
+physical footprint):
+
+| Config | Wall | Peak (memory.current) | Avg (memory.current) |
+|--------|------|-----------------------|----------------------|
+| jemalloc       | 620s | 17,952 MiB | 10,404 MiB |
+| smash full     | 687s | 17,814 MiB | 10,279 MiB |
+| Δ (smash−jem)  | +11% | **−0.8%** | **−1.2%** |
+
+**Under fair cgroup accounting, smash full-mode is memory-neutral vs jemalloc
+(within ~1%, i.e. noise) while ~11% slower.** The previously-reported −6% peak /
+−16% avg "wins" were a per-process-RSS summing artifact, not a real reduction.
+
+Harness notes (`tools/mstat_bench.sh`): mstat hardcodes a 16 GiB `memory.max` on
+its cgroup → a background watcher raises it to avoid OOM-killing the ~17.5 GB
+compile; and mstat discards its TSV if the child exits non-zero, so the compile
+is wrapped `bash -c "...; true"` (neuron-cc exits 245 even on success; the .neff
+is the real success signal). N=1 per config.
+
+**Honest standing:** the wall-time engineering wins (profile-merge −11%,
+P2_CHUNK −9%) are real and shipped. The *memory* advantage over jemalloc does
+not survive a fair (cgroup) measurement on this workload. Smash full-mode's case
+on neuron-cc is therefore "comparable memory, higher wall-time" — not a clear
+win. `SMASH_LARGE_ONLY=1` remains the conservative production default.
+
 ### Full Mode Analysis
 
 **Smash full mode achieves lower peak RSS than jemalloc:**

@@ -42,6 +42,7 @@ extern std::atomic<bool> g_smash_skip_external_tracking;
 #include <cstring>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/file.h>         // flock — cross-process profile-merge lock
 #if defined(__linux__)
 #include <sys/uio.h>          // process_vm_readv
 #include <fcntl.h>
@@ -3544,38 +3545,83 @@ public:
         if (!shouldSaveProfile()) return;
         const char* path = profileFilePath();
         if (!path) return;
-        // Aggregate across workers: take the worker with the highest count
-        // for each bucket as authoritative (workers see disjoint pages, so
-        // one worker typically owns the bucket's ratio history).
         size_t total = static_cast<size_t>(kNumArenas) * kTotalBucketsPerArena;
-        char tmp[1024];
-        snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
-        FILE* f = fopen(tmp, "wb");
-        if (!f) return;
-        uint32_t flags = 0;
-        if (external_pages_hot_.load(std::memory_order_relaxed)) {
-            flags |= kProfileFlagExternalHot;
-        }
-        ProfileHeader hdr{kProfileMagic, kProfileVersion,
-                          static_cast<uint16_t>(kNumArenas),
-                          static_cast<uint16_t>(kTotalBucketsPerArena), flags};
-        fwrite(&hdr, sizeof(hdr), 1, f);
+
+        // Build THIS process's per-bucket records in memory first (aggregate
+        // across workers: highest sample count wins per bucket).
+        SizeClassStats::Persist* mine = bootstrapArray<SizeClassStats::Persist>(total);
         for (size_t i = 0; i < total; ++i) {
             int best = 0;
             for (int w = 1; w < kMaxCompressorWorkers; ++w) {
                 if (workers_[w].sc_stats[i].count >
                     workers_[best].sc_stats[i].count) best = w;
             }
-            SizeClassStats::Persist rec{};
-            workers_[best].sc_stats[i].serialize(&rec);
-            fwrite(&rec, sizeof(rec), 1, f);
+            workers_[best].sc_stats[i].serialize(&mine[i]);
         }
+        uint32_t my_flags = 0;
+        if (external_pages_hot_.load(std::memory_order_relaxed))
+            my_flags |= kProfileFlagExternalHot;
+
+        // ── Cross-process merge ────────────────────────────────────────────
+        // neuron-cc compiles in a ProcessPoolExecutor: the heavy slab churn
+        // lives in hlo2penguin / walrus_driver subprocesses, while the parent
+        // driver barely touches the managed heap. The old code did a bare
+        // rename(tmp.PID -> path), i.e. last-writer-wins — so the parent's
+        // EMPTY profile routinely clobbered the subprocesses' real bucket
+        // histories, leaving a profile of all-zero buckets that guides
+        // nothing. Verified empirically (90 KB profile, 5632 buckets, every
+        // count==0). Fix: serialize all saves through an flock on a sidecar
+        // lock file and MERGE into the existing profile, keeping whichever
+        // record has the higher sample count per bucket. Concurrent
+        // subprocess exits now accumulate instead of overwrite, and the
+        // empty-heap parent can never wipe real data.
+        char lockpath[1100];
+        snprintf(lockpath, sizeof(lockpath), "%s.lock", path);
+        int lockfd = open(lockpath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+        if (lockfd >= 0) flock(lockfd, LOCK_EX);
+
+        // Read existing profile records (if any, same version/dims) and merge.
+        FILE* ex = fopen(path, "rb");
+        if (ex) {
+            ProfileHeader ehdr{};
+            if (fread(&ehdr, sizeof(ehdr), 1, ex) == 1 &&
+                ehdr.magic == kProfileMagic && ehdr.version == kProfileVersion &&
+                ehdr.num_arenas == kNumArenas &&
+                ehdr.num_classes == kTotalBucketsPerArena) {
+                my_flags |= ehdr.flags;  // external-hot is sticky across procs
+                for (size_t i = 0; i < total; ++i) {
+                    SizeClassStats::Persist disk{};
+                    if (fread(&disk, sizeof(disk), 1, ex) != 1) break;
+                    // Higher sample count is the more-informed observation.
+                    if (disk.count > mine[i].count) mine[i] = disk;
+                }
+            }
+            fclose(ex);
+        }
+
+        // Write the merged result to a temp file and atomically rename.
+        char tmp[1100];
+        snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+        FILE* f = fopen(tmp, "wb");
+        if (!f) {
+            if (lockfd >= 0) { flock(lockfd, LOCK_UN); close(lockfd); }
+            return;
+        }
+        ProfileHeader hdr{kProfileMagic, kProfileVersion,
+                          static_cast<uint16_t>(kNumArenas),
+                          static_cast<uint16_t>(kTotalBucketsPerArena), my_flags};
+        fwrite(&hdr, sizeof(hdr), 1, f);
+        for (size_t i = 0; i < total; ++i)
+            fwrite(&mine[i], sizeof(mine[i]), 1, f);
 
         // Dictionary section (v4). Skipping the section is fine: the
         // sentinel is the only thing v4 readers require to find EOF before
         // returning, and a missing-dict-section is then equivalent to
         // "no dictionaries trained" — which is exactly the case if the
-        // process never hit kDictTrainSamples.
+        // process never hit kDictTrainSamples. (Dicts are not merged across
+        // processes; whichever save runs last contributes its own. The
+        // per-bucket records — which drive persist_hint — are what matter for
+        // churn suppression and those ARE merged above.)
         if (engine_) {
             for (int sc = 0; sc < kNumClasses; ++sc) {
                 if (!engine_->hasDictionary(static_cast<uint8_t>(sc)))
@@ -3595,6 +3641,7 @@ public:
 
         fclose(f);
         rename(tmp, path);
+        if (lockfd >= 0) { flock(lockfd, LOCK_UN); close(lockfd); }
     }
 
     void start() {

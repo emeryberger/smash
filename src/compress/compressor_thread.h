@@ -1953,12 +1953,21 @@ private:
             shadow_tick_[page_idx] = tick_counter_;
             states_->set(page_idx, PageState::COMPRESSED_SHADOW);
         } else {
-            // P2 chunking knob: SMASH_P2_CHUNK=1 enables the batched
-            // (decommit + mprotect PROT_NONE) path; default off until we
-            // verify it's strictly correctness-preserving on neuron-cc.
+            // P2 chunking: batch the mprotect(PROT_NONE) of just-compressed
+            // pages over coalesced contiguous runs (up to kProtectChunkPages
+            // per syscall) instead of one mprotect per page. Each mprotect on
+            // a mapped page broadcasts a TLB-shootdown IPI to every core
+            // running the process; perf showed ~11% of all cycles in
+            // asm_sysvec_call_function / smp_call_function_many / flush_tlb
+            // plus ~4% kernel mmap_lock contention from this per-page storm.
+            // Batching cut neuron-cc full-mode wall time ~9% (640s→581s avg,
+            // 2 runs each) at equal RSS. Now DEFAULT ON; the earlier
+            // correctness concern (a decompress race on a mid-batch page) is
+            // closed by restorePageContents()'s populate-before-readable fix.
+            // SMASH_P2_CHUNK=0 reverts to per-page mprotect for comparison.
             static const bool p2_chunk = []{
                 const char* v = std::getenv("SMASH_P2_CHUNK");
-                return v && v[0] == '1';
+                return !v || v[0] != '0';
             }();
             if (p2_chunk) {
                 states_->set(page_idx, PageState::COMPRESSED);

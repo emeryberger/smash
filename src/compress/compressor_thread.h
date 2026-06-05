@@ -170,18 +170,22 @@ inline bool deferMadviseEnabled() {
     return enabled;
 }
 
-// SMASH_PROFILE_THRASH_BACKOFF (default ON): when a persisted profile records
+// SMASH_PROFILE_THRASH_BACKOFF (default OFF): when a persisted profile records
 // that an (arena, size_class) bucket thrashed last run (high compress→
 // decompress churn), phase2 multiplies that bucket's cold floor so its pages
-// must stay quiescent much longer before becoming eligible again. Compressing
-// a page the app immediately faults back in is pure wasted CPU; deferring
-// known-thrashy buckets cuts wall time and churn together. =0 disables (for
-// A/B comparison against the prior profile behavior).
+// must stay quiescent much longer before becoming eligible again.
+//
+// MEASURED NET-NEGATIVE on neuron-cc test7_full (2026-06-05): enabling it made
+// the compile *slower* (950s vs 721s control, +32%) and slightly *increased*
+// churn (23.5% vs 22.9%). Deferring compression keeps thrashy pages ACTIVE
+// longer, so the per-tick scan visits more uncompressed pages every tick and a
+// large wave compresses at once when the inflated floor is finally crossed —
+// the opposite of the intended effect. Kept as an opt-in knob (=1) to document
+// the negative result and allow re-testing on other workloads; default OFF.
 inline bool profileThrashBackoffEnabled() {
     static const bool enabled = []{
         const char* v = std::getenv("SMASH_PROFILE_THRASH_BACKOFF");
-        if (v) return v[0] != '0';
-        return true;
+        return v && v[0] == '1';
     }();
     return enabled;
 }

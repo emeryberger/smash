@@ -170,6 +170,22 @@ inline bool deferMadviseEnabled() {
     return enabled;
 }
 
+// SMASH_PROFILE_THRASH_BACKOFF (default ON): when a persisted profile records
+// that an (arena, size_class) bucket thrashed last run (high compress→
+// decompress churn), phase2 multiplies that bucket's cold floor so its pages
+// must stay quiescent much longer before becoming eligible again. Compressing
+// a page the app immediately faults back in is pure wasted CPU; deferring
+// known-thrashy buckets cuts wall time and churn together. =0 disables (for
+// A/B comparison against the prior profile behavior).
+inline bool profileThrashBackoffEnabled() {
+    static const bool enabled = []{
+        const char* v = std::getenv("SMASH_PROFILE_THRASH_BACKOFF");
+        if (v) return v[0] != '0';
+        return true;
+    }();
+    return enabled;
+}
+
 inline uint32_t deferMadviseTicks() {
     static const uint32_t ticks = []() -> uint32_t {
         const char* v = std::getenv("SMASH_DEFER_MADVISE_TICKS");
@@ -537,6 +553,10 @@ class CompressorThread {
             // v6: load stable_cold and best_tier for profile-driven optimization
             profile_stable_cold = in.stable_cold;
             profile_best_tier = in.best_tier;
+            // v6+: load thrash_rate so phase2 can back off buckets that
+            // churned badly last run (compress→fault→decompress is wasted
+            // CPU; deferring those buckets cuts wall time AND reduces churn).
+            profile_thrash_rate = in.thrash_rate;
         }
 
         // Decision hint cached on the live struct after deserialize, so
@@ -571,6 +591,11 @@ class CompressorThread {
         // Loaded from profile: if stable_cold=1, skip cold observation period
         uint8_t profile_stable_cold = 0;
         uint8_t profile_best_tier = 255;  // 255=unknown, 0=LZ4, 1=zstd
+        // Loaded from profile: prior-run thrash rate (0-255 = decompress/compress).
+        // High values mark buckets where compression was wasted churn; phase2
+        // multiplies the cold floor for these so they must stay quiescent much
+        // longer before becoming eligible again. 0 when unknown/cold-start.
+        uint8_t profile_thrash_rate = 0;
     };
 
     // ── Per-arena UCB arm aggregate ───────────────────────────────────────
@@ -1107,9 +1132,19 @@ private:
                 }
             }
 
-            // v6 profile: if bucket is stable_cold (low thrash rate in prior
-            // run), use reduced floor — pages from this allocation site stay
-            // cold, so we don't need to re-prove it.
+            // v6 profile: adjust the cold floor per the prior run's behavior
+            // for this (arena, size_class) bucket:
+            //   - stable_cold (thrash < 10% last run): pages stay cold, so we
+            //     don't need to re-prove it — compress sooner (floor / 4).
+            //   - high thrash (compress→fault→decompress churn last run):
+            //     compressing these was wasted CPU that the app immediately
+            //     undid. Defer aggressively so they must stay quiescent much
+            //     longer before becoming eligible. The multiplier scales with
+            //     the recorded thrash rate (0-255): ≥50% thrash → 8× floor,
+            //     ≥25% → 4×, ≥12% → 2×. Gated by SMASH_PROFILE_THRASH_BACKOFF
+            //     (default ON; =0 restores the prior behavior for A/B testing).
+            // stable_cold and high-thrash are mutually exclusive by
+            // construction (stable_cold requires thrash < 26/255 ≈ 10%).
             uint32_t profile_floor = floor;
             if (page_map_) {
                 void* page_addr_pf = vm_->pageAddress(i);
@@ -1120,9 +1155,23 @@ private:
                         : sp_pf->size_class;
                     if (sc_pf < kTotalBucketsPerArena) {
                         size_t bidx_pf = statsIndex(sp_pf->arena_id, sc_pf);
-                        if (bidx_pf < kBucketTableLen &&
-                            workers_[worker_id].sc_stats[bidx_pf].profile_stable_cold) {
-                            profile_floor = std::max(1u, floor / 4);
+                        if (bidx_pf < kBucketTableLen) {
+                            const auto& pf = workers_[worker_id].sc_stats[bidx_pf];
+                            if (pf.profile_stable_cold) {
+                                profile_floor = std::max(1u, floor / 4);
+                            } else if (profileThrashBackoffEnabled()) {
+                                uint8_t tr = pf.profile_thrash_rate;
+                                uint32_t mult = 1;
+                                if (tr >= 128) mult = 8;       // ≥50% thrash
+                                else if (tr >= 64) mult = 4;   // ≥25%
+                                else if (tr >= 31) mult = 2;   // ≥12%
+                                if (mult > 1) {
+                                    uint64_t wf = static_cast<uint64_t>(floor) * mult;
+                                    profile_floor = wf > kMaxEffectiveFloorTicks
+                                        ? kMaxEffectiveFloorTicks
+                                        : static_cast<uint32_t>(wf);
+                                }
+                            }
                         }
                     }
                 }

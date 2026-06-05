@@ -252,6 +252,24 @@ unchanged (same pages compressed, fewer syscalls).
   (950s vs 721s control). Deferring keeps thrashy pages ACTIVE longer, so the
   per-tick scan does more work and a wave compresses at once. Defaulted OFF
   (`SMASH_PROFILE_THRASH_BACKOFF=1` to re-enable).
+- **Larger P2_CHUNK window** (`SMASH_PROTECT_CHUNK_PAGES` 64/128): no wall-time
+  gain over 16, and a wash on RSS. Default stays 16.
+
+**Final benchmark with correct whole-tree RSS** (test7_full, profile loaded,
+P2_CHUNK on; the RSS sampler's per-0.5s /proc walk inflates all smash
+wall-times here by a fixed amount, so compare RSS absolutely and wall-time only
+across the smash rows):
+
+| Config | Wall | Peak RSS | Avg RSS | Peak vs jemalloc | Avg vs jemalloc |
+|--------|------|----------|---------|------------------|-----------------|
+| jemalloc           | 253s | 18,583 MB | 11,475 MB | baseline | baseline |
+| smash chunk=16     | 674s | 17,512 MB | 10,303 MB | −5.8% | −10.2% |
+| smash chunk=64     | 711s | 17,315 MB |  9,653 MB | −6.8% | **−15.9%** |
+| smash chunk=128    | 674s | 17,574 MB |  9,849 MB | −5.4% | −14.2% |
+
+Smash holds the lowest peak AND avg RSS across all chunk sizes. The wall-time
+gap to jemalloc remains (compression is CPU work the baseline doesn't do), but
+the profile-merge and P2_CHUNK wins removed ~20% of smash's *own* overhead.
 
 ### Full Mode Analysis
 

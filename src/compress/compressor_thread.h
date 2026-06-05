@@ -296,6 +296,17 @@ class CompressorThread {
     int clear_refs_fd_ = -1;
     int pagemap_fd_ = -1;
 
+    // /proc/self/mem fd (Linux). Used to populate a page's physical backing
+    // *while it is still PROT_NONE*, before flipping it readable — closing the
+    // decompress-restore TOCTOU window where a concurrent app thread could read
+    // a page that is already PROT_RW but does not yet hold the decompressed
+    // data. A pwrite() through this fd uses the kernel's FOLL_FORCE access
+    // path, which bypasses the PTE protection bits (the VMA still carries
+    // VM_MAYWRITE because our reservation is PROT_RW), so the store lands even
+    // though direct user stores to the page would fault. Opened lazily on
+    // first restore; reset across fork() like the soft-dirty fds.
+    int self_mem_fd_ = -1;
+
     // Per-(arena, size_class) recompression-rate signal. Single shared
     // table (not per-worker) so the fault handler can update it without
     // first finding the right worker. Relaxed atomics; tearing on the EMA
@@ -747,9 +758,14 @@ public:
         // fork(), our fds still point at the parent's PTE table. Close
         // them so ensureSoftDirtyFds() re-opens the child's correctly
         // on the first tick post-fork.
+        // /proc/self/mem is the same story: the open fd resolves to the
+        // parent's address space. Close it so restorePageContents() re-opens
+        // the child's on first use. (Writing through a stale parent-mem fd
+        // would corrupt the parent or fail — must reset.)
 #ifdef __linux__
         if (clear_refs_fd_ >= 0) { close(clear_refs_fd_); clear_refs_fd_ = -1; }
         if (pagemap_fd_ >= 0)    { close(pagemap_fd_);    pagemap_fd_ = -1; }
+        if (self_mem_fd_ >= 0)   { close(self_mem_fd_);   self_mem_fd_ = -1; }
 #endif
     }
 private:
@@ -2216,8 +2232,9 @@ private:
                     compressed_[adj].data, fault_slots_[slot].buf,
                     compressed_[adj].compressedSize(), kPageSize,
                     algo, sc);
-                vm::commitPages(adj_addr, kPageSize);
-                __builtin_memcpy(adj_addr, fault_slots_[slot].buf, kPageSize);
+                // Populate backing before the page becomes readable so a
+                // concurrent app load never sees a readable-but-empty page.
+                restorePageContents(adj_addr, fault_slots_[slot].buf);
                 releaseFaultSlot(slot);
 
                 // Release compressed blob (sharded by page index)
@@ -2456,6 +2473,82 @@ private:
 #else
         return false;
 #endif
+    }
+
+    // ── Atomic page restore (decompress-on-fault correctness) ──────────────
+    //
+    // Restore `kPageSize` bytes of decompressed data from `src` into the page
+    // at `page_addr`, which is currently PROT_NONE (its backing may also have
+    // been dropped via madvise(DONTNEED)). The caller holds the page's
+    // per-page lock.
+    //
+    // The hard correctness requirement: a concurrent application thread doing
+    // an ordinary load on this page must NEVER observe the page in a readable
+    // state that does not yet contain the decompressed bytes. Such a thread
+    // does not go through handleFault (it's a hardware load, not our code) and
+    // does not take the per-page lock, so the ONLY thing standing between it
+    // and stale/zero data is the page protection. Therefore the data MUST be
+    // in place before the page becomes readable.
+    //
+    // The previous implementation did `mprotect(PROT_RW)` THEN `memcpy`,
+    // opening a window in which the page was readable but empty. Under
+    // multithreaded workloads (e.g. walrus mod_parallel_pass) a remote thread
+    // read that window and got zeros / stale bytes, silently corrupting the
+    // compiler's data structures. This manifested as nondeterministic internal
+    // errors ("overlapping memloc", BIR verification failures, DenseMap
+    // assertions) — all downstream symptoms of one page coming back wrong.
+    //
+    // Linux fast path: write the bytes through /proc/self/mem while the page
+    // is still PROT_NONE. The kernel's mem-file access uses FOLL_FORCE, which
+    // honors VM_MAYWRITE (our reservation is mapped PROT_RW) rather than the
+    // current PTE protection, so the store lands and faults in a fresh backing
+    // page even though a direct user store would SIGSEGV. Concurrent readers
+    // keep faulting on PROT_NONE and block in handleFault on the per-page lock
+    // we hold. Only after the data is in place do we flip to PROT_RW.
+    //
+    // Fallback (non-Linux, or if /proc/self/mem is unavailable): commit then
+    // memcpy. This restores the legacy behavior with its small race window —
+    // acceptable because Linux is the production target and the fast path is
+    // expected to succeed there.
+    void restorePageContents(void* page_addr, const void* src) {
+#ifdef __linux__
+        if (self_mem_fd_ < 0) {
+            self_mem_fd_ = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+        }
+        if (self_mem_fd_ >= 0) {
+            // Populate backing while PROT_NONE. pwrite handles partial writes
+            // by looping; a page is small enough that one call almost always
+            // suffices, but loop to be safe.
+            const char* p = static_cast<const char*>(src);
+            size_t remaining = kPageSize;
+            off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(page_addr));
+            bool ok = true;
+            while (remaining > 0) {
+                ssize_t w = pwrite(self_mem_fd_, p, remaining, off);
+                if (w <= 0) { ok = false; break; }
+                p += w; off += w; remaining -= static_cast<size_t>(w);
+            }
+            if (ok) {
+                // Data is in place; now make it readable. Use mprotect; if the
+                // VMA-count cap makes that fail, remapPages can't help here
+                // (it would discard the bytes we just wrote), so fall through
+                // only on the rare mprotect failure.
+                if (vm::protectPages(page_addr, kPageSize, true, true)) {
+                    return;
+                }
+                // mprotect(PROT_RW) failed (ENOMEM at vm.max_map_count). The
+                // only recovery is remapPages, which would discard the bytes
+                // we just wrote — so fall through to the copy path below, which
+                // re-establishes a mapping AND re-writes the data. Rare.
+            }
+        }
+#endif
+        // Fallback: legacy commit-then-copy (has a small readable-but-empty
+        // window; only reached off the Linux fast path).
+        if (!vm::commitPages(page_addr, kPageSize)) {
+            vm::remapPages(page_addr, kPageSize, true, true);
+        }
+        __builtin_memcpy(page_addr, src, kPageSize);
     }
 
     // Read pagemap entries for the smash region [start, end) and OR the
@@ -3763,10 +3856,7 @@ public:
                     fault_slots_[slot].dctx,
                     compressed_[i].data, fault_slots_[slot].buf,
                     compressed_[i].compressedSize(), kPageSize, algo, sc);
-                if (!vm::commitPages(page_addr, kPageSize)) {
-                    vm::remapPages(page_addr, kPageSize, true, true);
-                }
-                __builtin_memcpy(page_addr, fault_slots_[slot].buf, kPageSize);
+                restorePageContents(page_addr, fault_slots_[slot].buf);
                 releaseFaultSlot(slot);
                 store_->release(compressed_[i].data,
                                 compressed_[i].alloc_size, i);
@@ -3907,16 +3997,16 @@ public:
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     dec_t1 - dec_t0).count());
 
-            // Restore the page to PROT_RW. mprotect can fail with ENOMEM
-            // if the per-page VMA splits have us at vm.max_map_count;
-            // remapPages replaces the mapping atomically (which also
-            // re-merges adjacent VMAs in many cases) and never grows the
-            // VMA count. This is the recovery path for long compiles
-            // that have accumulated thousands of compressed-page VMAs.
-            if (!vm::commitPages(page_addr, kPageSize)) {
-                vm::remapPages(page_addr, kPageSize, true, true);
-            }
-            __builtin_memcpy(page_addr, fault_slots_[slot].buf, kPageSize);
+            // Restore the page. CRITICAL: the decompressed bytes must be in
+            // the page's backing BEFORE the page becomes readable — otherwise
+            // a concurrent application thread (which does not take the per-page
+            // lock and does not go through this handler for an ordinary load)
+            // could observe a readable-but-empty page and read stale/zero
+            // data. restorePageContents() populates the backing while the page
+            // is still PROT_NONE (Linux /proc/self/mem fast path) and only then
+            // flips it to PROT_RW. See restorePageContents() for the full
+            // rationale and the fallback path.
+            restorePageContents(page_addr, fault_slots_[slot].buf);
             releaseFaultSlot(slot);
 
             // Release compressed blob (sharded store)

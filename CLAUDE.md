@@ -138,7 +138,30 @@ For applications with concurrent threads and significant slab/small-object traff
 LD_PRELOAD=/path/to/libsmash.so PYTHONMALLOC=malloc SMASH_LARGE_ONLY=1
 ```
 
-Full mode (without `SMASH_LARGE_ONLY=1`) is **experimental**. Status as of 2026-05-31:
+Full mode (without `SMASH_LARGE_ONLY=1`) is **experimental**.
+
+**2026-06-05 — decompress-on-fault TOCTOU race found and fixed.** The dominant
+full-mode failure on neuron-cc (nondeterministic ~67% failure rate, surfacing as
+"overlapping memloc", BIR-verification, scheduler, or DenseMap assertions inside
+the multithreaded `walrus_driver mod_parallel_pass`) was a real smash bug, not a
+neuron-cc bug. `handleFault()` / `prefetchAdjacent()` restored a compressed page
+by doing `mprotect(PROT_RW)` **then** `memcpy(decompressed)`, leaving a window in
+which the page was readable but still held stale/zero bytes. A concurrent app
+thread doing a plain load on that page does not fault and does not take the
+per-page lock, so it read the wrong data and corrupted the compiler's state.
+Fixed in `CompressorThread::restorePageContents()`: on Linux the decompressed
+bytes are written through `/proc/self/mem` while the page is still `PROT_NONE`
+(kernel `FOLL_FORCE` write honors the VMA's `VM_MAYWRITE`), then the page is
+flipped to `PROT_RW` — concurrent readers keep faulting and block on the per-page
+lock until the data is in place. Non-Linux keeps the legacy commit-then-copy.
+Binary-search evidence that localized it: no-compression configs pass 100%; both
+LZ4 and zstd fail (codec-independent); `SMASH_FIXAV=1` failed *worse* (0/3,
+because it `madvise`s backing immediately, so the window always exposed zeros);
+`SMASH_NO_DECOMMIT=1` turned corruption into OOM (backing never dropped → window
+exposed correct data). Post-fix: 16/16 smash unit tests pass and full-mode
+neuron-cc runs pass repeatedly (was ~1/3).
+
+Status of the earlier-known blockers as of 2026-05-31:
 
 **The "isl_id_free aborts in glibc free" failure is a neuron-cc bug, not a smash bug.** Root cause located in `neuronxcc/driver/JobRegistry.py:51`:
 

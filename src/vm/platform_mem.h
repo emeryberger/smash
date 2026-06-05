@@ -69,7 +69,24 @@ inline void decommitPages(void* addr, size_t size) {
 #if defined(_WIN32)
     VirtualFree(addr, size, MEM_DECOMMIT);
 #elif defined(__linux__)
-    madvise(addr, size, MADV_DONTNEED);
+    // MADV_DONTNEED immediately frees the physical page AND shoots down the
+    // TLB on every core mapping it — the dominant smash-induced IPI cost
+    // (microbench: MADV_DONTNEED added ~45K of 102K TLB IPIs over 100K ops).
+    // MADV_FREE is lazy: it marks the page reclaimable but doesn't drop it or
+    // shoot down TLBs until the kernel hits memory pressure, cutting both the
+    // IPI count (~11%) and wall time (~17%) in the microbench. The tradeoff is
+    // that MADV_FREE pages remain in RSS until reclaimed, so on a
+    // low-memory-pressure host the RSS win shrinks. Correctness is unaffected:
+    // smash only decommits pages that are already PROT_NONE, so any access
+    // faults into the handler and is overwritten with decompressed data before
+    // the (possibly stale, possibly zero) underlying page is observed.
+    // SMASH_MADV_FREE=1 selects the lazy path; default DONTNEED preserves the
+    // current eager-reclaim RSS behavior.
+    static const int madv = []{
+        const char* v = std::getenv("SMASH_MADV_FREE");
+        return (v && v[0] == '1') ? MADV_FREE : MADV_DONTNEED;
+    }();
+    madvise(addr, size, madv);
 #elif defined(__APPLE__)
     // MADV_FREE_REUSABLE tells the kernel to reclaim physical backing immediately.
     // Must be called while pages are still accessible (PROT_READ or PROT_RW);

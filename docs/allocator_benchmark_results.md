@@ -207,6 +207,52 @@ Takeaway: with the TOCTOU fix, full mode delivers the lowest peak RSS of any
 allocator tested while staying correct (5/5). The memory win is real; the
 wall-time cost is the open question for whether it ships beyond LARGE_ONLY.
 
+### Wall-time attack (2026-06-05)
+
+Goal: cut the ~2.5× wall-time gap vs jemalloc. Method: instrument churn,
+profile with `perf`, then target the dominant cost.
+
+**Churn / compression stats** (`SMASH_BUCKET_STATS`, no-profile baseline):
+1.26M compressions, 300K fault-decompressions ⇒ **~22% churn**. Pages compress
+*well* (74–99% ratios) — the wasted work is re-access churn and the syscall
+overhead of compressing, not poor compressibility.
+
+**`perf` flat profile** (privileged container, system-wide 99 Hz, cycles) of a
+644 s full-mode compile — cycle distribution by DSO:
+
+| DSO | % cycles |
+|-----|----------|
+| `[kernel.kallsyms]` | 46.2% |
+| `libwalrus.so` (compiler backend, real work) | 24.7% |
+| `libsmash.so` | 11.1% |
+| libtbb / libc / libBIR / python | ~11% |
+
+Kernel time broke down as: **TLB-shootdown IPIs 11.4%**
+(`asm_sysvec_call_function` + `smp_call_function_many` + `flush_tlb_func`),
+**mmap_lock contention 4.0%**, sched/idle 6.2%, page faults 1.2%. The 11.4% +
+4.0% are *directly caused* by issuing one `mprotect(PROT_NONE)` per
+just-compressed page — each broadcasts a TLB-flush IPI to all ~24 worker cores.
+
+**Wins applied:**
+
+| Change | Effect | Status |
+|--------|--------|--------|
+| Profile-merge fix (was clobbered → empty) | 657s vs 741s = **−11%** | shipped |
+| P2_CHUNK batched mprotect (default-on) | 581s vs 640s avg = **−9%** | shipped |
+
+P2_CHUNK coalesces contiguous just-compressed pages into one `mprotect`
+(≤ `SMASH_PROTECT_CHUNK_PAGES`, default 16), cutting the IPI/lock cost the perf
+profile exposed. Both batched runs beat both per-page-control runs; RSS
+unchanged (same pages compressed, fewer syscalls).
+
+**Dead ends (measured, reverted/defaulted-off):**
+- **Python `gc.disable()`**: net-negative (715s vs 657s). Cyclic garbage
+  accumulates → larger heap → more pages to compress. Not recommended.
+- **Profile thrash-backoff** (defer buckets that churned last run): net-negative
+  (950s vs 721s control). Deferring keeps thrashy pages ACTIVE longer, so the
+  per-tick scan does more work and a wave compresses at once. Defaulted OFF
+  (`SMASH_PROFILE_THRASH_BACKOFF=1` to re-enable).
+
 ### Full Mode Analysis
 
 **Smash full mode achieves lower peak RSS than jemalloc:**

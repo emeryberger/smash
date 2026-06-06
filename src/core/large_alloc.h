@@ -115,8 +115,8 @@ public:
         return span->large_size;
     }
 
-    void lockAlloc() { lock_.lock(); }
-    void unlockAlloc() { lock_.unlock(); }
+    void lockAlloc() SMASH_ACQUIRE(lock_) { lock_.lock(); }
+    void unlockAlloc() SMASH_RELEASE(lock_) { lock_.unlock(); }
 };
 
 } // namespace smash

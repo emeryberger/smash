@@ -1167,13 +1167,21 @@ public:
         return classSize(span->size_class);
     }
 
-    void lock() {
+    // Whole-heap lock/unlock used by the pthread_atfork prepare/parent handlers
+    // to quiesce every slab + the large-alloc lock across fork(). Clang Thread
+    // Safety Analysis cannot reason about acquiring an *array* of mutexes in a
+    // loop (runtime-indexed capabilities are not statically tractable — the
+    // "locks in a loop" limitation in the clang docs), so these two functions
+    // are exempted. They are exact mirrors (lock all ascending; unlock large
+    // then all descending) and both short-circuit identically in compress-only
+    // mode, so the pairing is balanced by construction.
+    void lock() SMASH_NO_TS_ANALYSIS {
         if (isCompressOnlyMode()) return;
         const int total = getTotalArenas() * kNumClasses;
         for (int i = 0; i < total; ++i) slabs_[i].lockSlab();
         large_alloc_.lockAlloc();
     }
-    void unlock() {
+    void unlock() SMASH_NO_TS_ANALYSIS {
         if (isCompressOnlyMode()) return;
         large_alloc_.unlockAlloc();
         const int total = getTotalArenas() * kNumClasses;

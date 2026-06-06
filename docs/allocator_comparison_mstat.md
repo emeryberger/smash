@@ -41,30 +41,39 @@ outside smash's reach by design.)
 
 ## Redis (200K keys × 2KB; mstat cgroup memory.current)
 
+> **Correction (2026-06-06):** the originally-reported Redis `min during cool`
+> numbers were a **measurement artifact**. The sampler kept reading the cgroup's
+> `memory.current` as `redis-server` exited, so the final sample(s) captured the
+> *emptying* cgroup (e.g. mimalloc's "2 MiB") — not idle reclaim. After trimming
+> the shutdown-teardown tail (drop trailing samples < 50% of peak), the true
+> cooling-phase minimums are below. **mimalloc does NOT reclaim idle Redis
+> memory** (it stays flat at ~411 MiB); only smash does.
+
 **Standard (SET → cool → GET):**
 
-| alloc | get rps | peak | min during cool | avg |
-|-------|---------|------|-----------------|-----|
-| glibc    | 58K | 331 | 141 | 311 |
-| jemalloc | 63K | 408 | 105 | 383 |
-| mimalloc | 61K | 414 | **2** | 388 |
-| smash    | 44K | 606 | 187 | 330 |
+| alloc | peak MiB | cool min MiB | reclaims idle? | get rps |
+|-------|----------|--------------|----------------|---------|
+| glibc    | 331 | 330 | no | 58K |
+| jemalloc | 408 | 406 | no | 63K |
+| mimalloc | 414 | 411 | no | 61K |
+| **smash** | 606 | **187** | **yes (compresses)** | 44K |
 
 **Extended (SET → DELETE 50% → cool → GET):**
 
-| alloc | min during cool | avg |
-|-------|-----------------|-----|
-| glibc    | 330 | 313 |
-| jemalloc | 407 | 386 |
-| mimalloc | 375 | 391 |
-| **smash** | **187** | **330** |
+| alloc | peak MiB | cool min MiB |
+|-------|----------|--------------|
+| glibc    | 332 | 330 |
+| jemalloc | 410 | 407 |
+| mimalloc | 414 | 375 |
+| **smash** | 603 | **187** |
 
-On the standard workload, mimalloc's lazy `MADV_FREE` purge returns idle memory
-essentially for free (2 MiB trough) and beats smash; smash also pays a real
-~30% GET-throughput cost (decompression faults during serve). On the
-**extended** (post-deletion, fragmented) workload smash wins clearly — 187 MiB
-trough / 330 avg vs 375–407 for the others — because it compresses the
-fragmented freed regions the other allocators retain.
+In both variants smash is the **only** allocator that reduces its footprint
+during the idle cooling window (606→187 MiB), by compressing the cold key data.
+glibc/jemalloc/mimalloc hold the full working set resident. Smash's peak is
+higher (its VM/compress-store/metadata overhead is real) and its GET throughput
+is ~30% lower (serve-phase decompression faults) — the genuine time/space
+tradeoff. The earlier claim that "mimalloc wins on cooling memory" was the
+teardown artifact and is retracted.
 
 ## Honest summary
 
@@ -72,10 +81,11 @@ fragmented freed regions the other allocators retain.
   broken (50s deferral) and is now restored; it again reduces cold-heap memory
   by 70–80% on sqlite/rocksdb, matching the paper.
 - **vs glibc:** smash is a large memory win on every cold-data workload.
-- **vs mimalloc:** closer than the paper (which compared against glibc + Mesh,
-  not mimalloc). mimalloc's aggressive idle purge already reclaims clean idle
-  memory cheaply; smash's edge is on **fragmented / partially-deleted** heaps
-  (redis-extended) and on **genuinely compressible cold data** it keeps resident
-  in compressed form rather than returning to the OS.
+- **vs mimalloc:** mimalloc does NOT reclaim idle memory on these workloads
+  (the earlier "mimalloc reclaims to ~2 MiB" was a shutdown-teardown sampling
+  artifact, now corrected — it stays flat at ~411 MiB on Redis). smash is the
+  only allocator here that shrinks its footprint when data goes cold, by
+  compressing it. The cost is a higher peak (VM/metadata overhead) and ~30%
+  lower Redis GET throughput (serve-phase decompression).
 - **Throughput:** smash costs ~8% on sqlite, ~0% on rocksdb, but ~30% on redis
   GET (serve-phase decompression faults) — the real time/space tradeoff.

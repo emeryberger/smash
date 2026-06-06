@@ -55,8 +55,12 @@ run_alloc(){
   wait $mpid 2>/dev/null || true
   local peak=$(awk -F'\t' 'NR>1{if($2>m)m=$2}END{printf "%.0f",m/1048576}' "$tsv" 2>/dev/null)
   local avg=$(awk -F'\t' 'NR>1&&$2>0{s+=$2;n++}END{if(n)printf "%.0f",s/n/1048576}' "$tsv" 2>/dev/null)
-  # min after cool = min memory.current in the last third of samples (cooling window)
-  local mincool=$(awk -F'\t' 'NR>1{v[NR]=$2; n=NR} END{start=int(n*0.55); m=1e18; for(i=start;i<=n;i++) if(v[i]>0&&v[i]<m)m=v[i]; printf "%.0f",m/1048576}' "$tsv" 2>/dev/null)
+  # min during cooling. IMPORTANT: trim the shutdown-teardown tail first — the
+  # sampler keeps reading memory.current as redis-server exits, so the final
+  # sample(s) capture the emptying cgroup, not idle reclaim (this artifact once
+  # made mimalloc look like it reclaimed to 2 MiB when it was flat at 411).
+  # Drop trailing samples < 50% of peak, then take the min over the last 45%.
+  local mincool=$(awk -F'\t' 'NR>1{v[++n]=$2} END{pk=0;for(i=1;i<=n;i++)if(v[i]>pk)pk=v[i]; last=n;while(last>1&&v[last]<0.5*pk)last--; st=int(last*0.55);if(st<1)st=1; m=1e18;for(i=st;i<=last;i++)if(v[i]>0&&v[i]<m)m=v[i]; printf "%.0f",m/1048576}' "$tsv" 2>/dev/null)
   echo "  $alloc: fill=${fill} get=${get} peak=${peak}MiB min_cool=${mincool}MiB avg=${avg}MiB"
   echo "$alloc,${fill},${get},${peak},${mincool},${avg}" >> "$OUT/redis_${VARIANT}.csv"
 }

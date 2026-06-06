@@ -172,7 +172,8 @@ class CompressStore {
         return nullptr;
     }
 
-    static void* bumpAlloc(Shard& shard, size_t size, size_t* out_alloc_size) {
+    static void* bumpAlloc(Shard& shard, size_t size, size_t* out_alloc_size)
+            SMASH_REQUIRES(shard.lock) {
         // Try current region's free list first.  In re-tier scenarios
         // (release X's old blob, then immediately allocate X's new blob)
         // this returns the just-freed slot, preventing the bump pointer

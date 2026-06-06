@@ -112,6 +112,12 @@
     epoll_wait;
     epoll_pwait;
 
+    # mmap/munmap interposition for SMASH_TRACK_EXTERNAL
+    mmap;
+    mmap64;
+    munmap;
+    mremap;
+
     # fstat / stat family — glibc remaps fstat → fstat64 with
     # _FILE_OFFSET_BITS=64 (Ubuntu C++ default); glibc < 2.33 routes through
     # __fxstat / __xstat / __lxstat / __fxstatat (and _64 variants). Cover
@@ -166,6 +172,20 @@
     # getcwd wrapper (buffer write from kernel)
     getcwd;
 
+    # execve / execv* — pre-warm argv/envp pages before exec, so the
+    # kernel can read them after the new image takes over (these are
+    # one-shot syscalls; no EFAULT-retry possible).
+    execve;
+    execv;
+    execvp;
+    execvpe;
+
+    # posix_spawn / posix_spawnp — Python 3.8+'s subprocess module uses
+    # these (default when close_fds=True) instead of fork+exec. Same
+    # warm-then-call pattern as execve.
+    posix_spawn;
+    posix_spawnp;
+
     # TBB scalable_allocator interposition
     # Allows Smash to manage TBB's memory allocations by intercepting its
     # internal allocator calls (TBB uses these for its 64MB per-thread arenas)
@@ -190,6 +210,17 @@
     pool_create_v1;
     pool_destroy;
     pool_reset;
+
+    # TBB cache_aligned_allocate interposition: REMOVED.
+    # libtbb dispatches its allocate/deallocate through internal function-pointer
+    # handlers. Interposing only the public symbols catches cross-DSO calls but
+    # not TBB-internal calls; the resulting alloc/free mismatch corrupts the heap
+    # ("double free or corruption (out)" / "munmap_chunk(): invalid pointer" in
+    # neuron-cc Tensorizer subprocesses). Letting TBB use its own allocator is
+    # safer; we lose visibility into TBB allocations but they're not the bulk of
+    # neuron-cc's footprint. (See linux_syscall_wrappers.cpp for matching removal.)
+    # _ZN3tbb6detail2r122cache_aligned_allocateEm;
+    # _ZN3tbb6detail2r124cache_aligned_deallocateEPv;
 
   local:
     *;
@@ -257,3 +288,58 @@ GLIBC_2.33 {
     fstatat_233;
     fstatat64_233;
 } @SMASH_GLIBC_BASE_VERSION@;
+
+# C++ operator new/delete with libstdc++ versioning
+# libBIR.so and other walrus libraries request these versions, not GLIBC_2.2.5.
+# Without these, LD_PRELOAD interposition fails to capture C++ allocations,
+# and walrus's statically-linked tcmalloc wins → cross-allocator corruption.
+# The wrapper functions (*_GLIBCXX_3_4, *_CXXABI_1_3_*) are defined in
+# linux_syscall_wrappers.cpp with .symver directives to create versioned aliases.
+GLIBCXX_3.4 {
+  global:
+    _Znwm;
+    _Znam;
+    _ZdlPv;
+    _ZdaPv;
+    _ZnwmRKSt9nothrow_t;
+    _ZnamRKSt9nothrow_t;
+    _ZdlPvRKSt9nothrow_t;
+    _ZdaPvRKSt9nothrow_t;
+    # Wrapper functions that will be aliased via .symver
+    _Znwm_GLIBCXX_3_4;
+    _Znam_GLIBCXX_3_4;
+    _ZdlPv_GLIBCXX_3_4;
+    _ZdaPv_GLIBCXX_3_4;
+    _ZnwmRKSt9nothrow_t_GLIBCXX_3_4;
+    _ZnamRKSt9nothrow_t_GLIBCXX_3_4;
+    _ZdlPvRKSt9nothrow_t_GLIBCXX_3_4;
+    _ZdaPvRKSt9nothrow_t_GLIBCXX_3_4;
+} @SMASH_GLIBC_BASE_VERSION@;
+
+CXXABI_1.3.9 {
+  global:
+    _ZdlPvm;
+    _ZdaPvm;
+    _ZdlPvm_CXXABI_1_3_9;
+    _ZdaPvm_CXXABI_1_3_9;
+} GLIBCXX_3.4;
+
+CXXABI_1.3.11 {
+  global:
+    _ZnwmSt11align_val_t;
+    _ZnamSt11align_val_t;
+    _ZdlPvSt11align_val_t;
+    _ZdaPvSt11align_val_t;
+    _ZdlPvmSt11align_val_t;
+    _ZdaPvmSt11align_val_t;
+    _ZnwmSt11align_val_tRKSt9nothrow_t;
+    _ZnamSt11align_val_tRKSt9nothrow_t;
+    _ZnwmSt11align_val_t_CXXABI_1_3_11;
+    _ZnamSt11align_val_t_CXXABI_1_3_11;
+    _ZdlPvSt11align_val_t_CXXABI_1_3_11;
+    _ZdaPvSt11align_val_t_CXXABI_1_3_11;
+    _ZdlPvmSt11align_val_t_CXXABI_1_3_11;
+    _ZdaPvmSt11align_val_t_CXXABI_1_3_11;
+    _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11;
+    _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11;
+} CXXABI_1.3.9;

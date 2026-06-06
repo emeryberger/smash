@@ -22,6 +22,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 namespace smash {
@@ -130,10 +132,22 @@ class VmRegion {
     }
 
     void processDecommitEntry(DecommitEntry* e) {
-        // Decommit the pages
+        // Restore PROT_RW on the range. A freed range may include pages
+        // smash compressed before the free (state COMPRESSED →
+        // mprotect PROT_NONE). Without this, allocatePages's freelist-pop
+        // path hands the still-PROT_NONE range back to the application,
+        // and the next access faults. The fault handler sees state=EMPTY
+        // (cleared by releaseHook in the free path) and bails — kernel
+        // delivers SIGSEGV. Manifests on workloads with many compressed
+        // pages followed by reuse of those addresses (e.g. test7_full
+        // walrus crash with "DenseMap node count imbalance" or null-deref
+        // in nlohmann::json::destroy).
+        vm::commitPages(e->addr, e->num_pages * kPageSize);
+
+        // Decommit the pages (release physical backing).
         vm::decommitPages(e->addr, e->num_pages * kPageSize);
 
-        // NOW add to free list (safe - pages are decommitted)
+        // NOW add to free list (safe - pages are decommitted and PROT_RW)
         FreeShard& shard = shards_[e->shard_idx];
         FreeRun* run = newFreeRun(shard);
         run->page_index = e->page_index;
@@ -220,6 +234,11 @@ class VmRegion {
     // Full-mode external-page bookkeeping. The contiguous arena uses
     // next_page_ for its bump pointer (indices 0..kVmMaxPages-1); this
     // counter assigns external indices starting at kVmMaxPages.
+    // external_slot_next_: monotonically incremented to reserve a slot
+    // external_count_: only incremented after the slot is fully populated
+    //                  (address written). committedPages() reads this, so
+    //                  the compressor won't iterate to slots-in-progress.
+    std::atomic<size_t> external_slot_next_{0};
     std::atomic<size_t> external_count_{0};
 
     // Flat direct page-index → Span* table. Sized to total_pages_ entries
@@ -395,6 +414,46 @@ public:
     void releasePages(void* addr, size_t num_pages) {
         if (tracking_mode_) return;
 
+        // SMASH_LANDMINES=1: synchronously mprotect(PROT_NONE) the freed range
+        // and log it. Pages are never returned to the free list, so any
+        // dangling pointer in the application surfaces as SIGSEGV at the
+        // exact dangling-read site (instead of corrupting later allocations
+        // or zero-filling silently). Compares to glibc/jemalloc which keep
+        // freed contents intact: this distinguishes "smash decommit causes
+        // crash" (landmines pass) from "app UAF" (landmines crash, with
+        // si_addr inside a logged range).
+        static const bool landmines = []{
+            const char* v = std::getenv("SMASH_LANDMINES");
+            return v && v[0] == '1';
+        }();
+        if (landmines) {
+            (void)::mprotect(addr, num_pages * kPageSize, PROT_NONE);
+            char buf[96];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash landmine] free addr=%p npages=%zu range=[%p,%p)\n",
+                addr, num_pages, addr,
+                static_cast<char*>(addr) + num_pages * kPageSize);
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+            return;  // never reuse — fail loudly on dangling reuse
+        }
+
+        // SMASH_ZERO_FREE=1: synchronously zero (memset) the freed range AND
+        // allow normal reuse via the freelist. If walrus reads from freed
+        // memory between free() and a subsequent allocation, this is exactly
+        // what madvise(MADV_DONTNEED) does (zero on next access) but without
+        // any kernel involvement: the zero is immediate. If this crashes,
+        // walrus has a UAF that reads pre-free data. If it passes, the
+        // problem is something else in the madvise/reuse path (e.g. TLB
+        // shootdown timing, freelist coherency).
+        static const bool zero_free = []{
+            const char* v = std::getenv("SMASH_ZERO_FREE");
+            return v && v[0] == '1';
+        }();
+        if (zero_free) {
+            __builtin_memset(addr, 0, num_pages * kPageSize);
+            // fall through to normal queue+decommit+reuse path
+        }
+
         // Start decommit thread lazily on first release (avoids reentrancy
         // during early library initialization when pthread_create might malloc).
         ensureDecommitThreadStarted();
@@ -466,11 +525,22 @@ public:
                 uintptr_t expected = 0;
                 if (track_hash_[s].key.compare_exchange_strong(
                         expected, key, std::memory_order_acq_rel)) {
-                    size_t local = external_count_.fetch_add(1, std::memory_order_relaxed);
-                    if (local >= kTrackMaxPages) return 0;
+                    // Reserve a slot first (use relaxed since we control visibility)
+                    size_t local = external_slot_next_.fetch_add(1, std::memory_order_relaxed);
+                    if (local >= kTrackMaxPages) {
+                        // No more slots available
+                        return 0;
+                    }
                     size_t idx = contig_pages_ + local;
+                    // Write address before publishing.
                     track_reverse_[local] = page_addr;
                     track_hash_[s].idx.store(idx, std::memory_order_release);
+                    // Only increment external_count_ AFTER everything is set.
+                    // This is what committedPages() reads, so the compressor
+                    // won't iterate to this index until the address is valid.
+                    // Use release so the address write is visible before the
+                    // count increment.
+                    external_count_.fetch_add(1, std::memory_order_release);
                     return idx;
                 }
                 if (track_hash_[s].key.load(std::memory_order_relaxed) == key)
@@ -524,13 +594,17 @@ public:
     void* pageAddress(size_t index) const {
         if (tracking_mode_) {
             if (index == 0 || index >= total_pages_) return nullptr;
-            return reinterpret_cast<void*>(track_reverse_[index]);
+            uintptr_t addr = track_reverse_[index];
+            return addr ? reinterpret_cast<void*>(addr) : nullptr;
         }
         // Full mode
         if (index < contig_pages_) return base_ + index * kPageSize;
         size_t local = index - contig_pages_;
         if (local >= kTrackMaxPages) return nullptr;
-        return reinterpret_cast<void*>(track_reverse_[local]);
+        // track_reverse_[local] may be 0 if the slot was reserved but the
+        // address hasn't been written yet (race with trackExternalPage).
+        uintptr_t addr = track_reverse_[local];
+        return addr ? reinterpret_cast<void*>(addr) : nullptr;
     }
 
     // ── Flat page-index → Span* table ───────────────────────────────────────

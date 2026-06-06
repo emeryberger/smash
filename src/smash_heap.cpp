@@ -32,6 +32,15 @@
 
 std::atomic<int> smash::g_thread_init_count{0};
 
+// mpaland/printf requires _putchar() to satisfy printf_() / vprintf_() which
+// are referenced unconditionally inside printf.cpp. We never call those
+// stdout-facing forms (we only use snprintf_/vsnprintf_ via safe_printf.h),
+// so this implementation is a stub: write the byte to stderr through write(2)
+// without going through stdio.
+extern "C" void _putchar(char c) {
+    (void)::write(STDERR_FILENO, &c, 1);
+}
+
 // ── System allocator function pointers for compress-only mode ───────────────
 smash::SystemAllocFns smash::g_system_alloc;
 
@@ -144,6 +153,10 @@ smash::VmRegion* smash::g_smash_vm_region = nullptr;
 // SmashHeap never wires up page_states_. The mmap / Mach VM interposers
 // gate every state mutation on this being non-null.
 smash::PageStateTable* smash::g_smash_page_states_for_external = nullptr;
+
+// g_smash_skip_external_tracking is now an inline variable defined in
+// compress/compressor_thread.h (single definition across libsmash and the
+// compress-only build); no separate definition needed here.
 
 // TLS for the malloc fast path.  initial-exec model: libsmash is always
 // LD_PRELOAD'd, so its TLS block is part of the program's startup TLS
@@ -1200,7 +1213,15 @@ volatile int xxthread_created_flag = 0;
 }
 
 using SmashRedirect = alloc8::HeapRedirect<smash::SmashHeap>;
+
+// When SMASH_NO_THREAD_HOOKS_BUILD is defined (via -D), use ALLOC8_REDIRECT
+// which doesn't register xxthread_init/xxthread_cleanup. This avoids alloc8's
+// pthread_create interposition which can cause crashes during process shutdown.
+#ifdef SMASH_NO_THREAD_HOOKS_BUILD
+ALLOC8_REDIRECT(SmashRedirect);
+#else
 ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);
+#endif
 
 // ── Start compressor from constructor ─────────────────────────────────────────
 // On macOS, threadInit() requires two calls before starting compression (to
@@ -1213,6 +1234,7 @@ ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);
 // the >= 1 guard, ensuring compression starts even for non-ObjC programs
 // (e.g. Python via DYLD_INSERT_LIBRARIES) and single-threaded programs.
 // On Linux, the same applies: no threads are created during LD_PRELOAD init.
+#ifndef SMASH_NO_THREAD_HOOKS_BUILD
 __attribute__((constructor(201)))  // After alloc8 pthread hooks init (200)
 static void smash_start_main_thread() {
     xxthread_init();
@@ -1221,6 +1243,7 @@ static void smash_start_main_thread() {
     xxthread_init();
 #endif
 }
+#endif  // SMASH_NO_THREAD_HOOKS_BUILD
 
 // ── Restart the compressor after fork() ──────────────────────────────────────
 // Linux fork() only clones the calling thread, so the compressor's coordinator
@@ -1257,4 +1280,18 @@ static void smash_register_atfork() {
     pthread_atfork(smash_atfork_prepare,
                    smash_atfork_parent,
                    smash_atfork_child);
+}
+
+// High-priority destructor: runs BEFORE other destructors in
+// __cxa_finalize order (lower priority number = later registration =
+// runs first). Priority 101 puts this ahead of typical static-storage
+// destructors and Python's interpreter teardown C-side cleanup, so
+// compressed pages are drained back to PROT_RW while the compressor
+// machinery is still alive. Without this, CPython's interpreter shutdown
+// touches a still-COMPRESSED page, faults, the handler runs, decompresses
+// using stale state, and we crash with SIGSEGV (F139).
+__attribute__((destructor(101)))
+static void smash_shutdown_compressor() {
+    auto* heap = SmashRedirect::getHeap();
+    if (heap) heap->shutdownCompressor();
 }

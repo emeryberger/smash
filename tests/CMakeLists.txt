@@ -4,11 +4,14 @@
 set(SMASH_TEST_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
   ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${printf_SOURCE_DIR}
 )
 
-# Helper to add a test executable
+# Helper to add a test executable. Tests transitively pull in headers that
+# depend on the mpaland/printf TU (via util/safe_printf.h), so every test
+# must link printf.cpp.
 function(smash_add_test name source)
-  add_executable(${name} ${source})
+  add_executable(${name} ${source} ${printf_SOURCE_DIR}/printf.cpp)
   target_include_directories(${name} PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
   target_link_libraries(${name} PRIVATE alloc8::headers)
   if(APPLE)
@@ -29,6 +32,7 @@ smash_add_test(test_vm_region test_vm_region.cpp)
 add_executable(test_integration
   test_integration.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
+  ${printf_SOURCE_DIR}/printf.cpp
 )
 target_include_directories(test_integration PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
 target_link_libraries(test_integration PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
@@ -38,7 +42,7 @@ endif()
 add_test(NAME test_integration COMMAND test_integration)
 
 # Compression test (needs LZ4 + zstd)
-add_executable(test_compression test_compression.cpp)
+add_executable(test_compression test_compression.cpp ${printf_SOURCE_DIR}/printf.cpp)
 target_include_directories(test_compression PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
 target_link_libraries(test_compression PRIVATE alloc8::headers lz4_static libzstd_static)
 if(APPLE)
@@ -47,12 +51,14 @@ endif()
 add_test(NAME test_compression COMMAND test_compression)
 # Drive the compressor through ticks deterministically — bypass the
 # CPU-pressure hard-skip and floor multiplier with an explicit
-# cold-ticks override.
+# cold-ticks override. Also pin SMASH_SOFTDIRTY=0 because this test
+# directly checks Phase-3 PROT_READ states (ACTIVE_MONITORING) which
+# don't exist under the soft-dirty path.
 set_tests_properties(test_compression PROPERTIES
-  ENVIRONMENT "SMASH_COLD_TICKS=2")
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0")
 
 # Dictionary training test (needs LZ4 + zstd)
-add_executable(test_dictionary test_dictionary.cpp)
+add_executable(test_dictionary test_dictionary.cpp ${printf_SOURCE_DIR}/printf.cpp)
 target_include_directories(test_dictionary PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
 target_link_libraries(test_dictionary PRIVATE alloc8::headers lz4_static libzstd_static)
 if(APPLE)
@@ -60,21 +66,34 @@ if(APPLE)
 endif()
 add_test(NAME test_dictionary COMMAND test_dictionary)
 
+# Profile + dictionary persistence test (needs LZ4 + zstd). Validates the
+# v4 SMASH_PROFILE_FILE format roundtrip — train, save, load, verify dict
+# is usable — plus corrupt-file rejection.
+add_executable(test_profile_dict_persistence test_profile_dict_persistence.cpp ${printf_SOURCE_DIR}/printf.cpp)
+target_include_directories(test_profile_dict_persistence PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
+target_link_libraries(test_profile_dict_persistence PRIVATE alloc8::headers lz4_static libzstd_static)
+if(APPLE)
+  target_compile_options(test_profile_dict_persistence PRIVATE -ftls-model=initial-exec)
+endif()
+add_test(NAME test_profile_dict_persistence COMMAND test_profile_dict_persistence)
+
 # Prefetch test (needs LZ4 + zstd)
-add_executable(test_prefetch test_prefetch.cpp)
+add_executable(test_prefetch test_prefetch.cpp ${printf_SOURCE_DIR}/printf.cpp)
 target_include_directories(test_prefetch PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
 target_link_libraries(test_prefetch PRIVATE alloc8::headers lz4_static libzstd_static)
 if(APPLE)
   target_compile_options(test_prefetch PRIVATE -ftls-model=initial-exec)
 endif()
 add_test(NAME test_prefetch COMMAND test_prefetch)
+# Pin SMASH_SOFTDIRTY=0 — test directly drives PROT_READ-based Phase 3.
 set_tests_properties(test_prefetch PROPERTIES
-  ENVIRONMENT "SMASH_COLD_TICKS=2")
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0")
 
 # Contention test (needs LZ4 + zstd + smash_heap.cpp)
 add_executable(test_contention
   test_contention.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
+  ${printf_SOURCE_DIR}/printf.cpp
 )
 target_include_directories(test_contention PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
 target_link_libraries(test_contention PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
@@ -84,7 +103,7 @@ endif()
 add_test(NAME test_contention COMMAND test_contention)
 
 # Fault cycle test - real SIGSEGV handling (needs LZ4 + zstd)
-add_executable(test_fault_cycle test_fault_cycle.cpp)
+add_executable(test_fault_cycle test_fault_cycle.cpp ${printf_SOURCE_DIR}/printf.cpp)
 target_include_directories(test_fault_cycle PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
 target_link_libraries(test_fault_cycle PRIVATE alloc8::headers lz4_static libzstd_static)
 if(APPLE)
@@ -212,6 +231,12 @@ else()
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
       "SMASH_COLD_TIMEOUT_SEC=1"
+      # SMASH_SOFTDIRTY=0: this test relies on the deterministic
+      # PROT_READ Phase-3 timing to drive the buffer to COMPRESSED
+      # before the syscall. Soft-dirty's pagemap-read sees the
+      # initial-fault writes for one extra tick, missing the test's
+      # 3 s window.
+      "SMASH_SOFTDIRTY=0"
       $<TARGET_FILE:syscall_efault_test>
   )
 endif()

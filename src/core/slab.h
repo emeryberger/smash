@@ -305,8 +305,8 @@ public:
         cap_ctx_ = ctx;
     }
 
-    void lockSlab() { lock_.lock(); }
-    void unlockSlab() { lock_.unlock(); }
+    void lockSlab() SMASH_ACQUIRE(lock_) { lock_.lock(); }
+    void unlockSlab() SMASH_RELEASE(lock_) { lock_.unlock(); }
 };
 
 } // namespace smash

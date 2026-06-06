@@ -106,23 +106,34 @@ long parseField(const std::string& s, const char* needle) {
 }
 
 bool waitForCompression(const char* phase) {
-    fprintf(stderr, "syscall_efault_test: [%s] sleeping %zus for compressor\n",
-            phase, kSleepSec);
-    sleep(kSleepSec);
-    std::string stats = captureSigusr2Stats();
-    long compressed = parseField(stats, "compressed=");
-    long committed  = parseField(stats, "committed=");
+    // Poll for compression instead of a single fixed sleep + check. The
+    // compressor's progress depends on the host's tick cadence and load; a
+    // single kSleepSec sleep raced the compressor on slow/contended CI runners
+    // (macos-latest observed compressed=0 after 3s, failing spuriously). Kick
+    // SIGUSR2 and re-check up to kMaxWaitSec, succeeding as soon as any page
+    // has compressed. With SMASH_COLD_TIMEOUT_SEC=1 this still returns in ~2-3s
+    // locally; the longer bound only matters on a slow runner.
+    constexpr int kMaxWaitSec = 30;
+    long compressed = 0, committed = 0;
+    for (int waited = 0; waited < kMaxWaitSec; ++waited) {
+        sleep(1);
+        std::string stats = captureSigusr2Stats();
+        compressed = parseField(stats, "compressed=");
+        committed  = parseField(stats, "committed=");
+        if (compressed > 0) {
+            fprintf(stderr,
+                    "syscall_efault_test: [%s] compressed=%ld committed=%ld "
+                    "(after %ds)\n", phase, compressed, committed, waited + 1);
+            return true;
+        }
+    }
     fprintf(stderr,
             "syscall_efault_test: [%s] compressed=%ld committed=%ld\n",
             phase, compressed, committed);
-    if (compressed <= 0) {
-        fprintf(stderr,
-                "FAIL: [%s] compressor never compressed any page; cannot "
-                "exercise EFAULT path\n",
-                phase);
-        return false;
-    }
-    return true;
+    fprintf(stderr,
+            "FAIL: [%s] compressor never compressed any page within %ds; "
+            "cannot exercise EFAULT path\n", phase, kMaxWaitSec);
+    return false;
 }
 
 bool bytesAllEqual(const unsigned char* p, size_t bytes, unsigned char want) {

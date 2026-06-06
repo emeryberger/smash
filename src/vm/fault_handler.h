@@ -151,10 +151,20 @@ class FaultHandler {
                        !(old->sa_flags & SA_SIGINFO) &&
                        old->sa_handler == SIG_DFL;
         if (want_bt) {
+            // Portable thread id: SYS_gettid is Linux-only; macOS uses
+            // pthread_threadid_np. Diagnostic-only.
+#if defined(__linux__)
+            long tid = syscall(SYS_gettid);
+#elif defined(__APPLE__)
+            uint64_t tid64 = 0; pthread_threadid_np(nullptr, &tid64);
+            long tid = static_cast<long>(tid64);
+#else
+            long tid = 0;
+#endif
             char hdr[160];
             int n = smash::safe_snprintf(hdr, sizeof(hdr),
-                "[smash crash] pid=%d tid=%d sig=%d si_code=%d si_addr=%p\n",
-                (int)getpid(), (int)syscall(SYS_gettid),
+                "[smash crash] pid=%d tid=%ld sig=%d si_code=%d si_addr=%p\n",
+                (int)getpid(), tid,
                 sig, info->si_code, info->si_addr);
             if (n > 0) (void)!write(2, hdr, (size_t)n);
             void* frames[64];

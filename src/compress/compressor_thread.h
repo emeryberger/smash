@@ -326,8 +326,8 @@ class CompressorThread {
     //   - One syscall per tick to clear vs N mprotect calls.
     // Cost: ~8 bytes per page in pagemap read at tick start, all-process
     // soft-dirty wipe at tick end (kernel does it lazily by zapping PTEs).
-    int clear_refs_fd_ = -1;
-    int pagemap_fd_ = -1;
+    [[maybe_unused]] int clear_refs_fd_ = -1;
+    [[maybe_unused]] int pagemap_fd_ = -1;
 
     // /proc/self/mem fd (Linux). Used to populate a page's physical backing
     // *while it is still PROT_NONE*, before flipping it readable — closing the
@@ -338,7 +338,7 @@ class CompressorThread {
     // VM_MAYWRITE because our reservation is PROT_RW), so the store lands even
     // though direct user stores to the page would fault. Opened lazily on
     // first restore; reset across fork() like the soft-dirty fds.
-    int self_mem_fd_ = -1;
+    [[maybe_unused]] int self_mem_fd_ = -1;
 
     // Per-(arena, size_class) recompression-rate signal. Single shared
     // table (not per-worker) so the fault handler can update it without

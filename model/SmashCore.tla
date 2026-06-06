@@ -162,10 +162,16 @@ AppLoop:
             \* here; that's processDecommitEntry's job (or, in the bug,
             \* nobody's job).
         AppFree:
+            \* Acquire + release the per-page lock within one atomic step.
+            \* PlusCal forbids assigning the same variable (lock[target])
+            \* twice under one label, so we model the lock as held only for
+            \* the duration of this atomic block (guarded by lock="free") and
+            \* leave it "free" on exit — equivalent to acquire-do-release with
+            \* no observable intermediate state. (823515f introduced a double
+            \* lock[target] assignment here that broke PlusCal translation.)
             if state[target] = "ACTIVE"
                /\ releases[target] < MaxReleases
                /\ lock[target] = "free" then
-                lock[target] := self;
                 state[target]    := "EMPTY";
                 hasBlob[target]  := FALSE;
                 hasPhysical[target] := FALSE;
@@ -173,7 +179,6 @@ AppLoop:
                 accessed[target]  := FALSE;
                 releases[target]  := releases[target] + 1;
                 decommitQ := decommitQ \cup {target};
-                lock[target] := "free";
             end if;
         end either;
     end while;
@@ -386,11 +391,12 @@ end process;
 
 end algorithm; *)
 \* BEGIN TRANSLATION (manual)
-VARIABLES pc, state, pageProt, lock, coldCount, accessed, hasBlob, hasPhysical,
-          releases, decommitQ, freeList, target, ap, dp, cp
+VARIABLES pc, state, pageProt, lock, coldCount, accessed, hasBlob, 
+          hasPhysical, releases, decommitQ, freeList
 
 (* define statement *)
 IncCold(c) == IF c < MaxCold THEN c + 1 ELSE MaxCold
+
 
 BlobIntegrity ==
     \A p \in Pages :
@@ -398,6 +404,8 @@ BlobIntegrity ==
         /\ (state[p] = "ACTIVE")      => (~hasBlob[p] /\ hasPhysical[p])
         /\ (state[p] = "COMPRESSING") => (~hasBlob[p] /\ hasPhysical[p])
         /\ (state[p] = "COMPRESSED_SHADOW") => (hasBlob[p] /\ hasPhysical[p])
+
+
         /\ (state[p] = "EMPTY")       => (~hasBlob[p] /\ ~hasPhysical[p])
 
 ProtectionSafety ==
@@ -406,430 +414,428 @@ ProtectionSafety ==
         /\ (state[p] = "ACTIVE")     => (pageProt[p] \in {"PROT_RW", "PROT_READ"})
         /\ (state[p] = "COMPRESSED_SHADOW") => (pageProt[p] \in {"PROT_RW", "PROT_READ"})
 
+
+
+
+
+
+
+
+
+
+
 ActiveImpliesRW ==
     \A p \in Pages : (state[p] = "ACTIVE") => (pageProt[p] = "PROT_RW")
 
 SafetyInv == BlobIntegrity /\ ProtectionSafety /\ ActiveImpliesRW
 
-vars == << pc, state, pageProt, lock, coldCount, accessed, hasBlob, hasPhysical,
-           releases, decommitQ, freeList, target, ap, dp, cp >>
+VARIABLES target, ap, dp, cp
+
+vars == << pc, state, pageProt, lock, coldCount, accessed, hasBlob, 
+           hasPhysical, releases, decommitQ, freeList, target, ap, dp, cp >>
 
 ProcSet == ({"t1", "t2"}) \cup {"alloc"} \cup {"dec"} \cup ({"comp1", "comp2"})
 
-Init ==
-    /\ state       = [p \in Pages |-> "ACTIVE"]
-    /\ pageProt    = [p \in Pages |-> "PROT_RW"]
-    /\ lock        = [p \in Pages |-> "free"]
-    /\ coldCount   = [p \in Pages |-> 0]
-    /\ accessed    = [p \in Pages |-> FALSE]
-    /\ hasBlob     = [p \in Pages |-> FALSE]
-    /\ hasPhysical = [p \in Pages |-> TRUE]
-    /\ releases    = [p \in Pages |-> 0]
-    /\ decommitQ   = {}
-    /\ freeList    = {}
-    /\ target      = [self \in {"t1", "t2"} |-> 1]
-    /\ ap          = 0
-    /\ dp          = 0
-    /\ cp          = [self \in {"comp1", "comp2"} |-> 0]
-    /\ pc = [self \in ProcSet |->
-                CASE self \in {"t1", "t2"}      -> "AppLoop"
-                  [] self = "alloc"             -> "AllocLoop"
-                  [] self = "dec"               -> "DecLoop"
-                  [] self \in {"comp1", "comp2"} -> "Tick"]
+Init == (* Global variables *)
+        /\ state = [p \in Pages |-> "ACTIVE"]
+        /\ pageProt = [p \in Pages |-> "PROT_RW"]
+        /\ lock = [p \in Pages |-> "free"]
+        /\ coldCount = [p \in Pages |-> 0]
+        /\ accessed = [p \in Pages |-> FALSE]
+        /\ hasBlob = [p \in Pages |-> FALSE]
+        /\ hasPhysical = [p \in Pages |-> TRUE]
+        /\ releases = [p \in Pages |-> 0]
+        /\ decommitQ = {}
+        /\ freeList = {}
+        (* Process AppThread *)
+        /\ target = [self \in {"t1", "t2"} |-> 1]
+        (* Process Allocator *)
+        /\ ap = 0
+        (* Process Decommit *)
+        /\ dp = 0
+        (* Process Compressor *)
+        /\ cp = [self \in {"comp1", "comp2"} |-> 0]
+        /\ pc = [self \in ProcSet |-> CASE self \in {"t1", "t2"} -> "AppLoop"
+                                        [] self = "alloc" -> "AllocLoop"
+                                        [] self = "dec" -> "DecLoop"
+                                        [] self \in {"comp1", "comp2"} -> "Tick"]
 
-\* ---- AppThread actions ------------------------------------------------
-AppLoop(self) ==
-    /\ pc[self] = "AppLoop"
-    /\ \E p \in Pages: target' = [target EXCEPT ![self] = p]
-    /\ \/ pc' = [pc EXCEPT ![self] = "AppAccess"]
-       \/ pc' = [pc EXCEPT ![self] = "AppFree"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, ap, dp, cp >>
+AppLoop(self) == /\ pc[self] = "AppLoop"
+                 /\ \E p \in Pages:
+                      target' = [target EXCEPT ![self] = p]
+                 /\ \/ /\ pc' = [pc EXCEPT ![self] = "AppAccess"]
+                    \/ /\ pc' = [pc EXCEPT ![self] = "AppFree"]
+                 /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                 hasBlob, hasPhysical, releases, decommitQ, 
+                                 freeList, ap, dp, cp >>
 
-AppAccess(self) ==
-    /\ pc[self] = "AppAccess"
-    /\ IF state[target[self]] = "EMPTY"
-          THEN /\ pc' = [pc EXCEPT ![self] = "AppLoop"]
-               /\ UNCHANGED accessed
-          ELSE IF pageProt[target[self]] = "PROT_RW"
-                  THEN /\ accessed' = [accessed EXCEPT ![target[self]] = TRUE]
-                       /\ pc' = [pc EXCEPT ![self] = "AppLoop"]
-                  ELSE /\ pc' = [pc EXCEPT ![self] = "FaultLock"]
-                       /\ UNCHANGED accessed
-    /\ UNCHANGED << state, pageProt, lock, coldCount, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+AppAccess(self) == /\ pc[self] = "AppAccess"
+                   /\ IF state[target[self]] = "EMPTY"
+                         THEN /\ TRUE
+                              /\ pc' = [pc EXCEPT ![self] = "AppLoop"]
+                              /\ UNCHANGED accessed
+                         ELSE /\ IF pageProt[target[self]] = "PROT_RW"
+                                    THEN /\ accessed' = [accessed EXCEPT ![target[self]] = TRUE]
+                                         /\ pc' = [pc EXCEPT ![self] = "AppLoop"]
+                                    ELSE /\ pc' = [pc EXCEPT ![self] = "FaultLock"]
+                                         /\ UNCHANGED accessed
+                   /\ UNCHANGED << state, pageProt, lock, coldCount, hasBlob, 
+                                   hasPhysical, releases, decommitQ, freeList, 
+                                   target, ap, dp, cp >>
 
-FaultLock(self) ==
-    /\ pc[self] = "FaultLock"
-    /\ lock[target[self]] = "free"
-    /\ lock' = [lock EXCEPT ![target[self]] = self]
-    /\ pc' = [pc EXCEPT ![self] = "FaultHandle"]
-    /\ UNCHANGED << state, pageProt, coldCount, accessed, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+FaultLock(self) == /\ pc[self] = "FaultLock"
+                   /\ lock[target[self]] = "free"
+                   /\ lock' = [lock EXCEPT ![target[self]] = self]
+                   /\ pc' = [pc EXCEPT ![self] = "FaultHandle"]
+                   /\ UNCHANGED << state, pageProt, coldCount, accessed, 
+                                   hasBlob, hasPhysical, releases, decommitQ, 
+                                   freeList, target, ap, dp, cp >>
 
-FaultHandle(self) ==
-    LET t == target[self] IN
-    /\ pc[self] = "FaultHandle"
-    /\ IF state[t] = "COMPRESSED"
-          THEN /\ state'       = [state       EXCEPT ![t] = "ACTIVE"]
-               /\ pageProt'    = [pageProt    EXCEPT ![t] = "PROT_RW"]
-               /\ hasPhysical' = [hasPhysical EXCEPT ![t] = TRUE]
-               /\ hasBlob'     = [hasBlob     EXCEPT ![t] = FALSE]
-               /\ coldCount'   = [coldCount   EXCEPT ![t] = 0]
-               /\ accessed'    = [accessed    EXCEPT ![t] = TRUE]
-          ELSE IF state[t] = "ACTIVE_MONITORING"
-                  THEN /\ state'     = [state     EXCEPT ![t] = "ACTIVE"]
-                       /\ pageProt'  = [pageProt  EXCEPT ![t] = "PROT_RW"]
-                       /\ coldCount' = [coldCount EXCEPT ![t] = 0]
-                       /\ accessed'  = [accessed  EXCEPT ![t] = TRUE]
-                       /\ UNCHANGED << hasPhysical, hasBlob >>
-                  ELSE IF state[t] = "COMPRESSED_SHADOW"
-                          THEN /\ state'     = [state     EXCEPT ![t] = "ACTIVE"]
-                               /\ pageProt'  = [pageProt  EXCEPT ![t] = "PROT_RW"]
-                               /\ hasBlob'   = [hasBlob   EXCEPT ![t] = FALSE]
-                               /\ coldCount' = [coldCount EXCEPT ![t] = 0]
-                               /\ accessed'  = [accessed  EXCEPT ![t] = TRUE]
-                               /\ UNCHANGED hasPhysical
-                          ELSE IF state[t] = "ACTIVE"
-                                  THEN /\ pageProt' = [pageProt EXCEPT ![t] = "PROT_RW"]
-                                       /\ UNCHANGED << state, coldCount, accessed,
-                                                       hasBlob, hasPhysical >>
-                                  \* state = EMPTY (or COMPRESSING):
-                                  \* fault handler bails. Model as no-op
-                                  \* so violating state persists.
-                                  ELSE UNCHANGED << state, pageProt, coldCount,
-                                                    accessed, hasBlob, hasPhysical >>
-    /\ lock' = [lock EXCEPT ![t] = "free"]
-    /\ pc' = [pc EXCEPT ![self] = "AppLoop"]
-    /\ UNCHANGED << releases, decommitQ, freeList, target, ap, dp, cp >>
+FaultHandle(self) == /\ pc[self] = "FaultHandle"
+                     /\ IF state[target[self]] = "COMPRESSED"
+                           THEN /\ state' = [state EXCEPT ![target[self]] = "ACTIVE"]
+                                /\ pageProt' = [pageProt EXCEPT ![target[self]] = "PROT_RW"]
+                                /\ hasPhysical' = [hasPhysical EXCEPT ![target[self]] = TRUE]
+                                /\ hasBlob' = [hasBlob EXCEPT ![target[self]] = FALSE]
+                                /\ coldCount' = [coldCount EXCEPT ![target[self]] = 0]
+                                /\ accessed' = [accessed EXCEPT ![target[self]] = TRUE]
+                           ELSE /\ IF state[target[self]] = "ACTIVE_MONITORING"
+                                      THEN /\ state' = [state EXCEPT ![target[self]] = "ACTIVE"]
+                                           /\ pageProt' = [pageProt EXCEPT ![target[self]] = "PROT_RW"]
+                                           /\ coldCount' = [coldCount EXCEPT ![target[self]] = 0]
+                                           /\ accessed' = [accessed EXCEPT ![target[self]] = TRUE]
+                                           /\ UNCHANGED hasBlob
+                                      ELSE /\ IF state[target[self]] = "COMPRESSED_SHADOW"
+                                                 THEN /\ state' = [state EXCEPT ![target[self]] = "ACTIVE"]
+                                                      /\ pageProt' = [pageProt EXCEPT ![target[self]] = "PROT_RW"]
+                                                      /\ hasBlob' = [hasBlob EXCEPT ![target[self]] = FALSE]
+                                                      /\ coldCount' = [coldCount EXCEPT ![target[self]] = 0]
+                                                      /\ accessed' = [accessed EXCEPT ![target[self]] = TRUE]
+                                                 ELSE /\ IF state[target[self]] = "ACTIVE"
+                                                            THEN /\ pageProt' = [pageProt EXCEPT ![target[self]] = "PROT_RW"]
+                                                            ELSE /\ TRUE
+                                                                 /\ UNCHANGED pageProt
+                                                      /\ UNCHANGED << state, 
+                                                                      coldCount, 
+                                                                      accessed, 
+                                                                      hasBlob >>
+                                /\ UNCHANGED hasPhysical
+                     /\ lock' = [lock EXCEPT ![target[self]] = "free"]
+                     /\ pc' = [pc EXCEPT ![self] = "AppLoop"]
+                     /\ UNCHANGED << releases, decommitQ, freeList, target, ap, 
+                                     dp, cp >>
 
-AppFree(self) ==
-    LET t == target[self] IN
-    \* Free path: app calls free() on a smash-owned page. Real
-    \* releaseHook clears state to EMPTY and queues the range for
-    \* decommit. Allowed from ACTIVE / COMPRESSED / COMPRESSED_SHADOW
-    \* / ACTIVE_MONITORING. Critically, pageProt is NOT touched here:
-    \* the bug we're modeling is that processDecommitEntry was the
-    \* only place that should restore pageProt=PROT_RW, and pre-fix
-    \* it didn't.
-    /\ pc[self] = "AppFree"
-    /\ IF state[t] \in {"ACTIVE", "ACTIVE_MONITORING",
-                         "COMPRESSED", "COMPRESSED_SHADOW"}
-          /\ releases[t] < MaxReleases
-          /\ lock[t] = "free"
-          THEN /\ state'       = [state       EXCEPT ![t] = "EMPTY"]
-               /\ hasBlob'     = [hasBlob     EXCEPT ![t] = FALSE]
-               /\ hasPhysical' = [hasPhysical EXCEPT ![t] = FALSE]
-               /\ coldCount'   = [coldCount   EXCEPT ![t] = 0]
-               /\ accessed'    = [accessed    EXCEPT ![t] = FALSE]
-               /\ releases'    = [releases    EXCEPT ![t] = releases[t] + 1]
-               /\ decommitQ'   = decommitQ \cup {t}
-          ELSE UNCHANGED << state, hasBlob, hasPhysical, coldCount, accessed,
-                            releases, decommitQ >>
-    /\ pc' = [pc EXCEPT ![self] = "AppLoop"]
-    /\ UNCHANGED << pageProt, lock, freeList, target, ap, dp, cp >>
+AppFree(self) == /\ pc[self] = "AppFree"
+                 /\ IF state[target[self]] = "ACTIVE"
+                       /\ releases[target[self]] < MaxReleases
+                       /\ lock[target[self]] = "free"
+                       THEN /\ state' = [state EXCEPT ![target[self]] = "EMPTY"]
+                            /\ hasBlob' = [hasBlob EXCEPT ![target[self]] = FALSE]
+                            /\ hasPhysical' = [hasPhysical EXCEPT ![target[self]] = FALSE]
+                            /\ coldCount' = [coldCount EXCEPT ![target[self]] = 0]
+                            /\ accessed' = [accessed EXCEPT ![target[self]] = FALSE]
+                            /\ releases' = [releases EXCEPT ![target[self]] = releases[target[self]] + 1]
+                            /\ decommitQ' = (decommitQ \cup {target[self]})
+                       ELSE /\ TRUE
+                            /\ UNCHANGED << state, coldCount, accessed, 
+                                            hasBlob, hasPhysical, releases, 
+                                            decommitQ >>
+                 /\ pc' = [pc EXCEPT ![self] = "AppLoop"]
+                 /\ UNCHANGED << pageProt, lock, freeList, target, ap, dp, cp >>
 
 AppThread(self) == AppLoop(self) \/ AppAccess(self) \/ FaultLock(self)
-                       \/ FaultHandle(self) \/ AppFree(self)
+                      \/ FaultHandle(self) \/ AppFree(self)
 
-\* ---- Allocator actions ------------------------------------------------
-AllocLoop ==
-    /\ pc["alloc"] = "AllocLoop"
-    /\ \/ pc' = [pc EXCEPT !["alloc"] = "AllocPop"]
-       \/ pc' = [pc EXCEPT !["alloc"] = "AllocBump"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+AllocLoop == /\ pc["alloc"] = "AllocLoop"
+             /\ \/ /\ pc' = [pc EXCEPT !["alloc"] = "AllocPop"]
+                \/ /\ pc' = [pc EXCEPT !["alloc"] = "AllocBump"]
+             /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                             hasBlob, hasPhysical, releases, decommitQ, 
+                             freeList, target, ap, dp, cp >>
 
-AllocPop ==
-    /\ pc["alloc"] = "AllocPop"
-    /\ IF freeList /= {}
-          THEN /\ \E p \in freeList:
-                    /\ ap' = p
-                    /\ freeList' = freeList \ {p}
-                    /\ IF state[p] = "EMPTY"
-                          THEN /\ state' = [state EXCEPT ![p] = "ACTIVE"]
-                               /\ hasPhysical' = [hasPhysical EXCEPT ![p] = TRUE]
-                          ELSE UNCHANGED << state, hasPhysical >>
-          ELSE /\ UNCHANGED << ap, freeList, state, hasPhysical >>
-    /\ pc' = [pc EXCEPT !["alloc"] = "AllocLoop"]
-    /\ UNCHANGED << pageProt, lock, coldCount, accessed, hasBlob, releases,
-                    decommitQ, target, dp, cp >>
+AllocPop == /\ pc["alloc"] = "AllocPop"
+            /\ IF freeList /= {}
+                  THEN /\ \E p \in freeList:
+                            ap' = p
+                       /\ freeList' = freeList \ {ap'}
+                       /\ IF state[ap'] = "EMPTY"
+                             THEN /\ state' = [state EXCEPT ![ap'] = "ACTIVE"]
+                                  /\ hasPhysical' = [hasPhysical EXCEPT ![ap'] = TRUE]
+                             ELSE /\ TRUE
+                                  /\ UNCHANGED << state, hasPhysical >>
+                  ELSE /\ TRUE
+                       /\ UNCHANGED << state, hasPhysical, freeList, ap >>
+            /\ pc' = [pc EXCEPT !["alloc"] = "AllocLoop"]
+            /\ UNCHANGED << pageProt, lock, coldCount, accessed, hasBlob, 
+                            releases, decommitQ, target, dp, cp >>
 
-AllocBump ==
-    /\ pc["alloc"] = "AllocBump"
-    /\ pc' = [pc EXCEPT !["alloc"] = "AllocLoop"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+AllocBump == /\ pc["alloc"] = "AllocBump"
+             /\ TRUE
+             /\ pc' = [pc EXCEPT !["alloc"] = "AllocLoop"]
+             /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                             hasBlob, hasPhysical, releases, decommitQ, 
+                             freeList, target, ap, dp, cp >>
 
 Allocator == AllocLoop \/ AllocPop \/ AllocBump
 
-\* ---- Decommit thread actions -----------------------------------------
-DecLoop ==
-    /\ pc["dec"] = "DecLoop"
-    /\ IF decommitQ /= {}
-          THEN /\ pc' = [pc EXCEPT !["dec"] = "DecPick"]
-          ELSE /\ pc' = [pc EXCEPT !["dec"] = "DecLoop"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+DecLoop == /\ pc["dec"] = "DecLoop"
+           /\ IF decommitQ /= {}
+                 THEN /\ pc' = [pc EXCEPT !["dec"] = "DecPick"]
+                 ELSE /\ pc' = [pc EXCEPT !["dec"] = "DecLoop"]
+           /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob, 
+                           hasPhysical, releases, decommitQ, freeList, target, 
+                           ap, dp, cp >>
 
-DecPick ==
-    /\ pc["dec"] = "DecPick"
-    /\ \E p \in decommitQ:
-        /\ dp' = p
-        /\ decommitQ' = decommitQ \ {p}
-    /\ pc' = [pc EXCEPT !["dec"] = "DecCommitPages"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, freeList, target, ap, cp >>
+DecPick == /\ pc["dec"] = "DecPick"
+           /\ \E p \in decommitQ:
+                dp' = p
+           /\ decommitQ' = decommitQ \ {dp'}
+           /\ pc' = [pc EXCEPT !["dec"] = "DecCommitPages"]
+           /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob, 
+                           hasPhysical, releases, freeList, target, ap, cp >>
 
-DecCommitPages ==
-    /\ pc["dec"] = "DecCommitPages"
-    /\ IF ~BuggyMode
-          THEN /\ pageProt' = [pageProt EXCEPT ![dp] = "PROT_RW"]
-          ELSE /\ UNCHANGED pageProt
-    /\ pc' = [pc EXCEPT !["dec"] = "DecMadvise"]
-    /\ UNCHANGED << state, lock, coldCount, accessed, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+DecCommitPages == /\ pc["dec"] = "DecCommitPages"
+                  /\ IF ~BuggyMode
+                        THEN /\ pageProt' = [pageProt EXCEPT ![dp] = "PROT_RW"]
+                        ELSE /\ TRUE
+                             /\ UNCHANGED pageProt
+                  /\ pc' = [pc EXCEPT !["dec"] = "DecMadvise"]
+                  /\ UNCHANGED << state, lock, coldCount, accessed, hasBlob, 
+                                  hasPhysical, releases, decommitQ, freeList, 
+                                  target, ap, dp, cp >>
 
-DecMadvise ==
-    /\ pc["dec"] = "DecMadvise"
-    /\ pc' = [pc EXCEPT !["dec"] = "DecPush"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+DecMadvise == /\ pc["dec"] = "DecMadvise"
+              /\ TRUE
+              /\ pc' = [pc EXCEPT !["dec"] = "DecPush"]
+              /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                              hasBlob, hasPhysical, releases, decommitQ, 
+                              freeList, target, ap, dp, cp >>
 
-DecPush ==
-    /\ pc["dec"] = "DecPush"
-    /\ freeList' = freeList \cup {dp}
-    /\ pc' = [pc EXCEPT !["dec"] = "DecLoop"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, target, ap, dp, cp >>
+DecPush == /\ pc["dec"] = "DecPush"
+           /\ freeList' = (freeList \cup {dp})
+           /\ pc' = [pc EXCEPT !["dec"] = "DecLoop"]
+           /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob, 
+                           hasPhysical, releases, decommitQ, target, ap, dp, 
+                           cp >>
 
 Decommit == DecLoop \/ DecPick \/ DecCommitPages \/ DecMadvise \/ DecPush
 
-\* ---- Compressor actions ----------------------------------------------
-Tick(self) ==
-    /\ pc[self] = "Tick"
-    /\ pc' = [pc EXCEPT ![self] = "P1Start"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+Tick(self) == /\ pc[self] = "Tick"
+              /\ pc' = [pc EXCEPT ![self] = "P1Start"]
+              /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                              hasBlob, hasPhysical, releases, decommitQ, 
+                              freeList, target, ap, dp, cp >>
 
-P1Start(self) ==
-    /\ pc[self] = "P1Start"
-    /\ cp' = [cp EXCEPT ![self] = 1]
-    /\ pc' = [pc EXCEPT ![self] = "Phase1"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap, dp >>
+P1Start(self) == /\ pc[self] = "P1Start"
+                 /\ cp' = [cp EXCEPT ![self] = 1]
+                 /\ pc' = [pc EXCEPT ![self] = "Phase1"]
+                 /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                 hasBlob, hasPhysical, releases, decommitQ, 
+                                 freeList, target, ap, dp >>
 
-Phase1(self) ==
-    /\ pc[self] = "Phase1"
-    /\ IF cp[self] <= NumPages
-          THEN /\ IF state[cp[self]] = "EMPTY"
-                     THEN /\ UNCHANGED << coldCount, accessed >>
-                     ELSE IF accessed[cp[self]]
-                            THEN /\ coldCount' = [coldCount EXCEPT ![cp[self]] = 0]
-                                 /\ accessed'  = [accessed  EXCEPT ![cp[self]] = FALSE]
-                            ELSE /\ coldCount' = [coldCount EXCEPT ![cp[self]] =
-                                                    IncCold(coldCount[cp[self]])]
-                                 /\ UNCHANGED accessed
-               /\ cp' = [cp EXCEPT ![self] = cp[self] + 1]
-               /\ pc' = [pc EXCEPT ![self] = "Phase1"]
-          ELSE /\ pc' = [pc EXCEPT ![self] = "P2Start"]
-               /\ UNCHANGED << coldCount, accessed, cp >>
-    /\ UNCHANGED << state, pageProt, lock, hasBlob, hasPhysical, releases,
-                    decommitQ, freeList, target, ap, dp >>
+Phase1(self) == /\ pc[self] = "Phase1"
+                /\ IF cp[self] <= NumPages
+                      THEN /\ IF state[cp[self]] = "EMPTY"
+                                 THEN /\ TRUE
+                                      /\ UNCHANGED << coldCount, accessed >>
+                                 ELSE /\ IF accessed[cp[self]]
+                                            THEN /\ coldCount' = [coldCount EXCEPT ![cp[self]] = 0]
+                                                 /\ accessed' = [accessed EXCEPT ![cp[self]] = FALSE]
+                                            ELSE /\ coldCount' = [coldCount EXCEPT ![cp[self]] = IncCold(coldCount[cp[self]])]
+                                                 /\ UNCHANGED accessed
+                           /\ cp' = [cp EXCEPT ![self] = cp[self] + 1]
+                           /\ pc' = [pc EXCEPT ![self] = "Phase1"]
+                      ELSE /\ pc' = [pc EXCEPT ![self] = "P2Start"]
+                           /\ UNCHANGED << coldCount, accessed, cp >>
+                /\ UNCHANGED << state, pageProt, lock, hasBlob, hasPhysical, 
+                                releases, decommitQ, freeList, target, ap, dp >>
 
-P2Start(self) ==
-    /\ pc[self] = "P2Start"
-    /\ cp' = [cp EXCEPT ![self] = 1]
-    /\ pc' = [pc EXCEPT ![self] = "Phase2"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap, dp >>
+P2Start(self) == /\ pc[self] = "P2Start"
+                 /\ cp' = [cp EXCEPT ![self] = 1]
+                 /\ pc' = [pc EXCEPT ![self] = "Phase2"]
+                 /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                 hasBlob, hasPhysical, releases, decommitQ, 
+                                 freeList, target, ap, dp >>
 
-Phase2(self) ==
-    /\ pc[self] = "Phase2"
-    /\ IF cp[self] <= NumPages
-          THEN /\ IF state[cp[self]] \in {"ACTIVE", "ACTIVE_MONITORING"}
-                  /\ coldCount[cp[self]] > ColdThreshold
-                     THEN pc' = [pc EXCEPT ![self] = "P2Lock"]
-                     ELSE pc' = [pc EXCEPT ![self] = "P2Next"]
-          ELSE /\ pc' = [pc EXCEPT ![self] = "P3Start"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+Phase2(self) == /\ pc[self] = "Phase2"
+                /\ IF cp[self] <= NumPages
+                      THEN /\ IF state[cp[self]] \in {"ACTIVE", "ACTIVE_MONITORING"}
+                                 /\ coldCount[cp[self]] > ColdThreshold
+                                 THEN /\ pc' = [pc EXCEPT ![self] = "P2Lock"]
+                                 ELSE /\ pc' = [pc EXCEPT ![self] = "P2Next"]
+                      ELSE /\ pc' = [pc EXCEPT ![self] = "P3Start"]
+                /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                hasBlob, hasPhysical, releases, decommitQ, 
+                                freeList, target, ap, dp, cp >>
 
-P2Next(self) ==
-    /\ pc[self] = "P2Next"
-    /\ cp' = [cp EXCEPT ![self] = cp[self] + 1]
-    /\ pc' = [pc EXCEPT ![self] = "Phase2"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap, dp >>
+P2Next(self) == /\ pc[self] = "P2Next"
+                /\ cp' = [cp EXCEPT ![self] = cp[self] + 1]
+                /\ pc' = [pc EXCEPT ![self] = "Phase2"]
+                /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                hasBlob, hasPhysical, releases, decommitQ, 
+                                freeList, target, ap, dp >>
 
-P2Lock(self) ==
-    /\ pc[self] = "P2Lock"
-    /\ lock[cp[self]] = "free"
-    /\ IF state[cp[self]] \in {"ACTIVE", "ACTIVE_MONITORING"}
-          THEN /\ lock'  = [lock  EXCEPT ![cp[self]] = self]
-               /\ state' = [state EXCEPT ![cp[self]] = "COMPRESSING"]
-               /\ pc' = [pc EXCEPT ![self] = "P2Compress"]
-          ELSE /\ pc' = [pc EXCEPT ![self] = "P2Next"]
-               /\ UNCHANGED << state, lock >>
-    /\ UNCHANGED << pageProt, coldCount, accessed, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+P2Lock(self) == /\ pc[self] = "P2Lock"
+                /\ lock[cp[self]] = "free"
+                /\ IF state[cp[self]] \in {"ACTIVE", "ACTIVE_MONITORING"}
+                      THEN /\ lock' = [lock EXCEPT ![cp[self]] = self]
+                           /\ state' = [state EXCEPT ![cp[self]] = "COMPRESSING"]
+                           /\ pc' = [pc EXCEPT ![self] = "P2Compress"]
+                      ELSE /\ pc' = [pc EXCEPT ![self] = "P2Next"]
+                           /\ UNCHANGED << state, lock >>
+                /\ UNCHANGED << pageProt, coldCount, accessed, hasBlob, 
+                                hasPhysical, releases, decommitQ, freeList, 
+                                target, ap, dp, cp >>
 
-P2Compress(self) ==
-    /\ pc[self] = "P2Compress"
-    /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_READ"]
-    /\ pc' = [pc EXCEPT ![self] = "P2CompressFinish"]
-    /\ UNCHANGED << state, lock, coldCount, accessed, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+P2Compress(self) == /\ pc[self] = "P2Compress"
+                    /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_READ"]
+                    /\ pc' = [pc EXCEPT ![self] = "P2CompressFinish"]
+                    /\ UNCHANGED << state, lock, coldCount, accessed, hasBlob, 
+                                    hasPhysical, releases, decommitQ, freeList, 
+                                    target, ap, dp, cp >>
 
-P2CompressFinish(self) ==
-    /\ pc[self] = "P2CompressFinish"
-    /\ \/ /\ state'       = [state       EXCEPT ![cp[self]] = "COMPRESSED"]
-          /\ pageProt'    = [pageProt    EXCEPT ![cp[self]] = "PROT_NONE"]
-          /\ hasBlob'     = [hasBlob     EXCEPT ![cp[self]] = TRUE]
-          /\ hasPhysical' = [hasPhysical EXCEPT ![cp[self]] = FALSE]
-       \/ /\ state'    = [state    EXCEPT ![cp[self]] = "COMPRESSED_SHADOW"]
-          /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_RW"]
-          /\ hasBlob'  = [hasBlob  EXCEPT ![cp[self]] = TRUE]
-          /\ UNCHANGED hasPhysical
-    /\ lock' = [lock EXCEPT ![cp[self]] = "free"]
-    /\ pc' = [pc EXCEPT ![self] = "P2Next"]
-    /\ UNCHANGED << coldCount, accessed, releases, decommitQ, freeList,
-                    target, ap, dp, cp >>
+P2CompressFinish(self) == /\ pc[self] = "P2CompressFinish"
+                          /\ \/ /\ state' = [state EXCEPT ![cp[self]] = "COMPRESSED"]
+                                /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_NONE"]
+                                /\ hasBlob' = [hasBlob EXCEPT ![cp[self]] = TRUE]
+                                /\ hasPhysical' = [hasPhysical EXCEPT ![cp[self]] = FALSE]
+                             \/ /\ state' = [state EXCEPT ![cp[self]] = "COMPRESSED_SHADOW"]
+                                /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_RW"]
+                                /\ hasBlob' = [hasBlob EXCEPT ![cp[self]] = TRUE]
+                                /\ UNCHANGED hasPhysical
+                          /\ lock' = [lock EXCEPT ![cp[self]] = "free"]
+                          /\ pc' = [pc EXCEPT ![self] = "P2Next"]
+                          /\ UNCHANGED << coldCount, accessed, releases, 
+                                          decommitQ, freeList, target, ap, dp, 
+                                          cp >>
 
-P3Start(self) ==
-    /\ pc[self] = "P3Start"
-    /\ cp' = [cp EXCEPT ![self] = 1]
-    /\ pc' = [pc EXCEPT ![self] = "Phase3"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap, dp >>
+P3Start(self) == /\ pc[self] = "P3Start"
+                 /\ cp' = [cp EXCEPT ![self] = 1]
+                 /\ pc' = [pc EXCEPT ![self] = "Phase3"]
+                 /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                 hasBlob, hasPhysical, releases, decommitQ, 
+                                 freeList, target, ap, dp >>
 
-Phase3(self) ==
-    /\ pc[self] = "Phase3"
-    /\ IF cp[self] <= NumPages
-          THEN /\ IF state[cp[self]] = "ACTIVE"
-                     THEN pc' = [pc EXCEPT ![self] = "P3CAS"]
-                     ELSE pc' = [pc EXCEPT ![self] = "P3Next"]
-          ELSE /\ pc' = [pc EXCEPT ![self] = "PBStart"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+Phase3(self) == /\ pc[self] = "Phase3"
+                /\ IF cp[self] <= NumPages
+                      THEN /\ IF state[cp[self]] = "ACTIVE"
+                                 THEN /\ pc' = [pc EXCEPT ![self] = "P3CAS"]
+                                 ELSE /\ pc' = [pc EXCEPT ![self] = "P3Next"]
+                      ELSE /\ pc' = [pc EXCEPT ![self] = "PBStart"]
+                /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                hasBlob, hasPhysical, releases, decommitQ, 
+                                freeList, target, ap, dp, cp >>
 
-P3Next(self) ==
-    /\ pc[self] = "P3Next"
-    /\ cp' = [cp EXCEPT ![self] = cp[self] + 1]
-    /\ pc' = [pc EXCEPT ![self] = "Phase3"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap, dp >>
+P3Next(self) == /\ pc[self] = "P3Next"
+                /\ cp' = [cp EXCEPT ![self] = cp[self] + 1]
+                /\ pc' = [pc EXCEPT ![self] = "Phase3"]
+                /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                hasBlob, hasPhysical, releases, decommitQ, 
+                                freeList, target, ap, dp >>
 
-P3CAS(self) ==
-    /\ pc[self] = "P3CAS"
-    /\ IF state[cp[self]] = "ACTIVE"
-          THEN /\ state' = [state EXCEPT ![cp[self]] = "ACTIVE_MONITORING"]
-               /\ pc' = [pc EXCEPT ![self] = "P3Prot"]
-          ELSE /\ pc' = [pc EXCEPT ![self] = "P3Next"]
-               /\ UNCHANGED state
-    /\ UNCHANGED << pageProt, lock, coldCount, accessed, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+P3CAS(self) == /\ pc[self] = "P3CAS"
+               /\ IF state[cp[self]] = "ACTIVE"
+                     THEN /\ state' = [state EXCEPT ![cp[self]] = "ACTIVE_MONITORING"]
+                          /\ pc' = [pc EXCEPT ![self] = "P3Prot"]
+                     ELSE /\ pc' = [pc EXCEPT ![self] = "P3Next"]
+                          /\ state' = state
+               /\ UNCHANGED << pageProt, lock, coldCount, accessed, hasBlob, 
+                               hasPhysical, releases, decommitQ, freeList, 
+                               target, ap, dp, cp >>
 
-P3Prot(self) ==
-    /\ pc[self] = "P3Prot"
-    /\ IF state[cp[self]] = "ACTIVE_MONITORING"
-          THEN /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_READ"]
-          ELSE /\ UNCHANGED pageProt
-    /\ pc' = [pc EXCEPT ![self] = "P3Next"]
-    /\ UNCHANGED << state, lock, coldCount, accessed, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+P3Prot(self) == /\ pc[self] = "P3Prot"
+                /\ IF state[cp[self]] = "ACTIVE_MONITORING"
+                      THEN /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_READ"]
+                      ELSE /\ TRUE
+                           /\ UNCHANGED pageProt
+                /\ pc' = [pc EXCEPT ![self] = "P3Next"]
+                /\ UNCHANGED << state, lock, coldCount, accessed, hasBlob, 
+                                hasPhysical, releases, decommitQ, freeList, 
+                                target, ap, dp, cp >>
 
-PBStart(self) ==
-    /\ pc[self] = "PBStart"
-    /\ cp' = [cp EXCEPT ![self] = 1]
-    /\ pc' = [pc EXCEPT ![self] = "PhaseB"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap, dp >>
+PBStart(self) == /\ pc[self] = "PBStart"
+                 /\ cp' = [cp EXCEPT ![self] = 1]
+                 /\ pc' = [pc EXCEPT ![self] = "PhaseB"]
+                 /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                 hasBlob, hasPhysical, releases, decommitQ, 
+                                 freeList, target, ap, dp >>
 
-PhaseB(self) ==
-    /\ pc[self] = "PhaseB"
-    /\ IF cp[self] <= NumPages
-          THEN /\ IF state[cp[self]] = "COMPRESSED_SHADOW"
-                     THEN pc' = [pc EXCEPT ![self] = "PBLock"]
-                     ELSE pc' = [pc EXCEPT ![self] = "PBNext"]
-          ELSE /\ pc' = [pc EXCEPT ![self] = "Tick"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+PhaseB(self) == /\ pc[self] = "PhaseB"
+                /\ IF cp[self] <= NumPages
+                      THEN /\ IF state[cp[self]] = "COMPRESSED_SHADOW"
+                                 THEN /\ pc' = [pc EXCEPT ![self] = "PBLock"]
+                                 ELSE /\ pc' = [pc EXCEPT ![self] = "PBNext"]
+                      ELSE /\ pc' = [pc EXCEPT ![self] = "Tick"]
+                /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                hasBlob, hasPhysical, releases, decommitQ, 
+                                freeList, target, ap, dp, cp >>
 
-PBNext(self) ==
-    /\ pc[self] = "PBNext"
-    /\ cp' = [cp EXCEPT ![self] = cp[self] + 1]
-    /\ pc' = [pc EXCEPT ![self] = "PhaseB"]
-    /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, hasBlob,
-                    hasPhysical, releases, decommitQ, freeList, target, ap, dp >>
+PBNext(self) == /\ pc[self] = "PBNext"
+                /\ cp' = [cp EXCEPT ![self] = cp[self] + 1]
+                /\ pc' = [pc EXCEPT ![self] = "PhaseB"]
+                /\ UNCHANGED << state, pageProt, lock, coldCount, accessed, 
+                                hasBlob, hasPhysical, releases, decommitQ, 
+                                freeList, target, ap, dp >>
 
-PBLock(self) ==
-    /\ pc[self] = "PBLock"
-    /\ lock[cp[self]] = "free"
-    /\ IF state[cp[self]] = "COMPRESSED_SHADOW"
-          THEN /\ lock' = [lock EXCEPT ![cp[self]] = self]
-               /\ pc' = [pc EXCEPT ![self] = "PBProtRead"]
-          ELSE /\ pc' = [pc EXCEPT ![self] = "PBNext"]
-               /\ UNCHANGED lock
-    /\ UNCHANGED << state, pageProt, coldCount, accessed, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+PBLock(self) == /\ pc[self] = "PBLock"
+                /\ lock[cp[self]] = "free"
+                /\ IF state[cp[self]] = "COMPRESSED_SHADOW"
+                      THEN /\ lock' = [lock EXCEPT ![cp[self]] = self]
+                           /\ pc' = [pc EXCEPT ![self] = "PBProtRead"]
+                      ELSE /\ pc' = [pc EXCEPT ![self] = "PBNext"]
+                           /\ lock' = lock
+                /\ UNCHANGED << state, pageProt, coldCount, accessed, hasBlob, 
+                                hasPhysical, releases, decommitQ, freeList, 
+                                target, ap, dp, cp >>
 
-PBProtRead(self) ==
-    /\ pc[self] = "PBProtRead"
-    /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_READ"]
-    /\ pc' = [pc EXCEPT ![self] = "PBVerify"]
-    /\ UNCHANGED << state, lock, coldCount, accessed, hasBlob, hasPhysical,
-                    releases, decommitQ, freeList, target, ap, dp, cp >>
+PBProtRead(self) == /\ pc[self] = "PBProtRead"
+                    /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_READ"]
+                    /\ pc' = [pc EXCEPT ![self] = "PBVerify"]
+                    /\ UNCHANGED << state, lock, coldCount, accessed, hasBlob, 
+                                    hasPhysical, releases, decommitQ, freeList, 
+                                    target, ap, dp, cp >>
 
-PBVerify(self) ==
-    /\ pc[self] = "PBVerify"
-    /\ IF state[cp[self]] /= "COMPRESSED_SHADOW" \/ accessed[cp[self]]
-          THEN /\ IF state[cp[self]] = "COMPRESSED_SHADOW"
-                     THEN /\ state'     = [state     EXCEPT ![cp[self]] = "ACTIVE"]
-                          /\ pageProt'  = [pageProt  EXCEPT ![cp[self]] = "PROT_RW"]
-                          /\ hasBlob'   = [hasBlob   EXCEPT ![cp[self]] = FALSE]
-                          /\ coldCount' = [coldCount EXCEPT ![cp[self]] = 0]
-                          /\ accessed'  = [accessed  EXCEPT ![cp[self]] = FALSE]
-                     ELSE /\ UNCHANGED << state, pageProt, coldCount, accessed,
-                                          hasBlob >>
-               /\ lock' = [lock EXCEPT ![cp[self]] = "free"]
-               /\ pc' = [pc EXCEPT ![self] = "PBNext"]
-          ELSE /\ pc' = [pc EXCEPT ![self] = "PBReclaim"]
-               /\ UNCHANGED << state, pageProt, lock, coldCount, accessed,
-                               hasBlob >>
-    /\ UNCHANGED << hasPhysical, releases, decommitQ, freeList, target, ap,
-                    dp, cp >>
+PBVerify(self) == /\ pc[self] = "PBVerify"
+                  /\ IF state[cp[self]] /= "COMPRESSED_SHADOW" \/ accessed[cp[self]]
+                        THEN /\ IF state[cp[self]] = "COMPRESSED_SHADOW"
+                                   THEN /\ state' = [state EXCEPT ![cp[self]] = "ACTIVE"]
+                                        /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_RW"]
+                                        /\ hasBlob' = [hasBlob EXCEPT ![cp[self]] = FALSE]
+                                        /\ coldCount' = [coldCount EXCEPT ![cp[self]] = 0]
+                                        /\ accessed' = [accessed EXCEPT ![cp[self]] = FALSE]
+                                   ELSE /\ TRUE
+                                        /\ UNCHANGED << state, pageProt, 
+                                                        coldCount, accessed, 
+                                                        hasBlob >>
+                             /\ lock' = [lock EXCEPT ![cp[self]] = "free"]
+                             /\ pc' = [pc EXCEPT ![self] = "PBNext"]
+                        ELSE /\ pc' = [pc EXCEPT ![self] = "PBReclaim"]
+                             /\ UNCHANGED << state, pageProt, lock, coldCount, 
+                                             accessed, hasBlob >>
+                  /\ UNCHANGED << hasPhysical, releases, decommitQ, freeList, 
+                                  target, ap, dp, cp >>
 
-PBReclaim(self) ==
-    /\ pc[self] = "PBReclaim"
-    /\ state'       = [state       EXCEPT ![cp[self]] = "COMPRESSED"]
-    /\ pageProt'    = [pageProt    EXCEPT ![cp[self]] = "PROT_NONE"]
-    /\ hasPhysical' = [hasPhysical EXCEPT ![cp[self]] = FALSE]
-    /\ lock'        = [lock        EXCEPT ![cp[self]] = "free"]
-    /\ pc' = [pc EXCEPT ![self] = "PBNext"]
-    /\ UNCHANGED << coldCount, accessed, hasBlob, releases, decommitQ,
-                    freeList, target, ap, dp, cp >>
+PBReclaim(self) == /\ pc[self] = "PBReclaim"
+                   /\ state' = [state EXCEPT ![cp[self]] = "COMPRESSED"]
+                   /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_NONE"]
+                   /\ hasPhysical' = [hasPhysical EXCEPT ![cp[self]] = FALSE]
+                   /\ lock' = [lock EXCEPT ![cp[self]] = "free"]
+                   /\ pc' = [pc EXCEPT ![self] = "PBNext"]
+                   /\ UNCHANGED << coldCount, accessed, hasBlob, releases, 
+                                   decommitQ, freeList, target, ap, dp, cp >>
 
-Compressor(self) ==
-    Tick(self) \/ P1Start(self) \/ Phase1(self)
-    \/ P2Start(self) \/ Phase2(self) \/ P2Next(self)
-    \/ P2Lock(self) \/ P2Compress(self) \/ P2CompressFinish(self)
-    \/ P3Start(self) \/ Phase3(self) \/ P3Next(self) \/ P3CAS(self) \/ P3Prot(self)
-    \/ PBStart(self) \/ PhaseB(self) \/ PBNext(self) \/ PBLock(self)
-    \/ PBProtRead(self) \/ PBVerify(self) \/ PBReclaim(self)
+Compressor(self) == Tick(self) \/ P1Start(self) \/ Phase1(self)
+                       \/ P2Start(self) \/ Phase2(self) \/ P2Next(self)
+                       \/ P2Lock(self) \/ P2Compress(self)
+                       \/ P2CompressFinish(self) \/ P3Start(self)
+                       \/ Phase3(self) \/ P3Next(self) \/ P3CAS(self)
+                       \/ P3Prot(self) \/ PBStart(self) \/ PhaseB(self)
+                       \/ PBNext(self) \/ PBLock(self) \/ PBProtRead(self)
+                       \/ PBVerify(self) \/ PBReclaim(self)
 
-Next == (\E self \in {"t1", "t2"}: AppThread(self))
-        \/ Allocator
-        \/ Decommit
-        \/ (\E self \in {"comp1", "comp2"}: Compressor(self))
+Next == Allocator \/ Decommit
+           \/ (\E self \in {"t1", "t2"}: AppThread(self))
+           \/ (\E self \in {"comp1", "comp2"}: Compressor(self))
 
 Spec == /\ Init /\ [][Next]_vars
         /\ \A self \in {"t1", "t2"} : WF_vars(AppThread(self))

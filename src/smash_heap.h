@@ -872,7 +872,7 @@ public:
             char dbg[128];
             int n = smash::safe_snprintf(dbg, sizeof(dbg),
                 "[smash debug] large_alloc_.allocate(%zu) returned NULL\n", size);
-            if (n > 0) (void)::write(STDERR_FILENO, dbg, n);
+            if (n > 0) (void)!::write(STDERR_FILENO, dbg, n);
         }
         if (ptr && isEagerZeroMode()) __builtin_memset(ptr, 0, size);
         return ptr;

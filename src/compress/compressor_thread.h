@@ -2977,7 +2977,7 @@ private:
             FILE* f = fopen("/proc/sys/vm/max_map_count", "r");
             if (!f) return 65530L;
             long n = 65530;
-            (void)fscanf(f, "%ld", &n);
+            if (fscanf(f, "%ld", &n) != 1) n = 65530;
             fclose(f);
             return n;
         }();

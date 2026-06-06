@@ -197,7 +197,19 @@ inline uint32_t deferMadviseTicks() {
             int n = std::atoi(v);
             if (n > 0 && n < 100000) return static_cast<uint32_t>(n);
         }
-        return 50;  // ~500ms at 10ms tick rate
+        // REGRESSION FIX (2026-06-06): the old default of 50 was documented as
+        // "~500ms at 10ms tick rate" — but the compressor tick interval is
+        // kCompressIntervalMs = 1000ms, so 50 ticks = 50 SECONDS. That meant a
+        // just-compressed page's physical backing was not dropped for 50s.
+        // Any workload whose cooling window is shorter than 50s therefore saw
+        // ZERO RSS reduction (pages COMPRESSED but still resident), making
+        // smash look strictly worse than the baseline allocators. Bisected to
+        // 823515f, which introduced the deferred-madvise sweep with this
+        // mismatched constant. The deferral exists to close a TLB-lag
+        // corruption window (a few ticks is ample); 2 ticks (~2s) keeps that
+        // safety margin while letting reclaim actually happen within a normal
+        // cooling phase. Override with SMASH_DEFER_MADVISE_TICKS.
+        return 2;  // ~2s at the 1s compressor tick rate
     }();
     return ticks;
 }

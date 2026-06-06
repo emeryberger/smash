@@ -23,8 +23,14 @@
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
 namespace smash {
-// Forward declaration - defined in smash_heap.cpp
-extern std::atomic<bool> g_smash_skip_external_tracking;
+// Set true when a loaded profile says external pages were hot, so the mmap/
+// mach_vm interposers skip external-page tracking. Defined here as a C++17
+// inline variable (single definition across all TUs) so it links in both the
+// main libsmash build (smash_heap.cpp) AND the compress-only build
+// (co_interpose_*.cpp), which compiles compressor_thread.h but not
+// smash_heap.cpp — the latter previously left this symbol undefined on
+// macOS's strict linker (Linux happened to tolerate it).
+inline std::atomic<bool> g_smash_skip_external_tracking{false};
 }
 
 #include <csignal>

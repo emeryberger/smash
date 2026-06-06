@@ -47,7 +47,8 @@ extern PageStateTable* g_smash_page_states_for_external;
 // compressor when loading a profile that marks external pages as hot.
 // When true, mmap interposers skip the per-page tracking loop entirely,
 // avoiding the O(pages) overhead for each TBB arena allocation.
-extern std::atomic<bool> g_smash_skip_external_tracking;
+// (Defined as an inline variable in compress/compressor_thread.h, included
+// above — no separate declaration needed here.)
 
 // TLS variables on the malloc fast path are declared extern at namespace
 // scope with tls_model("initial-exec"), and defined in smash_heap.cpp.

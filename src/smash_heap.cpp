@@ -154,8 +154,9 @@ smash::VmRegion* smash::g_smash_vm_region = nullptr;
 // gate every state mutation on this being non-null.
 smash::PageStateTable* smash::g_smash_page_states_for_external = nullptr;
 
-// Profile-driven skip flag for external page tracking.
-std::atomic<bool> smash::g_smash_skip_external_tracking{false};
+// g_smash_skip_external_tracking is now an inline variable defined in
+// compress/compressor_thread.h (single definition across libsmash and the
+// compress-only build); no separate definition needed here.
 
 // TLS for the malloc fast path.  initial-exec model: libsmash is always
 // LD_PRELOAD'd, so its TLS block is part of the program's startup TLS

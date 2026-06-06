@@ -141,3 +141,33 @@ java -jar tla2tools.jar -config SmashRestoreRace_procmem_fixed.cfg SmashRestoreR
 
 The corresponding fix lives in `src/compress/compressor_thread.h`
 (`CompressorThread::restorePageContents()`).
+
+---
+
+# Model status / code sync (verified 2026-06-06)
+
+Re-checked all hand-written models against the current code after the
+session's fixes (TOCTOU `restorePageContents`, P2_CHUNK default-on, the
+deferred-madvise TTL fix). Results with the bundled TLC (`tla2tools.jar` +
+`jdk-21/`):
+
+| Model | Config | Result | Corresponds to |
+|-------|--------|--------|----------------|
+| `SmashRestoreRace` | `_atomic` | PASS (no error) | old models' atomic restore (why they missed the bug) |
+| `SmashRestoreRace` | `_split_buggy` | **VIOLATED** NoStaleRead | the pre-fix mprotect-then-memcpy restore |
+| `SmashRestoreRace` | `_procmem_fixed` | PASS (no error) | the shipped `restorePageContents` fix |
+| `SmashSnapshotRace4` | `_fixAv` | PASS | compress-side PROT_NONE→madvise ordering (FixAv) |
+| `SmashSnapshotRace4` | `_buggy` | **VIOLATED** SafetyInv | pre-fix compress-side store-loss / reader-zero |
+| `SmashCore` | `SmashCore.cfg` (BuggyMode=FALSE) | runs; no violation over tens of millions of states | allocator↔compressor PROT/state desync |
+
+Notes:
+- `SmashCore.tla` (the broad allocator+compressor PlusCal model) was left
+  **untranslatable** by commit 823515f (double `lock[target]` assignment under
+  one label). Fixed and re-translated; it model-checks again. Its state space
+  is large; exhaustive runs are best done with bounded constants.
+- The two race-specific models (`SmashRestoreRace`, `SmashSnapshotRace4`) are
+  the ones that map 1:1 to the shipped data-race fixes and are confirmed in
+  sync — each passes in the fixed configuration and produces a counterexample
+  in the buggy configuration.
+- TLC error-trace artifacts (`*_TTrace_*.tla/.bin`) are generated on a
+  violation and are not source; they can be deleted.

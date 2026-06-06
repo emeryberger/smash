@@ -36,7 +36,6 @@ namespace {
 
 constexpr size_t kChunkBytes = 64 * 1024;  // 64 KiB → multi-page on any OS
 constexpr size_t kNumChunks  = 512;        // 32 MiB total
-constexpr size_t kSleepSec   = 5;          // ≥ 2 × COLD_TIMEOUT_SEC=1
 
 void fillChunk(unsigned char* p, size_t bytes, size_t chunk_index) {
     // Highly compressible: a single byte repeated. The whole region
@@ -145,18 +144,34 @@ int main() {
         if (p) std::free(p);
     }
 
-    // 2. Wait for the compressor.
-    fprintf(stderr, "malloc_compression_test: sleeping %zus for compressor\n",
-            kSleepSec);
-    sleep(kSleepSec);
+    // 2. Wait for the compressor, polling rather than sleeping a single
+    //    fixed window. A one-shot sleep+check raced the compressor on
+    //    slow/contended CI runners (macos-latest intermittently observed
+    //    compressed=0 after 5s — committed=61 monitor=61, i.e. pages were
+    //    being monitored but had not yet ticked through to COMPRESSED).
+    //    Kick SIGUSR2 once per second and stop as soon as compression is
+    //    observed; the happy path returns in ~2-3s, only a genuine failure
+    //    runs the full bound. Stays well inside the test's 60s timeout.
+    constexpr int kMaxWaitSec = 30;
+    long compressed = -1, active = -1, committed = -1;
+    std::string stats;
+    for (int waited = 0; waited < kMaxWaitSec; ++waited) {
+        sleep(1);
+        stats = captureSigusr2Stats();
+        compressed = parseCompressed(stats);
+        active = parseField(stats, "active=");
+        committed = parseField(stats, "committed=");
+        if (compressed > 0) {
+            fprintf(stderr,
+                    "malloc_compression_test: compressed after %ds\n",
+                    waited + 1);
+            break;
+        }
+    }
 
     // 3. Stats: assert compressed > 0.
-    std::string stats = captureSigusr2Stats();
     fprintf(stderr, "malloc_compression_test: captured stats:\n  %s",
             stats.empty() ? "<empty>\n" : stats.c_str());
-    long compressed = parseCompressed(stats);
-    long active = parseField(stats, "active=");
-    long committed = parseField(stats, "committed=");
     if (compressed < 0 || active < 0 || committed < 0) {
         fprintf(stderr,
                 "FAIL: SIGUSR2 stats missing or unparsable. "
@@ -166,11 +181,11 @@ int main() {
     }
     if (compressed == 0) {
         fprintf(stderr,
-                "FAIL: compressor never compressed any page "
+                "FAIL: compressor never compressed any page within %ds "
                 "(committed=%ld active=%ld). Either smash didn't start "
                 "the compressor, or COLD_TIMEOUT_SEC was too high for "
-                "the test sleep duration.\n",
-                committed, active);
+                "the test poll duration.\n",
+                kMaxWaitSec, committed, active);
         return 1;
     }
     fprintf(stderr,

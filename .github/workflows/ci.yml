@@ -81,4 +81,7 @@ jobs:
       # bench/run_quick_ci.py for the parsing + thresholds.
       - name: Run quick benchmarks
         working-directory: smash
+        env:
+          SMASH_COUNT_FREE: "1"   # BISECT: route all free() through freeSlow (no fast path / TLS cache)
+          SMASH_DEFER_FREE: "0"   # BISECT: disable lock-free deferred free
         run: python3 bench/run_quick_ci.py --build-dir build

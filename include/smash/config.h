@@ -392,6 +392,18 @@ inline constexpr int kBucketRcBiasThreshold_x256 = 256;
 #else
 inline constexpr int kBucketRcBiasThreshold_x256 = SMASH_RECOMPRESS_BUCKET_BIAS_X256;
 #endif
+
+// Soft-dirty ROI (SMASH_SOFTDIRTY_ROI): number of consecutive WRITE-clean ticks
+// after which a page earns FULL relief from its bucket's re-dirty prior — i.e.
+// its own demonstrated write-stability fully overrides the bucket average. At
+// the 1s tick this is "write-untouched for this many seconds ⇒ trust the page,
+// not the bucket." Tunable via SMASH_WRITE_CLEAN_FULL_RELIEF.
+#ifndef SMASH_WRITE_CLEAN_FULL_RELIEF
+inline constexpr uint32_t kWriteCleanFullRelief = 16;
+#else
+inline constexpr uint32_t kWriteCleanFullRelief = SMASH_WRITE_CLEAN_FULL_RELIEF;
+#endif
+
 // Compile-time default for dictionary training samples per size class.
 // Runtime override is SMASH_DICT_TRAIN_SAMPLES (see getDictTrainSamples()
 // below), which is the supported way to flip dict training on/off without

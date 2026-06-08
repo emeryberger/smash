@@ -24,6 +24,17 @@ enum class PageState : uint8_t {
     COMPRESSED_SHADOW = 5,  // Compressed copy stored; page still PROT_RW (deferred reclaim)
 };
 
+// Set the first time any page is driven to COMPRESSED. The span bitmap walk
+// (Span::pickActiveBit / slotPageCompressed) reads a per-slot page-state byte
+// to avoid handing out chunks on COMPRESSED pages — but until the compressor
+// has actually compressed something (and always, when compression is disabled
+// via SMASH_NO_COMPRESSOR) no page can be COMPRESSED, so that per-slot atomic
+// load is pure overhead on the allocation hot path. This flag lets the walk
+// short-circuit it: false → no page is COMPRESSED → skip the check entirely.
+// One monotonic 0→1 transition, only ever set on the (comparatively rare)
+// compression path, only ever read (relaxed) on the alloc path.
+inline std::atomic<bool> g_any_page_compressed{false};
+
 class PageStateTable {
     std::atomic<uint8_t>* states_;
     size_t num_pages_;
@@ -40,6 +51,22 @@ public:
 
     void set(size_t page_idx, PageState state) {
         states_[page_idx].store(static_cast<uint8_t>(state), std::memory_order_release);
+        // Latch the global "some page is compressed" flag so the alloc-path
+        // bitmap walk can skip its per-slot COMPRESSED check until this fires.
+        if (state == PageState::COMPRESSED) [[unlikely]]
+            g_any_page_compressed.store(true, std::memory_order_relaxed);
+    }
+
+    // Set a contiguous run of pages to the same state in one pass. Used by the
+    // span-create path (every page of a fresh span → ACTIVE) so the per-page
+    // store loop isn't re-entered through set()'s COMPRESSED-latch branch each
+    // iteration. Semantically identical to looping set().
+    void setRange(size_t first_page_idx, size_t num_pages, PageState state) {
+        const auto v = static_cast<uint8_t>(state);
+        for (size_t i = 0; i < num_pages; ++i)
+            states_[first_page_idx + i].store(v, std::memory_order_release);
+        if (state == PageState::COMPRESSED) [[unlikely]]
+            g_any_page_compressed.store(true, std::memory_order_relaxed);
     }
 
     // CAS transition. Returns true on success.

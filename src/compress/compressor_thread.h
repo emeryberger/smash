@@ -293,6 +293,15 @@ class CompressorThread {
     // Saturating uint8_t — the bucket EMA captures values above ~6 anyway.
     uint8_t* recompress_count_ = nullptr;
 
+    // ── Soft-dirty ROI per-page state (SMASH_SOFTDIRTY_ROI) ─────────────────
+    // write_clean_streak_: consecutive ticks a page's soft-dirty (write) bit
+    // stayed UNSET. Distinct from cold_count_ (which also resets on reads under
+    // the PROT_READ fallback); this is write-specific evidence the page's data
+    // is stable, so its compressed blob would survive. Drives the per-page
+    // "streak relief" that lets a long-write-clean page override a thrashy
+    // bucket's re-dirty prior. Saturating uint8_t.
+    uint8_t* write_clean_streak_ = nullptr;
+
     // Deferred-reclaim mode: tick at which Phase A completed for each page.
     // Non-zero only for pages in COMPRESSED_SHADOW state.
     uint32_t* shadow_tick_ = nullptr;
@@ -334,6 +343,23 @@ class CompressorThread {
     // soft-dirty wipe at tick end (kernel does it lazily by zapping PTEs).
     [[maybe_unused]] int clear_refs_fd_ = -1;
     [[maybe_unused]] int pagemap_fd_ = -1;
+
+    // Idle-page read tracking (Linux, opt-in, privileged). The only fault-free
+    // way to learn whether a page was READ since last tick is the PTE Accessed
+    // (young) bit, exposed by the kernel's idle-page-tracking sysfs interface
+    // (/sys/kernel/mm/page_idle/bitmap). Today read detection costs an
+    // mprotect(PROT_NONE) to arm + a SIGSEGV per read (escalateToDeepMonitoring).
+    // The idle bitmap removes both: mark a candidate page "idle" this tick, and
+    // next tick test the bit — still idle ⇒ not read ⇒ read-cold (compressible);
+    // cleared ⇒ was read ⇒ reset cold_count, no fault paid.
+    //
+    // HARD CONSTRAINT: the bitmap is PFN-indexed and root-only; /proc/self/pagemap
+    // redacts the PFN to 0 for unprivileged processes. So this works ONLY when
+    // smash runs with CAP_SYS_ADMIN on a CONFIG_IDLE_PAGE_TRACKING=y kernel.
+    // ensureIdleReadFds() probes both conditions; on failure idle_read_ok_ stays
+    // false and we fall back to the existing PROT_NONE read-arm, byte-identical.
+    [[maybe_unused]] int page_idle_fd_ = -1;     // /sys/kernel/mm/page_idle/bitmap
+    [[maybe_unused]] int idle_read_ok_ = -1;     // -1 unprobed, 0 unavailable, 1 active
 
     // /proc/self/mem fd (Linux). Used to populate a page's physical backing
     // *while it is still PROT_NONE*, before flipping it readable — closing the
@@ -429,6 +455,43 @@ class CompressorThread {
         // to cycle deep-tier pulls without synchronizing the forcing across
         // buckets (which would create a tick-aligned CPU spike).
         uint32_t selections = 0;
+
+        // ── Soft-dirty ROI: per-bucket re-dirty rate (×256 fixed point) ──────
+        // EMA of "a page compressed in this bucket was WRITTEN again shortly
+        // after" (soft-dirty set on a recently-decompressed page). High value ⇒
+        // compressing this bucket's pages tends to be wasted (blob invalidated
+        // by a write), so ROI benefit should be discounted. Observations come
+        // from recordRedirty(true on a write-redirty event, false on a clean
+        // survival). α = 1/8 (slower than cost EMA: re-dirty is the rarer, more
+        // load-bearing signal and we want it stable). count gates trust.
+        uint16_t redirty_ema_x256 = 0;
+        uint8_t  redirty_count = 0;
+
+        void recordRedirty(bool rewritten) {
+            uint16_t sample = rewritten ? 256 : 0;
+            if (redirty_count == 0) {
+                redirty_ema_x256 = sample;
+            } else {
+                redirty_ema_x256 = static_cast<uint16_t>(
+                    redirty_ema_x256 +
+                    (static_cast<int32_t>(sample) - static_cast<int32_t>(redirty_ema_x256)) / 8);
+            }
+            if (redirty_count < 64) redirty_count++;
+        }
+
+        // Survival discount (×256) for computeROI: (256 - P_redirty). Returns
+        // 256 (no discount) until enough samples accumulate, so a cold bucket
+        // isn't penalized on noise. `streak_relief` (0..256) nudges the discount
+        // back toward 1.0 for an individual page with a long write-clean streak
+        // (per-page evidence overriding the bucket prior — the "both" design).
+        uint32_t redirtyDiscountX256(uint32_t streak_relief_x256) const {
+            if (redirty_count < 8) return 256;          // prior: trust nothing yet
+            uint32_t p = redirty_ema_x256;              // P_redirty ×256
+            if (streak_relief_x256 > 0) {               // relieve by per-page streak
+                p = (p > streak_relief_x256) ? (p - streak_relief_x256) : 0;
+            }
+            return (p >= 256) ? 0 : (256 - p);          // survival = 1 - P_redirty
+        }
 
         void record(size_t comp_size, size_t orig_size) {
             uint8_t r = 0;
@@ -814,6 +877,10 @@ public:
         if (clear_refs_fd_ >= 0) { close(clear_refs_fd_); clear_refs_fd_ = -1; }
         if (pagemap_fd_ >= 0)    { close(pagemap_fd_);    pagemap_fd_ = -1; }
         if (self_mem_fd_ >= 0)   { close(self_mem_fd_);   self_mem_fd_ = -1; }
+        // page_idle bitmap fd is process-global (not /proc/self), but re-probe
+        // in the child since PFNs and privilege may differ; reset the cache.
+        if (page_idle_fd_ >= 0)  { close(page_idle_fd_);  page_idle_fd_ = -1; }
+        idle_read_ok_ = -1;
 #endif
     }
 private:
@@ -855,6 +922,11 @@ private:
 
     // ── Helper methods ────────────────────────────────────────────────────
 
+    // Soft-dirty ROI gate active? (env-driven, via ROIConfig). Cached read.
+    static bool cfgSoftdirtyRoi() {
+        return ROIConfig::instance().softdirty_roi;
+    }
+
     uint8_t lookupSizeClass(size_t page_idx) {
         if (!page_map_) return 0;
         void* addr = vm_->pageAddress(page_idx);
@@ -892,6 +964,20 @@ private:
     static inline size_t statsIndex(uint8_t arena_id, uint8_t sc) {
         return static_cast<size_t>(arena_id) * kTotalBucketsPerArena +
                static_cast<size_t>(sc);
+    }
+
+    // Soft-dirty ROI: fold one re-dirty observation for `page_idx` into its
+    // (arena,bucket) EMA. `rewritten` = a write hit the page after we
+    // decompressed it (blob would have been invalidated) vs a read-only touch
+    // (blob would have survived). Routed to worker 0's stats — the canonical
+    // sink, same convention as decompress_count attribution.
+    void recordRedirtyForPage(size_t page_idx, bool rewritten) {
+        uint8_t arena_id, sc;
+        if (!lookupSpanInfo(page_idx, arena_id, sc)) return;
+        if (sc >= kTotalBucketsPerArena) return;
+        size_t bidx = statsIndex(arena_id, sc);
+        if (bidx < kBucketTableLen)
+            workers_[0].sc_stats[bidx].recordRedirty(rewritten);
     }
 
     bool sameSpan(size_t page_a, size_t page_b) {
@@ -1009,10 +1095,36 @@ private:
 
     // Phase 1: Process access bits and update cold counts
     void phase1Range(size_t start, size_t end) {
+        const bool sd_roi = write_clean_streak_ != nullptr;  // gate on
         forEachLivePage(start, end, [&](size_t i) {
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
-                if (accessed_[i].load(std::memory_order_relaxed)) {
+                // Raw WRITE signal (soft-dirty) BEFORE the idle-read augmentation
+                // below folds reads in. The soft-dirty ROI machinery needs the
+                // write-only bit to track data stability independent of reads.
+                const bool written = accessed_[i].load(std::memory_order_relaxed);
+
+                if (sd_roi) {
+                    // Per-page write-clean streak: consecutive ticks unwritten.
+                    // (Re-dirty classification happens at fault time via the
+                    // hardware write-bit, not here — see the decompress path.)
+                    if (written) write_clean_streak_[i] = 0;
+                    else if (write_clean_streak_[i] < 255) write_clean_streak_[i]++;
+                }
+
+                bool accessed = written;
+#ifdef __linux__
+                // Read detection via idle-page tracking: a page armed idle (in
+                // escalateToDeepMonitoring) whose idle bit was CLEARED has been
+                // read since — count that as an access, fault-free. soft-dirty
+                // (accessed_) only covers writes; this adds the read signal.
+                if (!accessed && idle_read_ok_ == 1 &&
+                    st == PageState::ACTIVE_MONITORING) {
+                    uint64_t pfn = pfnForPage(i);
+                    if (pfn && !isPageIdle(pfn)) accessed = true;  // read since armed
+                }
+#endif
+                if (accessed) {
                     cold_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
                 } else {
@@ -1421,6 +1533,19 @@ private:
     // guard and bails, the SIGSEGV chains to SIG_DFL, and the process
     // dies. So acquire the lock and re-verify state before mprotecting.
     void escalateToDeepMonitoring(size_t page_idx) {
+#ifdef __linux__
+        // Fault-free read detection: if idle-page tracking is usable, mark the
+        // page idle instead of arming PROT_NONE. The next READ clears the idle
+        // bit in the PTE (no fault); phase2's read-cold check tests it. This
+        // avoids both the mprotect arm here and the per-read SIGSEGV. Only taken
+        // when the privileged probe passed — otherwise falls through to the
+        // legacy PROT_NONE path below, byte-identical to before.
+        if (idle_read_ok_ == 1) {
+            uint64_t pfn = pfnForPage(page_idx);
+            if (pfn) { markPageIdle(pfn); return; }
+            // PFN vanished (page swapped/migrated) → fall through to PROT_NONE.
+        }
+#endif
         locks_->lock(page_idx);
         if (states_->get(page_idx) == PageState::ACTIVE_MONITORING) {
             void* page_addr = vm_->pageAddress(page_idx);
@@ -1600,8 +1725,32 @@ private:
         uint16_t stats_sum = (have_span && sc < kTotalBucketsPerArena)
             ? worker.sc_stats[stats_idx].sum : 0;
 
+        // Soft-dirty ROI: discount the compression benefit by the estimated
+        // probability the blob survives un-rewritten. The bucket's learned
+        // re-dirty EMA is the prior; a long per-page WRITE-clean streak relieves
+        // it (this specific page has proven write-stable even if its bucket is
+        // churny on average — the "both" per-page-evidence + per-bucket-prior
+        // design). discount==256 (no effect) when the gate is off or the bucket
+        // lacks data, so behavior is identical to before in those cases.
+        uint32_t redirty_discount_x256 = 256;
+        if (cfgSoftdirtyRoi() && have_span && sc < kTotalBucketsPerArena) {
+            uint32_t streak_relief = 0;
+            if (write_clean_streak_) {
+                // Map streak (0..255 ticks) → relief (0..256). A page write-clean
+                // for >= kWriteCleanFullRelief ticks gets full relief (discount
+                // → 1.0): its own evidence dominates the bucket prior.
+                uint8_t s = write_clean_streak_[page_idx];
+                streak_relief = (s >= kWriteCleanFullRelief)
+                    ? 256u
+                    : (static_cast<uint32_t>(s) * 256u / kWriteCleanFullRelief);
+            }
+            redirty_discount_x256 =
+                worker.sc_stats[stats_idx].redirtyDiscountX256(streak_relief);
+        }
+
         if (!CompressionROI::shouldCompress(cold_count_[page_idx],
-                                             stats_count, stats_sum)) {
+                                             stats_count, stats_sum,
+                                             redirty_discount_x256)) {
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             return false;
@@ -2571,6 +2720,98 @@ private:
 #endif
     }
 
+    // Probe for usable idle-page read tracking. Requires (1) the sysfs bitmap
+    // openable O_RDWR (kernel built with CONFIG_IDLE_PAGE_TRACKING + root), and
+    // (2) /proc/self/pagemap exposing a real PFN (non-zero) for a resident page
+    // — redacted to 0 without CAP_SYS_ADMIN. Cached: idle_read_ok_ in {0,1}.
+    // SMASH_IDLE_READ_TRACK: unset/AUTO ⇒ use iff probe passes; 0 ⇒ force off;
+    // 1 ⇒ force on (still requires probe; warns to stderr if it can't).
+    bool ensureIdleReadFds() {
+#ifdef __linux__
+        if (idle_read_ok_ >= 0) return idle_read_ok_ == 1;
+        idle_read_ok_ = 0;  // assume unavailable until proven otherwise
+
+        static const int mode = []{
+            const char* v = std::getenv("SMASH_IDLE_READ_TRACK");
+            if (!v) return 0;                  // AUTO
+            if (v[0] == '0') return -1;        // force off
+            return 1;                          // force on
+        }();
+        if (mode == -1) return false;
+        if (!ensureSoftDirtyFds()) return false;  // need pagemap for PFNs
+
+        // (2) Can we read a real PFN? Probe our own region's first committed page.
+        if (vm_) {
+            void* pa = vm_->pageAddress(0);
+            if (pa) {
+                uint64_t off = (reinterpret_cast<uintptr_t>(pa) / kPageSize) * sizeof(uint64_t);
+                uint64_t e = 0;
+                if (pread(pagemap_fd_, &e, sizeof(e), off) == (ssize_t)sizeof(e)) {
+                    bool present = (e >> 63) & 1;
+                    uint64_t pfn = e & ((1ULL << 55) - 1);
+                    if (!present || pfn == 0) {
+                        if (mode == 1) {
+                            const char m[] = "[smash] SMASH_IDLE_READ_TRACK=1 but PFN redacted (need CAP_SYS_ADMIN); falling back\n";
+                            (void)!::write(2, m, sizeof(m) - 1);
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+        // (1) Open the idle bitmap O_RDWR.
+        page_idle_fd_ = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
+        if (page_idle_fd_ < 0) {
+            if (mode == 1) {
+                const char m[] = "[smash] SMASH_IDLE_READ_TRACK=1 but /sys/kernel/mm/page_idle/bitmap unavailable; falling back\n";
+                (void)!::write(2, m, sizeof(m) - 1);
+            }
+            return false;
+        }
+        idle_read_ok_ = 1;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+#ifdef __linux__
+    // Read the PFN for a smash page index from pagemap (0 if absent/redacted).
+    uint64_t pfnForPage(size_t page_idx) {
+        if (pagemap_fd_ < 0 || !vm_) return 0;
+        void* pa = vm_->pageAddress(page_idx);
+        if (!pa) return 0;
+        uint64_t off = (reinterpret_cast<uintptr_t>(pa) / kPageSize) * sizeof(uint64_t);
+        uint64_t e = 0;
+        if (pread(pagemap_fd_, &e, sizeof(e), off) != (ssize_t)sizeof(e)) return 0;
+        if (!((e >> 63) & 1)) return 0;  // not present
+        return e & ((1ULL << 55) - 1);
+    }
+
+    // Set the idle bit for a PFN (the bitmap is u64-per-64-PFN; bit = pfn%64).
+    void markPageIdle(uint64_t pfn) {
+        if (page_idle_fd_ < 0 || pfn == 0) return;
+        uint64_t word_off = (pfn / 64) * sizeof(uint64_t);
+        uint64_t word = 0;
+        if (pread(page_idle_fd_, &word, sizeof(word), word_off) == (ssize_t)sizeof(word)) {
+            word |= (1ULL << (pfn % 64));
+        } else {
+            word = (1ULL << (pfn % 64));
+        }
+        (void)!pwrite(page_idle_fd_, &word, sizeof(word), word_off);
+    }
+
+    // Test whether a PFN is still idle (true ⇒ NOT accessed since marked).
+    bool isPageIdle(uint64_t pfn) {
+        if (page_idle_fd_ < 0 || pfn == 0) return false;
+        uint64_t word_off = (pfn / 64) * sizeof(uint64_t);
+        uint64_t word = 0;
+        if (pread(page_idle_fd_, &word, sizeof(word), word_off) != (ssize_t)sizeof(word))
+            return false;
+        return (word >> (pfn % 64)) & 1;
+    }
+#endif
+
     // ── Atomic page restore (decompress-on-fault correctness) ──────────────
     //
     // Restore `kPageSize` bytes of decompressed data from `src` into the page
@@ -3080,6 +3321,13 @@ private:
         if (softdirty) {
             readSoftDirty(0, committed);
         }
+#ifdef __linux__
+        // Probe idle-page read tracking once (cached). No-op + fallback when the
+        // kernel lacks CONFIG_IDLE_PAGE_TRACKING or we lack CAP_SYS_ADMIN (the
+        // common unprivileged/LD_PRELOAD case). When active, phase1 reads the
+        // idle bit for ACTIVE_MONITORING pages as the fault-free read signal.
+        (void)ensureIdleReadFds();
+#endif
 
         dispatch(1);  // Phase 1: access tracking
 
@@ -3444,6 +3692,13 @@ public:
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
+        // Soft-dirty ROI per-page arrays: only allocate when the gate is on
+        // (~2 bytes/page = ~32 MiB at full VM otherwise wasted). Read the env
+        // directly here — ROIConfig::init() runs later in this function, so the
+        // singleton flag isn't set yet at allocation time.
+        if (const char* sr = std::getenv("SMASH_SOFTDIRTY_ROI"); sr && std::atoi(sr) != 0) {
+            write_clean_streak_ = bootstrapArray<uint8_t>(max_pages);
+        }
         if (isDeferredReclaimMode())
             shadow_tick_ = bootstrapArray<uint32_t>(max_pages);
         page_tier_ = bootstrapArray<uint8_t>(max_pages);
@@ -4168,6 +4423,21 @@ public:
             // same allocation site) the next round.
             uint8_t prev_rc = recompress_count_[page_idx];
             if (prev_rc < 255) recompress_count_[page_idx] = prev_rc + 1;
+
+            // Soft-dirty ROI: classify this decompress as a WRITE re-dirty (the
+            // blob was genuinely invalidated → real churn) vs a READ fault (the
+            // blob would have survived → not a re-dirty), using the hardware
+            // fault write-bit captured by the signal handler. This is the exact
+            // per-fault signal — far better than inferring from soft-dirty a
+            // tick later (the workload re-touches the page within the tick, so
+            // a next-tick check can't separate the two). When the bit is unknown
+            // (-1, e.g. Mach path), fall back to "treat as write" (conservative:
+            // a re-dirty defers future compression, the safe direction).
+            if (write_clean_streak_) {
+                write_clean_streak_[page_idx] = 0;  // freshly live again
+                bool was_write = (vm::faultWasWrite() != 0);  // -1 unknown → treat as write
+                recordRedirtyForPage(page_idx, was_write);
+            }
 
             // Adaptive cap: decompression = re-warm evidence.  Notify the
             // heap so it can bias cap sizing for this (arena, sc) toward

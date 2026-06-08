@@ -38,6 +38,34 @@ namespace smash::vm {
 // Callback type: receives faulting address, returns true if handled.
 using FaultCallback = bool(*)(uintptr_t fault_addr, void* context);
 
+// Read-vs-write classification of the in-flight fault, for the decompress
+// callback (soft-dirty ROI). signalHandler sets it on the faulting thread just
+// before calling the callback, so a thread_local is race-free across concurrent
+// faults. 1 = write, 0 = read, -1 = unknown (Mach path / non-x86). NOTE: we
+// rely on REG_ERR/ucontext_t already being visible via <csignal> — do NOT add
+// <ucontext.h>, which conflicts with the signal includes on glibc and corrupts
+// the handler's ucontext view (caused a teardown SIGSEGV/SIGBUS).
+// Accessor over a FUNCTION-LOCAL thread_local. A namespace-scope inline
+// thread_local in this widely-included, LD_PRELOAD'd header broke the static
+// TLS block (teardown SIGSEGV); a single .cpp definition fails to link in the
+// targets that don't pull in smash_heap.cpp (compress-only, tests). A
+// function-local static thread_local is header-safe (one lazily-initialized
+// instance per thread, no static-TLS-block slot) and links everywhere. Default
+// tls_model (local-dynamic) is fine here: this is read once per fault in the
+// handler, not on the malloc hot path, so it needn't be initial-exec.
+inline int& faultWasWrite() {
+    // initial-exec: resolved as a fixed tpidr offset (no __tls_get_addr).
+    // This is read/written from inside the SIGSEGV/SIGBUS handler, where
+    // local-dynamic access is fatal — __tls_get_addr lazily allocates the
+    // dynamic TLS block via the allocator (back into smash) and is not
+    // async-signal-safe, so it faults and re-enters the handler, recursing
+    // until the stack overflows. initial-exec sidesteps it entirely. The
+    // attribute is legal on a function-local static and keeps this header-safe
+    // (no .cpp definition needed, links in compress-only/test targets).
+    static thread_local __attribute__((tls_model("initial-exec"))) int v = -1;
+    return v;
+}
+
 #if defined(__APPLE__) || defined(__linux__)
 
 // Signal-based fault handler for macOS and Linux.
@@ -95,6 +123,18 @@ class FaultHandler {
         int saved_errno = errno;
         if (isKernelFault(info) && instance_ && instance_->callback_) {
             uintptr_t addr = reinterpret_cast<uintptr_t>(info->si_addr);
+            // Classify read vs write for the soft-dirty ROI re-dirty signal.
+            // x86-64: bit 1 of the page-fault error code (gregs[REG_ERR]) is the
+            // write bit. ucontext_t/REG_ERR come from <csignal> (already
+            // included); we deliberately do NOT include <ucontext.h>.
+            faultWasWrite() = -1;
+#if defined(__linux__) && defined(__x86_64__) && defined(REG_ERR)
+            if (ucontext) {
+                auto* uc = static_cast<const ucontext_t*>(ucontext);
+                faultWasWrite() =
+                    (uc->uc_mcontext.gregs[REG_ERR] & 0x2) ? 1 : 0;
+            }
+#endif
             if (instance_->callback_(addr, instance_->callback_ctx_)) {
                 errno = saved_errno;
                 return;  // Fault handled, resume execution

@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <chrono>
 
 using namespace smash;
@@ -49,6 +50,38 @@ static void benchBatchPattern(size_t size, int batch_size, int iterations) {
     delete[] ptrs;
 }
 
+// Churn pattern: keep `live` objects allocated, randomly replace one each
+// iteration. This is the representative stressor — unlike the LIFO single/batch
+// patterns above it actually misses the thread cache and exercises the free()
+// span-lookup path against a large working set (the real bottleneck).
+static void benchChurn(size_t size, int live, long iterations) {
+    void** slots = new void*[live];
+    for (int i = 0; i < live; ++i)
+        slots[i] = heap->malloc(size);
+
+    // xorshift32 — deterministic, no libc rand() on the hot path.
+    unsigned rng = 0x9e3779b9u;
+    auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; };
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (long i = 0; i < iterations; ++i) {
+        int idx = next() % live;
+        heap->free(slots[idx]);
+        slots[idx] = heap->malloc(size);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double elapsed_us = std::chrono::duration<double, std::micro>(end - start).count();
+    // 2 ops/iter (one free + one malloc)
+    double ops_per_sec = (iterations * 2.0) / (elapsed_us / 1e6);
+    fprintf(stdout, "  size=%5zu live=%7d: %.0f ops/sec (%.1f ns/op)\n",
+            size, live, ops_per_sec, (elapsed_us * 1000.0) / (iterations * 2));
+
+    for (int i = 0; i < live; ++i)
+        heap->free(slots[i]);
+    delete[] slots;
+}
+
 int main() {
     heap = new (heap_buf) SmashHeap();
     heap->threadInit();
@@ -64,6 +97,12 @@ int main() {
     fprintf(stdout, "\nBatch alloc/free (64 at a time):\n");
     for (size_t sz : sizes) {
         benchBatchPattern(sz, 64, 10000);
+    }
+
+    fprintf(stdout, "\nChurn (random replacement, large live set):\n");
+    int live_sets[] = { 64, 512, 4096, 65536, 262144 };
+    for (int live : live_sets) {
+        benchChurn(64, live, 50000000);
     }
 
     return 0;

@@ -42,11 +42,39 @@ class VmRegion {
     size_t contig_pages_ = 0;  // = region_size / kPageSize in full mode; 0 in tracking mode
     std::atomic<size_t> next_page_{0};  // bump pointer (normal) or next index (tracking)
 
+    // ── Chunked commit watermark ────────────────────────────────────────────
+    // The arena is reserved PROT_NONE; pages must be mprotect'd to PROT_RW
+    // before use. Committing per span bump means one mprotect per span, and
+    // every mprotect takes the kernel's mmap_lock for write — under a workload
+    // that bump-allocates a large live set (e.g. Hoard linux-scalability holds
+    // ~1.3 GB live) those serialize on osq_lock and dominate CPU. Instead we
+    // commit in large chunks ahead of the bump pointer: committed_pages_ is the
+    // high-water page index already PROT_RW, advanced under commit_lock_ in
+    // kCommitChunkPages steps. A bump only mprotects when it crosses the
+    // watermark, turning millions of mprotects into a few hundred. Behavior is
+    // preserved: mprotect on an untouched PROT_NONE anonymous range only flips
+    // VMA protection; no physical page is backed until first write, so RSS is
+    // unchanged (the kernel still faults pages in lazily on touch).
+    std::atomic<size_t> committed_pages_{0};
+    Spinlock commit_lock_;
+
     struct FreeRun {
         size_t page_index;
         size_t page_count;
         FreeRun* next;
     };
+
+    // Pages committed per watermark advance (see committed_pages_).
+    //
+    // DEFAULT 0 = OFF (commit exactly the requested pages, per-call). Chunked
+    // commit was measured to be net-negative: on a single-threaded bump-growth
+    // workload (Hoard linux-scalability) it cuts the per-span mprotect/mmap_lock
+    // cost ~25%, but it REGRESSES realloc churn (phong +90%) and, worst, holding
+    // the global commit_lock_ across a multi-MiB mprotect serializes high
+    // thread counts — Larson at 64 threads collapsed ~10x (47M→5M ops/s) with
+    // chunking on. The win is narrow and the downside is a scalability cliff, so
+    // it ships off. Opt in per-workload via SMASH_COMMIT_CHUNK_KIB=N.
+    static constexpr size_t kCommitChunkPages = 0;
 
     // Sharded free lists to reduce contention under high thread counts.
     // 64 shards = one per typical cache line, threads hash by ID.
@@ -407,8 +435,49 @@ public:
             return nullptr;
         }
         void* addr = base_ + start * kPageSize;
-        vm::commitPages(addr, num_pages * kPageSize);
+        ensureCommitted(start + num_pages);
         return addr;
+    }
+
+    // Ensure pages [0, end_page) are committed (PROT_RW). Fast path: a single
+    // relaxed load when the watermark already covers end_page (the common case
+    // — one chunk commit serves thousands of bumps). Slow path: take
+    // commit_lock_, re-check, and mprotect forward to the next kCommitChunkPages
+    // boundary (clamped to contig_pages_). The double-check under the lock means
+    // concurrent bumps that all cross the watermark issue exactly one mprotect
+    // for the chunk, not one each.
+    // Runtime-overridable commit chunk (pages). SMASH_COMMIT_CHUNK_KIB lets the
+    // chunk size be swept without rebuilding; 0 disables chunking (commit
+    // exactly the requested pages, like the pre-watermark behavior).
+    static size_t commitChunkPages() {
+        static const size_t pages = [] {
+            const char* v = std::getenv("SMASH_COMMIT_CHUNK_KIB");
+            if (!v) return kCommitChunkPages;
+            long kib = std::atol(v);
+            if (kib < 0) return kCommitChunkPages;
+            return static_cast<size_t>((static_cast<size_t>(kib) * 1024) / kPageSize);
+        }();
+        return pages;
+    }
+
+    void ensureCommitted(size_t end_page) {
+        if (end_page <= committed_pages_.load(std::memory_order_acquire)) [[likely]]
+            return;
+        LockGuard guard(commit_lock_);
+        size_t already = committed_pages_.load(std::memory_order_relaxed);
+        if (end_page <= already) return;  // another thread committed it
+        const size_t chunk = commitChunkPages();
+        // Commit forward to the next chunk boundary so a run of bumps shares
+        // this mprotect; round end_page up, clamp to the arena end. chunk==0
+        // means "no chunking" — commit exactly what's needed.
+        size_t target = (chunk == 0) ? end_page : already + chunk;
+        if (target < end_page) {
+            target = ((end_page + chunk - 1) / chunk) * chunk;
+        }
+        if (target > contig_pages_) target = contig_pages_;
+        void* addr = base_ + already * kPageSize;
+        vm::commitPages(addr, (target - already) * kPageSize);
+        committed_pages_.store(target, std::memory_order_release);
     }
 
     void releasePages(void* addr, size_t num_pages) {
@@ -624,6 +693,19 @@ public:
         if (!page_to_span_) [[unlikely]] return;
         if (page_idx >= total_pages_) [[unlikely]] return;
         page_to_span_[page_idx].store(span, std::memory_order_release);
+    }
+
+    // Set a contiguous run of flat-table slots to the same span. Bounds are
+    // checked once for the whole run, then the loop is a tight sequential store
+    // — avoids the per-page table-pointer null check + bound compare that
+    // calling setSpan() num_pages times would repeat. Used by the span-creation
+    // path (PageMap::setRange) where every page of a fresh span maps to the
+    // same Span*.
+    void setSpanRange(size_t first_page_idx, size_t num_pages, Span* span) {
+        if (!page_to_span_) [[unlikely]] return;
+        if (first_page_idx + num_pages > total_pages_) [[unlikely]] return;
+        for (size_t i = 0; i < num_pages; ++i)
+            page_to_span_[first_page_idx + i].store(span, std::memory_order_release);
     }
 
     // True iff the flat table is mapped (mmap succeeded in init()). Used by

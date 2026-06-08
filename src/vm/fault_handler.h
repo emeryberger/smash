@@ -50,21 +50,35 @@ using FaultCallback = bool(*)(uintptr_t fault_addr, void* context);
 // TLS block (teardown SIGSEGV); a single .cpp definition fails to link in the
 // targets that don't pull in smash_heap.cpp (compress-only, tests). A
 // function-local static thread_local is header-safe (one lazily-initialized
-// instance per thread, no static-TLS-block slot) and links everywhere. Default
-// tls_model (local-dynamic) is fine here: this is read once per fault in the
-// handler, not on the malloc hot path, so it needn't be initial-exec.
+// instance per thread, no static-TLS-block slot) and links everywhere.
+//
+// TLS model is PLATFORM-SPLIT and the split is load-bearing:
+//   Linux: initial-exec — resolved as a fixed tpidr offset (no __tls_get_addr).
+//     This is read/written from inside the SIGSEGV/SIGBUS handler, where the
+//     default local-dynamic model is fatal: __tls_get_addr lazily allocates the
+//     dynamic TLS block via the allocator (back into smash) and is not
+//     async-signal-safe, so it faults, re-enters the handler, and recurses
+//     until the stack overflows. initial-exec sidesteps it entirely.
+//   macOS: DEFAULT model (no attribute). Apple's linker does NOT support the
+//     initial-exec (static-offset) TLS model for a dylib loaded via
+//     DYLD_INSERT_LIBRARIES — the attribute on a function-local static there
+//     miscompiles into a TLS-descriptor sequence that traps with SIGILL inside
+//     the fault handler under a live compressor (caught by macOS CI; Linux is
+//     fine). macOS uses the signal-handler path too, but the write-bit
+//     classification below is __x86_64__-only, so on Apple silicon faultWasWrite
+//     is only ever -1 and the default-model lazy init is not exercised the way
+//     Linux's recursive case is.
+#if defined(__linux__)
 inline int& faultWasWrite() {
-    // initial-exec: resolved as a fixed tpidr offset (no __tls_get_addr).
-    // This is read/written from inside the SIGSEGV/SIGBUS handler, where
-    // local-dynamic access is fatal — __tls_get_addr lazily allocates the
-    // dynamic TLS block via the allocator (back into smash) and is not
-    // async-signal-safe, so it faults and re-enters the handler, recursing
-    // until the stack overflows. initial-exec sidesteps it entirely. The
-    // attribute is legal on a function-local static and keeps this header-safe
-    // (no .cpp definition needed, links in compress-only/test targets).
     static thread_local __attribute__((tls_model("initial-exec"))) int v = -1;
     return v;
 }
+#else
+inline int& faultWasWrite() {
+    static thread_local int v = -1;
+    return v;
+}
+#endif
 
 #if defined(__APPLE__) || defined(__linux__)
 

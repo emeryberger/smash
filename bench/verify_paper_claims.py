@@ -16,9 +16,12 @@ gates at 30% when the paper reports 46%):
   - HARD floor : a conservative reduction we must never fall below. Failing it
                  fails the run (exit 1).
   - Paper claim: the actual figure from evaluation.tex. Falling short only
-                 prints a WARN — the reference machine is a 192-core EPYC and a
-                 dev box / CI runner will legitimately come in lower without
-                 indicating a regression.
+                 prints a WARN, not a failure. The paper's numbers come from
+                 the FULL workloads (full dataset, ~20-30 s cooling); this
+                 harness defaults to the smaller bench profiles, which
+                 legitimately undershoot. A WARN means "verify with the full
+                 paper runner before claiming a regression", not "the box is
+                 too slow" — the reference machine is also an AMD EPYC 9R14.
 
 "As reported or better" is reported per-app: a ✓ BEATS line when measured >=
 the paper claim, a WARN when it's between the hard floor and the claim.
@@ -307,7 +310,8 @@ def main() -> int:
             mark = "PASS"
             extra = (f"{r.measured_pct:.1f}% ≥ floor {exp.hard_pct:.0f}%  "
                      f"WARN: short of paper {exp.paper_pct:.0f}% "
-                     f"(host weaker than reference EPYC)")
+                     f"(bench profile undershoots the full paper workload; "
+                     f"re-check with run_paper_experiments.py)")
         print(f"  [{mark}] {r.app} [{r.mode}]: {extra}")
 
     print()

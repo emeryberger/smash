@@ -108,6 +108,16 @@ class FaultHandler {
     // disposition.
     static inline std::atomic<bool> shutting_down_{false};
 
+    // Signal-handler env flags, cached at install time. getenv() is NOT
+    // async-signal-safe: calling it from signalHandler() can fault inside
+    // libc's environ walk, and with SA_NODEFER that re-enters signalHandler,
+    // which calls getenv() again → unbounded recursion → stack-overflow
+    // SIGSEGV. (Observed as redis-server under LD_PRELOAD dumping core with a
+    // getenv → signalHandler → __restore_rt → getenv … backtrace.) Read these
+    // once in start()/ensureInstalled() and consult the cached bools only.
+    static inline bool sigtrace_enabled_ = false;
+    static inline bool dump_crash_bt_enabled_ = false;
+
     // Detect signals that were synthesized by user-space (raise(),
     // pthread_kill(), kill(), tgkill()) rather than from a real memory
     // fault. For these, info->si_code is non-positive (SI_USER=0,
@@ -164,8 +174,9 @@ class FaultHandler {
             ? &instance_->old_sigsegv_ : &instance_->old_sigbus_;
 
         // SMASH_SIGTRACE=1 — async-signal-safe one-line trace per chain.
-        const char* trace_env = std::getenv("SMASH_SIGTRACE");
-        if (trace_env && trace_env[0] == '1') {
+        // Flag cached at install time; getenv() here would not be
+        // async-signal-safe (see sigtrace_enabled_ declaration).
+        if (sigtrace_enabled_) {
             char buf[160];
             const char* kind = "?";
             if (old->sa_flags & SA_SIGINFO) kind = "SA_SIGINFO";
@@ -199,8 +210,8 @@ class FaultHandler {
         // (e.g. compiler crashes in app code under full smash mode).
         // Only fires for kernel-fault SIGSEGV/SIGBUS that chain to
         // SIG_DFL — i.e. the process is about to die anyway.
-        const char* bt_env = std::getenv("SMASH_DUMP_CRASH_BT");
-        bool want_bt = bt_env && bt_env[0] == '1' &&
+        // Flag cached at install time (getenv() is not async-signal-safe).
+        bool want_bt = dump_crash_bt_enabled_ &&
                        isKernelFault(info) &&
                        !(old->sa_flags & SA_SIGINFO) &&
                        old->sa_handler == SIG_DFL;
@@ -381,6 +392,14 @@ public:
         callback_ = cb;
         callback_ctx_ = ctx;
         instance_ = this;
+
+        // Cache signal-handler env flags ONCE here, before the handler can
+        // ever run. signalHandler() must not call getenv() (not
+        // async-signal-safe; recurses under SA_NODEFER — see flag decls).
+        const char* st = std::getenv("SMASH_SIGTRACE");
+        sigtrace_enabled_ = st && st[0] == '1';
+        const char* bt = std::getenv("SMASH_DUMP_CRASH_BT");
+        dump_crash_bt_enabled_ = bt && bt[0] == '1';
 
 #ifdef __APPLE__
         const char* mach_env = std::getenv("SMASH_USE_MACH_EXCEPTIONS");

@@ -7,7 +7,8 @@ A compression-aware memory allocator that transparently compresses cold pages to
 ## Build
 
 ```bash
-# Requires alloc8 as sibling directory (../alloc8) or set -DALLOC8_DIR=...
+# alloc8 is cloned automatically via FetchContent on first configure.
+# To use a local checkout instead: cmake .. -DALLOC8_DIR=/path/to/alloc8
 mkdir build && cd build
 cmake .. && make -j$(nproc)
 
@@ -285,7 +286,7 @@ The compressor flow calls `decommitPages()` (MADV_FREE_REUSABLE) **before** `mpr
 
 ## Dependencies
 
-- **alloc8**: Interposition framework (sibling directory)
+- **alloc8**: Interposition framework (cloned via FetchContent; override with `-DALLOC8_DIR=`)
 - **LZ4 v1.9.4**: Fast compression (fetched via CMake FetchContent)
 - **Zstandard v1.5.6**: Dictionary compression (fetched via CMake FetchContent)
 

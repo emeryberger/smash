@@ -29,7 +29,7 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 
 - C++20 compiler (Clang 14+ or GCC 12+)
 - CMake 3.15+
-- [alloc8](https://github.com/emeryberger/alloc8) source as a sibling directory (or specify `-DALLOC8_DIR=...`)
+- Git network access on first configure (to fetch [alloc8](https://github.com/emeryberger/alloc8), LZ4, and zstd)
 
 ### Build
 
@@ -40,6 +40,12 @@ make -j$(nproc)
 ```
 
 This produces `libsmash.dylib` (macOS) or `libsmash.so` (Linux).
+
+smash is self-contained: the first `cmake ..` clones its dependency [alloc8](https://github.com/emeryberger/alloc8) (along with LZ4 and zstd) via CMake `FetchContent`. To build against a local alloc8 checkout instead — for offline builds or alloc8 development — pass its path explicitly:
+
+```bash
+cmake .. -DALLOC8_DIR=/path/to/alloc8
+```
 
 ### Build with benchmarks
 
@@ -233,7 +239,7 @@ cd build
 ctest --output-on-failure
 ```
 
-14 tests covering:
+18 tests covering:
 
 | Test | What it verifies |
 |------|-----------------|
@@ -243,6 +249,7 @@ ctest --output-on-failure
 | `test_slab` | Per-class slab management |
 | `test_vm_region` | Virtual memory reservation and page states |
 | `test_compression` | LZ4 compress/decompress roundtrip, access tracking |
+| `test_compression_ratio` | CompressEngine achieves the paper's ratios (LZ4 ≥ 2.5×, zstd ≥ 4× hard floor; warns below the paper's best case), plus byte-exact roundtrip |
 | `test_integration` | Full SmashHeap malloc/free/memalign |
 | `test_interpose` | malloc interposition via DYLD_INSERT |
 | `test_dictionary` | Dictionary training, ratio improvement, fallback |
@@ -250,9 +257,13 @@ ctest --output-on-failure
 | `test_contention` | 8-thread concurrent alloc/free stress test |
 | `test_fault_cycle` | Real SIGSEGV → decompress → verify data integrity |
 | `test_external_mapping` | `mmap` + `mach_vm_allocate` round-trip through the compressor (under `SMASH_TRACK_EXTERNAL=1`); negative tests confirm file-backed and read-only mappings are not tracked |
-| `test_malloc_compression` | End-to-end compression on the malloc/free path: `SIGUSR2` stats line shows `compressed > 0`, then read-back verifies fault-decompress integrity |
+| `test_malloc_compression` | End-to-end compression on the malloc/free path in **full mode**: `SIGUSR2` stats line shows `compressed > 0`, then read-back verifies fault-decompress integrity |
+| `test_large_only_compression` | Same body as above in **large-only mode** (`SMASH_LARGE_ONLY=1`): large (≥ 1 MiB) chunks compress while small (≤ 16 KiB) chunks pass through to system malloc; both classes read back byte-exact |
+| `test_syscall_efault` | EFAULT-driven decompress-and-retry: real `read`/`readv`/`writev` syscalls on compressed buffers recover correctly |
 
-The two end-to-end tests run under `DYLD_INSERT_LIBRARIES` (macOS) / `LD_PRELOAD` (Linux) with a live compressor, so they exercise the full Phase 1 → Phase 2 → fault-decompress cycle, not just unit-level invariants.
+`test_malloc_compression` and `test_large_only_compression` are the **same executable** (`mode_compression_test.cpp`) run twice with `SMASH_LARGE_ONLY` set to `0` and `1` — the mode is read from the environment at runtime, so the two production configurations exercise byte-identical assertions and cannot drift apart in coverage.
+
+The end-to-end tests run under `DYLD_INSERT_LIBRARIES` (macOS) / `LD_PRELOAD` (Linux) with a live compressor, so they exercise the full Phase 1 → Phase 2 → fault-decompress cycle, not just unit-level invariants.
 
 Continuous integration: `.github/workflows/ci.yml` builds and runs the full ctest suite on `ubuntu-latest` and `macos-latest` for every push to master and every pull request.
 
@@ -313,6 +324,18 @@ python3 ../bench/run_paper_experiments.py --runs 3
 python3 ../bench/run_paper_experiments.py --quick --runs 1
 
 # Results written to paper_results/
+```
+
+### Verifying paper claims
+
+`bench/verify_paper_claims.py` checks measured serve/cool-phase RSS reduction against the paper's per-app figures with a two-tier scheme: a conservative hard floor fails the run, a shortfall vs the published number only warns. In-process apps (`rss`, `sqlite`, `rocksdb`) run directly in both full and large-only mode; external services (`memcached`, `redis`, `redis_ext`, `redis_patched`) are full-mode only and driven through `run_paper_experiments.py` (opt in via `--apps`). The build directory is autodetected.
+
+```bash
+# In-process apps (default), both modes
+python3 bench/verify_paper_claims.py
+
+# External services (slower; needs bench_deps built)
+python3 bench/verify_paper_claims.py --apps redis,memcached
 ```
 
 ## Architecture

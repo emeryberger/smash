@@ -304,23 +304,64 @@ def run_one(spec: AppSpec, mode: str, exp: ModeExpect,
     return Result(spec.name, mode, pct, exp, detail=detail)
 
 
+def find_libsmash(build: Path) -> Path | None:
+    """Return the libsmash in `build`, or None."""
+    for name in ("libsmash.dylib", "libsmash.so"):
+        p = build / name
+        if p.exists():
+            return p
+    return None
+
+
+def autodetect_build_dir() -> Path | None:
+    """Pick a build dir when none was given. Scan ./build* for one that has
+    BOTH libsmash and the bench tree (external apps need the bench deps),
+    newest libsmash first; fall back to any dir with just libsmash."""
+    root = Path(__file__).resolve().parent.parent  # repo root (bench/..)
+    candidates = sorted(root.glob("build*"))
+    with_bench, lib_only = [], []
+    for d in candidates:
+        lib = find_libsmash(d)
+        if not lib:
+            continue
+        (with_bench if (d / "bench").is_dir() else lib_only).append((lib.stat().st_mtime, d))
+    pool = with_bench or lib_only
+    if not pool:
+        return None
+    return max(pool)[1]  # newest libsmash
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--build-dir", type=Path,
-                    default=Path(os.environ.get("BUILD_DIR", ".")))
+    ap.add_argument("--build-dir", type=Path, default=None,
+                    help="build dir containing libsmash + bench/ "
+                         "(default: $BUILD_DIR, else autodetect ./build*)")
     ap.add_argument("--apps", default="rss,sqlite,rocksdb",
                     help="comma-separated subset of: " + ",".join(APPS))
     ap.add_argument("--modes", default="full,large_only",
                     help="comma-separated subset of: full,large_only")
     args = ap.parse_args()
 
-    build = args.build_dir.resolve()
-    lib_macos = build / "libsmash.dylib"
-    lib_linux = build / "libsmash.so"
-    libsmash = lib_macos if lib_macos.exists() else lib_linux
-    if not libsmash.exists():
-        raise SystemExit(f"libsmash not found at {libsmash}")
+    # Resolve build dir: explicit flag > $BUILD_DIR > autodetect ./build*.
+    if args.build_dir is not None:
+        build = args.build_dir.resolve()
+    elif os.environ.get("BUILD_DIR"):
+        build = Path(os.environ["BUILD_DIR"]).resolve()
+    else:
+        auto = autodetect_build_dir()
+        if auto is None:
+            raise SystemExit(
+                "no build dir with libsmash found under ./build*. "
+                "Build with -DSMASH_BUILD_BENCH=ON, or pass --build-dir.")
+        build = auto.resolve()
+        print(f"(autodetected build dir: {build})")
+
+    libsmash = find_libsmash(build)
+    if libsmash is None:
+        raise SystemExit(
+            f"libsmash not found in {build}. "
+            f"Pass --build-dir to a dir built with -DSMASH_BUILD_BENCH=ON.")
 
     want_apps = [a.strip() for a in args.apps.split(",") if a.strip()]
     want_modes = [m.strip() for m in args.modes.split(",") if m.strip()]

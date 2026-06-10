@@ -151,13 +151,29 @@ class FaultHandler {
             // x86-64: bit 1 of the page-fault error code (gregs[REG_ERR]) is the
             // write bit. ucontext_t/REG_ERR come from <csignal> (already
             // included); we deliberately do NOT include <ucontext.h>.
+            //
+            // LINUX ONLY: touch faultWasWrite() here. On macOS the value is
+            // never set meaningfully (the write-bit read below is Linux-x86
+            // only) and the lone reader (compressor_thread.h) already treats
+            // the unset/-1 case as "write". More importantly, the macOS
+            // function-local thread_local carries a lazy-init guard that, when
+            // first run INSIDE this signal handler under a live compressor,
+            // traps with SIGILL (observed deterministically in macOS CI:
+            // bench_sqlite dies in the fault/decompress phase). Not touching
+            // the TLS in the handler on macOS avoids that guard entirely; the
+            // compressor thread inits it lazily (safely, not in a handler) on
+            // its first read.
+#if defined(__linux__)
             faultWasWrite() = -1;
-#if defined(__linux__) && defined(__x86_64__) && defined(REG_ERR)
+#if defined(__x86_64__) && defined(REG_ERR)
             if (ucontext) {
                 auto* uc = static_cast<const ucontext_t*>(ucontext);
                 faultWasWrite() =
                     (uc->uc_mcontext.gregs[REG_ERR] & 0x2) ? 1 : 0;
             }
+#endif
+#else
+            (void)ucontext;
 #endif
             if (instance_->callback_(addr, instance_->callback_ctx_)) {
                 errno = saved_errno;

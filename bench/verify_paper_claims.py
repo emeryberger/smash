@@ -223,8 +223,19 @@ def run_via_runner(spec: AppSpec, mode: str, exp: ModeExpect,
     import json
     runner = Path(__file__).resolve().parent / "run_paper_experiments.py"
     outdir = build / "paper_results" / f"verify_{spec.runner_app}"
+    jpath = outdir / "compress_only_results.json"
+    # Remove any stale JSON from a prior run: the runner appends/preserves
+    # existing results, so without this a current failure could be masked by a
+    # leftover passing entry (observed: redis "passing" off a stale file while
+    # the runner had actually aborted). A missing JSON must mean THIS run.
+    if jpath.exists():
+        jpath.unlink()
+    # Pass --build-dir explicitly. Without it the runner defaults to '.', looks
+    # for libsmash / bench binaries in the repo root, finds nothing, and aborts
+    # the whole compress-only experiment before producing any result.
     cmd = [sys.executable, "-u", str(runner), "--compress-only-only",
-           "--runs", "1", "--apps", spec.runner_app, "--output-dir", str(outdir)]
+           "--runs", "1", "--apps", spec.runner_app,
+           "--build-dir", str(build), "--output-dir", str(outdir)]
     print(f"$ {mode}: {' '.join(cmd[2:])}", flush=True)
     # Stream the runner's output through to our stdout (do NOT capture): the
     # runner takes minutes, and live output lets callers/harnesses see progress

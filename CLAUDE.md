@@ -21,12 +21,27 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All 14 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Two of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` with a live compressor:
+All 18 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Four of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` with a live compressor:
 
 - `test_external_mapping` exercises the `SMASH_TRACK_EXTERNAL=1` registration path. The ctest invocation sets the env var; without it the test would silently no-op (registration path gated).
-- `test_malloc_compression` allocates compressible chunks via the standard `malloc` path, sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2` to itself, captures stderr, parses `compressed=N` from the smash stats line, asserts `N > 0`, then reads every byte back to verify integrity through fault-decompress. Catches regressions in the malloc-side compression path that the interposer-only tests would miss.
+- `test_malloc_compression` and `test_large_only_compression` are the **same executable** (`mode_compression_test.cpp`) run twice, differing only in `SMASH_LARGE_ONLY` (`0` = full, `1` = large-only — the production-supported config). The mode is read from the env at runtime, never a compile flag, so the two modes execute byte-identical assertions and cannot drift apart in coverage. The body allocates large chunks (≥ 1 MiB, so they clear `kLargeAllocVmThreshold` and enter the compressible VmRegion in **both** modes) interleaved with small chunks (≤ 16 KiB — smash slab in full mode, system passthrough in large-only). It sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2`, parses `compressed=N` from the stats line, asserts `N > 0`, then verifies a byte-exact read-back of **both** classes — proving full-mode slab integrity / large-only passthrough is never corrupted, and that fault-decompress restores the compressed large chunks. (Registered via the `add_mode_compression_test(name, large_only)` helper in `tests/CMakeLists.txt`.)
+- `test_compression_ratio` (in-process, direct-linked, no compressor thread) compresses a realistically-compressible page with LZ4 and zstd and asserts the achieved ratio against the paper's RQ2 figures (evaluation.tex: LZ4 4.7–12.3×, zstd-1 8.8–20.4×). Two-tier: a hard floor that fails the test (2.5× LZ4 / 4× zstd — catches "stored uncompressed" regressions) plus a WARN if it falls short of the paper's best-case number. Also asserts byte-exact roundtrip. Unlike `test_malloc_compression` (which only checks compression *happened*), this pins the codec *ratio*.
 
 After ctest, CI also runs `bench/run_quick_ci.py` which drives `bench_rss` (in-process: 64 MiB compressible alloc → ≥30 % peak-RSS reduction at t=10 s) and `bench_sqlite --quick` under the preloaded libsmash (≥5 % cooling-phase RSS reduction). Local baselines are ~46 % and ~13 % respectively, so the thresholds are well below noise; a real regression in the compressor or the malloc-interposed path will trip them. Configured with `-DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=OFF -DSMASH_BUILD_BENCH_ALLOCATORS=OFF` so the CI build skips Redis/memcached/RocksDB/tcmalloc/jemalloc/hoard/mesh/etc. — only the smash-internal benches are needed.
+
+### Verifying paper claims end-to-end (`bench/verify_paper_claims.py`)
+
+`run_quick_ci.py` is a regression tripwire; `verify_paper_claims.py` is the explicit "do we still match the paper?" harness. It computes serve/cool-phase RSS reduction (`1 − min_rss/peak_rss`) and checks each workload against the paper's per-app figure with a two-tier scheme: a conservative hard floor fails the run; a shortfall vs the published number only WARNs (a shortfall usually means the bench profile undershoots the full paper workload — the WARN points to `run_paper_experiments.py` for the full-dataset re-check — not a hardware gap). Prints `✓ BEATS paper` when measured ≥ the claim.
+
+- **In-process apps** (`rss`, `sqlite`, `rocksdb`) run their bench binary directly, in **both** full and large-only mode. Large-only on these is a *no-regression* check, not a paper-reduction check: their allocations are < 1 MiB so large-only passes them through to the system allocator (the large-only compression mechanism is proven by `test_large_only_compression`). This is the default app set.
+- **External-service apps** (`memcached`, `redis`, `redis_ext`, `redis_patched`) are full-mode only and slower; they're driven through `run_paper_experiments.py` (which owns the server + protocol-client lifecycle) and read back from the JSON it writes. Opt in via `--apps`.
+
+Needs `-DSMASH_BUILD_BENCH=ON`. The build dir is autodetected from `./build*` (newest libsmash with a `bench/` tree); override with `--build-dir` or `$BUILD_DIR`. Examples:
+```
+python3 bench/verify_paper_claims.py                      # in-process apps, both modes
+python3 bench/verify_paper_claims.py --apps redis,memcached   # external services
+```
+Measured on the EPYC 9R14 (full datasets): memcached 86%, rocksdb 76%, sqlite 64%, redis 54%, redis-ext 64%, redis-patched 55%, redis-ext-patched 77% — five of seven beat the paper, two match.
 
 ## Project Structure
 
@@ -160,6 +175,31 @@ because it `madvise`s backing immediately, so the window always exposed zeros);
 `SMASH_NO_DECOMMIT=1` turned corruption into OOM (backing never dropped → window
 exposed correct data). Post-fix: 16/16 smash unit tests pass and full-mode
 neuron-cc runs pass repeatedly (was ~1/3).
+
+**2026-06-10 — two async-signal-safety bugs in the fault handler fixed.** Both
+in `FaultHandler::signalHandler()` (`src/vm/fault_handler.h`), both caused by
+touching not-async-signal-safe machinery inside the handler under `SA_NODEFER`
+(a fault inside the handler re-enters it → unbounded recursion or trap).
+- **`getenv()` recursion (Linux).** The handler's chain-to-default path called
+  `std::getenv()` (`SMASH_SIGTRACE`, `SMASH_DUMP_CRASH_BT`). `getenv()` is not
+  async-signal-safe; a fault during libc's `environ` walk re-enters the handler,
+  which calls `getenv()` again → stack-overflow SIGSEGV. **This crashed redis
+  under full smash** (and any app whose fault chains to default). Diagnosed via
+  gdb on a `redis-server` core: backtrace `getenv → signalHandler → __restore_rt
+  → getenv → …`. Fixed by caching both env flags once at handler-install time
+  (`start()`); the handler reads cached bools only. The other `getenv()` calls in
+  the file (Mach listener thread, install time) are off the signal path.
+- **macOS SIGILL.** `faultWasWrite()`'s function-local `thread_local` carries a
+  lazy-init guard that traps with SIGILL when first run inside the signal handler
+  (macOS CI: `bench_sqlite` exited −4 in the fault/decompress phase, on every
+  commit — an earlier fix removed the initial-exec TLS attribute but not the
+  guard). The value is only set meaningfully on Linux x86-64 and read once
+  (defaulting unset → "treat as write"), so the in-handler access is now guarded
+  to `__linux__`; macOS never touches it in the handler. macOS CI green post-fix.
+
+Post-fix all four redis bench configurations (stock / extended-DELETE / patched /
+ext-patched) run to completion under full smash and match or beat the paper
+(54–77% RSS reduction); before the `getenv` fix redis crashed during the run.
 
 Status of the earlier-known blockers as of 2026-05-31:
 

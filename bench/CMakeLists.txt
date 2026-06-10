@@ -172,6 +172,10 @@ smash_add_standalone_bench(bench_kv_store bench_kv_store.cpp)
 # Configurable cold/hot mix microbenchmark (raw malloc/free)
 smash_add_standalone_bench(bench_coldhotmix bench_coldhotmix.cpp)
 
+# Zipfian re-access microbenchmark — cold-age IS predictive of re-access, the
+# regime that discriminates a Lindy/Bayesian compress gate from blunt backoff.
+smash_add_standalone_bench(bench_zipf_reaccess bench_zipf_reaccess.cpp)
+
 # ── SQLite amalgamation (for bench_sqlite) ─────────────────────────────────
 FetchContent_Declare(
   sqlite3

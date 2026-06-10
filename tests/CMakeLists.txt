@@ -57,6 +57,17 @@ add_test(NAME test_compression COMMAND test_compression)
 set_tests_properties(test_compression PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0")
 
+# Compression-ratio test (needs LZ4 + zstd): verifies the engine hits the
+# paper's claimed ratios (RQ2), not just "compressed > 0". In-process,
+# direct-linked, no compressor thread — a deterministic guard on the codec.
+add_executable(compression_ratio_test compression_ratio_test.cpp ${printf_SOURCE_DIR}/printf.cpp)
+target_include_directories(compression_ratio_test PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
+target_link_libraries(compression_ratio_test PRIVATE alloc8::headers lz4_static libzstd_static)
+if(APPLE)
+  target_compile_options(compression_ratio_test PRIVATE -ftls-model=initial-exec)
+endif()
+add_test(NAME test_compression_ratio COMMAND compression_ratio_test)
+
 # Dictionary training test (needs LZ4 + zstd)
 add_executable(test_dictionary test_dictionary.cpp ${printf_SOURCE_DIR}/printf.cpp)
 target_include_directories(test_dictionary PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
@@ -168,38 +179,48 @@ else()
 endif()
 set_tests_properties(test_external_mapping PROPERTIES TIMEOUT 60)
 
-# Malloc/free compression test: verifies that smash's main allocator
-# path (not just the new mmap interposers) actually compresses cold
-# pages. Allocates compressible chunks, sleeps, reads SIGUSR2 stats,
-# asserts compressed > 0.
-add_executable(malloc_compression_test malloc_compression_test.cpp)
-set_target_properties(malloc_compression_test PROPERTIES
-  CXX_STANDARD 20
-)
-if(APPLE)
-  add_test(
-    NAME test_malloc_compression
-    COMMAND ${CMAKE_COMMAND} -E env
-      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
-      "MallocNanoZone=0"
-      "SMASH_LARGE_ONLY=0"
-      "SMASH_DEFER_PHASES_MS=0"
-      "SMASH_COLD_TIMEOUT_SEC=1"
-      $<TARGET_FILE:malloc_compression_test>
-  )
-else()
-  add_test(
-    NAME test_malloc_compression
-    COMMAND ${CMAKE_COMMAND} -E env
-      "LD_PRELOAD=$<TARGET_FILE:smash>"
-      "SMASH_LARGE_ONLY=0"
-      "SMASH_DEFER_PHASES_MS=0"
-      "SMASH_COLD_TIMEOUT_SEC=1"
-      $<TARGET_FILE:malloc_compression_test>
-  )
-endif()
-set_tests_properties(test_malloc_compression PROPERTIES TIMEOUT 60)
+# Mode compression test: ONE executable (mode_compression_test.cpp), run twice
+# with SMASH_LARGE_ONLY={0,1}, so FULL mode (test_malloc_compression) and
+# LARGE-ONLY mode (test_large_only_compression) execute byte-identical
+# assertions and cannot drift apart in coverage. The test allocates large
+# (>= 1 MiB, smash-managed -> compressible VmRegion in BOTH modes) and small
+# (<= 16 KiB, slab in full / system-passthrough in large-only) compressible
+# chunks, asserts compressed>0 via SIGUSR2 stats, then verifies a byte-exact
+# read-back of BOTH classes. The mode is read from the env at runtime, never a
+# compile flag — that's what guarantees the assertions are identical.
+add_executable(mode_compression_test mode_compression_test.cpp)
+set_target_properties(mode_compression_test PROPERTIES CXX_STANDARD 20)
+
+# add_mode_compression_test(<ctest-name> <SMASH_LARGE_ONLY value>)
+function(add_mode_compression_test test_name large_only)
+  if(APPLE)
+    add_test(
+      NAME ${test_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+        "DYLD_FORCE_FLAT_NAMESPACE=1"
+        "MallocNanoZone=0"
+        "SMASH_LARGE_ONLY=${large_only}"
+        "SMASH_DEFER_PHASES_MS=0"
+        "SMASH_COLD_TIMEOUT_SEC=1"
+        $<TARGET_FILE:mode_compression_test>
+    )
+  else()
+    add_test(
+      NAME ${test_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "LD_PRELOAD=$<TARGET_FILE:smash>"
+        "SMASH_LARGE_ONLY=${large_only}"
+        "SMASH_DEFER_PHASES_MS=0"
+        "SMASH_COLD_TIMEOUT_SEC=1"
+        $<TARGET_FILE:mode_compression_test>
+    )
+  endif()
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 60)
+endfunction()
+
+add_mode_compression_test(test_malloc_compression 0)      # full mode
+add_mode_compression_test(test_large_only_compression 1)  # large-only mode
 
 # Syscall EFAULT-retry test: allocates a buffer, forces compression, then
 # issues real syscalls (read/writev/readv) directly on the compressed

@@ -21,6 +21,23 @@
 
 namespace smash {
 
+// Global page→span mapping generation. Bumped every time a page's span
+// mapping is torn down (PageMap::set(addr, nullptr) — the universal teardown
+// signal for both Slab::releaseSpan and LargeAlloc::deallocate). Address-keyed
+// span caches (e.g. the free() TLS last-span cache) stamp this value at
+// populate time and discard the cache on mismatch.
+//
+// Correctness rests on the load-before-read ordering at the cache site: read
+// the generation BEFORE reading the span mapping. A teardown that races the
+// cache fill bumps the counter, so a cached entry whose stamped generation
+// still equals the current one provably reflects a mapping that has not been
+// torn down since. A stale-low stamp only forces an extra cache miss; it can
+// never yield a span for a range that has since been reassigned to a different
+// size class. Teardowns are rare, so this counter stays read-mostly and
+// cache-resident — that is the whole point versus re-reading the 128 MB flat
+// page→span table on every free.
+inline std::atomic<uint64_t> g_pagemap_generation{0};
+
 class PageMap {
     using L2Entry = std::atomic<Span*>;
     using L2Table = L2Entry*;
@@ -74,27 +91,72 @@ public:
     void attachVmRegion(VmRegion* vr) { vm_region_ = vr; }
 
     void set(uintptr_t addr, Span* span) {
-        size_t page_idx = addr >> kPageShift;
-        size_t l1 = page_idx >> kPageMapL2Bits;
-        size_t l2 = page_idx & (kPageMapL2Size - 1);
+        const auto page_idx = addr >> kPageShift;
+        const auto l1 = page_idx >> kPageMapL2Bits;
+        const auto l2 = page_idx & (kPageMapL2Size - 1);
         L2Table tbl = ensureL2(l1);
         tbl[l2].store(span, std::memory_order_release);
         mirrorFlat(addr, span);
+        // Teardown of a page→span mapping invalidates any address-keyed span
+        // cache. Bump after the store so observers that reload the generation
+        // and re-resolve see the cleared mapping. release ordering pairs with
+        // the acquire load at the cache site.
+        if (span == nullptr) {
+            g_pagemap_generation.fetch_add(1, std::memory_order_release);
+        }
     }
 
     Span* get(uintptr_t addr) const {
-        size_t page_idx = addr >> kPageShift;
-        size_t l1 = page_idx >> kPageMapL2Bits;
-        size_t l2 = page_idx & (kPageMapL2Size - 1);
+        const auto page_idx = addr >> kPageShift;
+        const auto l1 = page_idx >> kPageMapL2Bits;
+        const auto l2 = page_idx & (kPageMapL2Size - 1);
         L2Table tbl = level1_[l1].load(std::memory_order_acquire);
         if (!tbl) [[unlikely]] return nullptr;
         return tbl[l2].load(std::memory_order_acquire);
     }
 
-    // Set all pages in a range to the same span
+    // Set all pages in a range to the same span. Called per span create/teardown
+    // with all pages contiguous and mapping to one Span*. The naive form
+    // (num_pages × set()) redundantly re-derives the L2 table and re-runs the
+    // VmRegion dispatch for every page; here we resolve the radix L2 table(s)
+    // once and mirror the whole run into the flat table in a single batched
+    // store loop. Correctness is identical to looping set().
     void setRange(uintptr_t addr, size_t num_pages, Span* span) {
-        for (size_t i = 0; i < num_pages; ++i) {
-            set(addr + i * kPageSize, span);
+        if (num_pages == 0) return;
+        const auto first_page = addr >> kPageShift;
+        const auto last_page  = first_page + num_pages - 1;
+
+        // Radix tree: the L2 index is page_idx & (kPageMapL2Size-1); a run
+        // crosses an L2 table only if it straddles a kPageMapL2Size boundary
+        // (262144 pages = 1 GiB). Spans are at most kMaxSpanPages, so this is
+        // effectively always the single-L2 fast path; the multi-L2 case is
+        // handled correctly by walking table by table.
+        size_t page = first_page;
+        while (page <= last_page) {
+            const auto l1 = page >> kPageMapL2Bits;
+            const auto l2 = page & (kPageMapL2Size - 1);
+            L2Table tbl = ensureL2(l1);
+            // Fill to the end of this L2 table or the end of the run.
+            const size_t l2_end = (l2 + (last_page - page) < kPageMapL2Size - 1)
+                ? l2 + (last_page - page)
+                : kPageMapL2Size - 1;
+            for (size_t s = l2; s <= l2_end; ++s)
+                tbl[s].store(span, std::memory_order_release);
+            page += (l2_end - l2) + 1;
+        }
+
+        // Flat table mirror: one bounds-checked batched store run.
+        if (vm_region_ && vm_region_->contains(addr)) {
+            vm_region_->setSpanRange(vm_region_->pageIndex(addr), num_pages, span);
+        }
+
+        // A teardown (span == nullptr) invalidates address-keyed span caches.
+        // Bump once for the whole run, after the stores. Matches the per-page
+        // set() semantics (which bumps once per cleared page) closely enough —
+        // the cache only needs to observe *a* change, and a single monotonic
+        // bump per teardown is sufficient and cheaper.
+        if (span == nullptr) {
+            g_pagemap_generation.fetch_add(1, std::memory_order_release);
         }
     }
 

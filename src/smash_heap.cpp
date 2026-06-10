@@ -97,27 +97,78 @@ void* ThreadCache::refill(uint8_t sc, Slab* slab) {
     return c.ptrs[got - 1];
 }
 
+namespace {
+
+// Return the `n` pointers at `ptrs[start..start+n)` to their arenas' slabs for
+// size class `sc`. Resolves each span exactly once and groups by arena with a
+// counting sort into small fixed-size stack buffers (~10 KB), then dispatches
+// one deallocateBatchResolved() per non-empty arena.
+//
+// Replaces the previous approach, which (1) allocated a
+// kTotalArenas x kThreadCacheMaxPerClass bucket matrix — 256 KB zeroed on every
+// drain — and (2) re-resolved every pointer's span a second time inside
+// deallocateBatch. n is bounded by kThreadCacheMaxPerClass (cache capacity),
+// so all buffers are statically sized.
+void drainRangeToSlabs(void** ptrs, size_t start, size_t n,
+                       uint8_t sc, Slab* all_slabs, PageMap* page_map) {
+    if (n == 0) return;
+    const int total_arenas = getTotalArenas();
+
+    Span* spans[kThreadCacheMaxPerClass];
+    uint8_t arenas[kThreadCacheMaxPerClass];
+    uint32_t counts[kTotalArenas]{};
+    for (size_t i = 0; i < n; ++i) {
+        Span* span = page_map->get(reinterpret_cast<uintptr_t>(ptrs[start + i]));
+        // arena_id is in [0, getTotalArenas()) when cold-arena feedback is on.
+        uint8_t arena = (span && !span->is_large) ? span->arena_id : 0;
+        if (arena >= total_arenas) arena = 0;  // defensive
+        spans[i] = span;
+        arenas[i] = arena;
+        counts[arena]++;
+    }
+
+    // Prefix sums → per-arena offsets, then scatter into arena-contiguous order.
+    uint32_t offsets[kTotalArenas];
+    uint32_t cursor[kTotalArenas];
+    uint32_t acc = 0;
+    for (int a = 0; a < total_arenas; ++a) { offsets[a] = acc; cursor[a] = acc; acc += counts[a]; }
+
+    void* out_ptrs[kThreadCacheMaxPerClass];
+    Span* out_spans[kThreadCacheMaxPerClass];
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t pos = cursor[arenas[i]]++;
+        out_ptrs[pos] = ptrs[start + i];
+        out_spans[pos] = spans[i];
+    }
+
+    // SMASH_DEFER_FREE (default on): on slab-lock contention, push the resolved
+    // batch onto the slab's lock-free pending stack instead of blocking. The
+    // next lock holder applies it. Removes the per-arena slab lock from the
+    // contended cross-thread-free path (Larson @ high thread counts). Off uses
+    // the blocking resolved path for A/B comparison.
+    static const bool defer_free = [] {
+        const char* v = std::getenv("SMASH_DEFER_FREE");
+        return !v || v[0] != '0';
+    }();
+    for (int a = 0; a < total_arenas; ++a) {
+        if (counts[a] == 0) continue;
+        Slab& slab = all_slabs[a * kNumClasses + sc];
+        if (defer_free)
+            slab.deallocateBatchDeferred(out_ptrs + offsets[a], out_spans + offsets[a], counts[a]);
+        else
+            slab.deallocateBatchResolved(out_ptrs + offsets[a], out_spans + offsets[a], counts[a]);
+    }
+}
+
+} // namespace
+
 void ThreadCache::drain(uint8_t sc, Slab* all_slabs, PageMap* page_map) {
     auto& c = caches_[sc];
     // Drain half the cache
     size_t to_drain = c.count / 2;
     if (to_drain == 0) to_drain = c.count;
-    size_t start = c.count - to_drain;
-
-    // Bucket pointers by arena based on their span's arena_id.
-    // arena_id may be in [0, kTotalArenas) when cold-arena feedback is on.
-    void* buckets[kTotalArenas][kThreadCacheMaxPerClass];
-    size_t counts[kTotalArenas]{};
-    for (size_t i = start; i < c.count; ++i) {
-        Span* span = page_map->get(reinterpret_cast<uintptr_t>(c.ptrs[i]));
-        uint8_t arena = (span && !span->is_large) ? span->arena_id : 0;
-        if (arena >= kTotalArenas) arena = 0;  // defensive
-        buckets[arena][counts[arena]++] = c.ptrs[i];
-    }
-    for (int a = 0; a < kTotalArenas; ++a) {
-        if (counts[a] > 0)
-            all_slabs[a * kNumClasses + sc].deallocateBatch(buckets[a], counts[a]);
-    }
+    const size_t start = c.count - to_drain;
+    drainRangeToSlabs(c.ptrs, start, to_drain, sc, all_slabs, page_map);
     c.count = static_cast<uint32_t>(start);
 }
 
@@ -125,19 +176,7 @@ void ThreadCache::drainAll(Slab* all_slabs, PageMap* page_map) {
     for (int i = 0; i < kNumClasses; ++i) {
         auto& c = caches_[i];
         if (c.count > 0) {
-            // Bucket by arena — each bucket may receive up to kThreadCacheMaxPerClass ptrs
-            void* buckets[kTotalArenas][kThreadCacheMaxPerClass];
-            size_t counts[kTotalArenas]{};
-            for (size_t j = 0; j < c.count; ++j) {
-                Span* span = page_map->get(reinterpret_cast<uintptr_t>(c.ptrs[j]));
-                uint8_t arena = (span && !span->is_large) ? span->arena_id : 0;
-                if (arena >= kTotalArenas) arena = 0;
-                buckets[arena][counts[arena]++] = c.ptrs[j];
-            }
-            for (int a = 0; a < kTotalArenas; ++a) {
-                if (counts[a] > 0)
-                    all_slabs[a * kNumClasses + i].deallocateBatch(buckets[a], counts[a]);
-            }
+            drainRangeToSlabs(c.ptrs, 0, c.count, static_cast<uint8_t>(i), all_slabs, page_map);
             c.count = 0;
         }
     }
@@ -167,6 +206,25 @@ thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
 
 __attribute__((tls_model("initial-exec")))
 thread_local int smash::g_full_mode_cached = -1;
+
+
+// free()-path last-span cache (see smash_heap.h). Starts empty: the [base,end)
+// range is [0,0) so no address can hit it before the first resolve, and the
+// sentinel generation never matches the live one.
+__attribute__((tls_model("initial-exec")))
+thread_local smash::Span* smash::g_free_cache_span = nullptr;
+
+__attribute__((tls_model("initial-exec")))
+thread_local uintptr_t smash::g_free_cache_base = 0;
+
+__attribute__((tls_model("initial-exec")))
+thread_local uintptr_t smash::g_free_cache_end = 0;
+
+__attribute__((tls_model("initial-exec")))
+thread_local uint64_t smash::g_free_cache_gen = ~0ULL;
+
+__attribute__((tls_model("initial-exec")))
+thread_local uint32_t smash::g_free_cache_skip = 0;
 
 // ── Syscall interposition for kernel buffer compatibility ────────────────────
 //

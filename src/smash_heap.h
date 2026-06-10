@@ -21,10 +21,35 @@
 #include <cstdint>
 #include <atomic>
 #include <dlfcn.h>
+#if defined(__linux__)
+#include <sched.h>   // sched_getcpu (vDSO) for CPU-indexed arena routing
+#endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <pthread.h>  // pthread_cpu_number_np for CPU-indexed arena routing
 #endif
+
+namespace smash {
+// Current CPU id, or -1 if unavailable. Used to index arena routing by core
+// rather than by thread (see callsiteArena / cpuArenaHash). Both fast paths
+// avoid a syscall:
+//   Linux : sched_getcpu()        — vDSO, ~3ns.
+//   macOS : pthread_cpu_number_np — reads the thread-local commpage, ~2ns
+//           (macOS 11.0+; same primitive Hoard uses in threadpoolheap.h).
+[[gnu::always_inline]]
+inline int currentCpu() {
+#if defined(__linux__)
+    return sched_getcpu();
+#elif defined(__APPLE__)
+    size_t cpu = 0;
+    if (pthread_cpu_number_np(&cpu) == 0) return static_cast<int>(cpu);
+    return -1;
+#else
+    return -1;
+#endif
+}
+}  // namespace smash
 
 namespace smash {
 
@@ -63,8 +88,105 @@ extern __attribute__((tls_model("initial-exec")))
 extern __attribute__((tls_model("initial-exec")))
     thread_local int g_full_mode_cached;  // -1 = unknown, 0 = bypass, 1 = full
 
+// free()-path last-span cache. The dominant cost of free() at scale is the
+// single load from the 128 MB flat page→Span table (a near-random access that
+// misses cache once the live set is large). Consecutive frees overwhelmingly
+// hit the same span (objects from one slab page are freed together), so a
+// one-entry per-thread cache of the most recently resolved span elides that
+// load. Validated against g_pagemap_generation (see page_map.h): a span whose
+// stamped generation still matches the global one provably still owns its
+// range. initial-exec TLS keeps the access to a direct tpidr_el0 + offset load.
+//
+// The span's [base, end) range is cached INLINE (not read through the Span*)
+// so the hit test is a pure TLS integer comparison. This matters on the miss
+// path: a workload with no free-locality must not pay a dereference of the
+// stale cached span (its own cache miss) before falling through to the table
+// load. On a miss we touch only TLS scalars, then resolve via the table once.
+extern __attribute__((tls_model("initial-exec")))
+    thread_local Span* g_free_cache_span;
+extern __attribute__((tls_model("initial-exec")))
+    thread_local uintptr_t g_free_cache_base;
+extern __attribute__((tls_model("initial-exec")))
+    thread_local uintptr_t g_free_cache_end;
+extern __attribute__((tls_model("initial-exec")))
+    thread_local uint64_t g_free_cache_gen;
+// Populate-throttle countdown. On a miss the cache is repopulated only when
+// this hits 0, then reset to (interval-1); otherwise it counts down and the
+// stale entry is left in place. Hits reset it to 0 so the next miss repopulates
+// immediately (fast phase-change adoption). With interval==1 every miss
+// repopulates (max locality benefit); larger intervals amortize the populate
+// stores away on locality-free workloads where they are pure overhead.
+extern __attribute__((tls_model("initial-exec")))
+    thread_local uint32_t g_free_cache_skip;
+
+// Repopulate interval for the free() last-span cache (see above). Read once
+// from SMASH_FREE_CACHE_REPOP (default kFreeCacheRepopDefault); 1 = always
+// repopulate. Exposed as a runtime knob so the policy can be swept without
+// rebuilding; the resolved value is cached in a static.
+//
+// Default 8 chosen by a parameter sweep across the real suite (bench_sqlite,
+// bench_rss) plus the locality and no-locality extremes of the churn microbench
+// (bench_throughput). The real suite is flat for all intervals (the cache is
+// invisible to locality-bearing workloads), the locality case holds 3.2 ns/op
+// at every interval, and 8 recovers most of the no-locality populate overhead
+// (random-replacement churn 18.9→18.3 ns/op vs 1) while still adopting a new
+// hot span within 8 misses on a phase change. Higher intervals buy a sliver
+// more on the synthetic no-locality case with no real-suite gain and slower
+// phase adoption, so 8 is the Pareto knee.
+inline constexpr uint32_t kFreeCacheRepopDefault = 8;
+[[gnu::always_inline]]
+inline uint32_t freeCacheRepopInterval() {
+    static const uint32_t interval = [] {
+        const char* v = std::getenv("SMASH_FREE_CACHE_REPOP");
+        if (!v) return kFreeCacheRepopDefault;
+        long n = std::atol(v);
+        return (n >= 1 && n <= (1L << 20)) ? static_cast<uint32_t>(n)
+                                           : kFreeCacheRepopDefault;
+    }();
+    return interval;
+}
+
 [[gnu::always_inline]]
 inline ThreadCache*& currentThreadCache() { return g_thread_cache; }
+
+// CPU-indexed arena routing (SMASH_CPU_ARENA, default OFF). When set,
+// callsiteArena() mixes the running CPU id (sched_getcpu on Linux,
+// pthread_cpu_number_np on macOS — same primitive Hoard uses) into the arena
+// hash instead of a per-thread monotonic id.
+//
+// DEFAULT OFF — measured a NET REGRESSION on Hoard Larson: ~22% slower at 32
+// threads (125M vs 161M ops/s) and no win at 64t. Root cause: smash mixes the
+// lane id into a hash that is then masked to getNumArenas() (64 here) shared
+// arenas — so CPU-indexing does NOT give a thread a dedicated arena, it only
+// reshuffles which hash collisions occur, and the high-entropy tid hash
+// distributes into 64 buckets slightly better. Hoard's win comes from indexing
+// a TRUE per-CPU cache array directly (caches[cpu], no shared lock); replicating
+// that in smash needs per-CPU/per-core slab lanes, not a hash tweak. Kept as an
+// opt-in knob for hosts where CPU-locality routing helps (e.g. arena count ≈
+// CPU count). See the deferred-free work for the actual contention fix.
+[[gnu::always_inline]]
+inline bool cpuArenaHash() {
+    static const bool on = [] {
+        const char* v = std::getenv("SMASH_CPU_ARENA");
+        return v && v[0] == '1';   // default OFF; opt in with SMASH_CPU_ARENA=1
+    }();
+    return on;
+}
+
+// True iff a free()-path diagnostic env var is set (SMASH_COUNT_FREE counts
+// every free; SMASH_TRACE_FOREIGN_FREE logs foreign frees). When either is
+// active the inlined free() fast path is disabled so every free is routed
+// through freeSlow() — keeping the counters/traces complete. One-shot, so the
+// steady-state cost is a single predictable branch.
+[[gnu::always_inline]]
+inline bool freeDiagnosticsActive() {
+    static const bool active = [] {
+        const char* c = std::getenv("SMASH_COUNT_FREE");
+        const char* t = std::getenv("SMASH_TRACE_FOREIGN_FREE");
+        return (c && c[0] == '1') || (t && t[0] == '1');
+    }();
+    return active;
+}
 
 // SMASH_PASSTHROUGH=1: smash passes all malloc/free to system allocator.
 // Used to isolate whether issues are caused by smash's allocation logic
@@ -335,7 +457,23 @@ class SmashHeap {
         uintptr_t h = static_cast<uintptr_t>(stable_ra) ^
                       (static_cast<uintptr_t>(depth_bucket) << 8) ^
                       static_cast<uintptr_t>(sc);
-        if constexpr (kThreadArenaHash) {
+        if (cpuArenaHash()) {
+            // CPU-indexed routing. Mix the running CPU (not a per-thread id)
+            // into the arena hash so the number of distinct lanes tracks the
+            // core count, not the thread count. With per-thread ids, N threads
+            // hashing onto M arenas collide by the birthday paradox (measured:
+            // Larson@64t variance 17-50M ops/s as threads randomly share an
+            // arena's slab lock). Indexing by CPU makes threads that share a
+            // core share an arena *structurally* — and they can't run
+            // concurrently on that core, so per-arena slab-lock contention is
+            // bounded by oversubscription, not luck. sched_getcpu() is vDSO
+            // (~3ns) and this runs only on the refill slow path (~1/batch),
+            // so the cost is amortized. A migration between read and use only
+            // changes routing (a hint); the slab lock still guards correctness.
+            const int cpu = currentCpu();
+            const uint32_t lane = (cpu >= 0) ? static_cast<uint32_t>(cpu) : 0;
+            h ^= static_cast<uintptr_t>(lane) * 0x9E3779B97F4A7C15ULL;
+        } else if constexpr (kThreadArenaHash) {
             // Thread-local monotonic id (A2-lite).  Multiplied by a
             // large odd constant so the low bits mix well into h.
             static std::atomic<uint32_t> next_tid{0};
@@ -896,7 +1034,77 @@ public:
         return mallocSlow(size, caller_ra);
     }
 
+    // Hot path. A non-null, full-mode, smash-owned pointer is resolved to its
+    // span via the TLS last-span cache (or the flat table on a miss) and
+    // pushed to the thread cache — all inlined into the caller. Everything
+    // uncommon (null, bootstrap pointer, passthrough/compress-only modes,
+    // foreign pointers, drains, diagnostics) falls through to freeSlow().
+    [[gnu::always_inline]]
     void free(void* ptr) {
+        if (!ptr) [[unlikely]] return;
+        // Anything other than plain full mode (passthrough/compress-only/etc.)
+        // or an active diagnostic routes through the cold path, which handles
+        // every mode and keeps the diagnostic counters complete.
+        if (!fullMallocPath() || freeDiagnosticsActive()) [[unlikely]]
+            return freeSlow(ptr);
+        if (BootstrapAlloc::instance().owns(ptr)) [[unlikely]] return;
+
+        const auto addr = reinterpret_cast<uintptr_t>(ptr);
+
+        // TLS last-span cache. Read the generation BEFORE resolving the span
+        // (the load-before-read ordering that makes the stamp safe — see
+        // page_map.h). The hit test is a pure TLS scalar comparison: the
+        // pointer falls in the cached span's [base, end) range AND the stamped
+        // generation still matches (so that mapping has not been torn down).
+        // No span dereference until a hit is confirmed — a locality-free
+        // workload pays only TLS compares before falling through to the table.
+        const auto gen = g_pagemap_generation.load(std::memory_order_acquire);
+        Span* span;
+        // No static branch hint: real workloads hit (free-locality), the
+        // adversarial random-replacement churn always misses; the hardware
+        // predictor adapts to either far better than a fixed [[likely]] that
+        // would mispredict every iteration of the no-locality case.
+        if (addr >= g_free_cache_base && addr < g_free_cache_end &&
+            g_free_cache_gen == gen) {
+            span = g_free_cache_span;
+            g_free_cache_skip = 0;  // hit → next miss repopulates immediately
+        } else {
+            if (vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()) [[likely]] {
+                span = vm_region_.getSpan(vm_region_.contigPageIndex(addr));
+            } else {
+                span = page_map_.get(addr);
+            }
+            if (!span) [[unlikely]] return freeSlow(ptr);
+            // Repopulate-throttle: under sustained misses (a locality-free
+            // workload) the populate stores are pure overhead, so only
+            // repopulate every freeCacheRepopInterval()-th miss. A hit above
+            // resets the countdown to 0, so a workload with real locality
+            // repopulates on the very next miss (immediate phase adoption).
+            if (g_free_cache_skip == 0) {
+                // Cache the span and its immutable [base, end) range with the
+                // generation read above (never newer than the span we resolved
+                // → a future stamp match is sound). A Span* describes the same
+                // range for life, so base/end stay valid while the stamp holds.
+                g_free_cache_span = span;
+                g_free_cache_base = reinterpret_cast<uintptr_t>(span->base);
+                g_free_cache_end = g_free_cache_base +
+                    static_cast<uintptr_t>(span->page_count) * kPageSize;
+                g_free_cache_gen = gen;
+                g_free_cache_skip = freeCacheRepopInterval() - 1;
+            } else {
+                --g_free_cache_skip;
+            }
+        }
+        if (span->is_large) [[unlikely]] { large_alloc_.deallocate(span); return; }
+        const auto sc = span->size_class;
+        ThreadCache* tc = currentThreadCache();
+        if (!tc) [[unlikely]] return freeSlow(ptr);
+        if (!tc->deallocate(sc, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, ptr); }
+    }
+
+    // Cold path: full free() semantics for every mode. Never inlined.
+    [[gnu::noinline, gnu::cold]]
+    void freeSlow(void* ptr) {
         if (!ptr) return;
         if (BootstrapAlloc::instance().owns(ptr)) return;
 
@@ -947,10 +1155,11 @@ public:
             return;
         }
 
-        // Fast path: pointer inside the VmRegion's contiguous arena → single
-        // load from the flat page→Span table. Avoids the two-level radix
-        // walk (acquire-load chain) that page_map_.get() requires.
-        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        // Resolve the span via the flat page→Span table (single load), or the
+        // two-level radix walk for addresses that escape the VmRegion. The
+        // cold path does not consult or populate the TLS last-span cache —
+        // that lives on the inlined fast path.
+        const auto addr = reinterpret_cast<uintptr_t>(ptr);
         Span* span;
         if (vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()) [[likely]] {
             span = vm_region_.getSpan(vm_region_.contigPageIndex(addr));

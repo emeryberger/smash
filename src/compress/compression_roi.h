@@ -100,8 +100,17 @@ struct AlgoProfile {
     // still estimated from the calibrated profile because decompression
     // happens at fault time in the signal handler, where we cannot cheaply
     // attribute timing back to a bucket.
+    // `redirty_discount_x256` (default 256 = 1.0 = no discount) scales the
+    // benefit by the estimated probability the compressed blob SURVIVES without
+    // being written again before we'd reclaim the RSS. It is the soft-dirty ROI
+    // lever: a page in a (arena,size_class) bucket that historically gets
+    // re-written soon after compression has a low survival probability, so its
+    // benefit is discounted and it falls below the compress threshold — churn
+    // avoided proactively, in the cost/benefit, rather than via reactive
+    // backoff. 256 reproduces the exact prior behavior (gate off).
     uint32_t computeROI(uint8_t cold_count, uint16_t ratio_255,
-                        uint32_t observed_comp_us = 0) const {
+                        uint32_t observed_comp_us = 0,
+                        uint32_t redirty_discount_x256 = 256) const {
         // Scale ratio for algorithms that achieve better ratios than the
         // fast-tier baseline.
         uint16_t effective_ratio = ratio_255;
@@ -113,6 +122,11 @@ struct AlgoProfile {
 
         uint64_t benefit = static_cast<uint64_t>(kPageSize) *
                            effective_ratio * cold_count / 255;
+        // Discount benefit by expected blob survival (soft-dirty ROI). Clamp
+        // the multiplier to [0,256]; 256 leaves benefit unchanged.
+        if (redirty_discount_x256 < 256) {
+            benefit = benefit * redirty_discount_x256 / 256;
+        }
         if (benefit == 0) return 0;
 
         // Cost: use observed microseconds when available, else derive from
@@ -148,6 +162,14 @@ struct ROIConfig {
     // to ablate; phase2 then ignores recompress_count_ and bucket EMAs and
     // gates only on cold_ticks_floor as before.
     bool recompress_backoff = true;
+
+    // Soft-dirty ROI gate (SMASH_SOFTDIRTY_ROI, default OFF). When on, phase2
+    // discounts a page's compression ROI benefit by the estimated probability
+    // its blob survives without being re-WRITTEN (learned per-bucket from the
+    // soft-dirty signal + a per-page write-clean streak). Proactively defers
+    // churn-prone buckets in the cost/benefit instead of reactively after a
+    // thrash. Off ⇒ discount is hard-256 (1.0) ⇒ behavior identical to today.
+    bool softdirty_roi = false;
 
     AlgoProfile profiles[4];
     int num_profiles = 0;
@@ -234,6 +256,9 @@ struct ROIConfig {
 
         if (const char* rb = std::getenv("SMASH_RECOMPRESS_BACKOFF")) {
             recompress_backoff = (std::atoi(rb) != 0);
+        }
+        if (const char* sr = std::getenv("SMASH_SOFTDIRTY_ROI")) {
+            softdirty_roi = (std::atoi(sr) != 0);
         }
 
         // 2. Try loading calibration file
@@ -617,8 +642,10 @@ namespace CompressionROI {
 // cold_count: ticks without access
 // stats_count: SizeClassStats::count (sliding window sample count)
 // stats_sum: SizeClassStats::sum (sum of ratio_255 values)
+// redirty_discount_x256: soft-dirty ROI survival multiplier (256 = no discount)
 inline bool shouldCompress(uint8_t cold_count,
-                            uint8_t stats_count, uint16_t stats_sum) {
+                            uint8_t stats_count, uint16_t stats_sum,
+                            uint32_t redirty_discount_x256 = 256) {
     auto& cfg = ROIConfig::instance();
 
     // Hard floor: never compress before minimum ticks
@@ -631,12 +658,18 @@ inline bool shouldCompress(uint8_t cold_count,
     return true;
 #endif
 
-    // Not enough samples to estimate ratio — optimistically compress
-    if (stats_count < 8) return true;
+    // Not enough samples to estimate ratio — optimistically compress.
+    // EXCEPTION: even with thin ratio data, a bucket with a strong learned
+    // re-dirty signal (deep discount) should still be gated, else churn-prone
+    // buckets escape the ROI check during their (long) warm-up window.
+    if (stats_count < 8 && redirty_discount_x256 >= 256) return true;
 
-    // Compute LZ4 ROI using average ratio from sliding window
-    uint16_t avg_ratio = stats_sum / stats_count;
-    uint32_t roi = cfg.profiles[0].computeROI(cold_count, avg_ratio);
+    // Compute LZ4 ROI using average ratio from sliding window. With thin ratio
+    // data assume a neutral mid ratio so the discount still has something to act
+    // on (otherwise stats_sum/stats_count is undefined for count 0).
+    uint16_t avg_ratio = (stats_count >= 8) ? (stats_sum / stats_count) : 128;
+    uint32_t roi = cfg.profiles[0].computeROI(cold_count, avg_ratio, 0,
+                                              redirty_discount_x256);
     return roi >= cfg.roi_threshold;
 }
 

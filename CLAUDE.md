@@ -302,7 +302,7 @@ cd build
 cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 
 # External tool dependencies
-brew install memcached redis rocksdb duckdb
+brew install memcached redis rocksdb
 # Allocator compare also needs: mimalloc, jemalloc, tcmalloc, hoard (built via FetchContent/find_library)
 ```
 
@@ -310,7 +310,7 @@ brew install memcached redis rocksdb duckdb
 
 | Flag | Gates |
 |------|-------|
-| `SMASH_BUILD_BENCH_DEPS` | The `bench_deps` target (Redis, memcached, DuckDB, RocksDB built from source via ExternalProject_Add). |
+| `SMASH_BUILD_BENCH_DEPS` | The `bench_deps` target (Redis, memcached, RocksDB built from source via ExternalProject_Add). |
 | `SMASH_BUILD_BENCH_ALLOCATORS` | The allocator-comparison block — mimalloc + jemalloc + tcmalloc + hoard + mesh + diehard + dieharder targets, plus `bench_allocator_compare.py.in`. Pulls in tcmalloc via Bazel (when `bazel`/`bazelisk` is on PATH and glibc ≥ 2.35) which uses `bench/tcmalloc_patch_build.cmake` to inject a `cc_binary(libtcmalloc_preload.so)` rule into the upstream `//tcmalloc:BUILD` file. |
 
 Paper experiments need both `=ON`. CI regression runs (`.github/workflows/ci.yml`) set both `=OFF` because the quick benches (`bench_rss`, `bench_sqlite`) don't need any of those allocators or external services, and skipping the heavy paths cuts CI build time from ~10 min to ~3 min.
@@ -367,13 +367,9 @@ bash bench/bench_memcached.sh [--quick]
 # Redis
 bash bench/bench_redis.sh [--quick]
 
-# DuckDB (TPC-H queries)
-bash bench/bench_duckdb.sh [--quick]
-
 # Multi-allocator comparison on Redis/Memcached
 bash bench/bench_redis_alloc.sh
 bash bench/bench_memcached_alloc.sh
-bash bench/bench_duckdb_alloc.sh
 ```
 
 ### Allocator Substrate Comparison (RQ5)
@@ -505,7 +501,7 @@ Runtime environment variables:
 
 ## Benchmark Result Provenance
 
-Every results JSON written by `bench/run_paper_experiments.py` (`ablation_results.json`, `compress_only_results.json`, `duckdb_compression_results.json`) carries:
+Every results JSON written by `bench/run_paper_experiments.py` (`ablation_results.json`, `compress_only_results.json`) carries:
 
 - **Top-level `_sessions[]`** appended per runner invocation: timestamp_utc, runs_requested, quick flag, apps list, `system_info` (hostname, platform, CPU, cores, mem_gib, page_size, tool versions for cmake/gcc/clang/redis-server/memcached), `smash_env_at_start` (snapshot of all `SMASH_*` env vars), and `bench_params` (the actual keys/value_size/num_clients/cool_sec/server_flags used by each `run_*` function).
 - **Per-(app, config) `provenance`**: `cmake_flags`, `smash_env`, `source_hash` (SHA-256 of `src/` + `include/` + top-level `CMakeLists.txt`; catches uncommitted edits), `libsmash_sha256` and `libsmash_mtime`, `git_head` and `git_dirty`.

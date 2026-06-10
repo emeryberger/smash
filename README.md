@@ -23,6 +23,28 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 
 4. **Decompression**: When the application accesses a compressed page, a SIGSEGV/SIGBUS handler recommits the page, decompresses the data, and resumes execution transparently.
 
+## Results
+
+Full smash vs. baseline (system malloc) across seven workloads, measured on an AMD EPYC 9R14 (192 cores, Amazon Linux 2023). Each app fills, cools, then serves; **RSS reduction** is peak → minimum serve-phase RSS, **AUC reduction** is the change in the integral of RSS over the cooling phase (MB·s), and **throughput** is application ops/s where the workload reports it.
+
+| Workload | Peak → Min RSS | RSS reduction | AUC reduction | Throughput vs baseline |
+|----------|---------------:|--------------:|--------------:|-----------------------:|
+| SQLite (in-memory DB)        | 588 → 33 MiB | 62.5 % | −7.6 % | 0.90× (88k vs 98k ops/s) |
+| RocksDB (block cache)        | 299 → 80 MiB | 73.3 % |  6.2 % | 0.96× (687k vs 713k ops/s) |
+| memcached (slab KV)          | 305 → 42 MiB | 86.4 % | 37.7 % | — |
+| Redis (stock)                | 283 → 130 MiB | 54.3 % |  8.5 % | — |
+| Redis-ext (50 % DELETE)      | 283 → 103 MiB | 63.4 % | 24.7 % | — |
+| Redis-patched (idle-mode)    | 280 → 126 MiB | 55.2 % |  8.7 % | 1.02× (62k vs 61k ops/s) |
+| Redis-ext-patched            | 281 → 66 MiB | 76.5 % | 25.1 % | 0.97× (61k vs 63k ops/s) |
+
+RSS reductions of **54–86 %** with throughput within a few percent of baseline. AUC tracks how long memory stays reclaimed: it is strongly positive where pages stay cold (memcached, the extended-DELETE Redis workloads) and near zero or slightly negative where the workload keeps re-touching pages during the measured window (SQLite's serve phase re-warms faster than the cooling integral captures, so its AUC is marginally negative even though peak RSS drops 62 %). Throughput is blank for workloads whose harness does not report a steady-state ops/s in this mode.
+
+These numbers come from `bench/run_paper_experiments.py --compress-only-only`; regenerate the figures below with `bench/plot_results.py` (see [Benchmarks](#benchmarks)).
+
+![RSS reduction](docs/figures/rss_reduction.png)
+![AUC reduction](docs/figures/auc_reduction.png)
+![Throughput](docs/figures/timing.png)
+
 ## Building
 
 ### Prerequisites
@@ -58,7 +80,7 @@ make -j$(nproc)
 
 | Option | Default | What it gates |
 |--------|---------|---------------|
-| `SMASH_BUILD_BENCH_DEPS` | `ON` | Build Redis, memcached, DuckDB, RocksDB from source via `make bench_deps`. See "Build with benchmark dependencies" below. Set `OFF` to skip — the rest of the benchmark targets still build. |
+| `SMASH_BUILD_BENCH_DEPS` | `ON` | Build Redis, memcached, RocksDB from source via `make bench_deps`. See "Build with benchmark dependencies" below. Set `OFF` to skip — the rest of the benchmark targets still build. |
 | `SMASH_BUILD_BENCH_ALLOCATORS` | `ON` | Build the allocator-comparison benches (mimalloc, jemalloc, tcmalloc, hoard, mesh, diehard, dieharder) and the `bench_allocator_compare.py` runner. Pulls in tcmalloc / mimalloc via FetchContent + ExternalProject_Add, which adds significant build time and several optional `find_library` probes. Set `OFF` for fast smash-only builds (e.g. CI regression runs). |
 
 To build only the smash-internal benches (`bench_rss`, `bench_sqlite`, `bench_throughput`, `bench_compression`, `bench_algo_compare`, etc.) without external services or competing allocators:
@@ -72,20 +94,19 @@ make -j$(nproc)
 
 This is what the CI regression-spotting workflow uses (see `.github/workflows/ci.yml`).
 
-### Build with benchmark dependencies (Redis, memcached, DuckDB, RocksDB)
+### Build with benchmark dependencies (Redis, memcached, RocksDB)
 
 For full A/B benchmarking, build the external dependencies from source. This ensures they use system malloc (libc) instead of their default allocators (jemalloc), which is required for Smash to effectively compress their memory.
 
 ```bash
 cmake .. -DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=ON
 make -j$(nproc)
-make bench_deps   # Builds Redis, memcached, DuckDB, RocksDB from source
+make bench_deps   # Builds Redis, memcached, RocksDB from source
 ```
 
-**Note**: Building DuckDB from source takes significant time (10-20 minutes). The `bench_deps` target builds:
+The `bench_deps` target builds:
 - Redis 8.0.2 with `MALLOC=libc` (instead of jemalloc)
 - memcached 1.6.34 (requires libevent-devel)
-- DuckDB 1.2.0 CLI
 - RocksDB 9.8.4 static library
 
 ## Usage
@@ -168,6 +189,7 @@ All runtime behavior is controlled via `SMASH_*` environment variables read once
 | `SMASH_COLD_TIMEOUT_SEC=N` | 2 | Minimum cold-time floor (seconds) before fast-tier compression considered. CPU-pressure adaptive cap raises this on busy systems. |
 | `SMASH_COLD_TICKS=N` | 2 | Override the fast-tier cold-tick threshold directly (alternative to `SMASH_COLD_TIMEOUT_SEC`). |
 | `SMASH_VERY_COLD_TICKS=N` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile. `9999` disables the deep tier entirely (fast tier only). |
+| `SMASH_USE_LZ4=1` | unset | Use LZ4 as the fast tier instead of zstd-1. zstd-1 is the default (higher ratio at comparable throughput on the measured workloads); LZ4 trades ratio for speed. |
 | `SMASH_ROI_THRESHOLD=N` | 1024 | Bytes-saved-per-microsecond cutoff for the ROI model. |
 | `SMASH_MIN_COMPRESS_RATIO=F` | 0.75 | Reject compressed page unless `comp_size < F × original_size`. |
 | `SMASH_RECOMPRESS_BACKOFF=0` | 1 (active) | Disable per-bucket recompression-thrash back-off (ablation switch); phase 2 then ignores `recompress_count_` and bucket EMAs. |
@@ -303,9 +325,6 @@ bash bench/bench_redis.sh [--quick]
 # Memcached (fill → cool → serve → cold re-access)
 bash bench/bench_memcached.sh [--quick]
 
-# DuckDB (TPC-H OLAP queries)
-bash bench/bench_duckdb.sh [--quick]
-
 # RocksDB (block cache with hot/cold access)
 bash bench/bench_rocksdb.sh [--quick]
 ```
@@ -324,6 +343,20 @@ python3 ../bench/run_paper_experiments.py --runs 3
 python3 ../bench/run_paper_experiments.py --quick --runs 1
 
 # Results written to paper_results/
+```
+
+The [Results](#results) table and figures above are generated from a
+`--compress-only-only` run. To reproduce them:
+
+```bash
+cd build
+python3 ../bench/run_paper_experiments.py --compress-only-only --runs 1 \
+    --apps sqlite,rocksdb,memcached,redis,redis_ext,redis_patched,redis_ext_patched \
+    --output-dir paper_results/all
+
+# Render the RSS / AUC / throughput bar charts (requires matplotlib)
+python3 ../bench/plot_results.py paper_results/all/compress_only_results.json \
+    --outdir ../docs/figures
 ```
 
 ### Verifying paper claims
@@ -365,10 +398,13 @@ python3 bench/verify_paper_claims.py --apps redis,memcached
 │                    │                 │       │
 │  ┌─────────────────▼─────────────────▼─────┐ │
 │  │         CompressEngine                   │ │
-│  │    LZ4 │ zstd │ zstd+dict              │ │
-│  └─────────────────────────────────────────┘ │
+│  │  zstd-1 (fast) │ zstd-9 (deep)           │ │
+│  │  [opt-in: LZ4 fast tier, zstd+dict]      │ │
+│  └──────────────────────────────────────────┘ │
 └─────────────────────────────────────────────┘
 ```
+
+The compressor's two tiers are **zstd-1** (fast) and **zstd-9** (deep), chosen per page by the ROI model. **LZ4** is available as an alternate fast tier (opt-in via `SMASH_USE_LZ4`) and dictionary compression (zstd+dict) is opt-in via dictionary training; neither is on by default.
 
 ## Configuration
 
@@ -390,4 +426,4 @@ Key tuning constants in `include/smash/config.h`:
 
 ## License
 
-TBD
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

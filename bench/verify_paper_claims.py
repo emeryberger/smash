@@ -27,18 +27,26 @@ gates at 30% when the paper reports 46%):
 the paper claim, a WARN when it's between the hard floor and the claim.
 
 Paper claims (serve/cool-phase RSS reduction vs baseline, evaluation.tex):
-  sqlite   : 69%   (429 -> 191 MiB)
-  rocksdb  : 80%   (280 -> 88  MiB)
-  memcached: 83%   (290 -> 80  MiB)   [needs external memcached; not run here]
-  redis    : 53%   (264 -> 140 MiB)   [needs external redis;     not run here]
+  sqlite      : 69%   (429 -> 191 MiB)   in-process bench
+  rocksdb     : 80%   (280 -> 88  MiB)   in-process bench
+  memcached   : 83%   (290 -> 80  MiB)   external service (via runner)
+  redis       : 53%   (264 -> 140 MiB)   external service (via runner)
+  redis-ext   : 60%   (extended: 50% DELETE)   external service (via runner)
+  redis-patch : 53%   (idle-mode patch)        external service (via runner)
 The in-process micro-bench (bench_rss, 64 MiB fully-compressible) is also
 checked against the paper's ~97% best-case sensitivity result as a WARN target.
+
+In-process apps (rss/sqlite/rocksdb) run their bench binary directly and are the
+default. External-service apps (memcached/redis/redis_ext/redis_patched) are
+driven through run_paper_experiments.py — slower, full mode only — and must be
+requested explicitly via --apps.
 
 Usage:
     cd build_bench2
     python3 ../bench/verify_paper_claims.py
     python3 ../bench/verify_paper_claims.py --build-dir . --modes full,large_only
     python3 ../bench/verify_paper_claims.py --apps sqlite,rocksdb
+    python3 ../bench/verify_paper_claims.py --apps redis,memcached  # external
 """
 
 from __future__ import annotations
@@ -71,7 +79,7 @@ class ModeExpect:
 @dataclass
 class AppSpec:
     name: str
-    binary: str                 # under build_dir/bench/
+    binary: str                 # under build_dir/bench/ (in-process benches)
     args: list[str]
     expect: dict[str, ModeExpect]   # keyed by mode
     peak_metric: str = "peak_rss_mb"
@@ -79,6 +87,12 @@ class AppSpec:
     timeout: int = 240
     # bench_rss links smash statically (no preload); the apps interpose.
     needs_preload: bool = True
+    # runner_app: external-service workloads (redis, memcached) are not
+    # standalone METRIC-emitting binaries — they need a live server plus a
+    # protocol client. When set, we delegate to run_paper_experiments.py
+    # (which owns that lifecycle), then read rss_reduction_pct for the
+    # "<runner_app>_full_smash" entry from the JSON it writes.
+    runner_app: str | None = None
 
 
 # Conservative hard floors are ~0.6x the paper number — low enough to pass on a
@@ -112,6 +126,34 @@ APPS: dict[str, AppSpec] = {
             "large_only": ModeExpect(no_regression_only=True),
         },
         timeout=240,
+    ),
+    # External-service workloads, driven via run_paper_experiments.py. Full
+    # mode only: these are server processes whose small-object traffic is what
+    # smash compresses; large-only would pass it through and is not the
+    # configuration the paper reports. The runner manages server + client.
+    "memcached": AppSpec(
+        name="memcached (slab KV store)",
+        binary="", args=[], runner_app="memcached",
+        expect={"full": ModeExpect(paper_pct=83.0, hard_pct=45.0)},
+        timeout=600,
+    ),
+    "redis": AppSpec(
+        name="redis (stock, bg-tasks disabled)",
+        binary="", args=[], runner_app="redis",
+        expect={"full": ModeExpect(paper_pct=53.0, hard_pct=30.0)},
+        timeout=600,
+    ),
+    "redis_ext": AppSpec(
+        name="redis-ext (extended: SET + 50% DELETE + GET)",
+        binary="", args=[], runner_app="redis_ext",
+        expect={"full": ModeExpect(paper_pct=60.0, hard_pct=30.0)},
+        timeout=600,
+    ),
+    "redis_patched": AppSpec(
+        name="redis-patched (idle-mode, redis-smash)",
+        binary="", args=[], runner_app="redis_patched",
+        expect={"full": ModeExpect(paper_pct=53.0, hard_pct=30.0)},
+        timeout=600,
     ),
 }
 
@@ -174,8 +216,53 @@ def parse_bench_rss_pct(out: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+def run_via_runner(spec: AppSpec, mode: str, exp: ModeExpect,
+                   build: Path) -> Result:
+    """Delegate an external-service app to run_paper_experiments.py and read
+    rss_reduction_pct for <runner_app>_full_smash from the JSON it writes."""
+    import json
+    runner = Path(__file__).resolve().parent / "run_paper_experiments.py"
+    outdir = build / "paper_results" / f"verify_{spec.runner_app}"
+    cmd = [sys.executable, "-u", str(runner), "--compress-only-only",
+           "--runs", "1", "--apps", spec.runner_app, "--output-dir", str(outdir)]
+    print(f"$ {mode}: {' '.join(cmd[2:])}", flush=True)
+    # Stream the runner's output through to our stdout (do NOT capture): the
+    # runner takes minutes, and live output lets callers/harnesses see progress
+    # instead of a silent hang. The result is read from the JSON it writes, so
+    # we don't need to parse stdout anyway.
+    try:
+        proc = subprocess.run(cmd, timeout=spec.timeout)
+    except subprocess.TimeoutExpired:
+        return Result(spec.name, mode, None, exp,
+                      note=f"TIMEOUT after {spec.timeout}s")
+
+    jpath = outdir / "compress_only_results.json"
+    if not jpath.exists():
+        return Result(spec.name, mode, None, exp,
+                      note=f"runner wrote no JSON (exit {proc.returncode}); "
+                           f"see runner output above")
+    data = json.loads(jpath.read_text())
+    entry = data.get(f"{spec.runner_app}_full_smash")
+    runs = (entry or {}).get("runs") if isinstance(entry, dict) else None
+    if not runs:
+        return Result(spec.name, mode, None, exp,
+                      note=f"no {spec.runner_app}_full_smash result in JSON "
+                           f"(server may have failed to start/fill)")
+    r = runs[0]
+    pct = r.get("rss_reduction_pct")
+    if pct is None:
+        return Result(spec.name, mode, None, exp,
+                      note="JSON entry missing rss_reduction_pct")
+    detail = {}
+    if r.get("peak_rss_mb") is not None and r.get("min_rss_mb") is not None:
+        detail = {"peak_mb": r["peak_rss_mb"], "min_mb": r["min_rss_mb"]}
+    return Result(spec.name, mode, float(pct), exp, detail=detail)
+
+
 def run_one(spec: AppSpec, mode: str, exp: ModeExpect,
             build: Path, libsmash: Path) -> Result:
+    if spec.runner_app:
+        return run_via_runner(spec, mode, exp, build)
     binpath = build / "bench" / spec.binary
     if not binpath.exists():
         return Result(spec.name, mode, None, exp,

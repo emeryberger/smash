@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 
 namespace smash {
 
@@ -46,6 +47,96 @@ class Slab {
     void (*release_hook_)(size_t, size_t, void*) = nullptr;
     void* release_ctx_ = nullptr;
 
+    // ── Lock-free deferred free (Approach A) ────────────────────────────────
+    // When a freeing thread finds lock_ contended, instead of blocking it pushes
+    // its already-resolved free batch onto this MPSC Treiber stack and returns.
+    // The next thread to acquire lock_ (a malloc refill, or a drain that wins
+    // tryLock) drains and applies the whole stack first. Nodes live in bootstrap
+    // memory (NOT threaded through user objects — that would put metadata on
+    // data pages and break compression) and carry the span resolved AT FREE TIME
+    // (page ranges recycle across size classes, so re-resolving later is wrong).
+    // Modeled on VmRegion's decommit Treiber stack.
+    struct PendingNode {
+        void*  ptrs[kThreadCacheMaxPerClass];
+        Span*  spans[kThreadCacheMaxPerClass];
+        uint32_t count;
+        PendingNode* next;
+    };
+    std::atomic<PendingNode*> pending_head_{nullptr};
+    std::atomic<uint32_t> pending_depth_{0};   // node count, for back-pressure
+    // Bootstrap node free-pool (recycled; steady-state allocation-free).
+    Spinlock pending_pool_lock_;
+    PendingNode* pending_pool_ = nullptr;
+
+    // Above this many queued nodes, the next freer force-locks and drains rather
+    // than pushing — bounds memory if a lock owner stalls.
+    static constexpr uint32_t kPendingNodeCap = 64;
+
+    PendingNode* acquirePendingNode() {
+        {
+            LockGuard g(pending_pool_lock_);
+            if (pending_pool_) {
+                PendingNode* n = pending_pool_;
+                pending_pool_ = n->next;
+                return n;
+            }
+        }
+        return static_cast<PendingNode*>(
+            BootstrapAlloc::instance().allocate(sizeof(PendingNode), alignof(PendingNode)));
+    }
+
+    void recyclePendingNode(PendingNode* n) {
+        LockGuard g(pending_pool_lock_);
+        n->next = pending_pool_;
+        pending_pool_ = n;
+    }
+
+    // Push a resolved batch onto the pending stack (lock-free, MP producers).
+    void pushPending(void** ptrs, Span** spans, size_t count) {
+        PendingNode* n = acquirePendingNode();
+        __builtin_memcpy(n->ptrs, ptrs, count * sizeof(void*));
+        __builtin_memcpy(n->spans, spans, count * sizeof(Span*));
+        n->count = static_cast<uint32_t>(count);
+        PendingNode* head = pending_head_.load(std::memory_order_relaxed);
+        do {
+            n->next = head;
+        } while (!pending_head_.compare_exchange_weak(
+            head, n, std::memory_order_release, std::memory_order_relaxed));
+        pending_depth_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Apply all queued deferred frees. CALLER MUST HOLD lock_ (single consumer).
+    // Fast-exits on an empty stack with one relaxed load.
+    void drainPending() SMASH_REQUIRES(lock_) {
+        if (pending_head_.load(std::memory_order_relaxed) == nullptr) [[likely]] return;
+        PendingNode* n = pending_head_.exchange(nullptr, std::memory_order_acquire);
+        while (n) {
+            PendingNode* next = n->next;
+            for (uint32_t i = 0; i < n->count; ++i)
+                if (n->spans[i]) deallocateOne(n->ptrs[i], n->spans[i]);
+            pending_depth_.fetch_sub(1, std::memory_order_relaxed);
+            recyclePendingNode(n);
+            n = next;
+        }
+    }
+
+    // Return one object to its span, updating the partial/full/empty lists.
+    // Caller holds lock_. Shared by deallocateBatch (resolves spans itself)
+    // and deallocateBatchResolved (spans pre-resolved by the caller).
+    void deallocateOne(void* ptr, Span* span) {
+        const bool was_full = span->full();
+        span->deallocate(ptr);
+
+        if (was_full) {
+            full_.remove(span);
+            partial_.pushFront(span);
+        } else if (span->empty()) {
+            partial_.remove(span);
+            decommitEmptySpan(span);
+            empty_.pushFront(span);
+        }
+    }
+
     Span* allocateNewSpan() {
         const auto& info = kSizeClasses[size_class_];
         size_t span_bytes = info.pages * kPageSize;
@@ -56,8 +147,7 @@ class Slab {
             if (!mem) return nullptr;
             if (page_states_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
-                for (uint32_t p = 0; p < info.pages; ++p)
-                    page_states_->set(idx + p, PageState::ACTIVE);
+                page_states_->setRange(idx, info.pages, PageState::ACTIVE);
             }
         } else {
             mem = vm::mapPages(span_bytes);
@@ -106,8 +196,7 @@ class Slab {
         vm::decommitPages(span->base, bytes);
         if (page_states_ && vm_region_) {
             size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
-            for (uint32_t p = 0; p < span->page_count; ++p)
-                page_states_->set(idx + p, PageState::EMPTY);
+            page_states_->setRange(idx, span->page_count, PageState::EMPTY);
         }
     }
 
@@ -117,8 +206,7 @@ class Slab {
     void recommitEmptySpan(Span* span) {
         if (page_states_ && vm_region_) {
             size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
-            for (uint32_t p = 0; p < span->page_count; ++p)
-                page_states_->set(idx + p, PageState::ACTIVE);
+            page_states_->setRange(idx, span->page_count, PageState::ACTIVE);
         }
     }
 
@@ -163,6 +251,7 @@ public:
     // Allocate one object from this size class. Caller must hold no locks.
     void* allocate() {
         LockGuard guard(lock_);
+        drainPending();  // apply any deferred cross-thread frees first
 
         // Try partial spans first
         Span* span = partial_.front();
@@ -226,6 +315,7 @@ public:
     // and (under Pareto-skew access) tend to cool together.
     size_t allocateBatch(void** out, size_t count) {
         LockGuard guard(lock_);
+        drainPending();  // apply any deferred cross-thread frees first
         size_t allocated = 0;
 
         while (allocated < count) {
@@ -277,24 +367,53 @@ public:
             // Look up the span for each pointer
             Span* span = page_map_->get(reinterpret_cast<uintptr_t>(ptrs[i]));
             if (!span) continue;
-
-            bool was_full = span->full();
-            span->deallocate(ptrs[i]);
-
-            if (was_full) {
-                full_.remove(span);
-                partial_.pushFront(span);
-            } else if (span->empty()) {
-                partial_.remove(span);
-                decommitEmptySpan(span);
-                empty_.pushFront(span);
-            }
+            deallocateOne(ptrs[i], span);
         }
+    }
+
+    // Same as deallocateBatch but with spans already resolved by the caller
+    // (ThreadCache::drain resolves each span once, then groups by arena). Skips
+    // the per-pointer PageMap radix walk the plain deallocateBatch would repeat.
+    void deallocateBatchResolved(void** ptrs, Span** spans, size_t count) {
+        LockGuard guard(lock_);
+        drainPending();
+        for (size_t i = 0; i < count; ++i) {
+            if (!spans[i]) continue;
+            deallocateOne(ptrs[i], spans[i]);
+        }
+    }
+
+    // Lock-free-friendly batch free (Approach A). If the slab lock is
+    // uncontended, take it, drain any pending deferred frees, and apply this
+    // batch directly. If contended, push the resolved batch onto the pending
+    // stack and return without blocking — a future lock holder applies it. To
+    // bound memory if a holder stalls, force-lock once the queue is deep.
+    void deallocateBatchDeferred(void** ptrs, Span** spans, size_t count)
+            SMASH_NO_TS_ANALYSIS {
+        if (count == 0) return;
+        if (pending_depth_.load(std::memory_order_relaxed) < kPendingNodeCap) {
+            if (lock_.tryLock()) {
+                drainPending();
+                for (size_t i = 0; i < count; ++i)
+                    if (spans[i]) deallocateOne(ptrs[i], spans[i]);
+                lock_.unlock();
+                return;
+            }
+            // Contended → defer without blocking.
+            pushPending(ptrs, spans, count);
+            return;
+        }
+        // Back-pressure: queue too deep, block to drain it and apply directly.
+        LockGuard guard(lock_);
+        drainPending();
+        for (size_t i = 0; i < count; ++i)
+            if (spans[i]) deallocateOne(ptrs[i], spans[i]);
     }
 
     // Return empty spans' pages to OS
     void scavenge() {
         LockGuard guard(lock_);
+        drainPending();
         while (Span* span = empty_.popFront()) {
             releaseSpan(span);
         }
@@ -305,8 +424,8 @@ public:
         cap_ctx_ = ctx;
     }
 
-    void lockSlab() { lock_.lock(); }
-    void unlockSlab() { lock_.unlock(); }
+    void lockSlab() SMASH_ACQUIRE(lock_) { lock_.lock(); }
+    void unlockSlab() SMASH_RELEASE(lock_) { lock_.unlock(); }
 };
 
 } // namespace smash

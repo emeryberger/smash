@@ -16,22 +16,69 @@
 #include <cstddef>
 #include <cstdint>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
+#include <execinfo.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include "smash/config.h"
+#include "../util/safe_printf.h"  // signal-handler-safe snprintf
 
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/exception_types.h>
 #include <mach/task.h>
 #include <pthread.h>
-#include <unistd.h>
-#include <cstdio>
 #endif
 
 namespace smash::vm {
 
 // Callback type: receives faulting address, returns true if handled.
 using FaultCallback = bool(*)(uintptr_t fault_addr, void* context);
+
+// Read-vs-write classification of the in-flight fault, for the decompress
+// callback (soft-dirty ROI). signalHandler sets it on the faulting thread just
+// before calling the callback, so a thread_local is race-free across concurrent
+// faults. 1 = write, 0 = read, -1 = unknown (Mach path / non-x86). NOTE: we
+// rely on REG_ERR/ucontext_t already being visible via <csignal> — do NOT add
+// <ucontext.h>, which conflicts with the signal includes on glibc and corrupts
+// the handler's ucontext view (caused a teardown SIGSEGV/SIGBUS).
+// Accessor over a FUNCTION-LOCAL thread_local. A namespace-scope inline
+// thread_local in this widely-included, LD_PRELOAD'd header broke the static
+// TLS block (teardown SIGSEGV); a single .cpp definition fails to link in the
+// targets that don't pull in smash_heap.cpp (compress-only, tests). A
+// function-local static thread_local is header-safe (one lazily-initialized
+// instance per thread, no static-TLS-block slot) and links everywhere.
+//
+// TLS model is PLATFORM-SPLIT and the split is load-bearing:
+//   Linux: initial-exec — resolved as a fixed tpidr offset (no __tls_get_addr).
+//     This is read/written from inside the SIGSEGV/SIGBUS handler, where the
+//     default local-dynamic model is fatal: __tls_get_addr lazily allocates the
+//     dynamic TLS block via the allocator (back into smash) and is not
+//     async-signal-safe, so it faults, re-enters the handler, and recurses
+//     until the stack overflows. initial-exec sidesteps it entirely.
+//   macOS: DEFAULT model (no attribute). Apple's linker does NOT support the
+//     initial-exec (static-offset) TLS model for a dylib loaded via
+//     DYLD_INSERT_LIBRARIES — the attribute on a function-local static there
+//     miscompiles into a TLS-descriptor sequence that traps with SIGILL inside
+//     the fault handler under a live compressor (caught by macOS CI; Linux is
+//     fine). macOS uses the signal-handler path too, but the write-bit
+//     classification below is __x86_64__-only, so on Apple silicon faultWasWrite
+//     is only ever -1 and the default-model lazy init is not exercised the way
+//     Linux's recursive case is.
+#if defined(__linux__)
+inline int& faultWasWrite() {
+    static thread_local __attribute__((tls_model("initial-exec"))) int v = -1;
+    return v;
+}
+#else
+inline int& faultWasWrite() {
+    static thread_local int v = -1;
+    return v;
+}
+#endif
 
 #if defined(__APPLE__) || defined(__linux__)
 
@@ -53,10 +100,81 @@ class FaultHandler {
 
     static FaultHandler* instance_;
 
+    // Set when we've decided this signal terminates the process.
+    // ensureInstalled() checks it before re-arming our handler so the
+    // compressor's periodic re-install doesn't race with the
+    // sigaction(SIG_DFL) → raise() chain we use to propagate
+    // user-space-synthesized SIGSEGV/SIGBUS to the original
+    // disposition.
+    static inline std::atomic<bool> shutting_down_{false};
+
+    // Signal-handler env flags, cached at install time. getenv() is NOT
+    // async-signal-safe: calling it from signalHandler() can fault inside
+    // libc's environ walk, and with SA_NODEFER that re-enters signalHandler,
+    // which calls getenv() again → unbounded recursion → stack-overflow
+    // SIGSEGV. (Observed as redis-server under LD_PRELOAD dumping core with a
+    // getenv → signalHandler → __restore_rt → getenv … backtrace.) Read these
+    // once in start()/ensureInstalled() and consult the cached bools only.
+    static inline bool sigtrace_enabled_ = false;
+    static inline bool dump_crash_bt_enabled_ = false;
+
+    // Detect signals that were synthesized by user-space (raise(),
+    // pthread_kill(), kill(), tgkill()) rather than from a real memory
+    // fault. For these, info->si_code is non-positive (SI_USER=0,
+    // SI_TKILL=-6, SI_QUEUE=-1, etc.) and info->si_addr is not a real
+    // faulting address. POSIX guarantees positive si_code values are
+    // kernel-synchronous fault sources (SEGV_MAPERR=1, SEGV_ACCERR=2,
+    // BUS_ADRALN, etc.).
+    //
+    // For user-synthesized SIGSEGV/SIGBUS the correct chain action is
+    // "act as if smash hadn't installed a handler at all": uninstall
+    // ourselves and re-raise so the original disposition (often
+    // SIG_DFL → terminate, sometimes a Python C-level handler) takes
+    // over. Without this carve-out, a user-space raise(SIGSEGV)
+    // fed through smash's handler chains to whatever old_sigsegv_
+    // was — which on Linux+Python is SIG_DFL — and the chain logic
+    // works *most* of the time, but races with ensureInstalled() can
+    // re-arm our handler in the µs-window between signal(SIG_DFL)
+    // and raise(), producing an infinite loop.
+    //
+    // WalrusDriver.py:518 calls signal.raise_signal(-rc) on backend
+    // SIGSEGV exits, which is the production trigger for this path.
+    static bool isKernelFault(const siginfo_t* info) {
+        return info->si_code > 0;
+    }
+
     static void signalHandler(int sig, siginfo_t* info, void* ucontext) {
         int saved_errno = errno;
-        if (instance_ && instance_->callback_) {
+        if (isKernelFault(info) && instance_ && instance_->callback_) {
             uintptr_t addr = reinterpret_cast<uintptr_t>(info->si_addr);
+            // Classify read vs write for the soft-dirty ROI re-dirty signal.
+            // x86-64: bit 1 of the page-fault error code (gregs[REG_ERR]) is the
+            // write bit. ucontext_t/REG_ERR come from <csignal> (already
+            // included); we deliberately do NOT include <ucontext.h>.
+            //
+            // LINUX ONLY: touch faultWasWrite() here. On macOS the value is
+            // never set meaningfully (the write-bit read below is Linux-x86
+            // only) and the lone reader (compressor_thread.h) already treats
+            // the unset/-1 case as "write". More importantly, the macOS
+            // function-local thread_local carries a lazy-init guard that, when
+            // first run INSIDE this signal handler under a live compressor,
+            // traps with SIGILL (observed deterministically in macOS CI:
+            // bench_sqlite dies in the fault/decompress phase). Not touching
+            // the TLS in the handler on macOS avoids that guard entirely; the
+            // compressor thread inits it lazily (safely, not in a handler) on
+            // its first read.
+#if defined(__linux__)
+            faultWasWrite() = -1;
+#if defined(__x86_64__) && defined(REG_ERR)
+            if (ucontext) {
+                auto* uc = static_cast<const ucontext_t*>(ucontext);
+                faultWasWrite() =
+                    (uc->uc_mcontext.gregs[REG_ERR] & 0x2) ? 1 : 0;
+            }
+#endif
+#else
+            (void)ucontext;
+#endif
             if (instance_->callback_(addr, instance_->callback_ctx_)) {
                 errno = saved_errno;
                 return;  // Fault handled, resume execution
@@ -70,11 +188,89 @@ class FaultHandler {
         // instead of POSIX signal handlers. Tracked in FIREFOX_PLAN.md.
         struct sigaction* old = (sig == SIGSEGV)
             ? &instance_->old_sigsegv_ : &instance_->old_sigbus_;
+
+        // SMASH_SIGTRACE=1 — async-signal-safe one-line trace per chain.
+        // Flag cached at install time; getenv() here would not be
+        // async-signal-safe (see sigtrace_enabled_ declaration).
+        if (sigtrace_enabled_) {
+            char buf[160];
+            const char* kind = "?";
+            if (old->sa_flags & SA_SIGINFO) kind = "SA_SIGINFO";
+            else if (old->sa_handler == SIG_DFL) kind = "SIG_DFL";
+            else if (old->sa_handler == SIG_IGN) kind = "SIG_IGN";
+            else kind = "OTHER";
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash sig] sig=%d si_code=%d si_addr=%p chain_kind=%s flags=0x%x\n",
+                sig, info->si_code, info->si_addr, kind,
+                (unsigned)old->sa_flags);
+            if (n > 0) (void)!write(2, buf, (size_t)n);
+        }
+
+        // For non-kernel-synchronous faults (raise/kill/etc.) that we
+        // didn't handle, we MUST uninstall ourselves before returning;
+        // otherwise the kernel resumes the faulting instruction (the
+        // raise() syscall return), the caller's next instruction
+        // executes, and the user's intent (terminate the process) is
+        // silently dropped. By restoring the old sigaction and calling
+        // raise() ourselves, we let the original disposition fire.
+        if (!isKernelFault(info)) {
+            shutting_down_.store(true, std::memory_order_release);
+            sigaction(sig, old, nullptr);
+            raise(sig);
+            errno = saved_errno;
+            return;
+        }
+
+        // SMASH_DUMP_CRASH_BT=1 — dump a backtrace before terminating.
+        // Useful for diagnosing real segfaults that smash didn't handle
+        // (e.g. compiler crashes in app code under full smash mode).
+        // Only fires for kernel-fault SIGSEGV/SIGBUS that chain to
+        // SIG_DFL — i.e. the process is about to die anyway.
+        // Flag cached at install time (getenv() is not async-signal-safe).
+        bool want_bt = dump_crash_bt_enabled_ &&
+                       isKernelFault(info) &&
+                       !(old->sa_flags & SA_SIGINFO) &&
+                       old->sa_handler == SIG_DFL;
+        if (want_bt) {
+            // Portable thread id: SYS_gettid is Linux-only; macOS uses
+            // pthread_threadid_np. Diagnostic-only.
+#if defined(__linux__)
+            long tid = syscall(SYS_gettid);
+#elif defined(__APPLE__)
+            uint64_t tid64 = 0; pthread_threadid_np(nullptr, &tid64);
+            long tid = static_cast<long>(tid64);
+#else
+            long tid = 0;
+#endif
+            char hdr[160];
+            int n = smash::safe_snprintf(hdr, sizeof(hdr),
+                "[smash crash] pid=%d tid=%ld sig=%d si_code=%d si_addr=%p\n",
+                (int)getpid(), tid,
+                sig, info->si_code, info->si_addr);
+            if (n > 0) (void)!write(2, hdr, (size_t)n);
+            void* frames[64];
+            int nframes = backtrace(frames, 64);
+            backtrace_symbols_fd(frames, nframes, 2);
+        }
+
         if (old->sa_flags & SA_SIGINFO) {
             old->sa_sigaction(sig, info, ucontext);
         } else if (old->sa_handler == SIG_DFL) {
-            signal(sig, SIG_DFL);
+            shutting_down_.store(true, std::memory_order_release);
+            sigaction(sig, old, nullptr);
             raise(sig);
+        } else if (old->sa_handler == SIG_IGN) {
+            // Synchronous fault + caller asked to ignore = the
+            // faulting instruction would re-execute forever. Force
+            // SIG_DFL termination instead.
+            shutting_down_.store(true, std::memory_order_release);
+            struct sigaction dfl{};
+            dfl.sa_handler = SIG_DFL;
+            sigemptyset(&dfl.sa_mask);
+            sigaction(sig, &dfl, nullptr);
+            raise(sig);
+        } else {
+            old->sa_handler(sig);
         }
     }
 
@@ -135,7 +331,7 @@ class FaultHandler {
             }();
             if (trace) {
                 char buf[128];
-                int n = snprintf(buf, sizeof(buf),
+                int n = smash::safe_snprintf(buf, sizeof(buf),
                     "[smash mach] exc=%d code=[%llx,%llx] handled=%d\n",
                     req.body.exception,
                     (unsigned long long)req.body.code[0],
@@ -213,6 +409,14 @@ public:
         callback_ctx_ = ctx;
         instance_ = this;
 
+        // Cache signal-handler env flags ONCE here, before the handler can
+        // ever run. signalHandler() must not call getenv() (not
+        // async-signal-safe; recurses under SA_NODEFER — see flag decls).
+        const char* st = std::getenv("SMASH_SIGTRACE");
+        sigtrace_enabled_ = st && st[0] == '1';
+        const char* bt = std::getenv("SMASH_DUMP_CRASH_BT");
+        dump_crash_bt_enabled_ = bt && bt[0] == '1';
+
 #ifdef __APPLE__
         const char* mach_env = std::getenv("SMASH_USE_MACH_EXCEPTIONS");
         if (mach_env && mach_env[0] == '1') {
@@ -271,6 +475,11 @@ public:
     // reclaim SIGBUS to handle page faults from PROT_NONE pages.
     void ensureInstalled() {
         if (!running_.load(std::memory_order_relaxed)) return;
+        // Don't fight the chained termination path. signalHandler sets
+        // this when it's restored SIG_DFL (or another disposition) and
+        // is on its way out via raise(); reinstalling our handler here
+        // would race the kernel's pending delivery and loop.
+        if (shutting_down_.load(std::memory_order_acquire)) return;
 #ifdef __APPLE__
         if (mach_mode_) return;
 #endif

@@ -43,6 +43,11 @@ option(SMASH_BUILD_BENCH_ALLOCATORS "Build allocator-comparison benchmarks (mima
 set(SMASH_BENCH_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
   ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  # smash headers transitively #include "printf.h" (via src/util/safe_printf.h,
+  # the allocation-free diagnostic formatter added in 1169dc3). Any bench TU
+  # that pulls in a smash header therefore needs the vendored printf on its
+  # include path, or the build fails with "'::vsnprintf_' has not been declared".
+  ${printf_SOURCE_DIR}
 )
 
 # Helper to add a benchmark executable (linked against smash internals)
@@ -105,6 +110,10 @@ endif()
 add_executable(bench_throughput
   bench_throughput.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
+  # smash_heap.cpp uses the allocation-free safe_* printf wrappers (vsnprintf_),
+  # whose definition lives in the vendored printf.cpp — link it here, else the
+  # build fails at link with "undefined reference to vsnprintf_".
+  ${printf_SOURCE_DIR}/printf.cpp
 )
 target_include_directories(bench_throughput PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
 target_link_libraries(bench_throughput PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
@@ -125,6 +134,10 @@ smash_add_bench(bench_algo_compare bench_algo_compare.cpp)
 add_executable(bench_rss
   bench_rss.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
+  # smash_heap.cpp uses the allocation-free safe_* printf wrappers (vsnprintf_),
+  # whose definition lives in the vendored printf.cpp — link it here, else the
+  # build fails at link with "undefined reference to vsnprintf_".
+  ${printf_SOURCE_DIR}/printf.cpp
 )
 target_include_directories(bench_rss PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
 target_link_libraries(bench_rss PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
@@ -136,6 +149,10 @@ endif()
 add_executable(bench_latency
   bench_latency.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
+  # smash_heap.cpp uses the allocation-free safe_* printf wrappers (vsnprintf_),
+  # whose definition lives in the vendored printf.cpp — link it here, else the
+  # build fails at link with "undefined reference to vsnprintf_".
+  ${printf_SOURCE_DIR}/printf.cpp
 )
 target_include_directories(bench_latency PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
 target_link_libraries(bench_latency PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
@@ -154,6 +171,10 @@ smash_add_standalone_bench(bench_kv_store bench_kv_store.cpp)
 
 # Configurable cold/hot mix microbenchmark (raw malloc/free)
 smash_add_standalone_bench(bench_coldhotmix bench_coldhotmix.cpp)
+
+# Zipfian re-access microbenchmark — cold-age IS predictive of re-access, the
+# regime that discriminates a Lindy/Bayesian compress gate from blunt backoff.
+smash_add_standalone_bench(bench_zipf_reaccess bench_zipf_reaccess.cpp)
 
 # ── SQLite amalgamation (for bench_sqlite) ─────────────────────────────────
 FetchContent_Declare(

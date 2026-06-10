@@ -2,14 +2,15 @@
 #pragma once
 
 #include <atomic>
+#include "thread_safety.h"
 
 namespace smash {
 
-class Spinlock {
+class SMASH_CAPABILITY("mutex") Spinlock {
     std::atomic_flag flag_{};
 
 public:
-    void lock() {
+    void lock() SMASH_ACQUIRE() {
         while (flag_.test_and_set(std::memory_order_acquire)) {
 #if defined(__x86_64__) || defined(_M_X64)
             __builtin_ia32_pause();
@@ -19,20 +20,20 @@ public:
         }
     }
 
-    void unlock() {
+    void unlock() SMASH_RELEASE() {
         flag_.clear(std::memory_order_release);
     }
 
-    bool tryLock() {
+    bool tryLock() SMASH_TRY_ACQUIRE(true) {
         return !flag_.test_and_set(std::memory_order_acquire);
     }
 };
 
-class LockGuard {
+class SMASH_SCOPED_CAPABILITY LockGuard {
     Spinlock& lock_;
 public:
-    explicit LockGuard(Spinlock& lock) : lock_(lock) { lock_.lock(); }
-    ~LockGuard() { lock_.unlock(); }
+    explicit LockGuard(Spinlock& lock) SMASH_ACQUIRE(lock) : lock_(lock) { lock_.lock(); }
+    ~LockGuard() SMASH_RELEASE() { lock_.unlock(); }
     LockGuard(const LockGuard&) = delete;
     LockGuard& operator=(const LockGuard&) = delete;
 };

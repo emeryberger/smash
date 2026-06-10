@@ -22,6 +22,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 namespace smash {
@@ -40,11 +42,39 @@ class VmRegion {
     size_t contig_pages_ = 0;  // = region_size / kPageSize in full mode; 0 in tracking mode
     std::atomic<size_t> next_page_{0};  // bump pointer (normal) or next index (tracking)
 
+    // ── Chunked commit watermark ────────────────────────────────────────────
+    // The arena is reserved PROT_NONE; pages must be mprotect'd to PROT_RW
+    // before use. Committing per span bump means one mprotect per span, and
+    // every mprotect takes the kernel's mmap_lock for write — under a workload
+    // that bump-allocates a large live set (e.g. Hoard linux-scalability holds
+    // ~1.3 GB live) those serialize on osq_lock and dominate CPU. Instead we
+    // commit in large chunks ahead of the bump pointer: committed_pages_ is the
+    // high-water page index already PROT_RW, advanced under commit_lock_ in
+    // kCommitChunkPages steps. A bump only mprotects when it crosses the
+    // watermark, turning millions of mprotects into a few hundred. Behavior is
+    // preserved: mprotect on an untouched PROT_NONE anonymous range only flips
+    // VMA protection; no physical page is backed until first write, so RSS is
+    // unchanged (the kernel still faults pages in lazily on touch).
+    std::atomic<size_t> committed_pages_{0};
+    Spinlock commit_lock_;
+
     struct FreeRun {
         size_t page_index;
         size_t page_count;
         FreeRun* next;
     };
+
+    // Pages committed per watermark advance (see committed_pages_).
+    //
+    // DEFAULT 0 = OFF (commit exactly the requested pages, per-call). Chunked
+    // commit was measured to be net-negative: on a single-threaded bump-growth
+    // workload (Hoard linux-scalability) it cuts the per-span mprotect/mmap_lock
+    // cost ~25%, but it REGRESSES realloc churn (phong +90%) and, worst, holding
+    // the global commit_lock_ across a multi-MiB mprotect serializes high
+    // thread counts — Larson at 64 threads collapsed ~10x (47M→5M ops/s) with
+    // chunking on. The win is narrow and the downside is a scalability cliff, so
+    // it ships off. Opt in per-workload via SMASH_COMMIT_CHUNK_KIB=N.
+    static constexpr size_t kCommitChunkPages = 0;
 
     // Sharded free lists to reduce contention under high thread counts.
     // 64 shards = one per typical cache line, threads hash by ID.
@@ -130,10 +160,22 @@ class VmRegion {
     }
 
     void processDecommitEntry(DecommitEntry* e) {
-        // Decommit the pages
+        // Restore PROT_RW on the range. A freed range may include pages
+        // smash compressed before the free (state COMPRESSED →
+        // mprotect PROT_NONE). Without this, allocatePages's freelist-pop
+        // path hands the still-PROT_NONE range back to the application,
+        // and the next access faults. The fault handler sees state=EMPTY
+        // (cleared by releaseHook in the free path) and bails — kernel
+        // delivers SIGSEGV. Manifests on workloads with many compressed
+        // pages followed by reuse of those addresses (e.g. test7_full
+        // walrus crash with "DenseMap node count imbalance" or null-deref
+        // in nlohmann::json::destroy).
+        vm::commitPages(e->addr, e->num_pages * kPageSize);
+
+        // Decommit the pages (release physical backing).
         vm::decommitPages(e->addr, e->num_pages * kPageSize);
 
-        // NOW add to free list (safe - pages are decommitted)
+        // NOW add to free list (safe - pages are decommitted and PROT_RW)
         FreeShard& shard = shards_[e->shard_idx];
         FreeRun* run = newFreeRun(shard);
         run->page_index = e->page_index;
@@ -220,6 +262,11 @@ class VmRegion {
     // Full-mode external-page bookkeeping. The contiguous arena uses
     // next_page_ for its bump pointer (indices 0..kVmMaxPages-1); this
     // counter assigns external indices starting at kVmMaxPages.
+    // external_slot_next_: monotonically incremented to reserve a slot
+    // external_count_: only incremented after the slot is fully populated
+    //                  (address written). committedPages() reads this, so
+    //                  the compressor won't iterate to slots-in-progress.
+    std::atomic<size_t> external_slot_next_{0};
     std::atomic<size_t> external_count_{0};
 
     // Flat direct page-index → Span* table. Sized to total_pages_ entries
@@ -388,12 +435,93 @@ public:
             return nullptr;
         }
         void* addr = base_ + start * kPageSize;
-        vm::commitPages(addr, num_pages * kPageSize);
+        ensureCommitted(start + num_pages);
         return addr;
+    }
+
+    // Ensure pages [0, end_page) are committed (PROT_RW). Fast path: a single
+    // relaxed load when the watermark already covers end_page (the common case
+    // — one chunk commit serves thousands of bumps). Slow path: take
+    // commit_lock_, re-check, and mprotect forward to the next kCommitChunkPages
+    // boundary (clamped to contig_pages_). The double-check under the lock means
+    // concurrent bumps that all cross the watermark issue exactly one mprotect
+    // for the chunk, not one each.
+    // Runtime-overridable commit chunk (pages). SMASH_COMMIT_CHUNK_KIB lets the
+    // chunk size be swept without rebuilding; 0 disables chunking (commit
+    // exactly the requested pages, like the pre-watermark behavior).
+    static size_t commitChunkPages() {
+        static const size_t pages = [] {
+            const char* v = std::getenv("SMASH_COMMIT_CHUNK_KIB");
+            if (!v) return kCommitChunkPages;
+            long kib = std::atol(v);
+            if (kib < 0) return kCommitChunkPages;
+            return static_cast<size_t>((static_cast<size_t>(kib) * 1024) / kPageSize);
+        }();
+        return pages;
+    }
+
+    void ensureCommitted(size_t end_page) {
+        if (end_page <= committed_pages_.load(std::memory_order_acquire)) [[likely]]
+            return;
+        LockGuard guard(commit_lock_);
+        size_t already = committed_pages_.load(std::memory_order_relaxed);
+        if (end_page <= already) return;  // another thread committed it
+        const size_t chunk = commitChunkPages();
+        // Commit forward to the next chunk boundary so a run of bumps shares
+        // this mprotect; round end_page up, clamp to the arena end. chunk==0
+        // means "no chunking" — commit exactly what's needed.
+        size_t target = (chunk == 0) ? end_page : already + chunk;
+        if (target < end_page) {
+            target = ((end_page + chunk - 1) / chunk) * chunk;
+        }
+        if (target > contig_pages_) target = contig_pages_;
+        void* addr = base_ + already * kPageSize;
+        vm::commitPages(addr, (target - already) * kPageSize);
+        committed_pages_.store(target, std::memory_order_release);
     }
 
     void releasePages(void* addr, size_t num_pages) {
         if (tracking_mode_) return;
+
+        // SMASH_LANDMINES=1: synchronously mprotect(PROT_NONE) the freed range
+        // and log it. Pages are never returned to the free list, so any
+        // dangling pointer in the application surfaces as SIGSEGV at the
+        // exact dangling-read site (instead of corrupting later allocations
+        // or zero-filling silently). Compares to glibc/jemalloc which keep
+        // freed contents intact: this distinguishes "smash decommit causes
+        // crash" (landmines pass) from "app UAF" (landmines crash, with
+        // si_addr inside a logged range).
+        static const bool landmines = []{
+            const char* v = std::getenv("SMASH_LANDMINES");
+            return v && v[0] == '1';
+        }();
+        if (landmines) {
+            (void)::mprotect(addr, num_pages * kPageSize, PROT_NONE);
+            char buf[96];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash landmine] free addr=%p npages=%zu range=[%p,%p)\n",
+                addr, num_pages, addr,
+                static_cast<char*>(addr) + num_pages * kPageSize);
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+            return;  // never reuse — fail loudly on dangling reuse
+        }
+
+        // SMASH_ZERO_FREE=1: synchronously zero (memset) the freed range AND
+        // allow normal reuse via the freelist. If walrus reads from freed
+        // memory between free() and a subsequent allocation, this is exactly
+        // what madvise(MADV_DONTNEED) does (zero on next access) but without
+        // any kernel involvement: the zero is immediate. If this crashes,
+        // walrus has a UAF that reads pre-free data. If it passes, the
+        // problem is something else in the madvise/reuse path (e.g. TLB
+        // shootdown timing, freelist coherency).
+        static const bool zero_free = []{
+            const char* v = std::getenv("SMASH_ZERO_FREE");
+            return v && v[0] == '1';
+        }();
+        if (zero_free) {
+            __builtin_memset(addr, 0, num_pages * kPageSize);
+            // fall through to normal queue+decommit+reuse path
+        }
 
         // Start decommit thread lazily on first release (avoids reentrancy
         // during early library initialization when pthread_create might malloc).
@@ -466,11 +594,22 @@ public:
                 uintptr_t expected = 0;
                 if (track_hash_[s].key.compare_exchange_strong(
                         expected, key, std::memory_order_acq_rel)) {
-                    size_t local = external_count_.fetch_add(1, std::memory_order_relaxed);
-                    if (local >= kTrackMaxPages) return 0;
+                    // Reserve a slot first (use relaxed since we control visibility)
+                    size_t local = external_slot_next_.fetch_add(1, std::memory_order_relaxed);
+                    if (local >= kTrackMaxPages) {
+                        // No more slots available
+                        return 0;
+                    }
                     size_t idx = contig_pages_ + local;
+                    // Write address before publishing.
                     track_reverse_[local] = page_addr;
                     track_hash_[s].idx.store(idx, std::memory_order_release);
+                    // Only increment external_count_ AFTER everything is set.
+                    // This is what committedPages() reads, so the compressor
+                    // won't iterate to this index until the address is valid.
+                    // Use release so the address write is visible before the
+                    // count increment.
+                    external_count_.fetch_add(1, std::memory_order_release);
                     return idx;
                 }
                 if (track_hash_[s].key.load(std::memory_order_relaxed) == key)
@@ -524,13 +663,17 @@ public:
     void* pageAddress(size_t index) const {
         if (tracking_mode_) {
             if (index == 0 || index >= total_pages_) return nullptr;
-            return reinterpret_cast<void*>(track_reverse_[index]);
+            uintptr_t addr = track_reverse_[index];
+            return addr ? reinterpret_cast<void*>(addr) : nullptr;
         }
         // Full mode
         if (index < contig_pages_) return base_ + index * kPageSize;
         size_t local = index - contig_pages_;
         if (local >= kTrackMaxPages) return nullptr;
-        return reinterpret_cast<void*>(track_reverse_[local]);
+        // track_reverse_[local] may be 0 if the slot was reserved but the
+        // address hasn't been written yet (race with trackExternalPage).
+        uintptr_t addr = track_reverse_[local];
+        return addr ? reinterpret_cast<void*>(addr) : nullptr;
     }
 
     // ── Flat page-index → Span* table ───────────────────────────────────────
@@ -550,6 +693,19 @@ public:
         if (!page_to_span_) [[unlikely]] return;
         if (page_idx >= total_pages_) [[unlikely]] return;
         page_to_span_[page_idx].store(span, std::memory_order_release);
+    }
+
+    // Set a contiguous run of flat-table slots to the same span. Bounds are
+    // checked once for the whole run, then the loop is a tight sequential store
+    // — avoids the per-page table-pointer null check + bound compare that
+    // calling setSpan() num_pages times would repeat. Used by the span-creation
+    // path (PageMap::setRange) where every page of a fresh span maps to the
+    // same Span*.
+    void setSpanRange(size_t first_page_idx, size_t num_pages, Span* span) {
+        if (!page_to_span_) [[unlikely]] return;
+        if (first_page_idx + num_pages > total_pages_) [[unlikely]] return;
+        for (size_t i = 0; i < num_pages; ++i)
+            page_to_span_[first_page_idx + i].store(span, std::memory_order_release);
     }
 
     // True iff the flat table is mapped (mmap succeeded in init()). Used by

@@ -230,6 +230,57 @@ public:
         return size_class < kNumClasses && dicts_[size_class].trained;
     }
 
+    // Install a pre-trained dictionary for size_class. Used by warm-start
+    // profile load: bytes were produced by a previous run's
+    // ZDICT_trainFromBuffer and persisted, so we skip the (~50–200 ms)
+    // training step and go straight to building CDict/DDict over them.
+    // Copies the bytes into bootstrap memory; the caller's buffer can be
+    // freed after return. Returns true on success.
+    bool setDictionary(uint8_t size_class, const void* bytes, size_t size) {
+        if (size_class >= kNumClasses) return false;
+        if (!bytes || size == 0 || size > kDictCapacity) return false;
+        // Idempotent: leave first dict in place to avoid double-allocating
+        // bootstrap memory if the caller invokes setDictionary twice.
+        if (dicts_[size_class].trained) return true;
+
+        void* dict_buf = BootstrapAlloc::instance().allocate(size, 16);
+        if (!dict_buf) return false;
+        __builtin_memcpy(dict_buf, bytes, size);
+
+        auto mem = customMem();
+        ZSTD_compressionParameters cparams = ZSTD_getCParams(
+            kDictLevel, kPageSize, size);
+        ZSTD_CDict* cdict = ZSTD_createCDict_advanced(
+            dict_buf, size,
+            ZSTD_dlm_byRef, ZSTD_dct_auto,
+            cparams, mem);
+        ZSTD_DDict* ddict = ZSTD_createDDict_advanced(
+            dict_buf, size,
+            ZSTD_dlm_byRef, ZSTD_dct_auto,
+            mem);
+        if (!cdict || !ddict) return false;
+
+        dicts_[size_class].dict_buffer = dict_buf;
+        dicts_[size_class].dict_size = size;
+        dicts_[size_class].cdict = cdict;
+        dicts_[size_class].ddict = ddict;
+        dicts_[size_class].trained = true;
+        return true;
+    }
+
+    // Raw dictionary bytes / size for serialization. Returns nullptr / 0
+    // when no dictionary is trained.
+    const void* dictBytes(uint8_t size_class) const {
+        if (size_class >= kNumClasses || !dicts_[size_class].trained)
+            return nullptr;
+        return dicts_[size_class].dict_buffer;
+    }
+    size_t dictSize(uint8_t size_class) const {
+        if (size_class >= kNumClasses || !dicts_[size_class].trained)
+            return 0;
+        return dicts_[size_class].dict_size;
+    }
+
     // Create an independent DCtx from bootstrap memory (for fault handler slots).
     ZSTD_DCtx* createDCtx() const {
         return ZSTD_createDCtx_advanced(customMem());

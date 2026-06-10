@@ -21,12 +21,27 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All 14 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Two of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` with a live compressor:
+All 18 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Four of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` with a live compressor:
 
 - `test_external_mapping` exercises the `SMASH_TRACK_EXTERNAL=1` registration path. The ctest invocation sets the env var; without it the test would silently no-op (registration path gated).
-- `test_malloc_compression` allocates compressible chunks via the standard `malloc` path, sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2` to itself, captures stderr, parses `compressed=N` from the smash stats line, asserts `N > 0`, then reads every byte back to verify integrity through fault-decompress. Catches regressions in the malloc-side compression path that the interposer-only tests would miss.
+- `test_malloc_compression` and `test_large_only_compression` are the **same executable** (`mode_compression_test.cpp`) run twice, differing only in `SMASH_LARGE_ONLY` (`0` = full, `1` = large-only — the production-supported config). The mode is read from the env at runtime, never a compile flag, so the two modes execute byte-identical assertions and cannot drift apart in coverage. The body allocates large chunks (≥ 1 MiB, so they clear `kLargeAllocVmThreshold` and enter the compressible VmRegion in **both** modes) interleaved with small chunks (≤ 16 KiB — smash slab in full mode, system passthrough in large-only). It sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2`, parses `compressed=N` from the stats line, asserts `N > 0`, then verifies a byte-exact read-back of **both** classes — proving full-mode slab integrity / large-only passthrough is never corrupted, and that fault-decompress restores the compressed large chunks. (Registered via the `add_mode_compression_test(name, large_only)` helper in `tests/CMakeLists.txt`.)
+- `test_compression_ratio` (in-process, direct-linked, no compressor thread) compresses a realistically-compressible page with LZ4 and zstd and asserts the achieved ratio against the paper's RQ2 figures (evaluation.tex: LZ4 4.7–12.3×, zstd-1 8.8–20.4×). Two-tier: a hard floor that fails the test (2.5× LZ4 / 4× zstd — catches "stored uncompressed" regressions) plus a WARN if it falls short of the paper's best-case number. Also asserts byte-exact roundtrip. Unlike `test_malloc_compression` (which only checks compression *happened*), this pins the codec *ratio*.
 
 After ctest, CI also runs `bench/run_quick_ci.py` which drives `bench_rss` (in-process: 64 MiB compressible alloc → ≥30 % peak-RSS reduction at t=10 s) and `bench_sqlite --quick` under the preloaded libsmash (≥5 % cooling-phase RSS reduction). Local baselines are ~46 % and ~13 % respectively, so the thresholds are well below noise; a real regression in the compressor or the malloc-interposed path will trip them. Configured with `-DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=OFF -DSMASH_BUILD_BENCH_ALLOCATORS=OFF` so the CI build skips Redis/memcached/RocksDB/tcmalloc/jemalloc/hoard/mesh/etc. — only the smash-internal benches are needed.
+
+### Verifying paper claims end-to-end (`bench/verify_paper_claims.py`)
+
+`run_quick_ci.py` is a regression tripwire; `verify_paper_claims.py` is the explicit "do we still match the paper?" harness. It computes serve/cool-phase RSS reduction (`1 − min_rss/peak_rss`) and checks each workload against the paper's per-app figure with a two-tier scheme: a conservative hard floor fails the run; a shortfall vs the published number only WARNs (a shortfall usually means the bench profile undershoots the full paper workload — the WARN points to `run_paper_experiments.py` for the full-dataset re-check — not a hardware gap). Prints `✓ BEATS paper` when measured ≥ the claim.
+
+- **In-process apps** (`rss`, `sqlite`, `rocksdb`) run their bench binary directly, in **both** full and large-only mode. Large-only on these is a *no-regression* check, not a paper-reduction check: their allocations are < 1 MiB so large-only passes them through to the system allocator (the large-only compression mechanism is proven by `test_large_only_compression`). This is the default app set.
+- **External-service apps** (`memcached`, `redis`, `redis_ext`, `redis_patched`) are full-mode only and slower; they're driven through `run_paper_experiments.py` (which owns the server + protocol-client lifecycle) and read back from the JSON it writes. Opt in via `--apps`.
+
+Needs `-DSMASH_BUILD_BENCH=ON`. The build dir is autodetected from `./build*` (newest libsmash with a `bench/` tree); override with `--build-dir` or `$BUILD_DIR`. Examples:
+```
+python3 bench/verify_paper_claims.py                      # in-process apps, both modes
+python3 bench/verify_paper_claims.py --apps redis,memcached   # external services
+```
+Measured on the EPYC 9R14 (full datasets): memcached 86%, rocksdb 76%, sqlite 64%, redis 54%, redis-ext 64%, redis-patched 55%, redis-ext-patched 77% — five of seven beat the paper, two match.
 
 ## Project Structure
 
@@ -129,6 +144,115 @@ Cost: ~1 MB extra bootstrap memory (track hash + reverse map + page-state slots 
 Single-trial Firefox 5-tab Wikipedia at 90 s (full smash + DEFER 30 s + all-procs) showed the registration path possibly regressing stability (33–35 s lifetime vs 61 s with tracking off), but the variance across nominally-identical configs is too high to claim a regression with confidence — FIREFOX_STUDY's "10/10 alive at 60 s" baseline used N=10. Conservative default is off; targets with controlled allocation patterns (e.g. redb-style workloads) can opt in. The interposers themselves still install regardless of the env var, so the runtime cost when off is one branch per `mmap` / `mach_vm` call.
 
 The "compressed=266K pages = 4.2 GB" figure observed under tracking-on on Firefox is misleading: most of those are virtual-address-space artifacts (SpiderMonkey + Skia reserve large `MAP_ANON` ranges that never fault in; the compressor processes zero pages to ~30-byte buffers). A correct Firefox-RSS measurement needs virt-vs-RSS reconciliation in the SIGUSR2 stats handler before claiming any Firefox win.
+
+## Production Configuration
+
+For applications with concurrent threads and significant slab/small-object traffic (e.g., neuron-cc, walrus C++ backend), the production-supported configuration is:
+
+```
+LD_PRELOAD=/path/to/libsmash.so PYTHONMALLOC=malloc SMASH_LARGE_ONLY=1
+```
+
+Full mode (without `SMASH_LARGE_ONLY=1`) is **experimental**.
+
+**2026-06-05 — decompress-on-fault TOCTOU race found and fixed.** The dominant
+full-mode failure on neuron-cc (nondeterministic ~67% failure rate, surfacing as
+"overlapping memloc", BIR-verification, scheduler, or DenseMap assertions inside
+the multithreaded `walrus_driver mod_parallel_pass`) was a real smash bug, not a
+neuron-cc bug. `handleFault()` / `prefetchAdjacent()` restored a compressed page
+by doing `mprotect(PROT_RW)` **then** `memcpy(decompressed)`, leaving a window in
+which the page was readable but still held stale/zero bytes. A concurrent app
+thread doing a plain load on that page does not fault and does not take the
+per-page lock, so it read the wrong data and corrupted the compiler's state.
+Fixed in `CompressorThread::restorePageContents()`: on Linux the decompressed
+bytes are written through `/proc/self/mem` while the page is still `PROT_NONE`
+(kernel `FOLL_FORCE` write honors the VMA's `VM_MAYWRITE`), then the page is
+flipped to `PROT_RW` — concurrent readers keep faulting and block on the per-page
+lock until the data is in place. Non-Linux keeps the legacy commit-then-copy.
+Binary-search evidence that localized it: no-compression configs pass 100%; both
+LZ4 and zstd fail (codec-independent); `SMASH_FIXAV=1` failed *worse* (0/3,
+because it `madvise`s backing immediately, so the window always exposed zeros);
+`SMASH_NO_DECOMMIT=1` turned corruption into OOM (backing never dropped → window
+exposed correct data). Post-fix: 16/16 smash unit tests pass and full-mode
+neuron-cc runs pass repeatedly (was ~1/3).
+
+**2026-06-10 — two async-signal-safety bugs in the fault handler fixed.** Both
+in `FaultHandler::signalHandler()` (`src/vm/fault_handler.h`), both caused by
+touching not-async-signal-safe machinery inside the handler under `SA_NODEFER`
+(a fault inside the handler re-enters it → unbounded recursion or trap).
+- **`getenv()` recursion (Linux).** The handler's chain-to-default path called
+  `std::getenv()` (`SMASH_SIGTRACE`, `SMASH_DUMP_CRASH_BT`). `getenv()` is not
+  async-signal-safe; a fault during libc's `environ` walk re-enters the handler,
+  which calls `getenv()` again → stack-overflow SIGSEGV. **This crashed redis
+  under full smash** (and any app whose fault chains to default). Diagnosed via
+  gdb on a `redis-server` core: backtrace `getenv → signalHandler → __restore_rt
+  → getenv → …`. Fixed by caching both env flags once at handler-install time
+  (`start()`); the handler reads cached bools only. The other `getenv()` calls in
+  the file (Mach listener thread, install time) are off the signal path.
+- **macOS SIGILL.** `faultWasWrite()`'s function-local `thread_local` carries a
+  lazy-init guard that traps with SIGILL when first run inside the signal handler
+  (macOS CI: `bench_sqlite` exited −4 in the fault/decompress phase, on every
+  commit — an earlier fix removed the initial-exec TLS attribute but not the
+  guard). The value is only set meaningfully on Linux x86-64 and read once
+  (defaulting unset → "treat as write"), so the in-handler access is now guarded
+  to `__linux__`; macOS never touches it in the handler. macOS CI green post-fix.
+
+Post-fix all four redis bench configurations (stock / extended-DELETE / patched /
+ext-patched) run to completion under full smash and match or beat the paper
+(54–77% RSS reduction); before the `getenv` fix redis crashed during the run.
+
+Status of the earlier-known blockers as of 2026-05-31:
+
+**The "isl_id_free aborts in glibc free" failure is a neuron-cc bug, not a smash bug.** Root cause located in `neuronxcc/driver/JobRegistry.py:51`:
+
+```python
+sys.setdlopenflags(original_flags | os.RTLD_DEEPBIND)
+```
+
+That line was added to work around a TVM/LLVM symbol clash (TVM has since been deleted; the comment in the source admits it). With `RTLD_DEEPBIND`, the dynamic linker resolves the freshly-dlopen'd DSO's relocations against **its own symbol scope first**, before any LD_PRELOAD libraries. So `_isl.so`'s `free@plt` slot binds to `/lib64/libc.so.6 :: free` rather than to the LD_PRELOADed allocator's free. Same buffer was allocated through smash (or jemalloc/tcmalloc) via `strdup@plt` / `calloc@plt`, then freed through libc's free → glibc reads what it thinks is its own chunk header → "free(): invalid size" / "double free" / "munmap_chunk(): invalid pointer".
+
+Verified empirically (2026-05-31) using `tools/free_probe.c` (a tiny LD_PRELOAD probe that walks the dynamic linker structures to read the actual GOT slot for `free@plt` in each loaded DSO):
+
+- Standalone Python + jemalloc: `_isl.so :: free@plt -> jemalloc :: free` ✓
+- Same with smash: `_isl.so :: free@plt -> libsmash :: free` ✓
+- Inside neuron-cc's job-import path (after JobRegistry sets DEEPBIND): `_isl.so :: free@plt -> /lib64/libc.so.6 :: free` ✗ — bypasses every LD_PRELOAD allocator.
+
+This explains why the original CLAUDE.md text talked about a "slab race in smash" — it's not. The same failure mode reproduces under jemalloc with no smash code involved at all, and it was happening to neuron-cc with non-glibc allocators long before smash existed.
+
+**The fix is in `JobRegistry.__getJobFactory`**: drop the `RTLD_DEEPBIND` (TVM is gone) and gate the old behaviour behind `NEURON_KEEP_DEEPBIND=1` for anyone who still needs it. One-line change in neuron-cc, not in smash. After applying, the islpy crash disappears.
+
+After the DEEPBIND fix, full mode hits a SECOND blocker: **`libwalrus.so` exports its own tcmalloc-built `malloc`/`free`/`calloc`/`realloc`** as strong global symbols. Verified 2026-06-01 via `nm` + `objdump -R`:
+
+- `libwalrus.so` defines `T malloc` at `0x17c76c0`, `T free` at `0x17c58c0`, etc., as **non-versioned strong globals** (`@@Base`, not `@@GLIBC_*`).
+- The full `tcmalloc::` C++ namespace appears in defined symbols: `tcmalloc::ThreadCache::BecomeIdle`, `tcmalloc::DLL_Remove`, `tcmalloc::Span`, etc.
+- libwalrus is loaded by hlo2penguin and by other neuron-cc binaries that link `-lwalrus`.
+
+(My earlier write-up incorrectly attributed this to `hlo2penguin` itself — that binary is *clean*, with 7191 `call malloc@plt` sites and `R_X86_64_JUMP_SLOT  malloc@GLIBC_2.2.5` relocations. The static tcmalloc lives in libwalrus.so.)
+
+When libwalrus is loaded into a process that ALSO has `LD_PRELOAD=libsmash.so`, the dynamic linker resolves `malloc` from whichever DSO appears first in the symbol search order. With LD_PRELOAD smash should win — but for *intra-libwalrus* calls to `malloc`, the linker may bind directly to the local strong definition (especially under `-Bsymbolic` or RTLD_DEEPBIND combinations). And anything libwalrus allocates via its built-in tcmalloc has a tcmalloc chunk header that smash's free won't accept (and vice versa). Mismatched pairs surface as `src/tcmalloc.cc:333] Attempt to free invalid pointer` (signature captured 2026-06-01 with `SMASH_LARGE_ALLOC_VM_THRESHOLD=65536`).
+
+Real fix: rebuild libwalrus.so without statically-linked tcmalloc, OR rebuild it with `-Wl,-Bsymbolic-functions` removed and ensure tcmalloc symbols are weak/not-exported so LD_PRELOAD wins. That's a CMake change in neuron-cc, not in smash.
+
+Diagnostic for this class of bug: `tools/death_trace.c` catches every fatal signal AND every `_exit()`/`_Exit()` with non-zero status. Build with `gcc -O0 -fPIC -shared -o death_trace.so tools/death_trace.c -ldl`. Use as the second LD_PRELOAD entry. Was needed because the worker was leaving via `_exit(1)`, not abort, so `abort_trace.so` saw nothing.
+
+Other findings, less load-bearing:
+- Smash's interposers DO cover every allocator symbol `_isl.so` imports (audited via `nm -D --undefined-only`): `malloc`, `calloc`, `realloc`, `free`, `strdup`, plus the printf and qsort families that internally go through `*@plt`. No interposition gap.
+- After the JobRegistry fix removes DEEPBIND, the islpy crash disappears, but a *different* failure surfaces — child workers in `parallelCompileSubGraphs` (concurrent.futures ProcessPoolExecutor) terminate without a captured signal. That's unrelated to islpy and looks like a fork/compressor-thread interaction; track separately.
+
+Large-only mode bypasses both issues by leaving slab/small allocations to the system malloc and only managing allocations ≥ 16 KB. Verified 9/9 PASS at `SMASH_COLD_TIMEOUT_SEC ∈ {1, 5, 10}` on neuron-cc test7_full (largest HLO, 9.3 MB) post the `SMASH_DEFER_MADVISE` correctness fix.
+
+Diagnostics added 2026-05-31:
+- `SMASH_TRACE_FOREIGN_FREE=1` — log the first 32 frees that smash receives for pointers it does not recognise (i.e., where it is about to forward to `g_system_alloc.free`). Includes return address + caller DSO. Zero-overhead in steady state.
+- `SMASH_COUNT_FREE=1` — count every free entry, log the count every ~1M frees. Useful for confirming the interposer is actually on the call path.
+- `tools/free_probe.c` — standalone LD_PRELOAD probe that, post-`dlopen`, dumps the runtime target of `free@plt` for `_isl.so` / `libwalrus` / `libsmash`. Build with `gcc -shared -fPIC -O0 -o free_probe.so tools/free_probe.c -ldl`. Use as the second LD_PRELOAD entry: `LD_PRELOAD=libsmash.so:free_probe.so python3 …`.
+
+The other knob that's load-bearing for correctness:
+
+```
+SMASH_DEFER_MADVISE=1   # default ON; do not disable in production
+```
+
+Defers `madvise(MADV_DONTNEED)` to a per-tick sweeper that only runs after a page has been quiescent for `SMASH_DEFER_MADVISE_TICKS=N` ticks (default 50, ≈500 ms). Closes a separate corruption race where in-flight loads/stores from a writer's stale TLB observed a recently-DROPPED page and saw zeros.
 
 ## Large-Only Mode (`SMASH_LARGE_ONLY=1`)
 
@@ -363,7 +487,9 @@ Key constants in `include/smash/config.h`:
 - `kLargeAllocVmThreshold = 1MB`: Only large allocs above this go in VmRegion
 
 Runtime environment variables:
-- `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc
+- `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc. Production-supported config for concurrent workloads
+- `SMASH_DEFER_MADVISE=1`: Default ON. Defers `madvise(MADV_DONTNEED)` to a per-tick sweeper after `SMASH_DEFER_MADVISE_TICKS` quiescent ticks (default 50). Load-bearing for correctness; do not disable in production
+- `SMASH_DEFER_MADVISE_TICKS=N`: Number of ticks (default 50, ≈500 ms) a page must be quiescent before sweeper madvises it
 - `SMASH_MODE=compress_only`: Compress-only mode — track pages without replacing malloc
 - `SMASH_TRACK_EXTERNAL=1`: Register application-direct `mmap` / `mach_vm_allocate` results so the compressor sees them. Opt-in (see "External-Mapping Tracking" above)
 - `SMASH_DEFER_PHASES_MS=N`: Skip Phase 2 (compress) + Phase 3 (monitor) for the first N ms after start. Useful for workloads that establish IPC channels at startup with buffers in smash-managed pages (Firefox sweet spot is 30000)

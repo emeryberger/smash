@@ -196,12 +196,12 @@ struct Span {
     }
 
     // Initialize a large allocation span
-    void initLarge(void* base_, size_t size, uint32_t pages) {
+    void initLarge(void* base_, size_t size, uint32_t pages, uint8_t arena = 0) {
         base = base_;
         page_count = pages;
         size_class = kNumClasses;
         is_large = true;
-        arena_id = 0;
+        arena_id = arena;
         object_size = 0;
         full_capacity = 0;
         current_cap_per_page = 0;
@@ -232,6 +232,13 @@ struct Span {
     // atomic byte from PageStateTable per check.
     inline bool slotPageCompressed(size_t slot_byte_offset) const {
         if (!page_states) return false;
+        // Until any page has ever been compressed (always, when compression is
+        // disabled), no slot can be on a COMPRESSED page — skip the per-slot
+        // atomic page-state load that would otherwise run on every bit the
+        // bitmap walk examines. Relaxed load: a stale false is impossible once
+        // the latch is set (monotonic 0→1, set-with-release before any page is
+        // actually PROT_NONE), and a stale-true only costs an extra get().
+        if (!g_any_page_compressed.load(std::memory_order_relaxed)) return false;
         size_t page_off = slot_byte_offset / kPageSize;
         size_t page_idx = static_cast<size_t>(first_page_vm_idx) + page_off;
         return page_states->get(page_idx) == PageState::COMPRESSED;

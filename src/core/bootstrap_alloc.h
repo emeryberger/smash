@@ -14,6 +14,10 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace smash {
 
@@ -137,8 +141,30 @@ public:
         return expandAndAllocate(size, align);
     }
 
-    // Zero-initialized allocation
+    // Zero-initialized allocation. For small sizes, bump-allocate and memset.
+    // For large sizes (>= 64 KB), use direct mmap which provides zero pages
+    // on-demand without touching memory upfront.
     void* allocateZeroed(size_t size, size_t align = 16) {
+        // Threshold: direct mmap for large allocations to avoid memset cost
+        constexpr size_t kDirectMmapThreshold = 64 * 1024;  // 64 KB
+        if (size >= kDirectMmapThreshold) {
+            // Round up to page size for mmap
+            size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+            size_t rounded = (size + page_size - 1) & ~(page_size - 1);
+            // Use syscall directly to bypass our mmap interposer. This is
+            // internal smash metadata that must NOT be tracked as external
+            // pages (would cause infinite recursion or corruption).
+#ifdef __linux__
+            void* p = reinterpret_cast<void*>(
+                syscall(SYS_mmap, nullptr, rounded, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0));
+            return (p == MAP_FAILED) ? nullptr : p;
+#else
+            // macOS: use vm::mapPages which doesn't go through our interposer
+            return vm::mapPages(rounded);
+#endif
+        }
+        // Small allocation: bump-allocate and memset
         void* p = allocate(size, align);
         if (p) __builtin_memset(p, 0, size);
         return p;

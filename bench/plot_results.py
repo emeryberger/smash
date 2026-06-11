@@ -87,8 +87,8 @@ def plot_rss(rows, outdir: Path):
 def plot_auc(rows, outdir: Path):
     labels, red = [], []
     for r in rows:
-        b = r["base"].get("auc_mb_sec")
-        f = r["full"].get("auc_mb_sec")
+        b = r["base"].get("cool_auc_mb_sec", r["base"].get("auc_mb_sec"))
+        f = r["full"].get("cool_auc_mb_sec", r["full"].get("auc_mb_sec"))
         if not b or b <= 0 or f is None:
             continue
         labels.append(r["label"])

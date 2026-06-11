@@ -274,9 +274,11 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "Cooling phase: %d seconds (no access, waiting for compression)...\n",
             g_cool_duration_sec);
 
+    double cool_auc = 0;
     for (int sec = 1; sec <= g_cool_duration_sec; ++sec) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         size_t rss = getCurrentRSSBytes();
+        cool_auc += rss / (1024.0 * 1024.0);
         fprintf(stderr, "  t=%2ds: RSS=%.1f MB\n", sec, rss / (1024.0 * 1024.0));
         recordRss();
     }
@@ -291,6 +293,7 @@ int main(int argc, char* argv[]) {
 
     printf("METRIC post_cool_rss_mb %.1f\n", post_cool_rss / (1024.0 * 1024.0));
     printf("METRIC cool_reduction_pct %.1f\n", cool_reduction);
+    printf("METRIC cool_auc_mb_sec %.1f\n", cool_auc);
 
     // ── Phase 2: Hot-only serve ────────────────────────────────────────────
     // Simulate time-series access: only query recent rows (top 5% by id).
@@ -320,6 +323,7 @@ int main(int argc, char* argv[]) {
     int next_id = g_num_rows;
     size_t min_serve_rss = getCurrentRSSBytes();
     long total_ops = 0;
+    double serve_auc = 0;
 
     std::vector<double> hot_latencies;
     hot_latencies.reserve(500000);
@@ -388,6 +392,7 @@ int main(int argc, char* argv[]) {
         size_t rss = getCurrentRSSBytes();
         if (rss > peak_rss) peak_rss = rss;
         if (rss < min_serve_rss) min_serve_rss = rss;
+        serve_auc += rss / (1024.0 * 1024.0);
 
         fprintf(stderr, "  t=%2ds: RSS=%.1f MB  ops=%d\n",
                 sec + 1, rss / (1024.0 * 1024.0), ops_this_sec);
@@ -412,6 +417,7 @@ int main(int argc, char* argv[]) {
     printf("METRIC steady_rss_mb %.1f\n", steady_rss / (1024.0 * 1024.0));
     printf("METRIC min_rss_mb %.1f\n", min_serve_rss / (1024.0 * 1024.0));
     printf("METRIC rss_reduction_pct %.1f\n", serve_reduction);
+    printf("METRIC serve_auc_mb_sec %.1f\n", serve_auc);
     printf("METRIC ops_per_sec %.0f\n", ops_per_sec);
     printf("METRIC hot_p50_us %.2f\n", hot_p50);
     printf("METRIC hot_p99_us %.2f\n", hot_p99);

@@ -522,9 +522,13 @@ def run_sqlite(build_dir, smash_lib, quick):
 
         if metrics and rss_timeline:
             metrics["rss_timeline"] = rss_timeline
-            metrics["auc_mb_sec"] = sum(rss_timeline)
+            metrics["total_auc_mb_sec"] = sum(rss_timeline)
             metrics["peak_rss_mb"] = max(rss_timeline) if rss_timeline else metrics.get("peak_rss_mb", 0)
             metrics["min_rss_mb"] = min(rss_timeline) if rss_timeline else metrics.get("min_rss_mb", 0)
+            # Prefer the bench-computed cool-phase AUC (exact); fall back to total
+            if "cool_auc_mb_sec" not in metrics:
+                metrics["cool_auc_mb_sec"] = sum(rss_timeline)
+            metrics["auc_mb_sec"] = metrics["cool_auc_mb_sec"]
 
         return metrics
     except Exception as e:
@@ -565,11 +569,14 @@ def run_rocksdb(build_dir, smash_lib, quick):
             if metrics:
                 if rss_timeline:
                     metrics["rss_timeline"] = rss_timeline
-                    metrics["auc_mb_sec"] = sum(rss_timeline)
+                    metrics["total_auc_mb_sec"] = sum(rss_timeline)
                     if "peak_rss_mb" not in metrics:
                         metrics["peak_rss_mb"] = max(rss_timeline)
                     if "min_rss_mb" not in metrics:
                         metrics["min_rss_mb"] = min(rss_timeline)
+                    if "cool_auc_mb_sec" not in metrics:
+                        metrics["cool_auc_mb_sec"] = sum(rss_timeline)
+                    metrics["auc_mb_sec"] = metrics["cool_auc_mb_sec"]
 
                 if "rss_reduction_pct" not in metrics:
                     peak = metrics.get("peak_rss_mb", 0)

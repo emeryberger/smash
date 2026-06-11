@@ -1281,6 +1281,16 @@ ALLOC8_REDIRECT(SmashRedirect);
 ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);
 #endif
 
+extern "C" bool xxowns_active() { return true; }
+
+extern "C" bool xxowns(const void* ptr) {
+    if (!ptr) return false;
+    if (smash::BootstrapAlloc::instance().owns(ptr)) return true;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && vm->contains(reinterpret_cast<uintptr_t>(ptr))) return true;
+    return false;
+}
+
 // ── Start compressor from constructor ─────────────────────────────────────────
 // On macOS, threadInit() requires two calls before starting compression (to
 // avoid crashing the ObjC runtime during early DYLD init — pthread_create in

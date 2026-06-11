@@ -145,6 +145,13 @@ if(APPLE)
   target_compile_options(bench_rss PRIVATE -ftls-model=initial-exec)
 endif()
 
+# RSS reduction — standalone (no smash link; use LD_PRELOAD to test any allocator)
+add_executable(bench_rss_standalone bench_rss_standalone.cpp)
+target_link_libraries(bench_rss_standalone PRIVATE ${CMAKE_DL_LIBS})
+if(APPLE)
+  set_target_properties(bench_rss_standalone PROPERTIES OSX_ARCHITECTURES "arm64")
+endif()
+
 # Alloc/free latency percentiles
 add_executable(bench_latency
   bench_latency.cpp

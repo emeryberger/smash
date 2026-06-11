@@ -303,16 +303,16 @@ public:
         //   - compress-only mode: it IS the page directory.
         //   - full mode: it tracks application-direct mmap / Mach VM
         //     allocations alongside the contiguous arena.
+        // allocateZeroed uses direct mmap for large allocs → demand-paged,
+        // zero RSS until first access. TrackEntry's default state is all-zero
+        // (key=0 means empty), so no explicit initialization needed.
         track_hash_ = static_cast<TrackEntry*>(
-            BootstrapAlloc::instance().allocate(
+            BootstrapAlloc::instance().allocateZeroed(
                 kTrackHashCap * sizeof(TrackEntry), 64));
         track_reverse_ = static_cast<uintptr_t*>(
-            BootstrapAlloc::instance().allocate(
+            BootstrapAlloc::instance().allocateZeroed(
                 kTrackMaxPages * sizeof(uintptr_t), 8));
         if (!track_hash_ || !track_reverse_) return false;
-        for (size_t i = 0; i < kTrackHashCap; ++i)
-            new (&track_hash_[i]) TrackEntry();
-        __builtin_memset(track_reverse_, 0, kTrackMaxPages * sizeof(uintptr_t));
 
         if (!tracking_mode_) {
             // Full mode: reserve contiguous VM region. total_pages_ covers

@@ -504,6 +504,7 @@ def run_sqlite(build_dir, smash_lib, quick):
     if smash_lib:
         env[PRELOAD_VAR] = str(smash_lib)
         env["SMASH_VERY_COLD_TICKS"] = "5"
+        env["SMASH_COLD_TIMEOUT_SEC"] = "1"
     try:
         # Run as background process to sample RSS during execution
         proc = subprocess.Popen([str(exe)] + args, stdout=subprocess.PIPE,
@@ -550,6 +551,7 @@ def run_rocksdb(build_dir, smash_lib, quick):
         if smash_lib:
             env[PRELOAD_VAR] = str(smash_lib)
             env["SMASH_VERY_COLD_TICKS"] = "5"
+            env["SMASH_COLD_TIMEOUT_SEC"] = "1"
         try:
             # Run as background process to sample RSS during execution
             proc = subprocess.Popen([str(exe)] + args, stdout=subprocess.PIPE,

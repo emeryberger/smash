@@ -48,9 +48,12 @@ if(NOT WIN32)
 endif()
 
 # ── Pull in alloc8 ────────────────────────────────────────────────────────────
-# Prefer a sibling alloc8 checkout (developer workflow). If none exists and no
-# ALLOC8_DIR was given, fetch it from GitHub via FetchContent.
-set(ALLOC8_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../alloc8" CACHE PATH "Path to alloc8 source")
+# By default smash is self-contained: it clones alloc8 from GitHub via
+# FetchContent. To build against a local checkout instead (developer workflow,
+# offline builds), pass -DALLOC8_DIR=/path/to/alloc8. ALLOC8_DIR is empty by
+# default — we do NOT silently prefer a sibling ../alloc8, so the build is
+# reproducible regardless of what happens to sit next to the source tree.
+set(ALLOC8_DIR "" CACHE PATH "Local alloc8 source dir (empty = fetch from GitHub)")
 
 # On Linux, use Smash's version script (extends alloc8's with syscall wrappers).
 # Generated from src/smash_version_script.map.in with a per-arch GLIBC base
@@ -75,10 +78,18 @@ endif()
 
 include(FetchContent)
 
-if(EXISTS "${ALLOC8_DIR}/CMakeLists.txt")
+if(ALLOC8_DIR)
+  # Explicit local checkout requested.
+  if(NOT EXISTS "${ALLOC8_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+      "ALLOC8_DIR=${ALLOC8_DIR} does not contain a CMakeLists.txt. "
+      "Point it at a valid alloc8 checkout, or unset it to fetch from GitHub.")
+  endif()
+  message(STATUS "Using local alloc8 from ALLOC8_DIR=${ALLOC8_DIR}")
   add_subdirectory("${ALLOC8_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/alloc8")
 else()
-  message(STATUS "alloc8 not found at ${ALLOC8_DIR}; fetching via FetchContent")
+  # Default: self-contained. Clone alloc8 from GitHub.
+  message(STATUS "Fetching alloc8 from GitHub (set -DALLOC8_DIR=... to use a local checkout)")
   FetchContent_Declare(
     alloc8
     GIT_REPOSITORY https://github.com/emeryberger/alloc8.git

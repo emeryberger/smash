@@ -622,6 +622,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
     if smash_lib:
         env[PRELOAD_VAR] = str(smash_lib)
         env["SMASH_VERY_COLD_TICKS"] = "5"
+        env["SMASH_COLD_TIMEOUT_SEC"] = "1"
 
     proc = subprocess.Popen(
         [redis_server, "--port", str(port), "--save", "",
@@ -751,6 +752,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
     if smash_lib:
         env[PRELOAD_VAR] = str(smash_lib)
         env["SMASH_VERY_COLD_TICKS"] = "5"
+        env["SMASH_COLD_TIMEOUT_SEC"] = "1"
 
     proc = subprocess.Popen(
         [redis_server, "--port", str(port), "--save", "",
@@ -923,6 +925,7 @@ def _run_redis_bench_impl(build_dir, smash_lib, quick, patched, extended):
     if smash_lib:
         env[PRELOAD_VAR] = str(smash_lib)
         env["SMASH_VERY_COLD_TICKS"] = "5"
+        env["SMASH_COLD_TIMEOUT_SEC"] = "1"
 
     server_args = [redis_server, "--port", str(port), "--save", "",
                    "--appendonly", "no", "--daemonize", "no", "--loglevel", "warning",
@@ -1077,7 +1080,7 @@ def run_memcached_bench(build_dir, smash_lib, quick):
     env = os.environ.copy()
     if smash_lib:
         env[PRELOAD_VAR] = str(smash_lib)
-        # Don't override SMASH_VERY_COLD_TICKS - use defaults
+        env["SMASH_COLD_TIMEOUT_SEC"] = "1"
 
     # Start memcached with larger memory limit
     proc = subprocess.Popen(

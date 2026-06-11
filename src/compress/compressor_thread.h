@@ -788,6 +788,24 @@ class CompressorThread {
     };
 
     CompressWorker workers_[kMaxCompressorWorkers];
+    size_t max_comp_size_ = 0;
+    ZSTD_customMem zstd_custom_mem_{};
+
+    static void initWorkerState(CompressWorker& worker, size_t max_comp,
+                                ZSTD_customMem custom_mem) {
+        worker.page_buf = BootstrapAlloc::instance().allocate(kPageSize, kPageSize);
+        worker.compress_buf = BootstrapAlloc::instance().allocate(max_comp, 16);
+        worker.compress_buf2 = BootstrapAlloc::instance().allocate(max_comp, 16);
+        worker.lz4_state = BootstrapAlloc::instance().allocate(
+            static_cast<size_t>(LZ4_sizeofState()), 16);
+        worker.zstd_cctx = ZSTD_createCCtx_advanced(custom_mem);
+    }
+
+    void ensureWorkerState(int worker_id) {
+        auto& w = workers_[worker_id];
+        if (w.page_buf) return;
+        initWorkerState(w, max_comp_size_, zstd_custom_mem_);
+    }
 
     // ── Dictionary training (coordinator thread) ──────────────────────────
     struct DictTrainState {
@@ -3556,8 +3574,10 @@ private:
         int cap = cpuPressureWorkerCap();
         if (cap > 0 && n_needed > cap) n_needed = cap;
 
-        // Ensure helper threads exist for the new count
-        // (lazily create threads on first scale-up, never destroy them)
+        // Ensure worker state + helper threads exist for the new count
+        // (lazily allocated on first scale-up, never destroyed)
+        for (int w = 0; w < n_needed; ++w)
+            ensureWorkerState(w);
         while (helpers_created_ < n_needed - 1) {
             int helper_id = helpers_created_;
             auto* ha = static_cast<HelperArg*>(
@@ -3725,17 +3745,14 @@ public:
             nullptr
         };
 
-        // Pre-allocate state for all possible workers (adaptive scaling may
-        // activate up to kMaxCompressorWorkers at runtime).
-        for (int w = 0; w < kMaxCompressorWorkers; ++w) {
-            auto& worker = workers_[w];
-            worker.page_buf = BootstrapAlloc::instance().allocate(kPageSize, kPageSize);
-            worker.compress_buf = BootstrapAlloc::instance().allocate(max_comp, 16);
-            worker.compress_buf2 = BootstrapAlloc::instance().allocate(max_comp, 16);
-            worker.lz4_state = BootstrapAlloc::instance().allocate(
-                static_cast<size_t>(LZ4_sizeofState()), 16);
-            worker.zstd_cctx = ZSTD_createCCtx_advanced(custom_mem);
+        // Pre-allocate state for the initial worker count only. Additional
+        // workers get their state allocated lazily on first scale-up via
+        // ensureWorkerState(), saving ~300KB per deferred worker at startup.
+        for (int w = 0; w < kCompressorWorkers; ++w) {
+            initWorkerState(workers_[w], max_comp, custom_mem);
         }
+        max_comp_size_ = max_comp;
+        zstd_custom_mem_ = custom_mem;
 
         // Pre-allocate fault handler slots with per-slot DCtx
         for (int i = 0; i < kFaultSlotCount; ++i) {

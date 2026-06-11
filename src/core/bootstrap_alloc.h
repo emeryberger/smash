@@ -26,6 +26,7 @@ class BootstrapAlloc {
         char* base;
         size_t capacity;
         std::atomic<size_t> offset;
+        std::atomic<size_t> committed;  // high-water of committed bytes (page-aligned)
     };
 
     Region regions_[kBootstrapMaxRegions];
@@ -42,19 +43,46 @@ class BootstrapAlloc {
     std::atomic<uintptr_t> bounds_lo_{UINTPTR_MAX};
     std::atomic<uintptr_t> bounds_hi_{0};
 
+    static size_t pageSize() {
+        static const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        return ps;
+    }
+
+    static size_t roundUpToPage(size_t n) {
+        size_t ps = pageSize();
+        return (n + ps - 1) & ~(ps - 1);
+    }
+
+    void ensureCommitted(Region& r, size_t end) {
+        if (end <= r.committed.load(std::memory_order_acquire)) return;
+        size_t target = roundUpToPage(end);
+        if (target > r.capacity) target = r.capacity;
+        // Serialize commits: mprotect must complete before any thread
+        // may write to the newly-committed range. The lock is only
+        // contended when multiple threads cross a page boundary
+        // simultaneously (rare — bump allocator is fast).
+        LockGuard guard(expand_lock_);
+        size_t cur = r.committed.load(std::memory_order_relaxed);
+        if (cur >= target) return;
+        vm::commitPages(r.base + cur, target - cur);
+        r.committed.store(target, std::memory_order_release);
+    }
+
     void* tryAllocFrom(Region& r, size_t size, size_t align) {
         size_t off = r.offset.load(std::memory_order_relaxed);
         for (;;) {
             size_t aligned = (off + align - 1) & ~(align - 1);
             size_t end = aligned + size;
             if (end > r.capacity) return nullptr;
-            if (r.offset.compare_exchange_weak(off, end, std::memory_order_relaxed))
+            if (r.offset.compare_exchange_weak(off, end, std::memory_order_relaxed)) {
+                ensureCommitted(r, end);
                 return r.base + aligned;
+            }
         }
     }
 
     bool addRegion(size_t size) {
-        void* mem = vm::mapPages(size);
+        void* mem = vm::reservePages(size);
         if (!mem) return false;
         size_t idx = num_regions_.load(std::memory_order_relaxed);
         if (idx >= kBootstrapMaxRegions) {
@@ -64,6 +92,7 @@ class BootstrapAlloc {
         regions_[idx].base = static_cast<char*>(mem);
         regions_[idx].capacity = size;
         regions_[idx].offset.store(0, std::memory_order_relaxed);
+        regions_[idx].committed.store(0, std::memory_order_relaxed);
         num_regions_.store(idx + 1, std::memory_order_release);
 
         // Extend [lo, hi] envelope so owns() can fast-reject pointers

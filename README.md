@@ -29,17 +29,17 @@ Full smash vs. baseline (system malloc) across seven workloads, measured on an A
 
 | Workload | Peak → Min RSS | RSS reduction | AUC reduction | Throughput vs baseline |
 |----------|---------------:|--------------:|--------------:|-----------------------:|
-| SQLite (in-memory DB)        | 588 → 33 MiB | 62.5 % | −7.6 % | 0.90× (88k vs 98k ops/s) |
-| RocksDB (block cache)        | 299 → 80 MiB | 73.3 % |  6.2 % | 0.96× (687k vs 713k ops/s) |
-| memcached (slab KV)          | 305 → 42 MiB | 86.4 % | 37.7 % | — |
-| Redis (stock)                | 283 → 130 MiB | 54.3 % |  8.5 % | — |
-| Redis-ext (50 % DELETE)      | 283 → 103 MiB | 63.4 % | 24.7 % | — |
-| Redis-patched (idle-mode)    | 280 → 126 MiB | 55.2 % |  8.7 % | 1.02× (62k vs 61k ops/s) |
-| Redis-ext-patched            | 281 → 66 MiB | 76.5 % | 25.1 % | 0.97× (61k vs 63k ops/s) |
+| SQLite (in-memory DB)        | 531 → 29 MiB | 73.3 % |  2.7 % | 0.93× (88k vs 95k ops/s) |
+| RocksDB (block cache)        | 293 → 51 MiB | 82.6 % | 58.8 % | 0.97× (668k vs 685k ops/s) |
+| memcached (slab KV)          | 295 → 36 MiB | 87.7 % | 40.5 % | — |
+| Redis (stock)                | 278 → 121 MiB | 56.5 % | 13.3 % | 0.78× (48k vs 63k ops/s) |
+| Redis-ext (50 % DELETE)      | 278 → 97 MiB | 65.3 % | 29.4 % | 0.83× (51k vs 62k ops/s) |
+| Redis-patched (idle-mode)    | 276 → 276 MiB |  0.0 % | −21.3 % | 0.96× (59k vs 61k ops/s) |
+| Redis-ext-patched            | 275 → 60 MiB | 78.1 % | 26.5 % | 1.00× (59k vs 59k ops/s) |
 
-RSS reductions of **54–86 %** with throughput within a few percent of baseline. AUC tracks how long memory stays reclaimed: it is strongly positive where pages stay cold (memcached, the extended-DELETE Redis workloads) and near zero or slightly negative where the workload keeps re-touching pages during the measured window (SQLite's serve phase re-warms faster than the cooling integral captures, so its AUC is marginally negative even though peak RSS drops 62 %). Throughput is blank for workloads whose harness does not report a steady-state ops/s in this mode.
+RSS reductions of **57–88 %** (six of seven workloads) with throughput within a few percent of baseline. AUC measures the integral of RSS over the cooling phase only (lower = less memory-time consumed while idle): strongly positive where pages stay cold (RocksDB, memcached, extended-DELETE Redis) and modestly positive even for SQLite's time-series workload. Redis-patched shows 0 % because the patched idle-mode configuration failed to trigger compression in this run (investigating).
 
-These numbers come from `bench/run_paper_experiments.py --compress-only-only`; regenerate the figures below with `bench/plot_results.py` (see [Benchmarks](#benchmarks)).
+These numbers come from `bench/run_paper_experiments.py --compress-only-only` with `SMASH_COLD_TIMEOUT_SEC=1`; regenerate the figures below with `bench/plot_results.py` (see [Benchmarks](#benchmarks)).
 
 ![RSS reduction](docs/figures/rss_reduction.png)
 ![AUC reduction](docs/figures/auc_reduction.png)

@@ -54,18 +54,18 @@ class BootstrapAlloc {
     }
 
     void ensureCommitted(Region& r, size_t end) {
-        size_t cur = r.committed.load(std::memory_order_acquire);
-        if (end <= cur) return;
+        if (end <= r.committed.load(std::memory_order_acquire)) return;
         size_t target = roundUpToPage(end);
         if (target > r.capacity) target = r.capacity;
-        while (cur < target) {
-            if (r.committed.compare_exchange_weak(cur, target,
-                    std::memory_order_acq_rel, std::memory_order_acquire)) {
-                vm::commitPages(r.base + cur, target - cur);
-                return;
-            }
-            if (cur >= target) return;
-        }
+        // Serialize commits: mprotect must complete before any thread
+        // may write to the newly-committed range. The lock is only
+        // contended when multiple threads cross a page boundary
+        // simultaneously (rare — bump allocator is fast).
+        LockGuard guard(expand_lock_);
+        size_t cur = r.committed.load(std::memory_order_relaxed);
+        if (cur >= target) return;
+        vm::commitPages(r.base + cur, target - cur);
+        r.committed.store(target, std::memory_order_release);
     }
 
     void* tryAllocFrom(Region& r, size_t size, size_t align) {

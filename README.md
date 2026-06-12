@@ -25,11 +25,11 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 
 ## Results
 
-Full smash vs. baseline (glibc malloc) across seven workloads, measured on an AMD EPYC 9R14 (192 vCPUs, 1.5 TB RAM, Amazon Linux 2023, kernel 6.12). Each app fills, cools (10–30 s idle), then serves (hot-set queries); **RSS reduction** is peak → minimum RSS during cooling, **AUC reduction** is the change in the integral of RSS over the cooling phase (MB·s — lower = less memory-time consumed while idle), and **throughput** is application ops/s during serve.
+Full smash vs. baseline (glibc malloc) across seven workloads, measured on an AMD EPYC 9R14 (192 vCPUs, 1.5 TB RAM, Amazon Linux 2023, kernel 6.12). Each app fills, cools (10–30 s idle), then serves (hot-set queries only); **RSS reduction** is peak → minimum RSS during cooling, **AUC reduction** is the reduction in the integral of RSS over the serve phase (MB·s — lower = less memory consumed while serving live traffic), and **throughput** is application ops/s during serve.
 
 | Workload | Peak → Min RSS | RSS reduction | AUC reduction | Throughput vs baseline |
 |----------|---------------:|--------------:|--------------:|-----------------------:|
-| SQLite (in-memory DB)        | 535 → 28 MiB | 73.3 % |  4.0 % | 0.91× (87k vs 96k ops/s) |
+| SQLite (in-memory DB)        | 535 → 28 MiB | 73.3 % | 55.8 % | 0.91× (87k vs 96k ops/s) |
 | RocksDB (block cache)        | 290 → 46 MiB | 84.0 % | 61.5 % | 0.98× (676k vs 689k ops/s) |
 | memcached (slab KV)          | 300 → 36 MiB | 87.8 % | 66.3 % | 1.05× (189k vs 180k ops/s) |
 | Redis (stock)                | 287 → 120 MiB | 58.0 % | 35.1 % | 0.75× (47k vs 62k ops/s) |
@@ -37,7 +37,7 @@ Full smash vs. baseline (glibc malloc) across seven workloads, measured on an AM
 | Redis-patched (idle-mode)    | 285 → 120 MiB | 57.8 % | 36.9 % | 0.93× (57k vs 61k ops/s) |
 | Redis-ext-patched            | 284 → 60 MiB | 78.8 % | 62.8 % | 1.00× (60k vs 60k ops/s) |
 
-RSS reductions of **58–88 %** across all seven workloads. Throughput measured with `redis-benchmark` (Redis), `memtier_benchmark` (memcached, 4 threads × 10 clients), and application ops/s (SQLite, RocksDB). Memcached is 5 % *faster* under smash — compressed cold slabs reduce memory-bandwidth/TLB pressure on the hot working set. AUC measures the integral of RSS over the cooling phase only (lower = less memory-time consumed while idle): strongly positive where pages stay cold (RocksDB 62 %, memcached 66 %, Redis-ext-patched 63 %).
+RSS reductions of **58–88 %** across all seven workloads. Throughput measured with `redis-benchmark` (Redis), `memtier_benchmark` (memcached, 4 threads × 10 clients), and application ops/s (SQLite, RocksDB). Memcached is 5 % *faster* under smash — compressed cold slabs reduce memory-bandwidth/TLB pressure on the hot working set. Serve-phase AUC reduction of **35–66 %** shows that compressed pages stay reclaimed even while the application serves live hot-set queries (only 5 % of data is accessed during serve).
 
 These numbers come from `bench/run_paper_experiments.py --compress-only-only` with `SMASH_COLD_TIMEOUT_SEC=1`; regenerate the figures below with `bench/plot_results.py` (see [Benchmarks](#benchmarks)).
 

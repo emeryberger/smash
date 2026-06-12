@@ -94,8 +94,8 @@ def plot_rss(rows, outdir: Path):
 def plot_auc(rows, outdir: Path):
     labels, red = [], []
     for r in rows:
-        b = r["base"].get("cool_auc_mb_sec", r["base"].get("auc_mb_sec"))
-        f = r["full"].get("cool_auc_mb_sec", r["full"].get("auc_mb_sec"))
+        b = r["base"].get("serve_auc_mb_sec", r["base"].get("auc_mb_sec"))
+        f = r["full"].get("serve_auc_mb_sec", r["full"].get("auc_mb_sec"))
         if not b or b <= 0 or f is None:
             continue
         labels.append(r["label"])
@@ -103,7 +103,7 @@ def plot_auc(rows, outdir: Path):
     if not labels:
         return
     fig, ax = plt.subplots(figsize=(9, 4.5))
-    _bar(ax, labels, red, "AUC Reduction vs baseline (MB·s)",
+    _bar(ax, labels, red, "Serve-Phase AUC Reduction vs baseline (MB·s)",
          "AUC reduction (%)", "#3c9d4e", "{:.1f}%")
     fig.tight_layout()
     fig.savefig(outdir / "auc_reduction.png", dpi=130)

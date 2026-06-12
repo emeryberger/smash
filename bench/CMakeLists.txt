@@ -159,6 +159,13 @@ if(APPLE)
   set_target_properties(bench_alloc_speed PROPERTIES OSX_ARCHITECTURES "arm64")
 endif()
 
+# Compression ratio comparison: smash vs zswap (standalone, LD_PRELOAD)
+add_executable(bench_compression_vs_zswap bench_compression_vs_zswap.cpp)
+target_link_libraries(bench_compression_vs_zswap PRIVATE Threads::Threads)
+if(APPLE)
+  set_target_properties(bench_compression_vs_zswap PROPERTIES OSX_ARCHITECTURES "arm64")
+endif()
+
 # Alloc/free latency percentiles
 add_executable(bench_latency
   bench_latency.cpp

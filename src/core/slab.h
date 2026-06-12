@@ -296,11 +296,11 @@ public:
             full_.remove(span);
             partial_.pushFront(span);
         } else if (span->empty()) {
-            // Transition: partial → empty.  Immediately decommit pages
-            // via MADV_DONTNEED to release physical memory without waiting
-            // for the compressor to zero and compress them.
+            // Transition: partial → empty.  Move to empty list; the
+            // compressor's zeroFreeSlots + compress cycle handles
+            // reclamation. Immediate madvise here was a syscall per
+            // span that destroyed throughput under batch-free workloads.
             partial_.remove(span);
-            decommitEmptySpan(span);
             empty_.pushFront(span);
         }
     }

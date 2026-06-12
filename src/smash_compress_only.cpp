@@ -834,8 +834,8 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
 
 // ── Library initialization ──────────────────────────────────────────────────
 
-__attribute__((constructor))
-static void co_init() {
+__attribute__((constructor, used))
+void co_init() {
     (void)!write(STDERR_FILENO, "[co_init] enter\n", 16);
 #ifndef __APPLE__
     // Mark that we're in init (dlsym may call calloc)

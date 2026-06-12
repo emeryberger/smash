@@ -101,13 +101,8 @@ def load(results_path: Path) -> list:
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 
-def _grouped_bar(ax, labels, alloc_data, active_allocs, fmt="{:.0f}",
-                 label_all=False):
-    """Draw grouped bars for the given allocators with value labels.
-
-    By default, only labels the smash bar (to avoid clutter where baselines
-    cluster). Set label_all=True to label every bar.
-    """
+def _grouped_bar(ax, labels, alloc_data, active_allocs, fmt="{:.0f}"):
+    """Draw grouped bars for the given allocators."""
     x = np.arange(len(labels))
     n = len(active_allocs)
     w = 0.75 / n
@@ -115,23 +110,14 @@ def _grouped_bar(ax, labels, alloc_data, active_allocs, fmt="{:.0f}",
         key = ALLOC_KEYS[ALLOC_ORDER.index(alloc_name)]
         style = ALLOC_STYLE[alloc_name]
         offset = (i - n / 2 + 0.5) * w
-        bars = ax.bar(x + offset, alloc_data[key], w,
-                      label=style["label"], color=style["color"],
-                      edgecolor="white", linewidth=0.5)
-        if not label_all and alloc_name != "smash":
-            continue
-        for bar in bars:
-            h = bar.get_height()
-            if h <= 0:
-                continue
-            ax.annotate(fmt.format(h),
-                        xy=(bar.get_x() + bar.get_width() / 2, h),
-                        xytext=(0, 3), textcoords="offset points",
-                        ha="center", va="bottom", fontsize=10,
-                        color=style["color"], fontweight="bold")
+        ax.bar(x + offset, alloc_data[key], w,
+               label=style["label"], color=style["color"],
+               edgecolor="white", linewidth=0.5)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=25, ha="right")
     ax.legend(frameon=False)
+    ax.grid(axis="y", color="#cccccc", linewidth=0.5, linestyle="--", zorder=0)
+    ax.set_axisbelow(True)
 
 
 def _active_allocs(alloc_data):

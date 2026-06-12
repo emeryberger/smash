@@ -184,9 +184,34 @@ void startCompression() {
     if (!g_compression_started.compare_exchange_strong(expected, true))
         return;
     // Don't start the compressor thread or fault handler — mprotect on
-    // system-allocator pages causes SIGSEGV. Instead, just scan pages for
-    // tracking; compression ratios are measured on-demand via SIGUSR2.
+    // system-allocator pages causes SIGSEGV. Instead, scan pages for
+    // tracking and start the measurement thread which reports compression
+    // ratios after a delay.
     scanVmRegions();
+
+    pthread_t meas_thread;
+    pthread_create(&meas_thread, nullptr, measurementThread, nullptr);
+    pthread_detach(meas_thread);
+
+    // Auto-trigger ratio report after delay
+    static const int delay = []() {
+        const char* v = getenv("SMASH_REPORT_DELAY_SEC");
+        return v ? atoi(v) : 8;
+    }();
+    if (delay > 0) {
+        struct TimerArg { int sec; };
+        auto* ta = static_cast<TimerArg*>(
+            smash::BootstrapAlloc::instance().allocate(sizeof(TimerArg), 8));
+        ta->sec = delay;
+        pthread_t timer;
+        pthread_create(&timer, nullptr, [](void* arg) -> void* {
+            auto* a = static_cast<TimerArg*>(arg);
+            sleep(a->sec);
+            g_report_requested.store(true, std::memory_order_relaxed);
+            return nullptr;
+        }, ta);
+        pthread_detach(timer);
+    }
 }
 
 // Track pages covered by an allocation
@@ -836,7 +861,6 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
 
 __attribute__((constructor, used))
 void co_init() {
-    (void)!write(STDERR_FILENO, "[co_init] enter\n", 16);
 #ifndef __APPLE__
     // Mark that we're in init (dlsym may call calloc)
     g_in_dlsym.store(true, std::memory_order_relaxed);
@@ -850,14 +874,8 @@ void co_init() {
     g_in_dlsym.store(false, std::memory_order_relaxed);
 #endif
 
-    // In tracking mode (compress_only), the region_size arg is unused —
-    // pass 0 to make this explicit and avoid a 16GiB mmap attempt.
-    (void)!write(STDERR_FILENO, "[co_init] starting vm.init\n", 27);
-    if (!g_vm.init(0)) {
-        (void)!write(STDERR_FILENO, "[co_init] vm.init FAILED\n", 25);
+    if (!g_vm.init(0))
         return;
-    }
-    (void)!write(STDERR_FILENO, "[co_init] vm.init OK\n", 21);
 
     g_states.init(g_vm.totalPages());
     g_locks.init(g_vm.totalPages());
@@ -875,37 +893,7 @@ void co_init() {
 
     smash::g_smash_vm_region = &g_vm;
 
-    // Start measurement thread. It auto-reports compression ratios
-    // after SMASH_REPORT_DELAY_SEC seconds (default 8), and also on SIGUSR2.
     signal(SIGUSR2, sigusr2Handler);
-
-    pthread_t meas_thread;
-    pthread_create(&meas_thread, nullptr, measurementThread, nullptr);
-    pthread_detach(meas_thread);
-
-    // Auto-trigger after delay
-    static const int delay = []() {
-        const char* v = getenv("SMASH_REPORT_DELAY_SEC");
-        return v ? atoi(v) : 8;
-    }();
-    if (delay > 0) {
-        // Schedule alarm-based trigger
-        g_report_requested.store(false, std::memory_order_relaxed);
-        // The measurement thread polls; just set the flag after delay
-        // via a detached timer thread
-        pthread_t timer;
-        struct TimerArg { int sec; };
-        auto* ta = static_cast<TimerArg*>(
-            smash::BootstrapAlloc::instance().allocate(sizeof(TimerArg), 8));
-        ta->sec = delay;
-        pthread_create(&timer, nullptr, [](void* arg) -> void* {
-            auto* a = static_cast<TimerArg*>(arg);
-            sleep(a->sec);
-            g_report_requested.store(true, std::memory_order_relaxed);
-            return nullptr;
-        }, ta);
-        pthread_detach(timer);
-    }
 
     g_inited.store(true, std::memory_order_release);
 }

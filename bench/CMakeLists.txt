@@ -152,6 +152,13 @@ if(APPLE)
   set_target_properties(bench_rss_standalone PROPERTIES OSX_ARCHITECTURES "arm64")
 endif()
 
+# Allocation speed — standalone (threadtest, larson, linux-scalability)
+add_executable(bench_alloc_speed bench_alloc_speed.cpp)
+target_link_libraries(bench_alloc_speed PRIVATE Threads::Threads)
+if(APPLE)
+  set_target_properties(bench_alloc_speed PROPERTIES OSX_ARCHITECTURES "arm64")
+endif()
+
 # Alloc/free latency percentiles
 add_executable(bench_latency
   bench_latency.cpp

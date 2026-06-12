@@ -857,14 +857,10 @@ static void co_init() {
     g_store.init();
     g_engine.init();
 
-    // Compress-only mode cannot use smash's mprotect-based compression
-    // pipeline: system allocators write metadata into heap pages on every
-    // malloc/free, causing SIGSEGV when those pages are mprotect'd. Instead,
-    // we disable the compressor thread entirely. Compression ratio measurement
-    // is done via SIGUSR2 which samples tracked pages in read-only mode.
+    // Force compress-only mode so VmRegion uses tracking mode (hash-based
+    // page directory) instead of reserving a contiguous region.
+    setenv("SMASH_MODE", "compress_only", 0);
     setenv("SMASH_NO_MONITOR", "1", 0);
-    // Don't start the compressor thread — just track pages for measurement.
-    // The startCompression() path is disabled; ratio is reported on SIGUSR2.
 
     // page_map = nullptr: no span info available (system malloc manages objects)
     g_compressor.init(&g_vm, &g_states, &g_locks, &g_store, &g_engine,

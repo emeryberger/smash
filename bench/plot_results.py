@@ -3,12 +3,9 @@
 
 Reads the JSON written by run_paper_experiments.py (--compress-only-only) and
 emits three PNGs into an output directory:
-  - rss_reduction.png  : peak→min RSS reduction (%) per app, full smash vs baseline
-  - auc_reduction.png   : AUC (MB·s) reduction (%) per app vs baseline
-  - timing.png          : throughput (ops/s) full smash vs baseline, where available
-
-Each app has a <app>_baseline and <app>_full_smash entry; reductions are computed
-baseline→full_smash. Apps without an ops/sec metric are omitted from timing.png.
+  - rss_reduction.png  : min RSS per allocator (grouped bars)
+  - auc_reduction.png  : serve-phase RSS integral per allocator (grouped bars)
+  - timing.png         : throughput per allocator (grouped bars)
 
 Usage:
     python3 bench/plot_results.py <results.json> [--outdir docs/figures]
@@ -25,11 +22,43 @@ try:
     import matplotlib
     matplotlib.use("Agg")  # headless
     import matplotlib.pyplot as plt
+    import numpy as np
 except ImportError:
-    sys.exit("matplotlib not installed: pip install matplotlib")
+    sys.exit("matplotlib/numpy not installed: pip install matplotlib numpy")
 
 
-# Display order + pretty labels.
+# ── Style ─────────────────────────────────────────────────────────────────────
+
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Helvetica', 'Arial', 'DejaVu Sans'],
+    'font.size': 14,
+    'axes.labelsize': 15,
+    'axes.titlesize': 16,
+    'xtick.labelsize': 13,
+    'ytick.labelsize': 13,
+    'legend.fontsize': 12,
+    'figure.titlesize': 17,
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'pdf.fonttype': 42,
+    'ps.fonttype': 42,
+})
+
+# Okabe-Ito colorblind-safe palette. Smash is green (the "good" color).
+ALLOC_STYLE = {
+    "glibc":    {"color": "#56B4E9", "label": "glibc"},       # sky blue
+    "jemalloc": {"color": "#E69F00", "label": "jemalloc"},    # orange
+    "mimalloc": {"color": "#CC79A7", "label": "mimalloc"},    # reddish purple
+    "smash":    {"color": "#009E73", "label": "smash"},       # bluish green
+}
+
+ALLOC_ORDER = ["glibc", "jemalloc", "mimalloc", "smash"]
+ALLOC_KEYS = ["base", "jemalloc", "mimalloc", "full"]
+
+
+# ── Display order + pretty labels ────────────────────────────────────────────
+
 APP_ORDER = [
     ("sqlite", "SQLite"),
     ("rocksdb", "RocksDB"),
@@ -40,6 +69,8 @@ APP_ORDER = [
     ("redis_ext_patched", "Redis-ext†"),
 ]
 
+
+# ── Data loading ──────────────────────────────────────────────────────────────
 
 def load(results_path: Path) -> list:
     data = json.loads(results_path.read_text())
@@ -68,27 +99,39 @@ def load(results_path: Path) -> list:
     return rows
 
 
-def _bar(ax, labels, values, title, ylabel, color, fmt="{:.0f}"):
-    bars = ax.bar(labels, values, color=color)
-    ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.axhline(0, color="black", linewidth=0.6)
-    ax.tick_params(axis="x", rotation=30)
-    for b, v in zip(bars, values):
-        ax.annotate(fmt.format(v), (b.get_x() + b.get_width() / 2, v),
-                    ha="center", va="bottom" if v >= 0 else "top", fontsize=8)
-    return bars
+# ── Plotting helpers ──────────────────────────────────────────────────────────
 
+def _grouped_bar(ax, labels, alloc_data, active_allocs):
+    """Draw grouped bars for the given allocators."""
+    x = np.arange(len(labels))
+    n = len(active_allocs)
+    w = 0.75 / n
+    for i, alloc_name in enumerate(active_allocs):
+        key = ALLOC_KEYS[ALLOC_ORDER.index(alloc_name)]
+        style = ALLOC_STYLE[alloc_name]
+        offset = (i - n / 2 + 0.5) * w
+        ax.bar(x + offset, alloc_data[key], w,
+               label=style["label"], color=style["color"],
+               edgecolor="white", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.legend(frameon=False)
+
+
+def _active_allocs(alloc_data):
+    """Return allocator names that have at least one nonzero entry."""
+    active = []
+    for name, key in zip(ALLOC_ORDER, ALLOC_KEYS):
+        if any(v > 0 for v in alloc_data[key]):
+            active.append(name)
+    return active
+
+
+# ── Charts ────────────────────────────────────────────────────────────────────
 
 def plot_rss(rows, outdir: Path):
-    import numpy as np
-
-    alloc_names = ["glibc", "jemalloc", "mimalloc", "smash"]
-    alloc_keys = ["base", "jemalloc", "mimalloc", "full"]
-    alloc_colors = ["#999999", "#e6a817", "#4caf50", "#2a7ab9"]
-
     labels = [r["label"] for r in rows]
-    alloc_data = {k: [] for k in alloc_keys}
+    alloc_data = {k: [] for k in ALLOC_KEYS}
     for r in rows:
         alloc_data["base"].append(r["base"].get("min_rss_mb", r["base"].get("peak_rss_mb", 0)))
         alloc_data["full"].append(r["full"].get("min_rss_mb", 0))
@@ -99,35 +142,19 @@ def plot_rss(rows, outdir: Path):
             r["mimalloc"].get("min_rss_mb", r["mimalloc"].get("peak_rss_mb", 0))
             if r.get("mimalloc") else 0)
 
-    active = [(name, key, color) for name, key, color in
-              zip(alloc_names, alloc_keys, alloc_colors)
-              if any(v > 0 for v in alloc_data[key])]
-
-    x = np.arange(len(labels))
-    n = len(active)
-    w = 0.8 / n
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    for i, (name, key, color) in enumerate(active):
-        offset = (i - n / 2 + 0.5) * w
-        ax.bar(x + offset, alloc_data[key], w, label=name, color=color)
-    ax.set_title("Minimum RSS by allocator (lower is better)")
+    active = _active_allocs(alloc_data)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    _grouped_bar(ax, labels, alloc_data, active)
+    ax.set_title("Minimum RSS (lower is better)")
     ax.set_ylabel("RSS (MiB)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=30)
-    ax.legend()
+    ax.set_ylim(bottom=0)
     fig.tight_layout()
-    fig.savefig(outdir / "rss_reduction.png", dpi=130)
+    fig.savefig(outdir / "rss_reduction.png", dpi=150)
     plt.close(fig)
 
 
 def plot_auc(rows, outdir: Path):
-    import numpy as np
-
-    alloc_names = ["glibc", "jemalloc", "mimalloc", "smash"]
-    alloc_keys = ["base", "jemalloc", "mimalloc", "full"]
-    alloc_colors = ["#999999", "#e6a817", "#4caf50", "#2a7ab9"]
-
-    labels, alloc_data = [], {k: [] for k in alloc_keys}
+    labels, alloc_data = [], {k: [] for k in ALLOC_KEYS}
     for r in rows:
         b_auc = r["base"].get("serve_auc_mb_sec", r["base"].get("auc_mb_sec"))
         f_auc = r["full"].get("serve_auc_mb_sec", r["full"].get("auc_mb_sec"))
@@ -145,36 +172,19 @@ def plot_auc(rows, outdir: Path):
     if not labels:
         return
 
-    active = [(name, key, color) for name, key, color in
-              zip(alloc_names, alloc_keys, alloc_colors)
-              if any(v > 0 for v in alloc_data[key])]
-
-    x = np.arange(len(labels))
-    n = len(active)
-    w = 0.8 / n
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    for i, (name, key, color) in enumerate(active):
-        offset = (i - n / 2 + 0.5) * w
-        ax.bar(x + offset, alloc_data[key], w, label=name, color=color)
-    ax.set_title("Serve-Phase Memory-Time (AUC, lower is better)")
-    ax.set_ylabel("AUC (MB·s)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=30)
-    ax.legend()
+    active = _active_allocs(alloc_data)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    _grouped_bar(ax, labels, alloc_data, active)
+    ax.set_title("RSS × Time During Serve (lower is better)")
+    ax.set_ylabel("MB · s")
+    ax.set_ylim(bottom=0)
     fig.tight_layout()
-    fig.savefig(outdir / "auc_reduction.png", dpi=130)
+    fig.savefig(outdir / "auc_reduction.png", dpi=150)
     plt.close(fig)
 
 
 def plot_timing(rows, outdir: Path):
-    import numpy as np
-
-    # Collect data for all allocators that have ops
-    alloc_names = ["baseline", "jemalloc", "mimalloc", "full smash"]
-    alloc_keys = ["base", "jemalloc", "mimalloc", "full"]
-    alloc_colors = ["#999999", "#e6a817", "#4caf50", "#2a7ab9"]
-
-    labels, alloc_data = [], {k: [] for k in alloc_keys}
+    labels, alloc_data = [], {k: [] for k in ALLOC_KEYS}
     for r in rows:
         b = r["base"].get("ops_per_sec")
         f = r["full"].get("ops_per_sec")
@@ -190,28 +200,18 @@ def plot_timing(rows, outdir: Path):
     if not labels:
         return
 
-    # Only plot allocators that have at least one nonzero entry
-    active = [(name, key, color) for name, key, color in
-              zip(alloc_names, alloc_keys, alloc_colors)
-              if any(v > 0 for v in alloc_data[key])]
-
-    x = np.arange(len(labels))
-    n = len(active)
-    w = 0.8 / n
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    for i, (name, key, color) in enumerate(active):
-        offset = (i - n / 2 + 0.5) * w
-        vals = alloc_data[key]
-        ax.bar(x + offset, vals, w, label=name, color=color)
-    ax.set_title("Throughput by allocator")
+    active = _active_allocs(alloc_data)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    _grouped_bar(ax, labels, alloc_data, active)
+    ax.set_title("Throughput (higher is better)")
     ax.set_ylabel("kops/s")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=30)
-    ax.legend()
+    ax.set_ylim(bottom=0)
     fig.tight_layout()
-    fig.savefig(outdir / "timing.png", dpi=130)
+    fig.savefig(outdir / "timing.png", dpi=150)
     plt.close(fig)
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
     ap = argparse.ArgumentParser()

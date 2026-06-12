@@ -101,8 +101,8 @@ def load(results_path: Path) -> list:
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 
-def _grouped_bar(ax, labels, alloc_data, active_allocs):
-    """Draw grouped bars for the given allocators."""
+def _grouped_bar(ax, labels, alloc_data, active_allocs, fmt="{:.0f}"):
+    """Draw grouped bars for the given allocators with value labels."""
     x = np.arange(len(labels))
     n = len(active_allocs)
     w = 0.75 / n
@@ -110,9 +110,18 @@ def _grouped_bar(ax, labels, alloc_data, active_allocs):
         key = ALLOC_KEYS[ALLOC_ORDER.index(alloc_name)]
         style = ALLOC_STYLE[alloc_name]
         offset = (i - n / 2 + 0.5) * w
-        ax.bar(x + offset, alloc_data[key], w,
-               label=style["label"], color=style["color"],
-               edgecolor="white", linewidth=0.5)
+        bars = ax.bar(x + offset, alloc_data[key], w,
+                      label=style["label"], color=style["color"],
+                      edgecolor="white", linewidth=0.5)
+        for bar in bars:
+            h = bar.get_height()
+            if h <= 0:
+                continue
+            ax.annotate(fmt.format(h),
+                        xy=(bar.get_x() + bar.get_width() / 2, h),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=9,
+                        color=style["color"], fontweight="bold")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=25, ha="right")
     ax.legend(frameon=False)
@@ -143,8 +152,8 @@ def plot_rss(rows, outdir: Path):
             if r.get("mimalloc") else 0)
 
     active = _active_allocs(alloc_data)
-    fig, ax = plt.subplots(figsize=(10, 5))
-    _grouped_bar(ax, labels, alloc_data, active)
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    _grouped_bar(ax, labels, alloc_data, active, fmt="{:.0f}")
     ax.set_title("Minimum RSS (lower is better)")
     ax.set_ylabel("RSS (MiB)")
     ax.set_ylim(bottom=0)
@@ -173,8 +182,8 @@ def plot_auc(rows, outdir: Path):
         return
 
     active = _active_allocs(alloc_data)
-    fig, ax = plt.subplots(figsize=(10, 5))
-    _grouped_bar(ax, labels, alloc_data, active)
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    _grouped_bar(ax, labels, alloc_data, active, fmt="{:.0f}")
     ax.set_title("RSS × Time During Serve (lower is better)")
     ax.set_ylabel("MB · s")
     ax.set_ylim(bottom=0)
@@ -201,8 +210,8 @@ def plot_timing(rows, outdir: Path):
         return
 
     active = _active_allocs(alloc_data)
-    fig, ax = plt.subplots(figsize=(10, 5))
-    _grouped_bar(ax, labels, alloc_data, active)
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    _grouped_bar(ax, labels, alloc_data, active, fmt="{:.0f}")
     ax.set_title("Throughput (higher is better)")
     ax.set_ylabel("kops/s")
     ax.set_ylim(bottom=0)

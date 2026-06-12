@@ -785,6 +785,11 @@ static void co_init() {
     g_store.init();
     g_engine.init();
 
+    // Disable Phase 3 monitoring: system allocators write metadata into pages
+    // (free-list pointers, bin headers) which would fault on PROT_READ pages.
+    // Cold-detection relies solely on the accessed_ bitmap (set via trackAllocation).
+    setenv("SMASH_NO_MONITOR", "1", 0);
+
     // page_map = nullptr: no span info available (system malloc manages objects)
     g_compressor.init(&g_vm, &g_states, &g_locks, &g_store, &g_engine,
                       nullptr, &g_fault_handler);

@@ -875,15 +875,37 @@ void co_init() {
 
     smash::g_smash_vm_region = &g_vm;
 
-    // Start measurement thread + register SIGUSR2 handler
-    struct sigaction sa{};
-    sa.sa_handler = sigusr2Handler;
-    sa.sa_flags = SA_RESTART;
-    sigaction(SIGUSR2, &sa, nullptr);
+    // Start measurement thread. It auto-reports compression ratios
+    // after SMASH_REPORT_DELAY_SEC seconds (default 8), and also on SIGUSR2.
+    signal(SIGUSR2, sigusr2Handler);
 
     pthread_t meas_thread;
     pthread_create(&meas_thread, nullptr, measurementThread, nullptr);
     pthread_detach(meas_thread);
+
+    // Auto-trigger after delay
+    static const int delay = []() {
+        const char* v = getenv("SMASH_REPORT_DELAY_SEC");
+        return v ? atoi(v) : 8;
+    }();
+    if (delay > 0) {
+        // Schedule alarm-based trigger
+        g_report_requested.store(false, std::memory_order_relaxed);
+        // The measurement thread polls; just set the flag after delay
+        // via a detached timer thread
+        pthread_t timer;
+        struct TimerArg { int sec; };
+        auto* ta = static_cast<TimerArg*>(
+            smash::BootstrapAlloc::instance().allocate(sizeof(TimerArg), 8));
+        ta->sec = delay;
+        pthread_create(&timer, nullptr, [](void* arg) -> void* {
+            auto* a = static_cast<TimerArg*>(arg);
+            sleep(a->sec);
+            g_report_requested.store(true, std::memory_order_relaxed);
+            return nullptr;
+        }, ta);
+        pthread_detach(timer);
+    }
 
     g_inited.store(true, std::memory_order_release);
 }

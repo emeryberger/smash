@@ -351,12 +351,37 @@ struct Span {
     }
 };
 
-// Allocate a Span descriptor from bootstrap memory
+// Lock-free Span descriptor cache. Recycles large-alloc Span descriptors
+// to avoid unbounded BootstrapAlloc growth under alloc/free churn.
+inline std::atomic<Span*>& spanFreeList() {
+    static std::atomic<Span*> head{nullptr};
+    return head;
+}
+
 inline Span* newSpanDescriptor() {
-    auto* s = static_cast<Span*>(
+    // Try recycled descriptor first (Treiber stack pop)
+    Span* s = spanFreeList().load(std::memory_order_acquire);
+    while (s) {
+        Span* next = s->next_free;
+        if (spanFreeList().compare_exchange_weak(s, next,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            __builtin_memset(s, 0, sizeof(Span));
+            return s;
+        }
+    }
+    auto* p = static_cast<Span*>(
         BootstrapAlloc::instance().allocate(sizeof(Span), alignof(Span)));
-    __builtin_memset(s, 0, sizeof(Span));
-    return s;
+    __builtin_memset(p, 0, sizeof(Span));
+    return p;
+}
+
+inline void recycleSpanDescriptor(Span* s) {
+    // Treiber stack push
+    Span* head = spanFreeList().load(std::memory_order_relaxed);
+    do {
+        s->next_free = head;
+    } while (!spanFreeList().compare_exchange_weak(head, s,
+                std::memory_order_release, std::memory_order_relaxed));
 }
 
 } // namespace smash

@@ -1,6 +1,15 @@
 # smash/tests/CMakeLists.txt
 # Each test is a separate executable that tests internal components directly.
 
+# Build tests as arm64-only on macOS. The fat arm64+arm64e binary (needed for
+# libsmash.dylib to interpose system arm64e processes) causes SIGILL in the
+# arm64e slice for tests that exercise the fault handler — the thread_local
+# lazy-init guard traps when first run inside a signal handler under pointer
+# authentication. Tests don't need arm64e; they test allocator correctness.
+if(APPLE)
+  set(CMAKE_OSX_ARCHITECTURES "arm64")
+endif()
+
 set(SMASH_TEST_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
   ${CMAKE_CURRENT_SOURCE_DIR}/../src

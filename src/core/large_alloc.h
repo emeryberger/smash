@@ -109,6 +109,8 @@ public:
         } else {
             vm::unmapPages(base, num_pages * kPageSize);
         }
+
+        recycleSpanDescriptor(span);
     }
 
     size_t getSize(Span* span) const {

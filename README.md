@@ -29,15 +29,15 @@ Full smash vs. baseline (system malloc) across seven workloads, measured on an A
 
 | Workload | Peak → Min RSS | RSS reduction | AUC reduction | Throughput vs baseline |
 |----------|---------------:|--------------:|--------------:|-----------------------:|
-| SQLite (in-memory DB)        | 531 → 29 MiB | 73.3 % |  2.3 % | 0.91× (88k vs 96k ops/s) |
-| RocksDB (block cache)        | 293 → 51 MiB | 82.5 % | 57.3 % | 0.98× (691k vs 708k ops/s) |
-| memcached (slab KV)          | 300 → 37 MiB | 87.8 % | 66.2 % | — |
-| Redis (stock)                | 287 → 121 MiB | 57.9 % | 35.9 % | 0.80× (48k vs 60k ops/s) |
-| Redis-ext (50 % DELETE)      | 288 → 97 MiB | 68.4 % | 46.3 % | 0.86× (53k vs 62k ops/s) |
-| Redis-patched (idle-mode)    | 285 → 120 MiB | 57.8 % | 37.3 % | 0.97× (60k vs 61k ops/s) |
-| Redis-ext-patched            | 286 → 60 MiB | 78.8 % | 62.3 % | 0.97× (59k vs 61k ops/s) |
+| SQLite (in-memory DB)        | 535 → 28 MiB | 73.3 % |  4.0 % | 0.91× (87k vs 96k ops/s) |
+| RocksDB (block cache)        | 290 → 46 MiB | 84.0 % | 61.5 % | 0.98× (676k vs 689k ops/s) |
+| memcached (slab KV)          | 300 → 36 MiB | 87.8 % | 66.3 % | 1.05× (189k vs 180k ops/s) |
+| Redis (stock)                | 287 → 120 MiB | 58.0 % | 35.1 % | 0.75× (47k vs 62k ops/s) |
+| Redis-ext (50 % DELETE)      | 287 → 96 MiB | 68.7 % | 46.0 % | 0.84× (52k vs 62k ops/s) |
+| Redis-patched (idle-mode)    | 285 → 120 MiB | 57.8 % | 36.9 % | 0.93× (57k vs 61k ops/s) |
+| Redis-ext-patched            | 284 → 60 MiB | 78.8 % | 62.8 % | 1.00× (60k vs 60k ops/s) |
 
-RSS reductions of **58–88 %** across all seven workloads with throughput within a few percent of baseline. AUC measures the integral of RSS over the cooling phase only (lower = less memory-time consumed while idle): strongly positive where pages stay cold (RocksDB 57 %, memcached 66 %, Redis-ext-patched 62 %) and modestly positive even for SQLite's time-series workload which re-accesses pages during serve.
+RSS reductions of **58–88 %** across all seven workloads. Throughput measured with `redis-benchmark` (Redis), `memtier_benchmark` (memcached, 4 threads × 10 clients), and application ops/s (SQLite, RocksDB). Memcached is 5 % *faster* under smash — compressed cold slabs reduce memory-bandwidth/TLB pressure on the hot working set. AUC measures the integral of RSS over the cooling phase only (lower = less memory-time consumed while idle): strongly positive where pages stay cold (RocksDB 62 %, memcached 66 %, Redis-ext-patched 63 %).
 
 These numbers come from `bench/run_paper_experiments.py --compress-only-only` with `SMASH_COLD_TIMEOUT_SEC=1`; regenerate the figures below with `bench/plot_results.py` (see [Benchmarks](#benchmarks)).
 

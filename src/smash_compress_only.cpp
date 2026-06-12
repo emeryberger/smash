@@ -849,7 +849,9 @@ static void co_init() {
     g_in_dlsym.store(false, std::memory_order_relaxed);
 #endif
 
-    if (!g_vm.init(smash::kVmRegionSize))
+    // In tracking mode (compress_only), the region_size arg is unused —
+    // pass 0 to make this explicit and avoid a 16GiB mmap attempt.
+    if (!g_vm.init(0))
         return;
 
     g_states.init(g_vm.totalPages());

@@ -864,9 +864,9 @@ static void co_init() {
     g_store.init();
     g_engine.init();
 
-    // Force compress-only mode so VmRegion uses tracking mode (hash-based
-    // page directory) instead of reserving a contiguous region.
-    setenv("SMASH_MODE", "compress_only", 0);
+    // SMASH_COMPRESS_ONLY=1 compile define (from CMakeLists) forces
+    // isCompressOnlyMode() → true at compile time, so VmRegion uses
+    // tracking mode. No runtime env var needed.
     setenv("SMASH_NO_MONITOR", "1", 0);
 
     // page_map = nullptr: no span info available (system malloc manages objects)

@@ -77,83 +77,88 @@ static void run_threadtest() {
 }
 
 // ── Larson (producer-consumer cross-thread free) ─────────────────────────────
-// Half the threads produce (malloc), half consume (free). Objects are passed
-// through a shared ring buffer. Stresses cross-thread free performance.
+// N/2 paired producer-consumer threads. Each pair shares a SPSC ring buffer.
+// Producer mallocs, consumer frees — stresses cross-thread free performance.
 
 static constexpr int kLarsonRingSize = 4096;
 
-struct LarsonShared {
+struct LarsonPair {
     void* ring[kLarsonRingSize];
     std::atomic<int> head{0};
     std::atomic<int> tail{0};
-    std::atomic<bool> stop{false};
+    std::atomic<bool>* stop;
     std::atomic<long> produce_ops{0};
     std::atomic<long> consume_ops{0};
+    int id;
 };
 
 static void* larson_producer(void* arg) {
-    auto* s = static_cast<LarsonShared*>(arg);
-    std::mt19937 rng(42);
+    auto* p = static_cast<LarsonPair*>(arg);
+    std::mt19937 rng(p->id * 777 + 42);
     std::uniform_int_distribution<int> size_dist(8, 4096);
     long ops = 0;
 
-    while (!s->stop.load(std::memory_order_relaxed)) {
-        int next = (s->head.load(std::memory_order_relaxed) + 1) % kLarsonRingSize;
-        if (next == s->tail.load(std::memory_order_acquire))
-            continue;  // ring full
-        s->ring[s->head.load(std::memory_order_relaxed)] = malloc(size_dist(rng));
-        s->head.store(next, std::memory_order_release);
+    while (!p->stop->load(std::memory_order_relaxed)) {
+        int h = p->head.load(std::memory_order_relaxed);
+        int next = (h + 1) % kLarsonRingSize;
+        if (next == p->tail.load(std::memory_order_acquire))
+            continue;
+        p->ring[h] = malloc(size_dist(rng));
+        p->head.store(next, std::memory_order_release);
         ops++;
     }
-    s->produce_ops.fetch_add(ops, std::memory_order_relaxed);
+    p->produce_ops.store(ops, std::memory_order_relaxed);
     return nullptr;
 }
 
 static void* larson_consumer(void* arg) {
-    auto* s = static_cast<LarsonShared*>(arg);
+    auto* p = static_cast<LarsonPair*>(arg);
     long ops = 0;
 
-    while (!s->stop.load(std::memory_order_relaxed)) {
-        int t = s->tail.load(std::memory_order_relaxed);
-        if (t == s->head.load(std::memory_order_acquire))
-            continue;  // ring empty
-        free(s->ring[t]);
-        s->tail.store((t + 1) % kLarsonRingSize, std::memory_order_release);
+    while (!p->stop->load(std::memory_order_relaxed)) {
+        int t = p->tail.load(std::memory_order_relaxed);
+        if (t == p->head.load(std::memory_order_acquire))
+            continue;
+        free(p->ring[t]);
+        p->tail.store((t + 1) % kLarsonRingSize, std::memory_order_release);
         ops++;
     }
-    // Drain remaining
-    while (s->tail.load(std::memory_order_relaxed) != s->head.load(std::memory_order_acquire)) {
-        int t = s->tail.load(std::memory_order_relaxed);
-        free(s->ring[t]);
-        s->tail.store((t + 1) % kLarsonRingSize, std::memory_order_release);
+    while (p->tail.load(std::memory_order_relaxed) != p->head.load(std::memory_order_acquire)) {
+        int t = p->tail.load(std::memory_order_relaxed);
+        free(p->ring[t]);
+        p->tail.store((t + 1) % kLarsonRingSize, std::memory_order_release);
     }
-    s->consume_ops.fetch_add(ops, std::memory_order_relaxed);
+    p->consume_ops.store(ops, std::memory_order_relaxed);
     return nullptr;
 }
 
 static void run_larson() {
-    int n_producers = g_num_threads / 2;
-    int n_consumers = g_num_threads - n_producers;
-    if (n_producers < 1) n_producers = 1;
-    if (n_consumers < 1) n_consumers = 1;
+    int n_pairs = g_num_threads / 2;
+    if (n_pairs < 1) n_pairs = 1;
 
-    LarsonShared shared{};
-    std::vector<pthread_t> threads(n_producers + n_consumers);
+    std::atomic<bool> stop{false};
+    std::vector<LarsonPair> pairs(n_pairs);
+    std::vector<pthread_t> threads(n_pairs * 2);
 
-    for (int i = 0; i < n_producers; ++i)
-        pthread_create(&threads[i], nullptr, larson_producer, &shared);
-    for (int i = 0; i < n_consumers; ++i)
-        pthread_create(&threads[n_producers + i], nullptr, larson_consumer, &shared);
+    for (int i = 0; i < n_pairs; ++i) {
+        pairs[i].stop = &stop;
+        pairs[i].id = i;
+        pthread_create(&threads[i * 2], nullptr, larson_producer, &pairs[i]);
+        pthread_create(&threads[i * 2 + 1], nullptr, larson_consumer, &pairs[i]);
+    }
 
     std::this_thread::sleep_for(std::chrono::seconds(g_duration_sec));
-    shared.stop.store(true, std::memory_order_relaxed);
+    stop.store(true, std::memory_order_relaxed);
 
     for (auto& t : threads)
         pthread_join(t, nullptr);
 
-    double mops = (shared.produce_ops.load() + shared.consume_ops.load()) / 1e6;
-    printf("  larson:             %6.1f Mops/s  (%d prod + %d cons, %ds)\n",
-           mops / g_duration_sec, n_producers, n_consumers, g_duration_sec);
+    long total = 0;
+    for (auto& p : pairs)
+        total += p.produce_ops.load() + p.consume_ops.load();
+    double mops = total / 1e6;
+    printf("  larson:             %6.1f Mops/s  (%d pairs, %ds)\n",
+           mops / g_duration_sec, n_pairs, g_duration_sec);
     printf("METRIC larson_mops %.2f\n", mops / g_duration_sec);
 }
 

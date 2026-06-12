@@ -43,6 +43,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <pthread.h>
 #include <lz4.h>
 #include <zstd.h>
 
@@ -110,89 +111,72 @@ bool faultCallback(uintptr_t fault_addr, void* /*ctx*/) {
 
 void scanVmRegions();  // forward declaration
 
-// SIGUSR2 handler: identify cold pages via kernel accessed bits, then
-// compress only those to report achievable ratios on cold data.
-//
-// Mechanism: clear_refs resets the "accessed" (young) bit for all pages.
-// Pages that haven't been touched since the last clear_refs have bit 3
-// (Accessed) clear in /proc/self/pagemap. We identify those as cold.
-void reportCompressionRatios(int) {
-    scanVmRegions();
-    size_t committed = g_vm.committedPages();
+// SIGUSR2: set flag for the measurement thread to report ratios.
+std::atomic<bool> g_report_requested{false};
 
-    // Open pagemap for reading page flags
-    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
-    int mem_fd = open("/proc/self/mem", O_RDONLY);
-    if (pagemap_fd < 0 || mem_fd < 0) {
-        if (pagemap_fd >= 0) close(pagemap_fd);
-        if (mem_fd >= 0) close(mem_fd);
-        return;
-    }
+void sigusr2Handler(int) {
+    g_report_requested.store(true, std::memory_order_relaxed);
+}
 
+// Measurement thread: waits for SIGUSR2 flag, then scans all tracked pages
+// via /proc/self/mem and reports compression ratios to stderr.
+void* measurementThread(void*) {
+    // Pre-allocate buffers
     int lz4_bound = LZ4_compressBound(smash::kPageSize);
     size_t zstd_bound = ZSTD_compressBound(smash::kPageSize);
-    size_t buf_sz = (size_t)lz4_bound > zstd_bound ? lz4_bound : zstd_bound;
+    size_t buf_sz = (size_t)lz4_bound > zstd_bound ? (size_t)lz4_bound : zstd_bound;
     char* page_buf = (char*)::mmap(nullptr, smash::kPageSize, PROT_READ|PROT_WRITE,
                                     MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     char* comp_buf = (char*)::mmap(nullptr, buf_sz, PROT_READ|PROT_WRITE,
                                     MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (!page_buf || !comp_buf) goto cleanup;
+    if (page_buf == MAP_FAILED || comp_buf == MAP_FAILED) return nullptr;
 
-    {
-        size_t total_pages_checked = 0, cold_pages = 0;
-        size_t cold_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+    while (true) {
+        usleep(100000);  // poll 10× per second
+        if (!g_report_requested.load(std::memory_order_relaxed)) continue;
+        g_report_requested.store(false, std::memory_order_relaxed);
 
-        for (size_t i = 1; i < committed && cold_pages < 50000; ++i) {
+        scanVmRegions();
+        size_t committed = g_vm.committedPages();
+
+        int mem_fd = open("/proc/self/mem", O_RDONLY);
+        if (mem_fd < 0) continue;
+
+        size_t pages_ok = 0;
+        size_t total_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+
+        for (size_t i = 1; i < committed && pages_ok < 100000; ++i) {
             smash::PageState st = g_states.get(i);
             if (st != smash::PageState::ACTIVE) continue;
             void* addr = g_vm.pageAddress(i);
             if (!addr) continue;
 
-            total_pages_checked++;
-
-            // Read pagemap entry: bit 63 = present, bit 3 = accessed (young)
-            // after clear_refs was written, accessed=0 means cold.
-            uint64_t pme = 0;
-            uintptr_t vpn = (uintptr_t)addr / smash::kPageSize;
-            if (pread(pagemap_fd, &pme, 8, vpn * 8) != 8) continue;
-            bool present = (pme >> 63) & 1;
-            if (!present) continue;  // swapped out, skip
-
-            // All present tracked pages are candidates — the workload
-            // determines which are "cold" by not touching them.
-            cold_pages++;
             ssize_t rd = pread(mem_fd, page_buf, smash::kPageSize, (off_t)(uintptr_t)addr);
             if (rd != (ssize_t)smash::kPageSize) continue;
 
-            cold_bytes += smash::kPageSize;
+            pages_ok++;
+            total_bytes += smash::kPageSize;
             int lz4_sz = LZ4_compress_default(page_buf, comp_buf, smash::kPageSize, lz4_bound);
             lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : smash::kPageSize;
             size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, smash::kPageSize, 1);
             zstd1_bytes += ZSTD_isError(z1) ? smash::kPageSize : z1;
         }
+        close(mem_fd);
 
-        if (cold_bytes > 0) {
-            char msg[512];
-            int n = snprintf(msg, sizeof(msg),
-                "[smash compress-only] checked=%zu cold=%zu (%.0f%%) "
-                "cold_data=%.1fMiB lz4=%.1fx zstd1=%.1fx\n",
-                total_pages_checked, cold_pages,
-                100.0 * cold_pages / (total_pages_checked ? total_pages_checked : 1),
-                cold_bytes / (1024.0*1024.0),
-                (double)cold_bytes / lz4_bytes,
-                (double)cold_bytes / zstd1_bytes);
-            (void)!write(STDERR_FILENO, msg, n);
+        char msg[256];
+        int n;
+        if (total_bytes > 0) {
+            n = snprintf(msg, sizeof(msg),
+                "compressed=%zu pages=%.1fMiB lz4=%.2fx zstd1=%.2fx\n",
+                pages_ok, total_bytes / (1024.0*1024.0),
+                (double)total_bytes / lz4_bytes,
+                (double)total_bytes / zstd1_bytes);
         } else {
-            const char* msg = "[smash compress-only] no cold pages found\n";
-            (void)!write(STDERR_FILENO, msg, strlen(msg));
+            n = snprintf(msg, sizeof(msg), "compressed=0 (no tracked pages)\n");
         }
+        (void)!write(STDERR_FILENO, msg, n);
     }
-
-cleanup:
-    if (page_buf) ::munmap(page_buf, smash::kPageSize);
-    if (comp_buf) ::munmap(comp_buf, buf_sz);
-    close(pagemap_fd);
-    close(mem_fd);
+    return nullptr;
 }
 
 void startCompression() {
@@ -888,11 +872,15 @@ static void co_init() {
 
     smash::g_smash_vm_region = &g_vm;
 
-    // Register SIGUSR2 handler for on-demand compression ratio reporting
+    // Start measurement thread + register SIGUSR2 handler
     struct sigaction sa{};
-    sa.sa_handler = reportCompressionRatios;
+    sa.sa_handler = sigusr2Handler;
     sa.sa_flags = SA_RESTART;
     sigaction(SIGUSR2, &sa, nullptr);
+
+    pthread_t meas_thread;
+    pthread_create(&meas_thread, nullptr, measurementThread, nullptr);
+    pthread_detach(meas_thread);
 
     g_inited.store(true, std::memory_order_release);
 }

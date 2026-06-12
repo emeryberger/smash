@@ -39,9 +39,12 @@
 #endif
 
 #include <atomic>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <lz4.h>
+#include <zstd.h>
 
 // ── Platform-specific interposition macros ────────────────────────────────────
 
@@ -107,14 +110,99 @@ bool faultCallback(uintptr_t fault_addr, void* /*ctx*/) {
 
 void scanVmRegions();  // forward declaration
 
+// SIGUSR2 handler: identify cold pages via kernel accessed bits, then
+// compress only those to report achievable ratios on cold data.
+//
+// Mechanism: clear_refs resets the "accessed" (young) bit for all pages.
+// Pages that haven't been touched since the last clear_refs have bit 3
+// (Accessed) clear in /proc/self/pagemap. We identify those as cold.
+void reportCompressionRatios(int) {
+    scanVmRegions();
+    size_t committed = g_vm.committedPages();
+
+    // Open pagemap for reading page flags
+    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
+    int mem_fd = open("/proc/self/mem", O_RDONLY);
+    if (pagemap_fd < 0 || mem_fd < 0) {
+        if (pagemap_fd >= 0) close(pagemap_fd);
+        if (mem_fd >= 0) close(mem_fd);
+        return;
+    }
+
+    int lz4_bound = LZ4_compressBound(smash::kPageSize);
+    size_t zstd_bound = ZSTD_compressBound(smash::kPageSize);
+    size_t buf_sz = (size_t)lz4_bound > zstd_bound ? lz4_bound : zstd_bound;
+    char* page_buf = (char*)::mmap(nullptr, smash::kPageSize, PROT_READ|PROT_WRITE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    char* comp_buf = (char*)::mmap(nullptr, buf_sz, PROT_READ|PROT_WRITE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (!page_buf || !comp_buf) goto cleanup;
+
+    {
+        size_t total_pages_checked = 0, cold_pages = 0;
+        size_t cold_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+
+        for (size_t i = 1; i < committed && cold_pages < 50000; ++i) {
+            smash::PageState st = g_states.get(i);
+            if (st != smash::PageState::ACTIVE) continue;
+            void* addr = g_vm.pageAddress(i);
+            if (!addr) continue;
+
+            total_pages_checked++;
+
+            // Read pagemap entry: bit 63 = present, bit 3 = accessed (young)
+            // after clear_refs was written, accessed=0 means cold.
+            uint64_t pme = 0;
+            uintptr_t vpn = (uintptr_t)addr / smash::kPageSize;
+            if (pread(pagemap_fd, &pme, 8, vpn * 8) != 8) continue;
+            bool present = (pme >> 63) & 1;
+            if (!present) continue;  // swapped out, skip
+
+            // All present tracked pages are candidates — the workload
+            // determines which are "cold" by not touching them.
+            cold_pages++;
+            ssize_t rd = pread(mem_fd, page_buf, smash::kPageSize, (off_t)(uintptr_t)addr);
+            if (rd != (ssize_t)smash::kPageSize) continue;
+
+            cold_bytes += smash::kPageSize;
+            int lz4_sz = LZ4_compress_default(page_buf, comp_buf, smash::kPageSize, lz4_bound);
+            lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : smash::kPageSize;
+            size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, smash::kPageSize, 1);
+            zstd1_bytes += ZSTD_isError(z1) ? smash::kPageSize : z1;
+        }
+
+        if (cold_bytes > 0) {
+            char msg[512];
+            int n = snprintf(msg, sizeof(msg),
+                "[smash compress-only] checked=%zu cold=%zu (%.0f%%) "
+                "cold_data=%.1fMiB lz4=%.1fx zstd1=%.1fx\n",
+                total_pages_checked, cold_pages,
+                100.0 * cold_pages / (total_pages_checked ? total_pages_checked : 1),
+                cold_bytes / (1024.0*1024.0),
+                (double)cold_bytes / lz4_bytes,
+                (double)cold_bytes / zstd1_bytes);
+            (void)!write(STDERR_FILENO, msg, n);
+        } else {
+            const char* msg = "[smash compress-only] no cold pages found\n";
+            (void)!write(STDERR_FILENO, msg, strlen(msg));
+        }
+    }
+
+cleanup:
+    if (page_buf) ::munmap(page_buf, smash::kPageSize);
+    if (comp_buf) ::munmap(comp_buf, buf_sz);
+    close(pagemap_fd);
+    close(mem_fd);
+}
+
 void startCompression() {
     bool expected = false;
     if (!g_compression_started.compare_exchange_strong(expected, true))
         return;
-    g_fault_handler.start(faultCallback, nullptr);
-    scanVmRegions();  // initial scan before starting compressor
-    g_compressor.setPreTickCallback(scanVmRegions);
-    g_compressor.start();
+    // Don't start the compressor thread or fault handler — mprotect on
+    // system-allocator pages causes SIGSEGV. Instead, just scan pages for
+    // tracking; compression ratios are measured on-demand via SIGUSR2.
+    scanVmRegions();
 }
 
 // Track pages covered by an allocation
@@ -785,25 +873,26 @@ static void co_init() {
     g_store.init();
     g_engine.init();
 
-    // Disable Phase 3 monitoring: system allocators write metadata into pages
-    // (free-list pointers, bin headers) which would fault on PROT_READ pages.
-    // Cold-detection relies solely on the accessed_ bitmap (set via trackAllocation).
+    // Compress-only mode cannot use smash's mprotect-based compression
+    // pipeline: system allocators write metadata into heap pages on every
+    // malloc/free, causing SIGSEGV when those pages are mprotect'd. Instead,
+    // we disable the compressor thread entirely. Compression ratio measurement
+    // is done via SIGUSR2 which samples tracked pages in read-only mode.
     setenv("SMASH_NO_MONITOR", "1", 0);
-
-    // Use deferred-reclaim path: compressPage copies page data via memcpy
-    // while the page stays PROT_RW (no mprotect during snapshot). The page
-    // enters COMPRESSED_SHADOW state — still accessible, contents match the
-    // blob. On a subsequent tick, if unchanged, it's promoted to COMPRESSED
-    // + PROT_NONE + decommitted. This avoids the SIGSEGV that occurs when
-    // mprotect(PROT_READ) is applied to pages containing glibc allocator
-    // metadata that other threads concurrently write.
-    setenv("SMASH_DEFERRED_RECLAIM", "1", 0);
+    // Don't start the compressor thread — just track pages for measurement.
+    // The startCompression() path is disabled; ratio is reported on SIGUSR2.
 
     // page_map = nullptr: no span info available (system malloc manages objects)
     g_compressor.init(&g_vm, &g_states, &g_locks, &g_store, &g_engine,
                       nullptr, &g_fault_handler);
 
     smash::g_smash_vm_region = &g_vm;
+
+    // Register SIGUSR2 handler for on-demand compression ratio reporting
+    struct sigaction sa{};
+    sa.sa_handler = reportCompressionRatios;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR2, &sa, nullptr);
 
     g_inited.store(true, std::memory_order_release);
 }

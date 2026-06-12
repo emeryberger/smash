@@ -57,7 +57,14 @@ def load(results_path: Path) -> list:
         full = first_run(f"{key}_full_smash")
         if not base or not full:
             continue
-        rows.append({"label": label, "base": base, "full": full})
+        row = {"label": label, "base": base, "full": full}
+        jemalloc = first_run(f"{key}_jemalloc")
+        mimalloc = first_run(f"{key}_mimalloc")
+        if jemalloc:
+            row["jemalloc"] = jemalloc
+        if mimalloc:
+            row["mimalloc"] = mimalloc
+        rows.append(row)
     return rows
 
 
@@ -104,24 +111,43 @@ def plot_auc(rows, outdir: Path):
 
 
 def plot_timing(rows, outdir: Path):
-    labels, base_ops, full_ops = [], [], []
+    import numpy as np
+
+    # Collect data for all allocators that have ops
+    alloc_names = ["baseline", "jemalloc", "mimalloc", "full smash"]
+    alloc_keys = ["base", "jemalloc", "mimalloc", "full"]
+    alloc_colors = ["#999999", "#e6a817", "#4caf50", "#2a7ab9"]
+
+    labels, alloc_data = [], {k: [] for k in alloc_keys}
     for r in rows:
         b = r["base"].get("ops_per_sec")
         f = r["full"].get("ops_per_sec")
         if not b or not f:
             continue
         labels.append(r["label"])
-        base_ops.append(b / 1e3)   # kops/s
-        full_ops.append(f / 1e3)
+        alloc_data["base"].append(b / 1e3)
+        alloc_data["full"].append(f / 1e3)
+        alloc_data["jemalloc"].append(
+            r["jemalloc"]["ops_per_sec"] / 1e3 if r.get("jemalloc", {}).get("ops_per_sec") else 0)
+        alloc_data["mimalloc"].append(
+            r["mimalloc"]["ops_per_sec"] / 1e3 if r.get("mimalloc", {}).get("ops_per_sec") else 0)
     if not labels:
         return
-    import numpy as np
+
+    # Only plot allocators that have at least one nonzero entry
+    active = [(name, key, color) for name, key, color in
+              zip(alloc_names, alloc_keys, alloc_colors)
+              if any(v > 0 for v in alloc_data[key])]
+
     x = np.arange(len(labels))
-    w = 0.38
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    ax.bar(x - w / 2, base_ops, w, label="baseline", color="#999999")
-    ax.bar(x + w / 2, full_ops, w, label="full smash", color="#2a7ab9")
-    ax.set_title("Throughput (baseline vs full smash)")
+    n = len(active)
+    w = 0.8 / n
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    for i, (name, key, color) in enumerate(active):
+        offset = (i - n / 2 + 0.5) * w
+        vals = alloc_data[key]
+        ax.bar(x + offset, vals, w, label=name, color=color)
+    ax.set_title("Throughput by allocator")
     ax.set_ylabel("kops/s")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30)

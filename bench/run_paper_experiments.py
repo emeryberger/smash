@@ -1124,7 +1124,7 @@ def run_memcached_bench(build_dir, smash_lib, quick):
 
         # Serve phase: access hot 5%
         hot_keys = max(1, num_keys // 20)
-        _access_memcached(port, hot_keys, serve_sec)
+        ops_per_sec = _access_memcached(port, hot_keys, serve_sec)
 
         # Verify process survived serve phase
         if proc.poll() is not None:
@@ -1148,6 +1148,7 @@ def run_memcached_bench(build_dir, smash_lib, quick):
             "rss_reduction_pct": reduction,
             "rss_timeline": rss_timeline,
             "auc_mb_sec": auc_mb_sec,
+            "ops_per_sec": ops_per_sec,
         }
     finally:
         proc.terminate()
@@ -1205,10 +1206,12 @@ def _populate_memcached(port, num_keys, value_size=500):
 
 
 def _access_memcached(port, hot_keys, duration_sec):
-    """Access hot keys in memcached for a duration."""
+    """Access hot keys in memcached for a duration. Returns ops/s."""
     deadline = time.time() + duration_sec
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
     s.settimeout(1.0)
+    total_ops = 0
+    t_start = time.time()
     try:
         while time.time() < deadline:
             batch = []
@@ -1218,8 +1221,8 @@ def _access_memcached(port, hot_keys, duration_sec):
             try:
                 s.sendall("".join(batch).encode())
                 s.recv(65536)
+                total_ops += 100
             except (socket.timeout, BrokenPipeError, ConnectionResetError):
-                # Connection issues during serve phase - reconnect
                 try:
                     s.close()
                 except Exception:
@@ -1235,6 +1238,8 @@ def _access_memcached(port, hot_keys, duration_sec):
             s.close()
         except Exception:
             pass
+    elapsed = time.time() - t_start
+    return total_ops / elapsed if elapsed > 0 else 0
 
 
 def _check_cmd(name):
@@ -1569,8 +1574,24 @@ def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1):
     })
     results_path.write_text(json.dumps(all_results, indent=2))
 
+    # Detect available allocator libraries for comparison
+    jemalloc_lib = None
+    mimalloc_lib = None
+    for path in ["/usr/lib64/libjemalloc.so", "/usr/local/lib/libjemalloc.so",
+                 "/usr/lib/x86_64-linux-gnu/libjemalloc.so"]:
+        if Path(path).exists():
+            jemalloc_lib = Path(path)
+            break
+    for path in ["/usr/local/lib64/libmimalloc.so", "/usr/local/lib/libmimalloc.so",
+                 "/usr/lib/x86_64-linux-gnu/libmimalloc.so"]:
+        if Path(path).exists():
+            mimalloc_lib = Path(path)
+            break
+
     configs = [
         ("baseline", None),
+        ("jemalloc", jemalloc_lib),
+        ("mimalloc", mimalloc_lib),
         ("compress_only", co_lib),
         ("full_smash", smash_lib),
     ]

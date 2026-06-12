@@ -790,6 +790,15 @@ static void co_init() {
     // Cold-detection relies solely on the accessed_ bitmap (set via trackAllocation).
     setenv("SMASH_NO_MONITOR", "1", 0);
 
+    // Use deferred-reclaim path: compressPage copies page data via memcpy
+    // while the page stays PROT_RW (no mprotect during snapshot). The page
+    // enters COMPRESSED_SHADOW state — still accessible, contents match the
+    // blob. On a subsequent tick, if unchanged, it's promoted to COMPRESSED
+    // + PROT_NONE + decommitted. This avoids the SIGSEGV that occurs when
+    // mprotect(PROT_READ) is applied to pages containing glibc allocator
+    // metadata that other threads concurrently write.
+    setenv("SMASH_DEFERRED_RECLAIM", "1", 0);
+
     // page_map = nullptr: no span info available (system malloc manages objects)
     g_compressor.init(&g_vm, &g_states, &g_locks, &g_store, &g_engine,
                       nullptr, &g_fault_handler);

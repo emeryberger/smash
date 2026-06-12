@@ -48,3 +48,35 @@ No compression mechanism active. Pages stay resident at full size indefinitely.
 3. **Sparse workload gap**: zswap achieves 78.7× on sparse data (75% zeros) while smash only achieves 3.2×. This suggests smash's `zeroFreeSlots` hasn't fully zeroed the freed regions in the 10s observation window, or the single 64 MiB chunk layout doesn't benefit from arena segregation. Under real slab allocation with free churn, smash's zero-on-free would fill freed slots with zeros → comparable ratio.
 
 4. **The production argument**: In a container with `memory.high` set (e.g., Kubernetes resource limits), zswap would eventually fire. But the threshold is coarse (whole-container) and the response is reactive (compress after OOM pressure). Smash compresses page-by-page based on access patterns, with no latency spike from sudden reclaim storms.
+
+## Real Workload Comparison: SQLite (full run, 500K rows)
+
+**System**: AMD EPYC 9R14, 192 vCPUs, 1.5 TB RAM, kernel 6.12  
+**zswap config**: zstd compressor, 4 GB swap file  
+**Workload**: `bench_sqlite` — 500K row fill, 10s cool, 20s serve (5% hot), cold re-access
+
+| Metric | glibc (no pressure) | glibc + zswap (MemoryHigh=250M) | smash |
+|--------|:---:|:---:|:---:|
+| Peak RSS | 355 MiB | 209 MiB | 455 MiB |
+| Post-cool RSS | 355 MiB | 209 MiB | **121 MiB** |
+| Min serve RSS | 355 MiB | 168 MiB | **121 MiB** |
+| Serve AUC (MB·s) | 8531 | 3821 | **3766** |
+| Throughput | 96.4k ops/s | 90.8k ops/s | 88.1k ops/s |
+| Cold access p50 | 1.3 µs | 14.6 µs | 16.8 µs |
+| Cold access p99 | 2.0 µs | **2342 µs** | **143 µs** |
+
+### Analysis
+
+1. **Equivalent memory savings**: smash and zswap achieve nearly identical serve-phase AUC (3766 vs 3821 MB·s) — both compress cold pages to similar effective sizes. Smash is slightly better.
+
+2. **16× better tail latency**: smash decompresses in userspace via the SIGSEGV handler (143 µs p99). zswap goes through the kernel swap-in path: page table updates, TLB shootdown, swap cache lookup, decompression, page allocation — 2342 µs p99.
+
+3. **No configuration needed**: smash achieves 121 MiB on a 1.5 TB server with no cgroup limits. zswap requires explicit `MemoryHigh=250M` to trigger reclaim. Without it, pages sit in RAM at 355 MiB indefinitely.
+
+4. **Throughput parity**: both pay ~6-9% throughput cost vs the no-compression baseline. The decompression overhead is comparable despite different mechanisms.
+
+5. **Peak RSS tradeoff**: smash's peak (455 MiB) exceeds glibc's (355 MiB) due to allocator metadata (VmRegion, PageState tables, bootstrap allocator). This is a one-time cost amortized across the working set. zswap's apparent "209 MiB peak" is artificially limited by the cgroup — it's not true peak, it's throttled fill.
+
+### Conclusion
+
+On well-provisioned servers, smash delivers the same memory savings as zswap-under-pressure with 16× better tail latency and zero configuration. zswap is effectively inert without memory pressure, making it unsuitable as a "transparent" compression mechanism for memory-rich environments.

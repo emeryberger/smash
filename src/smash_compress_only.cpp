@@ -851,8 +851,12 @@ static void co_init() {
 
     // In tracking mode (compress_only), the region_size arg is unused —
     // pass 0 to make this explicit and avoid a 16GiB mmap attempt.
-    if (!g_vm.init(0))
+    (void)!write(STDERR_FILENO, "[co_init] starting vm.init\n", 27);
+    if (!g_vm.init(0)) {
+        (void)!write(STDERR_FILENO, "[co_init] vm.init FAILED\n", 25);
         return;
+    }
+    (void)!write(STDERR_FILENO, "[co_init] vm.init OK\n", 21);
 
     g_states.init(g_vm.totalPages());
     g_locks.init(g_vm.totalPages());

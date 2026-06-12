@@ -25,7 +25,7 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 
 ## Results
 
-Full smash vs. baseline (system malloc) across seven workloads, measured on an AMD EPYC 9R14 (192 cores, Amazon Linux 2023). Each app fills, cools, then serves; **RSS reduction** is peak → minimum serve-phase RSS, **AUC reduction** is the change in the integral of RSS over the cooling phase only (MB·s — lower AUC = less memory-time consumed while idle), and **throughput** is application ops/s where the workload reports it.
+Full smash vs. baseline (glibc malloc) across seven workloads, measured on an AMD EPYC 9R14 (192 vCPUs, 1.5 TB RAM, Amazon Linux 2023, kernel 6.12). Each app fills, cools (10–30 s idle), then serves (hot-set queries); **RSS reduction** is peak → minimum RSS during cooling, **AUC reduction** is the change in the integral of RSS over the cooling phase (MB·s — lower = less memory-time consumed while idle), and **throughput** is application ops/s during serve.
 
 | Workload | Peak → Min RSS | RSS reduction | AUC reduction | Throughput vs baseline |
 |----------|---------------:|--------------:|--------------:|-----------------------:|

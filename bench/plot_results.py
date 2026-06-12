@@ -81,30 +81,86 @@ def _bar(ax, labels, values, title, ylabel, color, fmt="{:.0f}"):
 
 
 def plot_rss(rows, outdir: Path):
+    import numpy as np
+
+    alloc_names = ["glibc", "jemalloc", "mimalloc", "smash"]
+    alloc_keys = ["base", "jemalloc", "mimalloc", "full"]
+    alloc_colors = ["#999999", "#e6a817", "#4caf50", "#2a7ab9"]
+
     labels = [r["label"] for r in rows]
-    red = [r["full"].get("rss_reduction_pct", 0.0) for r in rows]
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    _bar(ax, labels, red, "Peak→Min RSS Reduction (full smash)",
-         "RSS reduction (%)", "#2a7ab9", "{:.1f}%")
+    alloc_data = {k: [] for k in alloc_keys}
+    for r in rows:
+        alloc_data["base"].append(r["base"].get("min_rss_mb", r["base"].get("peak_rss_mb", 0)))
+        alloc_data["full"].append(r["full"].get("min_rss_mb", 0))
+        alloc_data["jemalloc"].append(
+            r["jemalloc"].get("min_rss_mb", r["jemalloc"].get("peak_rss_mb", 0))
+            if r.get("jemalloc") else 0)
+        alloc_data["mimalloc"].append(
+            r["mimalloc"].get("min_rss_mb", r["mimalloc"].get("peak_rss_mb", 0))
+            if r.get("mimalloc") else 0)
+
+    active = [(name, key, color) for name, key, color in
+              zip(alloc_names, alloc_keys, alloc_colors)
+              if any(v > 0 for v in alloc_data[key])]
+
+    x = np.arange(len(labels))
+    n = len(active)
+    w = 0.8 / n
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    for i, (name, key, color) in enumerate(active):
+        offset = (i - n / 2 + 0.5) * w
+        ax.bar(x + offset, alloc_data[key], w, label=name, color=color)
+    ax.set_title("Minimum RSS by allocator (lower is better)")
+    ax.set_ylabel("RSS (MiB)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30)
+    ax.legend()
     fig.tight_layout()
     fig.savefig(outdir / "rss_reduction.png", dpi=130)
     plt.close(fig)
 
 
 def plot_auc(rows, outdir: Path):
-    labels, red = [], []
+    import numpy as np
+
+    alloc_names = ["glibc", "jemalloc", "mimalloc", "smash"]
+    alloc_keys = ["base", "jemalloc", "mimalloc", "full"]
+    alloc_colors = ["#999999", "#e6a817", "#4caf50", "#2a7ab9"]
+
+    labels, alloc_data = [], {k: [] for k in alloc_keys}
     for r in rows:
-        b = r["base"].get("serve_auc_mb_sec", r["base"].get("auc_mb_sec"))
-        f = r["full"].get("serve_auc_mb_sec", r["full"].get("auc_mb_sec"))
-        if not b or b <= 0 or f is None:
+        b_auc = r["base"].get("serve_auc_mb_sec", r["base"].get("auc_mb_sec"))
+        f_auc = r["full"].get("serve_auc_mb_sec", r["full"].get("auc_mb_sec"))
+        if not b_auc or b_auc <= 0 or f_auc is None:
             continue
         labels.append(r["label"])
-        red.append((1.0 - f / b) * 100.0)
+        alloc_data["base"].append(b_auc)
+        alloc_data["full"].append(f_auc)
+        j = r.get("jemalloc", {})
+        alloc_data["jemalloc"].append(
+            j.get("serve_auc_mb_sec", j.get("auc_mb_sec", b_auc)) if j else b_auc)
+        m = r.get("mimalloc", {})
+        alloc_data["mimalloc"].append(
+            m.get("serve_auc_mb_sec", m.get("auc_mb_sec", b_auc)) if m else b_auc)
     if not labels:
         return
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    _bar(ax, labels, red, "Serve-Phase AUC Reduction vs baseline (MB·s)",
-         "AUC reduction (%)", "#3c9d4e", "{:.1f}%")
+
+    active = [(name, key, color) for name, key, color in
+              zip(alloc_names, alloc_keys, alloc_colors)
+              if any(v > 0 for v in alloc_data[key])]
+
+    x = np.arange(len(labels))
+    n = len(active)
+    w = 0.8 / n
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    for i, (name, key, color) in enumerate(active):
+        offset = (i - n / 2 + 0.5) * w
+        ax.bar(x + offset, alloc_data[key], w, label=name, color=color)
+    ax.set_title("Serve-Phase Memory-Time (AUC, lower is better)")
+    ax.set_ylabel("AUC (MB·s)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30)
+    ax.legend()
     fig.tight_layout()
     fig.savefig(outdir / "auc_reduction.png", dpi=130)
     plt.close(fig)

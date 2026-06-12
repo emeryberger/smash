@@ -34,10 +34,12 @@ struct ThreadtestArg {
     std::atomic<long>* total_ops;
 };
 
+static int g_max_alloc_size = 16384;  // default: slab-range sizes only
+
 static void* threadtest_worker(void* arg) {
     auto* a = static_cast<ThreadtestArg*>(arg);
     std::mt19937 rng(a->id * 12345 + 67890);
-    std::uniform_int_distribution<int> size_dist(8, 65536);
+    std::uniform_int_distribution<int> size_dist(8, g_max_alloc_size);
     constexpr int kBatch = 1000;
     void* ptrs[kBatch];
     long ops = 0;
@@ -220,10 +222,12 @@ int main(int argc, char* argv[]) {
             g_duration_sec = atoi(argv[++i]);
         else if (strcmp(argv[i], "--iterations") == 0 && i + 1 < argc)
             g_iterations = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc)
+            g_max_alloc_size = atoi(argv[++i]);
         else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc)
             bench = argv[++i];
         else if (strcmp(argv[i], "--help") == 0) {
-            fprintf(stderr, "Usage: %s [--threads N] [--duration SEC] [--iterations N] [--bench threadtest|larson|scalability|all]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--threads N] [--duration SEC] [--iterations N] [--max-size N] [--bench threadtest|larson|scalability|all]\n", argv[0]);
             return 0;
         }
     }

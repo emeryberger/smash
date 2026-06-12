@@ -1122,9 +1122,11 @@ def run_memcached_bench(build_dir, smash_lib, quick):
                 rss_timeline.append(rss_timeline[-1])
         cool_rss = get_rss_mb(proc.pid)
 
-        # Serve phase: access hot 5%
+        # Serve phase: access hot 5% with both clients for comparison.
         hot_keys = max(1, num_keys // 20)
-        ops_per_sec = _access_memcached(port, hot_keys, serve_sec)
+        memtier_ops = _memtier_memcached(port, hot_keys, serve_sec)
+        python_ops = _access_memcached(port, hot_keys, serve_sec)
+        ops_per_sec = memtier_ops if memtier_ops > 0 else python_ops
 
         # Verify process survived serve phase
         if proc.poll() is not None:
@@ -1149,6 +1151,8 @@ def run_memcached_bench(build_dir, smash_lib, quick):
             "rss_timeline": rss_timeline,
             "auc_mb_sec": auc_mb_sec,
             "ops_per_sec": ops_per_sec,
+            "memtier_ops_per_sec": memtier_ops,
+            "python_ops_per_sec": python_ops,
         }
     finally:
         proc.terminate()
@@ -1205,23 +1209,57 @@ def _populate_memcached(port, num_keys, value_size=500):
         s.close()
 
 
+def _memtier_memcached(port, hot_keys, duration_sec):
+    """Run memtier_benchmark against memcached. Returns ops/s, or 0 if unavailable."""
+    import shutil
+    memtier = shutil.which("memtier_benchmark")
+    if not memtier:
+        return 0
+    try:
+        result = subprocess.run([
+            memtier, "-s", "127.0.0.1", "-p", str(port),
+            "--protocol", "memcache_text",
+            "--threads", "4", "--clients", "10",
+            "--test-time", str(duration_sec),
+            "--key-maximum", str(hot_keys),
+            "--ratio", "0:1",  # 100% GET
+            "--hide-histogram",
+        ], capture_output=True, text=True, timeout=duration_sec + 30)
+        for line in result.stdout.splitlines():
+            if "Totals" in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        return float(parts[1])
+                    except ValueError:
+                        pass
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return 0
+
+
 def _access_memcached(port, hot_keys, duration_sec):
     """Access hot keys in memcached for a duration. Returns ops/s."""
     deadline = time.time() + duration_sec
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
-    s.settimeout(1.0)
+    s.settimeout(2.0)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     total_ops = 0
     t_start = time.time()
+    batch_size = 500
     try:
         while time.time() < deadline:
             batch = []
-            for _ in range(100):
-                key = f"key:{hash(time.time()) % hot_keys:07d}"
+            for _ in range(batch_size):
+                key = f"key:{total_ops % hot_keys:07d}"
                 batch.append(f"get {key}\r\n")
+                total_ops += 1
             try:
                 s.sendall("".join(batch).encode())
-                s.recv(65536)
-                total_ops += 100
+                while True:
+                    data = s.recv(65536)
+                    if not data or data.endswith(b"END\r\n"):
+                        break
             except (socket.timeout, BrokenPipeError, ConnectionResetError):
                 try:
                     s.close()
@@ -1229,10 +1267,10 @@ def _access_memcached(port, hot_keys, duration_sec):
                     pass
                 try:
                     s = socket.create_connection(("127.0.0.1", port), timeout=5)
-                    s.settimeout(1.0)
+                    s.settimeout(2.0)
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 except Exception:
                     break
-            time.sleep(0.01)
     finally:
         try:
             s.close()

@@ -478,10 +478,14 @@ public:
         void* addr = base_ + already * kPageSize;
         size_t commit_bytes = (target - already) * kPageSize;
         vm::commitPages(addr, commit_bytes);
+        // Request THP promotion for reduced TLB pressure on the data region.
+        // madvise mode is the default on most Linux distros; this hint lets
+        // the kernel coalesce 4K pages into 2M huge pages when possible.
+#ifdef __linux__
+        madvise(addr, commit_bytes, MADV_HUGEPAGE);
+#endif
         // Prefault: touch each page to allocate physical frames now (during
         // span allocation) rather than on the application's hot write path.
-        // Without this, the first write per page triggers a kernel page fault
-        // (~2-5µs each) that shows up as overhead during serve.
         volatile char* p = static_cast<volatile char*>(addr);
         for (size_t off = 0; off < commit_bytes; off += kPageSize)
             p[off] = 0;

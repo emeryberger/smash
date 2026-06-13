@@ -232,6 +232,7 @@ void co_start_threads() {
 static std::atomic<int> g_in_track{0};
 
 void trackAllocation(void* ptr, size_t size) {
+    return;  // DISABLED for debugging
     if (!ptr || size == 0) return;
     if (g_in_track.load(std::memory_order_relaxed)) return;
     g_in_track.store(1, std::memory_order_relaxed);

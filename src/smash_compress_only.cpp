@@ -227,9 +227,15 @@ void co_start_threads() {
     startMeasurementThreads();
 }
 
-// Track pages covered by an allocation
+// Track pages covered by an allocation.
+// Reentrancy guard: trackPage → BootstrapAlloc → mmap → mmap wrapper → trackAllocation
+static thread_local bool g_in_track = false;
+
 void trackAllocation(void* ptr, size_t size) {
     if (!ptr || size == 0) return;
+    if (g_in_track) return;
+    g_in_track = true;
+
     uintptr_t start_page = reinterpret_cast<uintptr_t>(ptr) & ~(smash::kPageSize - 1);
     uintptr_t end_page = (reinterpret_cast<uintptr_t>(ptr) + size - 1) & ~(smash::kPageSize - 1);
 
@@ -241,6 +247,7 @@ void trackAllocation(void* ptr, size_t size) {
                 g_states.set(idx, smash::PageState::ACTIVE);
         }
     }
+    g_in_track = false;
 }
 
 // ── VM region scanning ──────────────────────────────────────────────────────

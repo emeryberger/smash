@@ -123,6 +123,44 @@ extern "C" void* co_realloc(void* old_ptr, size_t size) {
     return ptr;
 }
 
+using posix_memalign_fn = int(*)(void**, size_t, size_t);
+using valloc_fn = void*(*)(size_t);
+
+extern "C" int co_posix_memalign(void** memptr, size_t alignment, size_t size);
+CO_INTERPOSE(co_posix_memalign, posix_memalign);
+extern "C" int co_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    int ret = CO_ORIG(posix_memalign_fn, co_posix_memalign)(memptr, alignment, size);
+    if (ret == 0 && *memptr) track_pages(*memptr, size);
+    return ret;
+}
+
+extern "C" void* co_valloc(size_t size);
+CO_INTERPOSE(co_valloc, valloc);
+extern "C" void* co_valloc(size_t size) {
+    void* ptr = CO_ORIG(valloc_fn, co_valloc)(size);
+    track_pages(ptr, size);
+    return ptr;
+}
+
+using reallocf_fn = void*(*)(void*, size_t);
+using strdup_fn = char*(*)(const char*);
+
+extern "C" void* co_reallocf(void* old_ptr, size_t size);
+CO_INTERPOSE(co_reallocf, reallocf);
+extern "C" void* co_reallocf(void* old_ptr, size_t size) {
+    void* ptr = CO_ORIG(reallocf_fn, co_reallocf)(old_ptr, size);
+    track_pages(ptr, size);
+    return ptr;
+}
+
+extern "C" char* co_strdup(const char* s);
+CO_INTERPOSE(co_strdup, strdup);
+extern "C" char* co_strdup(const char* s) {
+    char* ptr = CO_ORIG(strdup_fn, co_strdup)(s);
+    if (ptr) track_pages(ptr, __builtin_strlen(s) + 1);
+    return ptr;
+}
+
 // ── At-exit compression ratio report ─────────────────────────────────────────
 
 static void report_ratios() {

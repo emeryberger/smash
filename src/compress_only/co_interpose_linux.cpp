@@ -142,6 +142,61 @@ extern "C" __attribute__((visibility("default"))) void* realloc(void* old, size_
     return ptr;
 }
 
+using memalign_fn = void*(*)(size_t, size_t);
+using posix_memalign_fn = int(*)(void**, size_t, size_t);
+
+extern "C" __attribute__((visibility("default")))
+int posix_memalign(void** memptr, size_t alignment, size_t size) {
+    static posix_memalign_fn real = nullptr;
+    if (!real) {
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        real = (posix_memalign_fn)dlsym(RTLD_NEXT, "posix_memalign");
+        g_in_dlsym.store(false, std::memory_order_relaxed);
+    }
+    int ret = real(memptr, alignment, size);
+    if (ret == 0 && *memptr) track_pages(*memptr, size);
+    return ret;
+}
+
+extern "C" __attribute__((visibility("default")))
+void* memalign(size_t alignment, size_t size) {
+    static memalign_fn real = nullptr;
+    if (!real) {
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        real = (memalign_fn)dlsym(RTLD_NEXT, "memalign");
+        g_in_dlsym.store(false, std::memory_order_relaxed);
+    }
+    void* ptr = real(alignment, size);
+    track_pages(ptr, size);
+    return ptr;
+}
+
+extern "C" __attribute__((visibility("default")))
+void* aligned_alloc(size_t alignment, size_t size) {
+    static memalign_fn real = nullptr;
+    if (!real) {
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        real = (memalign_fn)dlsym(RTLD_NEXT, "aligned_alloc");
+        g_in_dlsym.store(false, std::memory_order_relaxed);
+    }
+    void* ptr = real(alignment, size);
+    track_pages(ptr, size);
+    return ptr;
+}
+
+extern "C" __attribute__((visibility("default")))
+void* valloc(size_t size) {
+    static malloc_fn real = nullptr;
+    if (!real) {
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        real = (malloc_fn)dlsym(RTLD_NEXT, "valloc");
+        g_in_dlsym.store(false, std::memory_order_relaxed);
+    }
+    void* ptr = real(size);
+    track_pages(ptr, size);
+    return ptr;
+}
+
 // ── At-exit report ───────────────────────────────────────────────────────────
 
 static void report_ratios() {

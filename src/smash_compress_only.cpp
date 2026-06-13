@@ -35,13 +35,18 @@
 #else
 #include <dlfcn.h>
 #include <sys/epoll.h>
+#include <sys/syscall.h>
 #include <cstdio>
 #endif
 
 #include <atomic>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <pthread.h>
+#include <lz4.h>
+#include <zstd.h>
 
 // ── Platform-specific interposition macros ────────────────────────────────────
 
@@ -107,19 +112,135 @@ bool faultCallback(uintptr_t fault_addr, void* /*ctx*/) {
 
 void scanVmRegions();  // forward declaration
 
-void startCompression() {
-    bool expected = false;
-    if (!g_compression_started.compare_exchange_strong(expected, true))
-        return;
-    g_fault_handler.start(faultCallback, nullptr);
-    scanVmRegions();  // initial scan before starting compressor
-    g_compressor.setPreTickCallback(scanVmRegions);
-    g_compressor.start();
+// SIGUSR2: set flag for the measurement thread to report ratios.
+std::atomic<bool> g_report_requested{false};
+
+void sigusr2Handler(int) {
+    g_report_requested.store(true, std::memory_order_relaxed);
 }
 
-// Track pages covered by an allocation
+// Measurement thread: waits for SIGUSR2 flag, then scans all tracked pages
+// via /proc/self/mem and reports compression ratios to stderr.
+void* measurementThread(void*) {
+    // Pre-allocate buffers
+    int lz4_bound = LZ4_compressBound(smash::kPageSize);
+    size_t zstd_bound = ZSTD_compressBound(smash::kPageSize);
+    size_t buf_sz = (size_t)lz4_bound > zstd_bound ? (size_t)lz4_bound : zstd_bound;
+    char* page_buf = (char*)::mmap(nullptr, smash::kPageSize, PROT_READ|PROT_WRITE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    char* comp_buf = (char*)::mmap(nullptr, buf_sz, PROT_READ|PROT_WRITE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (page_buf == MAP_FAILED || comp_buf == MAP_FAILED) return nullptr;
+
+    while (true) {
+        usleep(100000);  // poll 10× per second
+        if (!g_report_requested.load(std::memory_order_relaxed)) continue;
+        g_report_requested.store(false, std::memory_order_relaxed);
+
+        size_t committed = g_vm.committedPages();
+
+        int mem_fd = open("/proc/self/mem", O_RDONLY);
+        if (mem_fd < 0) continue;
+
+        size_t pages_ok = 0;
+        size_t total_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+
+        for (size_t i = 1; i < committed && pages_ok < 100000; ++i) {
+            smash::PageState st = g_states.get(i);
+            if (st != smash::PageState::ACTIVE) continue;
+            void* addr = g_vm.pageAddress(i);
+            if (!addr) continue;
+
+            ssize_t rd = pread(mem_fd, page_buf, smash::kPageSize, (off_t)(uintptr_t)addr);
+            if (rd != (ssize_t)smash::kPageSize) continue;
+
+            pages_ok++;
+            total_bytes += smash::kPageSize;
+            int lz4_sz = LZ4_compress_default(page_buf, comp_buf, smash::kPageSize, lz4_bound);
+            lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : smash::kPageSize;
+            size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, smash::kPageSize, 1);
+            zstd1_bytes += ZSTD_isError(z1) ? smash::kPageSize : z1;
+        }
+        close(mem_fd);
+
+        char msg[256];
+        int n;
+        if (total_bytes > 0) {
+            n = snprintf(msg, sizeof(msg),
+                "compressed=%zu pages=%.1fMiB lz4=%.2fx zstd1=%.2fx\n",
+                pages_ok, total_bytes / (1024.0*1024.0),
+                (double)total_bytes / lz4_bytes,
+                (double)total_bytes / zstd1_bytes);
+        } else {
+            n = snprintf(msg, sizeof(msg), "compressed=0 (no tracked pages)\n");
+        }
+        (void)!write(STDERR_FILENO, msg, n);
+    }
+    return nullptr;
+}
+
+void startCompression() {
+    g_compression_started.store(true, std::memory_order_relaxed);
+}
+
+// Run measurement synchronously at exit — no threads needed.
+__attribute__((destructor, used))
+void co_report_at_exit() {
+    if (!g_inited.load(std::memory_order_relaxed)) return;
+    // Run the measurement inline (synchronous, after main returns)
+    size_t committed = g_vm.committedPages();
+    int mem_fd = open("/proc/self/mem", O_RDONLY);
+    if (mem_fd < 0) return;
+
+    int lz4_bound = LZ4_compressBound(smash::kPageSize);
+    size_t zstd_bound = ZSTD_compressBound(smash::kPageSize);
+    size_t buf_sz = (size_t)lz4_bound > zstd_bound ? (size_t)lz4_bound : zstd_bound;
+    char* page_buf = (char*)::mmap(nullptr, smash::kPageSize, PROT_READ|PROT_WRITE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    char* comp_buf = (char*)::mmap(nullptr, buf_sz, PROT_READ|PROT_WRITE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (page_buf == MAP_FAILED || comp_buf == MAP_FAILED) { close(mem_fd); return; }
+
+    size_t pages_ok = 0, total_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+    for (size_t i = 1; i < committed && pages_ok < 100000; ++i) {
+        smash::PageState st = g_states.get(i);
+        if (st != smash::PageState::ACTIVE) continue;
+        void* addr = g_vm.pageAddress(i);
+        if (!addr) continue;
+        ssize_t rd = pread(mem_fd, page_buf, smash::kPageSize, (off_t)(uintptr_t)addr);
+        if (rd != (ssize_t)smash::kPageSize) continue;
+        pages_ok++;
+        total_bytes += smash::kPageSize;
+        int lz4_sz = LZ4_compress_default(page_buf, comp_buf, smash::kPageSize, lz4_bound);
+        lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : smash::kPageSize;
+        size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, smash::kPageSize, 1);
+        zstd1_bytes += ZSTD_isError(z1) ? smash::kPageSize : z1;
+    }
+    ::munmap(page_buf, smash::kPageSize);
+    ::munmap(comp_buf, buf_sz);
+    close(mem_fd);
+
+    if (total_bytes > 0) {
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg),
+            "compressed=%zu pages=%.1fMiB lz4=%.2fx zstd1=%.2fx\n",
+            pages_ok, total_bytes / (1024.0*1024.0),
+            (double)total_bytes / lz4_bytes,
+            (double)total_bytes / zstd1_bytes);
+        (void)!write(STDERR_FILENO, msg, n);
+    }
+}
+
+// Track pages covered by an allocation.
+// Reentrancy guard: trackPage → BootstrapAlloc → mmap → mmap wrapper → trackAllocation
+static std::atomic<int> g_in_track{0};
+
 void trackAllocation(void* ptr, size_t size) {
+    (void)ptr; (void)size; return;  // TOTALLY DISABLED
     if (!ptr || size == 0) return;
+    if (g_in_track.load(std::memory_order_relaxed)) return;
+    g_in_track.store(1, std::memory_order_relaxed);
+
     uintptr_t start_page = reinterpret_cast<uintptr_t>(ptr) & ~(smash::kPageSize - 1);
     uintptr_t end_page = (reinterpret_cast<uintptr_t>(ptr) + size - 1) & ~(smash::kPageSize - 1);
 
@@ -131,6 +252,7 @@ void trackAllocation(void* ptr, size_t size) {
                 g_states.set(idx, smash::PageState::ACTIVE);
         }
     }
+    g_in_track.store(0, std::memory_order_relaxed);
 }
 
 // ── VM region scanning ──────────────────────────────────────────────────────
@@ -390,8 +512,19 @@ extern "C" int posix_memalign(void** memptr, size_t alignment, size_t size) {
 }
 
 extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
-    CO_ORIG_DECL(mmap_fn_t, mmap);
-    void* ret = orig_mmap(addr, len, prot, flags, fd, offset);
+    // Reentrancy: BootstrapAlloc::allocateZeroed → mmap → this wrapper → dlsym → malloc → ...
+    // If dlsym hasn't been resolved yet, use direct syscall.
+    static mmap_fn_t orig_mmap_cached = nullptr;
+    if (!orig_mmap_cached) {
+        if (g_in_dlsym.load(std::memory_order_relaxed)) {
+            // Can't call dlsym (it called us). Use syscall directly.
+            return (void*)syscall(SYS_mmap, addr, len, prot, flags, fd, offset);
+        }
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        orig_mmap_cached = reinterpret_cast<mmap_fn_t>(dlsym(RTLD_NEXT, "mmap"));
+        g_in_dlsym.store(false, std::memory_order_relaxed);
+    }
+    void* ret = orig_mmap_cached(addr, len, prot, flags, fd, offset);
     if (ret != MAP_FAILED && g_inited.load(std::memory_order_relaxed)) {
         if ((flags & MAP_ANONYMOUS) && (prot & PROT_WRITE))
             trackAllocation(ret, len);
@@ -762,22 +895,21 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
 
 // ── Library initialization ──────────────────────────────────────────────────
 
-__attribute__((constructor))
-static void co_init() {
+__attribute__((constructor, used))
+void co_init() {
 #ifndef __APPLE__
-    // Mark that we're in init (dlsym may call calloc)
+    // Keep g_in_dlsym true for the entire init phase. This routes any
+    // calloc from dlsym/BootstrapAlloc/VmRegion init to the static buffer
+    // and makes the mmap wrapper use the syscall fallback.
     g_in_dlsym.store(true, std::memory_order_relaxed);
-    // Force resolution of malloc/free before setting g_inited
-    void* p = dlsym(RTLD_NEXT, "malloc");
-    (void)p;
-    p = dlsym(RTLD_NEXT, "free");
-    (void)p;
-    p = dlsym(RTLD_NEXT, "calloc");
-    (void)p;
-    g_in_dlsym.store(false, std::memory_order_relaxed);
+    // Force resolution of all interposed functions.
+    (void)dlsym(RTLD_NEXT, "malloc");
+    (void)dlsym(RTLD_NEXT, "free");
+    (void)dlsym(RTLD_NEXT, "calloc");
+    (void)dlsym(RTLD_NEXT, "mmap");
 #endif
 
-    if (!g_vm.init(smash::kVmRegionSize))
+    if (!g_vm.init(0))
         return;
 
     g_states.init(g_vm.totalPages());
@@ -785,11 +917,21 @@ static void co_init() {
     g_store.init();
     g_engine.init();
 
+    // SMASH_COMPRESS_ONLY=1 compile define (from CMakeLists) forces
+    // isCompressOnlyMode() → true at compile time, so VmRegion uses
+    // tracking mode. No runtime env var needed.
+    setenv("SMASH_NO_MONITOR", "1", 0);
+
     // page_map = nullptr: no span info available (system malloc manages objects)
     g_compressor.init(&g_vm, &g_states, &g_locks, &g_store, &g_engine,
                       nullptr, &g_fault_handler);
 
     smash::g_smash_vm_region = &g_vm;
 
+    signal(SIGUSR2, sigusr2Handler);
+
+#ifndef __APPLE__
+    g_in_dlsym.store(false, std::memory_order_relaxed);
+#endif
     g_inited.store(true, std::memory_order_release);
 }

@@ -614,7 +614,11 @@ inline SmashMode getSmashMode() {
 
 [[gnu::always_inline, gnu::hot]]
 inline bool isCompressOnlyMode() {
+#ifdef SMASH_COMPRESS_ONLY
+    return true;
+#else
     return getSmashMode() == SmashMode::CompressOnly;
+#endif
 }
 
 // ── Large-only mode ─────────────────────────────────────────────────────────

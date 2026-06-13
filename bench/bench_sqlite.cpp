@@ -162,6 +162,10 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--rows") == 0 && i + 1 < argc) {
             g_num_rows = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cool") == 0 && i + 1 < argc) {
+            g_cool_duration_sec = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) {
+            g_serve_duration_sec = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--quick") == 0) {
             g_cool_duration_sec = 5;
             g_serve_duration_sec = 10;

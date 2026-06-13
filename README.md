@@ -45,6 +45,35 @@ These numbers come from `bench/run_paper_experiments.py --compress-only-only` wi
 ![AUC reduction](docs/figures/auc_reduction.png)
 ![Throughput](docs/figures/timing.png)
 
+## Why Not Just Use zswap?
+
+On well-provisioned servers, the Linux kernel's compression cache (zswap) is effectively inert: it only compresses pages evicted under memory pressure, and the kernel strongly prefers evicting file-backed pages over swapping anonymous heap data. Smash compresses proactively based on per-page access tracking — no pressure required.
+
+**Three-way comparison on SQLite (500K rows, EPYC 9R14, 1.5 TB RAM):**
+
+| Metric | glibc | glibc + zswap (cgroup pressure) | smash |
+|--------|:---:|:---:|:---:|
+| Post-cool RSS | 355 MiB | 209 MiB† | **121 MiB** |
+| Anonymous pages compressed | 0 | 5 MiB | **~234 MiB** |
+| Cold access p99 | 2 µs | **2342 µs** | **143 µs** |
+| Throughput | 96k ops/s | 91k ops/s | 88k ops/s |
+
+†Capped by cgroup MemoryHigh; kernel evicts file pages preferentially.
+
+Smash delivers equivalent memory savings to zswap-under-pressure with **16× better decompression latency** and zero configuration. See `docs/smash_vs_zswap_empirical.md` for full methodology.
+
+### Layout advantages
+
+Smash's allocator design produces pages that are more compressible than standard allocators for workloads with small-object churn:
+
+| Workload pattern | jemalloc/glibc | smash (no compression) | Improvement |
+|-----------------|------:|------:|------:|
+| Redis 500B values, 50% deleted | 13× LZ4 | 23× LZ4 | **1.8×** |
+| 128B objects, 75% freed | 10× LZ4 | 22× LZ4 | **2.2×** |
+| SQLite 4K B-tree pages | 2.2× LZ4 | ~2.2× LZ4 | ~1× |
+
+The advantage comes from: (1) arena-based segregation placing similar objects together, (2) bitmap-based free tracking that doesn't write metadata into freed data, and (3) per-page object capping that maintains zero-filled regions within partially-occupied pages. The effect is largest when objects are small relative to OS page size and allocation churn creates partial occupancy.
+
 ## Building
 
 ### Prerequisites

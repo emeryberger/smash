@@ -160,7 +160,9 @@ static void dumpRssTimeline(const char* path) {
 int main(int argc, char* argv[]) {
     // Parse flags
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--quick") == 0) {
+        if (strcmp(argv[i], "--rows") == 0 && i + 1 < argc) {
+            g_num_rows = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--quick") == 0) {
             g_cool_duration_sec = 5;
             g_serve_duration_sec = 10;
             g_num_rows = 250000;

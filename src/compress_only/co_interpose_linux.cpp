@@ -94,8 +94,11 @@ static void resolve() {
     g_in_dlsym.store(false, std::memory_order_relaxed);
 }
 
+static std::atomic<size_t> g_track_calls{0};
+
 static inline void track_pages(void* ptr, size_t size) {
     if (!ptr || !size || !g_inited.load(std::memory_order_relaxed)) return;
+    g_track_calls.fetch_add(1, std::memory_order_relaxed);
     uintptr_t start = reinterpret_cast<uintptr_t>(ptr) & ~(uintptr_t)(kPageSize - 1);
     uintptr_t end = (reinterpret_cast<uintptr_t>(ptr) + size - 1) & ~(uintptr_t)(kPageSize - 1);
     for (uintptr_t p = start; p <= end; p += kPageSize)
@@ -214,9 +217,10 @@ static void co_init() {
 
 __attribute__((destructor))
 static void co_fini() {
-    char msg[64];
-    int n = snprintf(msg, sizeof(msg), "[co] fini tracked=%zu\n",
-                     g_tracker.count.load(std::memory_order_relaxed));
+    char msg[128];
+    int n = snprintf(msg, sizeof(msg), "[co] fini tracked=%zu calls=%zu\n",
+                     g_tracker.count.load(std::memory_order_relaxed),
+                     g_track_calls.load(std::memory_order_relaxed));
     (void)!write(STDERR_FILENO, msg, n);
     report_ratios();
 }

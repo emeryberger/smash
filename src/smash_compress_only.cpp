@@ -35,6 +35,7 @@
 #else
 #include <dlfcn.h>
 #include <sys/epoll.h>
+#include <sys/syscall.h>
 #include <cstdio>
 #endif
 
@@ -511,8 +512,19 @@ extern "C" int posix_memalign(void** memptr, size_t alignment, size_t size) {
 }
 
 extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
-    CO_ORIG_DECL(mmap_fn_t, mmap);
-    void* ret = orig_mmap(addr, len, prot, flags, fd, offset);
+    // Reentrancy: BootstrapAlloc::allocateZeroed → mmap → this wrapper → dlsym → malloc → ...
+    // If dlsym hasn't been resolved yet, use direct syscall.
+    static mmap_fn_t orig_mmap_cached = nullptr;
+    if (!orig_mmap_cached) {
+        if (g_in_dlsym.load(std::memory_order_relaxed)) {
+            // Can't call dlsym (it called us). Use syscall directly.
+            return (void*)syscall(SYS_mmap, addr, len, prot, flags, fd, offset);
+        }
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        orig_mmap_cached = reinterpret_cast<mmap_fn_t>(dlsym(RTLD_NEXT, "mmap"));
+        g_in_dlsym.store(false, std::memory_order_relaxed);
+    }
+    void* ret = orig_mmap_cached(addr, len, prot, flags, fd, offset);
     if (ret != MAP_FAILED && g_inited.load(std::memory_order_relaxed)) {
         if ((flags & MAP_ANONYMOUS) && (prot & PROT_WRITE))
             trackAllocation(ret, len);
@@ -888,12 +900,16 @@ void co_init() {
 #ifndef __APPLE__
     // Mark that we're in init (dlsym may call calloc)
     g_in_dlsym.store(true, std::memory_order_relaxed);
-    // Force resolution of malloc/free before setting g_inited
+    // Force resolution of all interposed functions before setting g_inited.
+    // dlsym itself may call malloc/calloc/mmap — the g_in_dlsym guard
+    // routes calloc to the static buffer fallback.
     void* p = dlsym(RTLD_NEXT, "malloc");
     (void)p;
     p = dlsym(RTLD_NEXT, "free");
     (void)p;
     p = dlsym(RTLD_NEXT, "calloc");
+    (void)p;
+    p = dlsym(RTLD_NEXT, "mmap");
     (void)p;
     g_in_dlsym.store(false, std::memory_order_relaxed);
 #endif

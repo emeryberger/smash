@@ -299,14 +299,18 @@ endif()
 add_library(smash_compress_only SHARED
   src/compress_only/co_interpose_mac.cpp
   src/compress_only/co_interpose_linux.cpp
+  ${printf_SOURCE_DIR}/printf.cpp
 )
 
 target_include_directories(smash_compress_only PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${lz4_SOURCE_DIR}/lib
   ${zstd_SOURCE_DIR}/lib
+  ${printf_SOURCE_DIR}
 )
 
-target_link_libraries(smash_compress_only PRIVATE lz4_static libzstd_static ${CMAKE_DL_LIBS})
+target_link_libraries(smash_compress_only PRIVATE alloc8::headers lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash_compress_only PROPERTIES
   OUTPUT_NAME "smash_compress_only"

@@ -155,3 +155,33 @@ larger RSS footprint (allocator metadata) causing L3 cache pollution
 and 23% IPC degradation in the application's own code (SQLite B-tree
 traversal). On workloads where cache isn't the bottleneck (memcached
 with its hash-table access pattern), smash is 5% FASTER than glibc.
+
+### Corrected analysis: Branch misprediction (not cache pollution)
+
+Serve-phase-only perf stat (8s window, attached after fill completes):
+
+| Counter | glibc serve | smash serve | Ratio |
+|---------|------:|------:|------:|
+| cycles | 29.3B | 25.9B | 0.89× (smash less!) |
+| instructions | 71.4B | 43.7B | 0.61× (smash 39% fewer!) |
+| cache-misses | 211M (15.6%) | 167M (13.8%) | 0.79× (smash FEWER!) |
+| dTLB misses | 21.1M | 19.1M | 0.91× (smash fewer) |
+| **branch-misses** | **20.1M (0.14%)** | **103.6M (1.20%)** | **5.2×** |
+| **frontend stalls** | **4.1%** | **14.5%** | **3.5×** |
+
+**The earlier diagnosis (cache pollution) was WRONG.** Smash has FEWER cache misses
+and FEWER TLB misses during serve. The actual bottleneck is **5.2× more branch
+mispredictions** causing 3.5× more frontend stalls:
+
+- `BootstrapAlloc::owns()` (bounds check on every free)
+- `vm_region_.inContigArena()` (arena membership check)
+- TLS free-cache hit/miss dispatch
+- `span->is_large` type dispatch
+- `fullMallocPath()` mode check
+
+glibc's tcache fastpath is a single highly-predictable branch. Smash's multi-level
+dispatch chain has 5+ conditional branches with mixed prediction profiles.
+
+`__attribute__((cold))` on compressor functions recovered +1.5% (reduced i-cache
+aliasing). Further gains require restructuring the free/malloc dispatch to fewer,
+more predictable branches (computed goto, branchless comparisons).

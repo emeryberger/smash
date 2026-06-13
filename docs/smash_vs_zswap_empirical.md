@@ -104,3 +104,54 @@ achieved their compression and are no longer in the address space).
 **The key insight**: zswap would get ~3–5× on the same data that smash achieves 73% RSS
 reduction (>3.5×) on — but smash only compresses the COLD pages and does it proactively.
 The per-page ratios are comparable; the advantage is selectivity + no-pressure triggering.
+
+## Throughput Analysis: Sources of Overhead
+
+### Profiling methodology
+perf stat + perf record on EPYC 9R14 with SQLite 2M rows (1.4 GiB working set).
+Isolated each overhead source by disabling features incrementally.
+
+### Overhead breakdown (SQLite 2M rows, serve phase)
+
+| Configuration | ops/s | vs glibc | Source |
+|---------------|------:|------:|--------|
+| glibc baseline | 79,000 | — | — |
+| smash slab only (no compression) | 62,100 | -21% | cache/TLB pollution from metadata |
+| smash + compression (60s cool) | 57,500 | -27% | +6% decompression faults on cold B-tree nodes |
+| smash LARGE_ONLY (system malloc) | 81,800 | +4% | no slab overhead |
+
+### Root cause: IPC degradation from metadata footprint
+
+| Metric | glibc | smash |
+|--------|------:|------:|
+| Instructions | 211.5B | 206.1B |
+| Cycles | 69.8B | 88.1B |
+| **IPC** | **3.03** | **2.34** |
+| sys time | 1.1s | 7.4s |
+
+Smash executes FEWER instructions (slab fastpath is efficient) but each
+instruction takes 23% longer due to L3 cache pollution from the 370 MiB
+metadata overhead (PageState, page_map, cold_count, bitmaps). The smash
+code itself accounts for only 0.36% of serve-phase CPU (perf record).
+
+### Softdirty vs PROT_READ monitoring
+
+| Workload | Default (PROT_READ) | Softdirty | Delta |
+|----------|---:|---:|---:|
+| SQLite (250K rows) | 89,806 | 91,881 | **+2.3%** |
+| Redis SET | 61,200 | 60,680 | -0.8% |
+| Redis GET | 61,881 | 59,737 | -3.5% |
+
+Softdirty eliminates PROT_READ faults on read-only B-tree traversals
+(+2.3% on SQLite). But the per-tick pagemap read (3.6 MiB syscall for
+450K pages) costs more than it saves on small/write-heavy working sets
+like Redis (-3.5%). Neither is universally better; workload-dependent.
+
+### Conclusion
+
+The throughput gap is NOT from per-allocation overhead (0.36% of CPU)
+or from the monitoring mechanism choice. It's from smash's 370 MiB
+larger RSS footprint (allocator metadata) causing L3 cache pollution
+and 23% IPC degradation in the application's own code (SQLite B-tree
+traversal). On workloads where cache isn't the bottleneck (memcached
+with its hash-table access pattern), smash is 5% FASTER than glibc.

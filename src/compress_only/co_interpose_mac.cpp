@@ -161,13 +161,22 @@ extern "C" char* co_strdup(const char* s) {
     return ptr;
 }
 
+// ── mmap interposition (catches system malloc's internal allocations) ─────────
+
+using mmap_fn = void*(*)(void*, size_t, int, int, int, off_t);
+
+extern "C" void* co_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset);
+CO_INTERPOSE(co_mmap, mmap);
+extern "C" void* co_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    void* ret = CO_ORIG(mmap_fn, co_mmap)(addr, len, prot, flags, fd, offset);
+    if (ret != MAP_FAILED && (flags & MAP_ANONYMOUS) && (prot & PROT_WRITE))
+        track_pages(ret, len);
+    return ret;
+}
+
 // ── At-exit compression ratio report ─────────────────────────────────────────
 
 static void report_ratios() {
-    if (!g_tracker.slots) return;
-    size_t tracked = g_tracker.count.load(std::memory_order_relaxed);
-    if (tracked == 0) return;
-
     mach_port_t task = mach_task_self();
     int lz4_bound = LZ4_compressBound(kPageSize);
     size_t zstd_bound = ZSTD_compressBound(kPageSize);
@@ -179,45 +188,69 @@ static void report_ratios() {
     if (page_buf == MAP_FAILED || comp_buf == MAP_FAILED) return;
 
     size_t pages_ok = 0, total_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+    size_t pages_scanned = 0;
 
-    for (size_t i = 0; i < kTrackCap && pages_ok < 100000; ++i) {
-        uintptr_t addr = g_tracker.slots[i].load(std::memory_order_relaxed);
-        if (!addr) continue;
+    // Scan all anonymous RW VM regions via mach_vm_region_recurse.
+    // This catches pages from system malloc's mach_vm_allocate zones
+    // that our malloc interposition can't see.
+    vm_address_t addr = 0;
+    vm_size_t vmsize = 0;
+    uint32_t depth = 1;
+    struct vm_region_submap_info_64 info;
+    mach_msg_type_number_t count;
 
-        // Read page via mach_vm_read
-        vm_size_t out_size = 0;
-        vm_offset_t data_out = 0;
-        kern_return_t kr = vm_read(task, (vm_address_t)addr, kPageSize,
-                                   &data_out, (mach_msg_type_number_t*)&out_size);
-        if (kr != KERN_SUCCESS || out_size != kPageSize) continue;
-        memcpy(page_buf, (void*)data_out, kPageSize);
-        vm_deallocate(task, data_out, out_size);
+    while (pages_ok < 100000) {
+        count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = vm_region_recurse_64(task, &addr, &vmsize, &depth,
+            reinterpret_cast<vm_region_recurse_info_t>(&info), &count);
+        if (kr != KERN_SUCCESS) break;
 
-        // Skip all-zero pages
-        bool zero = true;
-        for (size_t j = 0; j < kPageSize; j += 8)
-            if (*(uint64_t*)(page_buf + j)) { zero = false; break; }
-        if (zero) continue;
+        if (info.is_submap) { depth++; continue; }
 
-        pages_ok++;
-        total_bytes += kPageSize;
+        bool is_rw = (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) ==
+                     (VM_PROT_READ | VM_PROT_WRITE);
+        unsigned tag = info.user_tag;
+        bool is_malloc = (tag == 1 || tag == 2 || tag == 3 || tag == 4 ||
+                          tag == 7 || tag == 8 || tag == 9 || tag == 12 || tag == 23);
 
-        int lz4_sz = LZ4_compress_default(page_buf, comp_buf, kPageSize, lz4_bound);
-        lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : kPageSize;
+        if (is_rw && is_malloc && vmsize >= kPageSize) {
+            for (vm_address_t p = addr; p < addr + vmsize && pages_ok < 100000; p += kPageSize) {
+                pages_scanned++;
+                vm_size_t out_size = 0;
+                vm_offset_t data_out = 0;
+                kr = vm_read(task, p, kPageSize, &data_out, (mach_msg_type_number_t*)&out_size);
+                if (kr != KERN_SUCCESS || out_size != kPageSize) continue;
+                memcpy(page_buf, (void*)data_out, kPageSize);
+                vm_deallocate(task, data_out, out_size);
 
-        size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, kPageSize, 1);
-        zstd1_bytes += ZSTD_isError(z1) ? kPageSize : z1;
+                bool zero = true;
+                for (size_t j = 0; j < kPageSize; j += 8)
+                    if (*(uint64_t*)(page_buf + j)) { zero = false; break; }
+                if (zero) continue;
+
+                pages_ok++;
+                total_bytes += kPageSize;
+
+                int lz4_sz = LZ4_compress_default(page_buf, comp_buf, kPageSize, lz4_bound);
+                lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : kPageSize;
+
+                size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, kPageSize, 1);
+                zstd1_bytes += ZSTD_isError(z1) ? kPageSize : z1;
+            }
+        }
+        addr += vmsize;
     }
 
     munmap(page_buf, kPageSize);
     munmap(comp_buf, comp_sz);
 
     if (total_bytes > 0) {
+        size_t tracked = g_tracker.count.load(std::memory_order_relaxed);
         char msg[256];
         int n = snprintf(msg, sizeof(msg),
-            "[compress-only] tracked=%zu nonzero=%zu data=%.1fMiB "
+            "[compress-only] tracked=%zu scanned=%zu nonzero=%zu data=%.1fMiB "
             "lz4=%.2fx zstd1=%.2fx\n",
-            tracked, pages_ok, total_bytes / (1024.0 * 1024.0),
+            tracked, pages_scanned, pages_ok, total_bytes / (1024.0 * 1024.0),
             (double)total_bytes / lz4_bytes,
             (double)total_bytes / zstd1_bytes);
         (void)!write(STDERR_FILENO, msg, n);

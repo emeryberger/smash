@@ -202,12 +202,22 @@ static void report_ratios() {
 __attribute__((constructor))
 static void co_init() {
     resolve();
-    if (!g_tracker.init()) return;
+    if (!g_tracker.init()) {
+        const char m[] = "[co] tracker init FAILED\n";
+        (void)!write(STDERR_FILENO, m, sizeof(m)-1);
+        return;
+    }
     g_inited.store(true, std::memory_order_release);
+    const char m[] = "[co] init OK\n";
+    (void)!write(STDERR_FILENO, m, sizeof(m)-1);
 }
 
 __attribute__((destructor))
 static void co_fini() {
+    char msg[64];
+    int n = snprintf(msg, sizeof(msg), "[co] fini tracked=%zu\n",
+                     g_tracker.count.load(std::memory_order_relaxed));
+    (void)!write(STDERR_FILENO, msg, n);
     report_ratios();
 }
 

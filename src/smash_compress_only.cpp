@@ -229,12 +229,12 @@ void co_start_threads() {
 
 // Track pages covered by an allocation.
 // Reentrancy guard: trackPage → BootstrapAlloc → mmap → mmap wrapper → trackAllocation
-static __thread int g_in_track = 0;
+static std::atomic<int> g_in_track{0};
 
 void trackAllocation(void* ptr, size_t size) {
     if (!ptr || size == 0) return;
-    if (g_in_track) return;
-    g_in_track = 1;
+    if (g_in_track.load(std::memory_order_relaxed)) return;
+    g_in_track.store(1, std::memory_order_relaxed);
 
     uintptr_t start_page = reinterpret_cast<uintptr_t>(ptr) & ~(smash::kPageSize - 1);
     uintptr_t end_page = (reinterpret_cast<uintptr_t>(ptr) + size - 1) & ~(smash::kPageSize - 1);
@@ -247,7 +247,7 @@ void trackAllocation(void* ptr, size_t size) {
                 g_states.set(idx, smash::PageState::ACTIVE);
         }
     }
-    g_in_track = 0;
+    g_in_track.store(0, std::memory_order_relaxed);
 }
 
 // ── VM region scanning ──────────────────────────────────────────────────────

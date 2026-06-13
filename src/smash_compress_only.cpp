@@ -178,53 +178,56 @@ void* measurementThread(void*) {
     return nullptr;
 }
 
-std::atomic<bool> g_threads_started{false};
-
 void startCompression() {
     g_compression_started.store(true, std::memory_order_relaxed);
 }
 
-// Called from a non-malloc context to safely start threads.
-// Triggered by an atexit handler.
-void startMeasurementThreads() {
-    if (g_threads_started.exchange(true)) return;
+// Run measurement synchronously at exit — no threads needed.
+__attribute__((destructor, used))
+void co_report_at_exit() {
+    if (!g_inited.load(std::memory_order_relaxed)) return;
+    // Run the measurement inline (synchronous, after main returns)
+    size_t committed = g_vm.committedPages();
+    int mem_fd = open("/proc/self/mem", O_RDONLY);
+    if (mem_fd < 0) return;
 
-    pthread_t meas_thread;
-    pthread_create(&meas_thread, nullptr, measurementThread, nullptr);
-    pthread_detach(meas_thread);
+    int lz4_bound = LZ4_compressBound(smash::kPageSize);
+    size_t zstd_bound = ZSTD_compressBound(smash::kPageSize);
+    size_t buf_sz = (size_t)lz4_bound > zstd_bound ? (size_t)lz4_bound : zstd_bound;
+    char* page_buf = (char*)::mmap(nullptr, smash::kPageSize, PROT_READ|PROT_WRITE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    char* comp_buf = (char*)::mmap(nullptr, buf_sz, PROT_READ|PROT_WRITE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (page_buf == MAP_FAILED || comp_buf == MAP_FAILED) { close(mem_fd); return; }
 
-    static const int delay = []() {
-        const char* v = getenv("SMASH_REPORT_DELAY_SEC");
-        return v ? atoi(v) : 5;
-    }();
-    if (delay > 0) {
-        struct TimerArg { int sec; };
-        auto* ta = static_cast<TimerArg*>(
-            smash::BootstrapAlloc::instance().allocate(sizeof(TimerArg), 8));
-        ta->sec = delay;
-        pthread_t timer;
-        pthread_create(&timer, nullptr, [](void* arg) -> void* {
-            auto* a = static_cast<TimerArg*>(arg);
-            sleep(a->sec);
-            g_report_requested.store(true, std::memory_order_relaxed);
-            return nullptr;
-        }, ta);
-        pthread_detach(timer);
+    size_t pages_ok = 0, total_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+    for (size_t i = 1; i < committed && pages_ok < 100000; ++i) {
+        smash::PageState st = g_states.get(i);
+        if (st != smash::PageState::ACTIVE) continue;
+        void* addr = g_vm.pageAddress(i);
+        if (!addr) continue;
+        ssize_t rd = pread(mem_fd, page_buf, smash::kPageSize, (off_t)(uintptr_t)addr);
+        if (rd != (ssize_t)smash::kPageSize) continue;
+        pages_ok++;
+        total_bytes += smash::kPageSize;
+        int lz4_sz = LZ4_compress_default(page_buf, comp_buf, smash::kPageSize, lz4_bound);
+        lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : smash::kPageSize;
+        size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, smash::kPageSize, 1);
+        zstd1_bytes += ZSTD_isError(z1) ? smash::kPageSize : z1;
     }
-}
+    ::munmap(page_buf, smash::kPageSize);
+    ::munmap(comp_buf, buf_sz);
+    close(mem_fd);
 
-// atexit fires after main returns — safe to create threads here
-void atexitReport() {
-    g_report_requested.store(true, std::memory_order_relaxed);
-    usleep(200000);  // give measurement thread time to report
-}
-
-__attribute__((constructor(200), used))
-void co_start_threads() {
-    // Register atexit for final report
-    atexit(atexitReport);
-    // Start measurement threads — runs after co_init (priority default=65535)
-    startMeasurementThreads();
+    if (total_bytes > 0) {
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg),
+            "compressed=%zu pages=%.1fMiB lz4=%.2fx zstd1=%.2fx\n",
+            pages_ok, total_bytes / (1024.0*1024.0),
+            (double)total_bytes / lz4_bytes,
+            (double)total_bytes / zstd1_bytes);
+        (void)!write(STDERR_FILENO, msg, n);
+    }
 }
 
 // Track pages covered by an allocation.
@@ -232,7 +235,6 @@ void co_start_threads() {
 static std::atomic<int> g_in_track{0};
 
 void trackAllocation(void* ptr, size_t size) {
-    return;  // DISABLED for debugging
     if (!ptr || size == 0) return;
     if (g_in_track.load(std::memory_order_relaxed)) return;
     g_in_track.store(1, std::memory_order_relaxed);

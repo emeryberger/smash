@@ -136,7 +136,6 @@ void* measurementThread(void*) {
         if (!g_report_requested.load(std::memory_order_relaxed)) continue;
         g_report_requested.store(false, std::memory_order_relaxed);
 
-        scanVmRegions();
         size_t committed = g_vm.committedPages();
 
         int mem_fd = open("/proc/self/mem", O_RDONLY);
@@ -184,10 +183,8 @@ void startCompression() {
     if (!g_compression_started.compare_exchange_strong(expected, true))
         return;
     // Don't start the compressor thread or fault handler — mprotect on
-    // system-allocator pages causes SIGSEGV. Instead, scan pages for
-    // tracking and start the measurement thread which reports compression
-    // ratios after a delay.
-    scanVmRegions();
+    // system-allocator pages causes SIGSEGV. Pages are already tracked
+    // via trackAllocation() on each malloc call.
 
     pthread_t meas_thread;
     pthread_create(&meas_thread, nullptr, measurementThread, nullptr);

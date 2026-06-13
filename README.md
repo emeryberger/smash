@@ -62,17 +62,16 @@ On well-provisioned servers, the Linux kernel's compression cache (zswap) is eff
 
 Smash delivers equivalent memory savings to zswap-under-pressure with **16× better decompression latency** and zero configuration. See `docs/smash_vs_zswap_empirical.md` for full methodology.
 
-### Layout advantages
+### Per-page compression ratio
 
-Smash's allocator design produces pages that are more compressible than standard allocators for workloads with small-object churn:
+At scale, smash's allocator layout produces pages with the **same compressibility** as jemalloc — the advantage is not in per-page ratio but in which pages get compressed and when:
 
-| Workload pattern | jemalloc/glibc | smash (no compression) | Improvement |
-|-----------------|------:|------:|------:|
-| Redis 500B values, 50% deleted | 13× LZ4 | 23× LZ4 | **1.8×** |
-| 128B objects, 75% freed | 10× LZ4 | 22× LZ4 | **2.2×** |
-| SQLite 4K B-tree pages | 2.2× LZ4 | ~2.2× LZ4 | ~1× |
+| Workload | jemalloc | smash (no compression) |
+|----------|------:|------:|
+| Redis 1M keys × 2KB, 50% deleted (1.3 GiB) | 2.7× zstd-1 | 2.7× zstd-1 |
+| SQLite 500K rows (350 MiB) | 3.7× zstd-1 | 3.7× zstd-1 |
 
-The advantage comes from: (1) arena-based segregation placing similar objects together, (2) bitmap-based free tracking that doesn't write metadata into freed data, and (3) per-page object capping that maintains zero-filled regions within partially-occupied pages. The effect is largest when objects are small relative to OS page size and allocation churn creates partial occupancy.
+Both allocators achieve identical codec ratios on the same data because the page content is dominated by application data (not allocator metadata). Smash's value is in **proactive cold-page identification and compression** — it achieves 58–88% RSS reduction by compressing cold pages that jemalloc (or any standard allocator + zswap) leaves uncompressed on well-provisioned servers.
 
 ## Building
 

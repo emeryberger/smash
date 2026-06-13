@@ -1047,7 +1047,9 @@ public:
         // every mode and keeps the diagnostic counters complete.
         if (!fullMallocPath() || freeDiagnosticsActive()) [[unlikely]]
             return freeSlow(ptr);
-        if (BootstrapAlloc::instance().owns(ptr)) [[unlikely]] return;
+        // Note: BootstrapAlloc::owns() check removed from hot path.
+        // alloc8's xxowns() hook already prevents bootstrap pointers from
+        // reaching xxfree — they're dropped by alloc8's is_owned() dispatch.
 
         const auto addr = reinterpret_cast<uintptr_t>(ptr);
 

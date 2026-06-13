@@ -476,7 +476,15 @@ public:
         }
         if (target > contig_pages_) target = contig_pages_;
         void* addr = base_ + already * kPageSize;
-        vm::commitPages(addr, (target - already) * kPageSize);
+        size_t commit_bytes = (target - already) * kPageSize;
+        vm::commitPages(addr, commit_bytes);
+        // Prefault: touch each page to allocate physical frames now (during
+        // span allocation) rather than on the application's hot write path.
+        // Without this, the first write per page triggers a kernel page fault
+        // (~2-5µs each) that shows up as overhead during serve.
+        volatile char* p = static_cast<volatile char*>(addr);
+        for (size_t off = 0; off < commit_bytes; off += kPageSize)
+            p[off] = 0;
         committed_pages_.store(target, std::memory_order_release);
     }
 

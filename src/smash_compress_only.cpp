@@ -178,22 +178,24 @@ void* measurementThread(void*) {
     return nullptr;
 }
 
+std::atomic<bool> g_threads_started{false};
+
 void startCompression() {
-    bool expected = false;
-    if (!g_compression_started.compare_exchange_strong(expected, true))
-        return;
-    // Don't start the compressor thread or fault handler — mprotect on
-    // system-allocator pages causes SIGSEGV. Pages are already tracked
-    // via trackAllocation() on each malloc call.
+    g_compression_started.store(true, std::memory_order_relaxed);
+}
+
+// Called from a non-malloc context to safely start threads.
+// Triggered by an atexit handler.
+void startMeasurementThreads() {
+    if (g_threads_started.exchange(true)) return;
 
     pthread_t meas_thread;
     pthread_create(&meas_thread, nullptr, measurementThread, nullptr);
     pthread_detach(meas_thread);
 
-    // Auto-trigger ratio report after delay
     static const int delay = []() {
         const char* v = getenv("SMASH_REPORT_DELAY_SEC");
-        return v ? atoi(v) : 8;
+        return v ? atoi(v) : 5;
     }();
     if (delay > 0) {
         struct TimerArg { int sec; };
@@ -209,6 +211,20 @@ void startCompression() {
         }, ta);
         pthread_detach(timer);
     }
+}
+
+// atexit fires after main returns — safe to create threads here
+void atexitReport() {
+    g_report_requested.store(true, std::memory_order_relaxed);
+    usleep(200000);  // give measurement thread time to report
+}
+
+__attribute__((constructor(200), used))
+void co_start_threads() {
+    // Register atexit for final report
+    atexit(atexitReport);
+    // Start measurement threads — runs after co_init (priority default=65535)
+    startMeasurementThreads();
 }
 
 // Track pages covered by an allocation

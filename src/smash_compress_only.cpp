@@ -930,6 +930,8 @@ void co_init() {
 
     signal(SIGUSR2, sigusr2Handler);
 
+#ifndef __APPLE__
     g_in_dlsym.store(false, std::memory_order_relaxed);
+#endif
     g_inited.store(true, std::memory_order_release);
 }

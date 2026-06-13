@@ -898,20 +898,15 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
 __attribute__((constructor, used))
 void co_init() {
 #ifndef __APPLE__
-    // Mark that we're in init (dlsym may call calloc)
+    // Keep g_in_dlsym true for the entire init phase. This routes any
+    // calloc from dlsym/BootstrapAlloc/VmRegion init to the static buffer
+    // and makes the mmap wrapper use the syscall fallback.
     g_in_dlsym.store(true, std::memory_order_relaxed);
-    // Force resolution of all interposed functions before setting g_inited.
-    // dlsym itself may call malloc/calloc/mmap — the g_in_dlsym guard
-    // routes calloc to the static buffer fallback.
-    void* p = dlsym(RTLD_NEXT, "malloc");
-    (void)p;
-    p = dlsym(RTLD_NEXT, "free");
-    (void)p;
-    p = dlsym(RTLD_NEXT, "calloc");
-    (void)p;
-    p = dlsym(RTLD_NEXT, "mmap");
-    (void)p;
-    g_in_dlsym.store(false, std::memory_order_relaxed);
+    // Force resolution of all interposed functions.
+    (void)dlsym(RTLD_NEXT, "malloc");
+    (void)dlsym(RTLD_NEXT, "free");
+    (void)dlsym(RTLD_NEXT, "calloc");
+    (void)dlsym(RTLD_NEXT, "mmap");
 #endif
 
     if (!g_vm.init(0))
@@ -935,5 +930,6 @@ void co_init() {
 
     signal(SIGUSR2, sigusr2Handler);
 
+    g_in_dlsym.store(false, std::memory_order_relaxed);
     g_inited.store(true, std::memory_order_release);
 }

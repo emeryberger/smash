@@ -107,20 +107,20 @@ static inline void track_pages(void* ptr, size_t size) {
 
 // ── Interposition ────────────────────────────────────────────────────────────
 
-extern "C" void* malloc(size_t size) {
+extern "C" __attribute__((visibility("default"))) void* malloc(size_t size) {
     if (!g_real_malloc) resolve();
     void* ptr = g_real_malloc(size);
     track_pages(ptr, size);
     return ptr;
 }
 
-extern "C" void free(void* ptr) {
+extern "C" __attribute__((visibility("default"))) void free(void* ptr) {
     if (ptr >= g_calloc_buf && ptr < g_calloc_buf + sizeof(g_calloc_buf)) return;
     if (!g_real_free) resolve();
     g_real_free(ptr);
 }
 
-extern "C" void* calloc(size_t count, size_t size) {
+extern "C" __attribute__((visibility("default"))) void* calloc(size_t count, size_t size) {
     if (g_in_dlsym.load(std::memory_order_relaxed) || !g_real_calloc) {
         size_t total = count * size;
         size_t off = g_calloc_off.fetch_add(total, std::memory_order_relaxed);
@@ -135,7 +135,7 @@ extern "C" void* calloc(size_t count, size_t size) {
     return ptr;
 }
 
-extern "C" void* realloc(void* old, size_t size) {
+extern "C" __attribute__((visibility("default"))) void* realloc(void* old, size_t size) {
     if (!g_real_realloc) resolve();
     void* ptr = g_real_realloc(old, size);
     track_pages(ptr, size);

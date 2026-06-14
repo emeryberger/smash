@@ -220,6 +220,30 @@ inline uint32_t deferMadviseTicks() {
     return ticks;
 }
 
+// Force-initialize all function-local statics that call getenv().
+// Must be called before the fault handler is installed (i.e., during
+// CompressorThread::init()). Without this, a first-time call on the
+// compressor thread that happens to fault → signal handler → the lazy
+// static init calls getenv() → getenv traverses environ on a page
+// that smash compressed (PROT_NONE) → recursive SIGSEGV → crash.
+// Diagnosed from Redis crash: 1M-key fill, compressor thread faults
+// during memcpy of a freed page, signal handler chains to default,
+// but the lazy static in the handler's callee hadn't initialized yet.
+inline void warmupEnvStatics() {
+    (void)protReadBarrierEnabled();
+    (void)fixavEnabled();
+    (void)deferMadviseEnabled();
+    (void)profileThrashBackoffEnabled();
+    (void)deferMadviseTicks();
+    (void)isDeferredReclaimMode();
+    (void)getDeferredReclaimDelay();
+    (void)getColdTicks();
+    (void)getSmashMode();
+    (void)isLargeOnlyMode();
+    (void)vm::noDecommitEnabled();
+    (void)vm::madvMode();
+}
+
 class CompressorThread {
     // ── Shared state ──────────────────────────────────────────────────────
     VmRegion* vm_ = nullptr;
@@ -1922,10 +1946,7 @@ private:
             // which on 28K pages = ~85 ms of pure syscall time per
             // tick — measurably worse wall time on
             // cut_reshape_8298.
-            static const bool safe_memcpy = []{
-                const char* v = std::getenv("SMASH_SAFE_MEMCPY");
-                return v && v[0] == '1';
-            }();
+            const bool safe_memcpy = cfg_safe_memcpy_;
 #ifdef __linux__
             if (safe_memcpy) {
                 struct iovec local_iov{worker.page_buf, kPageSize};
@@ -1956,10 +1977,7 @@ private:
             // held) and compare against the snapshot. If they differ, a
             // store retired in our window — abandon this attempt, restore
             // PROT_RW, reset state to ACTIVE; next tick can retry.
-            static const bool snapshot_verify = []{
-                const char* v = std::getenv("SMASH_SNAPSHOT_VERIFY");
-                return v && v[0] == '1';
-            }();
+            const bool snapshot_verify = cfg_snapshot_verify_;
             // Snapshot-verify is correctness-mandatory under FixAv (it is the
             // sole defense against a writer's store retiring inside our
             // PROT_READ window). The legacy SMASH_SNAPSHOT_VERIFY env var
@@ -3214,10 +3232,7 @@ private:
         // buffers in smash-managed pages — once those buffers are no
         // longer hot, normal compressor operation resumes. Phase 1
         // (access tracking bookkeeping) still runs.
-        static const int defer_ms = []{
-            const char* v = std::getenv("SMASH_DEFER_PHASES_MS");
-            return v ? atoi(v) : 0;
-        }();
+        const int defer_ms = cfg_defer_phases_ms_;
         static const auto start_time = std::chrono::steady_clock::now();
         bool defer_phases = false;
         if (defer_ms > 0) {
@@ -3359,10 +3374,7 @@ private:
         // SMASH_NO_MONITOR=1 disables Phase 3 at runtime, trading off cold
         // detection accuracy for compatibility with such codepaths. Looked
         // up once at startup to keep the tick loop branch-free.
-        static const bool no_monitor = []{
-            const char* v = std::getenv("SMASH_NO_MONITOR");
-            return v && v[0] == '1';
-        }();
+        const bool no_monitor = cfg_no_monitor_;
         // Selective Phase 3 skip: if many recent ticks all reported
         // 0 pages eligible AND 0 compressed, Phase 3 monitoring just
         // creates VMA-fragmenting mprotect storms with no payoff
@@ -3760,6 +3772,13 @@ public:
             fault_slots_[i].dctx = ZSTD_createDCtx_advanced(custom_mem);
         }
 
+        // Force-initialize all function-local statics that call getenv()
+        // BEFORE the fault handler starts. If any of these first-init on the
+        // compressor thread while inside a fault context, getenv traverses
+        // environ on a smash-compressed page → recursive SIGSEGV → crash.
+        warmupEnvStatics();
+        warmupClassStatics();
+
         // Initialize ROI model (auto-calibrate throughput, read env vars)
         ROIConfig::instance().init(engine_);
     }
@@ -4009,6 +4028,35 @@ public:
         fclose(f);
         rename(tmp, path);
         if (lockfd >= 0) { flock(lockfd, LOCK_UN); close(lockfd); }
+    }
+
+    // Env-var cache: read once at init time, stored as member variables.
+    // Avoids function-local statics with getenv() that could first-init
+    // inside the signal handler on the compressor thread → crash.
+    bool cfg_safe_memcpy_ = false;
+    bool cfg_snapshot_verify_ = false;
+    bool cfg_no_monitor_ = false;
+    int cfg_phase3_skip_thresh_ = 20;
+    int cfg_defer_phases_ms_ = 0;
+
+    void warmupClassStatics() {
+        const char* v;
+        v = std::getenv("SMASH_SAFE_MEMCPY");
+        cfg_safe_memcpy_ = v && v[0] == '1';
+        v = std::getenv("SMASH_SNAPSHOT_VERIFY");
+        cfg_snapshot_verify_ = v && v[0] == '1';
+        v = std::getenv("SMASH_NO_MONITOR");
+        cfg_no_monitor_ = v && v[0] == '1';
+        v = std::getenv("SMASH_PHASE3_SKIP_THRESHOLD");
+        cfg_phase3_skip_thresh_ = v ? std::atoi(v) : 20;
+        v = std::getenv("SMASH_DEFER_PHASES_MS");
+        cfg_defer_phases_ms_ = v ? std::atoi(v) : 0;
+        // Touch remaining statics to force their initialization:
+        (void)std::getenv("SMASH_PROTECT_CHUNK_PAGES");
+        (void)std::getenv("SMASH_P2_CHUNK");
+        (void)std::getenv("SMASH_SOFTDIRTY");
+        (void)std::getenv("SMASH_IDLE_READ_TRACK");
+        (void)std::getenv("SMASH_CPU_PRESSURE_CAP");
     }
 
     void start() {

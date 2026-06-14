@@ -104,3 +104,84 @@ achieved their compression and are no longer in the address space).
 **The key insight**: zswap would get ~3–5× on the same data that smash achieves 73% RSS
 reduction (>3.5×) on — but smash only compresses the COLD pages and does it proactively.
 The per-page ratios are comparable; the advantage is selectivity + no-pressure triggering.
+
+## Throughput Analysis: Sources of Overhead
+
+### Profiling methodology
+perf stat + perf record on EPYC 9R14 with SQLite 2M rows (1.4 GiB working set).
+Isolated each overhead source by disabling features incrementally.
+
+### Overhead breakdown (SQLite 2M rows, serve phase)
+
+| Configuration | ops/s | vs glibc | Source |
+|---------------|------:|------:|--------|
+| glibc baseline | 79,000 | — | — |
+| smash slab only (no compression) | 62,100 | -21% | cache/TLB pollution from metadata |
+| smash + compression (60s cool) | 57,500 | -27% | +6% decompression faults on cold B-tree nodes |
+| smash LARGE_ONLY (system malloc) | 81,800 | +4% | no slab overhead |
+
+### Root cause: IPC degradation from metadata footprint
+
+| Metric | glibc | smash |
+|--------|------:|------:|
+| Instructions | 211.5B | 206.1B |
+| Cycles | 69.8B | 88.1B |
+| **IPC** | **3.03** | **2.34** |
+| sys time | 1.1s | 7.4s |
+
+Smash executes FEWER instructions (slab fastpath is efficient) but each
+instruction takes 23% longer due to L3 cache pollution from the 370 MiB
+metadata overhead (PageState, page_map, cold_count, bitmaps). The smash
+code itself accounts for only 0.36% of serve-phase CPU (perf record).
+
+### Softdirty vs PROT_READ monitoring
+
+| Workload | Default (PROT_READ) | Softdirty | Delta |
+|----------|---:|---:|---:|
+| SQLite (250K rows) | 89,806 | 91,881 | **+2.3%** |
+| Redis SET | 61,200 | 60,680 | -0.8% |
+| Redis GET | 61,881 | 59,737 | -3.5% |
+
+Softdirty eliminates PROT_READ faults on read-only B-tree traversals
+(+2.3% on SQLite). But the per-tick pagemap read (3.6 MiB syscall for
+450K pages) costs more than it saves on small/write-heavy working sets
+like Redis (-3.5%). Neither is universally better; workload-dependent.
+
+### Conclusion
+
+The throughput gap is NOT from per-allocation overhead (0.36% of CPU)
+or from the monitoring mechanism choice. It's from smash's 370 MiB
+larger RSS footprint (allocator metadata) causing L3 cache pollution
+and 23% IPC degradation in the application's own code (SQLite B-tree
+traversal). On workloads where cache isn't the bottleneck (memcached
+with its hash-table access pattern), smash is 5% FASTER than glibc.
+
+### Corrected analysis: Branch misprediction (not cache pollution)
+
+Serve-phase-only perf stat (8s window, attached after fill completes):
+
+| Counter | glibc serve | smash serve | Ratio |
+|---------|------:|------:|------:|
+| cycles | 29.3B | 25.9B | 0.89× (smash less!) |
+| instructions | 71.4B | 43.7B | 0.61× (smash 39% fewer!) |
+| cache-misses | 211M (15.6%) | 167M (13.8%) | 0.79× (smash FEWER!) |
+| dTLB misses | 21.1M | 19.1M | 0.91× (smash fewer) |
+| **branch-misses** | **20.1M (0.14%)** | **103.6M (1.20%)** | **5.2×** |
+| **frontend stalls** | **4.1%** | **14.5%** | **3.5×** |
+
+**The earlier diagnosis (cache pollution) was WRONG.** Smash has FEWER cache misses
+and FEWER TLB misses during serve. The actual bottleneck is **5.2× more branch
+mispredictions** causing 3.5× more frontend stalls:
+
+- `BootstrapAlloc::owns()` (bounds check on every free)
+- `vm_region_.inContigArena()` (arena membership check)
+- TLS free-cache hit/miss dispatch
+- `span->is_large` type dispatch
+- `fullMallocPath()` mode check
+
+glibc's tcache fastpath is a single highly-predictable branch. Smash's multi-level
+dispatch chain has 5+ conditional branches with mixed prediction profiles.
+
+`__attribute__((cold))` on compressor functions recovered +1.5% (reduced i-cache
+aliasing). Further gains require restructuring the free/malloc dispatch to fewer,
+more predictable branches (computed goto, branchless comparisons).

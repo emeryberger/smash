@@ -476,7 +476,8 @@ public:
         }
         if (target > contig_pages_) target = contig_pages_;
         void* addr = base_ + already * kPageSize;
-        vm::commitPages(addr, (target - already) * kPageSize);
+        size_t commit_bytes = (target - already) * kPageSize;
+        vm::commitPages(addr, commit_bytes);
         committed_pages_.store(target, std::memory_order_release);
     }
 

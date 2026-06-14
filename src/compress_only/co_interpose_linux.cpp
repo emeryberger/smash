@@ -1,291 +1,272 @@
-// smash/src/compress_only/co_interpose_linux.cpp - Linux LD_PRELOAD interposition
+// smash/src/compress_only/co_interpose_linux.cpp — Linux LD_PRELOAD measurement
 //
-// Uses LD_PRELOAD with dlsym(RTLD_NEXT) to intercept malloc/free and syscalls.
-// Forwards allocations to glibc malloc, tracks pages, runs compression.
+// Minimal implementation: tracks pages via raw syscall-allocated hash,
+// reports compression ratios at exit. No BootstrapAlloc, no VmRegion,
+// no mprotect — avoids all bootstrapping recursion.
 
 #ifndef __APPLE__
 
-#include "co_common.h"
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
 #include <dlfcn.h>
-#include <sys/epoll.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
-// ── dlsym helper ────────────────────────────────────────────────────────────
+#include <lz4.h>
+#include <zstd.h>
 
-#define CO_ORIG_DECL(fn_type, name) \
-    static fn_type orig_##name = nullptr; \
-    if (!orig_##name) { \
-        orig_##name = reinterpret_cast<fn_type>(dlsym(RTLD_NEXT, #name)); \
+// ── Raw mmap (bypasses our interposition) ────────────────────────────────────
+
+static void* raw_mmap(size_t size) {
+    long r = syscall(SYS_mmap, nullptr, size,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, (off_t)0);
+    return (r < 0 && r > -4096) ? MAP_FAILED : (void*)r;
+}
+
+// ── Page tracker: open-addressed hash set ────────────────────────────────────
+
+static constexpr size_t kPageSize = 4096;
+static constexpr size_t kTrackCap = 2 * 1024 * 1024;  // 2M slots (16 MiB)
+
+struct PageTracker {
+    std::atomic<uintptr_t>* slots = nullptr;
+    std::atomic<size_t> count{0};
+
+    bool init() {
+        void* mem = raw_mmap(kTrackCap * sizeof(std::atomic<uintptr_t>));
+        if (mem == MAP_FAILED) return false;
+        slots = static_cast<std::atomic<uintptr_t>*>(mem);
+        return true;
     }
 
-// ── VM region scanning (Linux) ──────────────────────────────────────────────
-// Parse /proc/self/maps to find anonymous RW regions (heap + mmap'd).
-// glibc malloc uses brk() for small heaps and mmap() for large allocations;
-// both show up as anonymous RW mappings.
-
-namespace co {
-
-void scanVmRegions() {
-    auto& bootstrap = smash::BootstrapAlloc::instance();
-    size_t new_pages = 0;
-
-    // Use dlsym to get the real fopen/fgets/fclose to avoid recursion
-    using fopen_fn_t = FILE*(*)(const char*, const char*);
-    using fgets_fn_t = char*(*)(char*, int, FILE*);
-    using fclose_fn_t = int(*)(FILE*);
-    static fopen_fn_t real_fopen = reinterpret_cast<fopen_fn_t>(dlsym(RTLD_NEXT, "fopen"));
-    static fgets_fn_t real_fgets = reinterpret_cast<fgets_fn_t>(dlsym(RTLD_NEXT, "fgets"));
-    static fclose_fn_t real_fclose = reinterpret_cast<fclose_fn_t>(dlsym(RTLD_NEXT, "fclose"));
-
-    if (!real_fopen || !real_fgets || !real_fclose) return;
-
-    FILE* f = real_fopen("/proc/self/maps", "r");
-    if (!f) return;
-
-    char line[512];
-    while (real_fgets(line, sizeof(line), f)) {
-        uintptr_t start, end;
-        char perms[8];
-        unsigned long offset, inode;
-        unsigned int major, minor;
-        int n = sscanf(line, "%lx-%lx %4s %lx %x:%x %lu",
-                       &start, &end, perms, &offset, &major, &minor, &inode);
-        if (n < 7) continue;
-
-        // Only anonymous RW regions
-        if (perms[0] != 'r' || perms[1] != 'w') continue;
-        if (inode != 0) continue;
-
-        // Skip stack, vdso, vvar, vsyscall
-        char* bracket = strchr(line, '[');
-        if (bracket && (strstr(bracket, "[stack") || strstr(bracket, "[vdso") ||
-                        strstr(bracket, "[vsyscall") || strstr(bracket, "[vvar"))) continue;
-
-        size_t region_size = end - start;
-        if (region_size < smash::kPageSize) continue;
-        if (bootstrap.owns(reinterpret_cast<void*>(start))) continue;
-
-        for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-            size_t idx = g_vm.trackPage(p);
-            if (idx > 0 && g_states.get(idx) == smash::PageState::EMPTY) {
-                g_states.set(idx, smash::PageState::ACTIVE);
-                new_pages++;
-            }
-            if (g_vm.committedPages() >= g_vm.totalPages() - 100) {
-                real_fclose(f);
-                goto done;
+    void track(uintptr_t page_addr) {
+        if (!slots || !page_addr) return;
+        size_t idx = (page_addr >> 12) % kTrackCap;
+        for (size_t probe = 0; probe < 128; ++probe) {
+            size_t i = (idx + probe) % kTrackCap;
+            uintptr_t cur = slots[i].load(std::memory_order_relaxed);
+            if (cur == page_addr) return;
+            if (cur == 0) {
+                uintptr_t expected = 0;
+                if (slots[i].compare_exchange_weak(expected, page_addr,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    count.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                if (expected == page_addr) return;
             }
         }
     }
-    real_fclose(f);
+};
 
-done:
-    if (new_pages > 0)
-        g_track_count.fetch_add(new_pages, std::memory_order_relaxed);
-}
+// ── Globals ──────────────────────────────────────────────────────────────────
 
-} // namespace co
-
-// ── calloc bootstrap ────────────────────────────────────────────────────────
-// dlsym itself may call calloc during symbol resolution. Provide a static
-// buffer fallback to break the recursion.
-
-static char g_calloc_buf[4096];
+static PageTracker g_tracker;
+static std::atomic<bool> g_inited{false};
 static std::atomic<bool> g_in_dlsym{false};
 
-// ── malloc/free interposition ───────────────────────────────────────────────
+static char g_calloc_buf[8192];
+static std::atomic<size_t> g_calloc_off{0};
 
-using malloc_fn   = void*(*)(size_t);
-using free_fn     = void(*)(void*);
-using calloc_fn   = void*(*)(size_t, size_t);
-using realloc_fn  = void*(*)(void*, size_t);
-using memalign_fn = int(*)(void**, size_t, size_t);
-using mmap_fn_t   = void*(*)(void*, size_t, int, int, int, off_t);
+using malloc_fn  = void*(*)(size_t);
+using free_fn    = void(*)(void*);
+using calloc_fn  = void*(*)(size_t, size_t);
+using realloc_fn = void*(*)(void*, size_t);
 
-// Global function pointers - pre-resolved during init
-static malloc_fn g_orig_malloc = nullptr;
-static free_fn g_orig_free = nullptr;
-static calloc_fn g_orig_calloc = nullptr;
-static realloc_fn g_orig_realloc = nullptr;
-static memalign_fn g_orig_posix_memalign = nullptr;
-static mmap_fn_t g_orig_mmap = nullptr;
+static malloc_fn  g_real_malloc  = nullptr;
+static free_fn    g_real_free    = nullptr;
+static calloc_fn  g_real_calloc  = nullptr;
+static realloc_fn g_real_realloc = nullptr;
 
-#define CO_EXPORT __attribute__((visibility("default")))
+static void resolve() {
+    g_in_dlsym.store(true, std::memory_order_relaxed);
+    g_real_malloc  = (malloc_fn)dlsym(RTLD_NEXT, "malloc");
+    g_real_free    = (free_fn)dlsym(RTLD_NEXT, "free");
+    g_real_calloc  = (calloc_fn)dlsym(RTLD_NEXT, "calloc");
+    g_real_realloc = (realloc_fn)dlsym(RTLD_NEXT, "realloc");
+    g_in_dlsym.store(false, std::memory_order_relaxed);
+}
 
-extern "C" CO_EXPORT void* malloc(size_t size) {
-    if (!g_orig_malloc) return nullptr;
-    void* ptr = g_orig_malloc(size);
-    co::trackMalloc(ptr, size);
+static std::atomic<size_t> g_track_calls{0};
+
+static inline void track_pages(void* ptr, size_t size) {
+    if (!ptr || !size || !g_inited.load(std::memory_order_relaxed)) return;
+    g_track_calls.fetch_add(1, std::memory_order_relaxed);
+    uintptr_t start = reinterpret_cast<uintptr_t>(ptr) & ~(uintptr_t)(kPageSize - 1);
+    uintptr_t end = (reinterpret_cast<uintptr_t>(ptr) + size - 1) & ~(uintptr_t)(kPageSize - 1);
+    for (uintptr_t p = start; p <= end; p += kPageSize)
+        g_tracker.track(p);
+}
+
+// ── Interposition ────────────────────────────────────────────────────────────
+
+extern "C" __attribute__((visibility("default"))) void* malloc(size_t size) {
+    if (!g_real_malloc) resolve();
+    void* ptr = g_real_malloc(size);
+    track_pages(ptr, size);
     return ptr;
 }
 
-extern "C" CO_EXPORT void free(void* ptr) {
-    if (ptr >= g_calloc_buf && ptr < g_calloc_buf + sizeof(g_calloc_buf))
-        return;
-    if (g_orig_free) g_orig_free(ptr);
+extern "C" __attribute__((visibility("default"))) void free(void* ptr) {
+    if (ptr >= g_calloc_buf && ptr < g_calloc_buf + sizeof(g_calloc_buf)) return;
+    if (!g_real_free) resolve();
+    g_real_free(ptr);
 }
 
-extern "C" CO_EXPORT void* calloc(size_t count, size_t size) {
-    if (g_in_dlsym.load(std::memory_order_relaxed) || !g_orig_calloc) {
+extern "C" __attribute__((visibility("default"))) void* calloc(size_t count, size_t size) {
+    if (g_in_dlsym.load(std::memory_order_relaxed) || !g_real_calloc) {
         size_t total = count * size;
-        if (total <= sizeof(g_calloc_buf)) {
-            __builtin_memset(g_calloc_buf, 0, total);
-            return g_calloc_buf;
+        size_t off = g_calloc_off.fetch_add(total, std::memory_order_relaxed);
+        if (off + total <= sizeof(g_calloc_buf)) {
+            __builtin_memset(g_calloc_buf + off, 0, total);
+            return g_calloc_buf + off;
         }
         return nullptr;
     }
-    void* ptr = g_orig_calloc(count, size);
-    if (ptr && co::g_inited.load(std::memory_order_relaxed))
-        co::trackAllocation(ptr, count * size);
+    void* ptr = g_real_calloc(count, size);
+    track_pages(ptr, count * size);
     return ptr;
 }
 
-extern "C" CO_EXPORT void* realloc(void* old_ptr, size_t size) {
-    if (!g_orig_realloc) return nullptr;
-    void* ptr = g_orig_realloc(old_ptr, size);
-    if (ptr && co::g_inited.load(std::memory_order_relaxed))
-        co::trackAllocation(ptr, size);
+extern "C" __attribute__((visibility("default"))) void* realloc(void* old, size_t size) {
+    if (!g_real_realloc) resolve();
+    void* ptr = g_real_realloc(old, size);
+    track_pages(ptr, size);
     return ptr;
 }
 
-extern "C" CO_EXPORT int posix_memalign(void** memptr, size_t alignment, size_t size) {
-    if (!g_orig_posix_memalign) return -1;
-    int ret = g_orig_posix_memalign(memptr, alignment, size);
-    if (ret == 0 && *memptr && co::g_inited.load(std::memory_order_relaxed))
-        co::trackAllocation(*memptr, size);
-    return ret;
-}
+using memalign_fn = void*(*)(size_t, size_t);
+using posix_memalign_fn = int(*)(void**, size_t, size_t);
 
-extern "C" CO_EXPORT void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
-    if (!g_orig_mmap) return MAP_FAILED;
-    void* ret = g_orig_mmap(addr, len, prot, flags, fd, offset);
-    if (ret != MAP_FAILED && co::g_inited.load(std::memory_order_relaxed)) {
-        if ((flags & MAP_ANONYMOUS) && (prot & PROT_WRITE))
-            co::trackAllocation(ret, len);
+extern "C" __attribute__((visibility("default")))
+int posix_memalign(void** memptr, size_t alignment, size_t size) {
+    static posix_memalign_fn real = nullptr;
+    if (!real) {
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        real = (posix_memalign_fn)dlsym(RTLD_NEXT, "posix_memalign");
+        g_in_dlsym.store(false, std::memory_order_relaxed);
     }
+    int ret = real(memptr, alignment, size);
+    if (ret == 0 && *memptr) track_pages(*memptr, size);
     return ret;
 }
 
-// ── Syscall interposition ───────────────────────────────────────────────────
-// On Linux with LD_PRELOAD, we export functions with the original names.
-// dlsym(RTLD_NEXT) finds the real glibc implementation.
-
-using read_fn_t = ssize_t(*)(int, void*, size_t);
-using write_fn_t = ssize_t(*)(int, const void*, size_t);
-using pread_fn_t = ssize_t(*)(int, void*, size_t, off_t);
-using pwrite_fn_t = ssize_t(*)(int, const void*, size_t, off_t);
-using readv_fn_t = ssize_t(*)(int, const struct iovec*, int);
-using writev_fn_t = ssize_t(*)(int, const struct iovec*, int);
-using recv_fn_t = ssize_t(*)(int, void*, size_t, int);
-using send_fn_t = ssize_t(*)(int, const void*, size_t, int);
-using poll_fn_t = int(*)(struct pollfd*, nfds_t, int);
-using epoll_wait_fn_t = int(*)(int, struct epoll_event*, int, int);
-
-extern "C" CO_EXPORT ssize_t read(int fd, void* buf, size_t count) {
-    CO_ORIG_DECL(read_fn_t, read);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
-    ssize_t ret = orig_read(fd, buf, count);
-    return ret;
-}
-
-extern "C" CO_EXPORT ssize_t write(int fd, const void* buf, size_t count) {
-    CO_ORIG_DECL(write_fn_t, write);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
-    ssize_t ret = orig_write(fd, buf, count);
-    return ret;
-}
-
-extern "C" CO_EXPORT ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
-    CO_ORIG_DECL(pread_fn_t, pread);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
-    ssize_t ret = orig_pread(fd, buf, count, offset);
-    return ret;
-}
-
-extern "C" CO_EXPORT ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
-    CO_ORIG_DECL(pwrite_fn_t, pwrite);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
-    ssize_t ret = orig_pwrite(fd, buf, count, offset);
-    return ret;
-}
-
-extern "C" CO_EXPORT ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
-    CO_ORIG_DECL(readv_fn_t, readv);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) co::warmIovec(iov, iovcnt, vm);
-    ssize_t ret = orig_readv(fd, iov, iovcnt);
-    return ret;
-}
-
-extern "C" CO_EXPORT ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
-    CO_ORIG_DECL(writev_fn_t, writev);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) co::warmIovec(iov, iovcnt, vm);
-    ssize_t ret = orig_writev(fd, iov, iovcnt);
-    return ret;
-}
-
-extern "C" CO_EXPORT ssize_t recv(int s, void* buf, size_t len, int flags) {
-    CO_ORIG_DECL(recv_fn_t, recv);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) smash::vm::warmPages(buf, len, vm);
-    ssize_t ret = orig_recv(s, buf, len, flags);
-    return ret;
-}
-
-extern "C" CO_EXPORT ssize_t send(int s, const void* buf, size_t len, int flags) {
-    CO_ORIG_DECL(send_fn_t, send);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) smash::vm::warmPages(buf, len, vm);
-    ssize_t ret = orig_send(s, buf, len, flags);
-    return ret;
-}
-
-extern "C" CO_EXPORT int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
-    CO_ORIG_DECL(poll_fn_t, poll);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && fds && nfds > 0) {
-        smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
+extern "C" __attribute__((visibility("default")))
+void* memalign(size_t alignment, size_t size) {
+    static memalign_fn real = nullptr;
+    if (!real) {
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        real = (memalign_fn)dlsym(RTLD_NEXT, "memalign");
+        g_in_dlsym.store(false, std::memory_order_relaxed);
     }
-    int ret = orig_poll(fds, nfds, timeout);
-    return ret;
+    void* ptr = real(alignment, size);
+    track_pages(ptr, size);
+    return ptr;
 }
 
-extern "C" CO_EXPORT int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
-    CO_ORIG_DECL(epoll_wait_fn_t, epoll_wait);
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && maxevents > 0) {
-        smash::vm::warmPages(events, maxevents * sizeof(struct epoll_event), vm);
+extern "C" __attribute__((visibility("default")))
+void* aligned_alloc(size_t alignment, size_t size) {
+    static memalign_fn real = nullptr;
+    if (!real) {
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        real = (memalign_fn)dlsym(RTLD_NEXT, "aligned_alloc");
+        g_in_dlsym.store(false, std::memory_order_relaxed);
     }
-    int ret = orig_epoll_wait(epfd, events, maxevents, timeout);
-    return ret;
+    void* ptr = real(alignment, size);
+    track_pages(ptr, size);
+    return ptr;
 }
 
-// Note: On Linux, LD_PRELOAD intercepts read/write calls from glibc's
-// buffered I/O (fread, fgets, etc.) as well, so separate fread/fwrite
-// interposition is not needed.
+extern "C" __attribute__((visibility("default")))
+void* valloc(size_t size) {
+    static malloc_fn real = nullptr;
+    if (!real) {
+        g_in_dlsym.store(true, std::memory_order_relaxed);
+        real = (malloc_fn)dlsym(RTLD_NEXT, "valloc");
+        g_in_dlsym.store(false, std::memory_order_relaxed);
+    }
+    void* ptr = real(size);
+    track_pages(ptr, size);
+    return ptr;
+}
 
-// ── Library initialization ──────────────────────────────────────────────────
+// ── At-exit report ───────────────────────────────────────────────────────────
 
-__attribute__((constructor(101)))  // Run early, before other constructors
+static void report_ratios() {
+    if (!g_tracker.slots) return;
+    size_t tracked = g_tracker.count.load(std::memory_order_relaxed);
+    if (tracked == 0) return;
+
+    int mem_fd = open("/proc/self/mem", O_RDONLY);
+    if (mem_fd < 0) return;
+
+    int lz4_bound = LZ4_compressBound(kPageSize);
+    size_t zstd_bound = ZSTD_compressBound(kPageSize);
+    size_t comp_sz = ((size_t)lz4_bound > zstd_bound) ? (size_t)lz4_bound : zstd_bound;
+    char* page_buf = (char*)raw_mmap(kPageSize);
+    char* comp_buf = (char*)raw_mmap(comp_sz);
+    if (page_buf == MAP_FAILED || comp_buf == MAP_FAILED) { close(mem_fd); return; }
+
+    size_t pages_ok = 0, total_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+
+    for (size_t i = 0; i < kTrackCap && pages_ok < 100000; ++i) {
+        uintptr_t addr = g_tracker.slots[i].load(std::memory_order_relaxed);
+        if (!addr) continue;
+
+        ssize_t rd = pread(mem_fd, page_buf, kPageSize, (off_t)addr);
+        if (rd != (ssize_t)kPageSize) continue;
+
+        // Skip all-zero pages
+        bool zero = true;
+        for (size_t j = 0; j < kPageSize; j += 8)
+            if (*(uint64_t*)(page_buf + j)) { zero = false; break; }
+        if (zero) continue;
+
+        pages_ok++;
+        total_bytes += kPageSize;
+
+        int lz4_sz = LZ4_compress_default(page_buf, comp_buf, kPageSize, lz4_bound);
+        lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : kPageSize;
+
+        size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, kPageSize, 1);
+        zstd1_bytes += ZSTD_isError(z1) ? kPageSize : z1;
+    }
+
+    munmap(page_buf, kPageSize);
+    munmap(comp_buf, comp_sz);
+    close(mem_fd);
+
+    if (total_bytes > 0) {
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg),
+            "[compress-only] tracked=%zu nonzero=%zu data=%.1fMiB "
+            "lz4=%.2fx zstd1=%.2fx\n",
+            tracked, pages_ok, total_bytes / (1024.0 * 1024.0),
+            (double)total_bytes / lz4_bytes,
+            (double)total_bytes / zstd1_bytes);
+        (void)!write(STDERR_FILENO, msg, n);
+    }
+}
+
+// ── Init/fini ────────────────────────────────────────────────────────────────
+
+__attribute__((constructor))
 static void co_init() {
-    // dlsym may call calloc; set flag to enable static buffer fallback
-    g_in_dlsym.store(true, std::memory_order_relaxed);
+    resolve();
+    if (!g_tracker.init()) return;
+    g_inited.store(true, std::memory_order_release);
+}
 
-    // Pre-resolve all function pointers before any malloc calls
-    g_orig_malloc = reinterpret_cast<malloc_fn>(dlsym(RTLD_NEXT, "malloc"));
-    g_orig_free = reinterpret_cast<free_fn>(dlsym(RTLD_NEXT, "free"));
-    g_orig_calloc = reinterpret_cast<calloc_fn>(dlsym(RTLD_NEXT, "calloc"));
-    g_orig_realloc = reinterpret_cast<realloc_fn>(dlsym(RTLD_NEXT, "realloc"));
-    g_orig_posix_memalign = reinterpret_cast<memalign_fn>(dlsym(RTLD_NEXT, "posix_memalign"));
-    g_orig_mmap = reinterpret_cast<mmap_fn_t>(dlsym(RTLD_NEXT, "mmap"));
-
-    g_in_dlsym.store(false, std::memory_order_relaxed);
-
-    co::init();
+__attribute__((destructor))
+static void co_fini() {
+    report_ratios();
 }
 
 #endif // !__APPLE__

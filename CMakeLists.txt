@@ -305,10 +305,11 @@ add_library(smash_compress_only SHARED
 target_include_directories(smash_compress_only PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${lz4_SOURCE_DIR}/lib
+  ${zstd_SOURCE_DIR}/lib
   ${printf_SOURCE_DIR}
 )
 
-# Only needs alloc8 headers (for platform.h), NOT the interpose machinery
 target_link_libraries(smash_compress_only PRIVATE alloc8::headers lz4_static libzstd_static Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(smash_compress_only PROPERTIES

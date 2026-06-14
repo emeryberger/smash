@@ -1112,7 +1112,7 @@ private:
     // ── Phase implementations ─────────────────────────────────────────────
 
     // Phase 1: Process access bits and update cold counts
-    void phase1Range(size_t start, size_t end) {
+    __attribute__((cold)) void phase1Range(size_t start, size_t end) {
         const bool sd_roi = write_clean_streak_ != nullptr;  // gate on
         forEachLivePage(start, end, [&](size_t i) {
             PageState st = states_->get(i);
@@ -1186,7 +1186,7 @@ private:
     // the fault handler, which sets accessed_[]=true.  If the page
     // survives one full tick at PROT_NONE without any access, it is truly
     // cold and Phase 2 compresses it on the next tick.
-    void phase2Range(int worker_id, size_t start, size_t end) {
+    __attribute__((cold)) void phase2Range(int worker_id, size_t start, size_t end) {
         const ROIConfig& cfg = ROIConfig::instance();
         uint32_t floor = cfg.cold_ticks_floor;
         bool backoff_enabled = cfg.recompress_backoff;
@@ -1713,7 +1713,7 @@ private:
 
     // ── Compress one page using worker's contexts ─────────────────────────
 
-    bool compressPage(size_t page_idx, CompressWorker& worker) {
+    __attribute__((cold)) bool compressPage(size_t page_idx, CompressWorker& worker) {
         const bool deferred = isDeferredReclaimMode();
 
         if (deferred) {
@@ -3197,7 +3197,7 @@ private:
 
     // ── Tick ──────────────────────────────────────────────────────────────
 
-    void tick() {
+    __attribute__((cold)) void tick() {
         ++tick_counter_;
         if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
@@ -3633,7 +3633,7 @@ private:
 
     // ── Thread entry points ───────────────────────────────────────────────
 
-    static void* coordEntry(void* arg) {
+    __attribute__((cold)) static void* coordEntry(void* arg) {
         auto* self = static_cast<CompressorThread*>(arg);
         while (self->running_.load(std::memory_order_relaxed)) {
             // Sleep in 10ms intervals, checking running_ flag each time.
@@ -3662,7 +3662,7 @@ private:
         int id;  // 0-based helper index (worker index = id + 1)
     };
 
-    static void* helperEntry(void* arg) {
+    __attribute__((cold)) static void* helperEntry(void* arg) {
         auto* ha = static_cast<HelperArg*>(arg);
         auto* self = ha->self;
         int helper_id = ha->id;

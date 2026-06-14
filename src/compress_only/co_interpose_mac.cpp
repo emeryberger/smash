@@ -1,11 +1,23 @@
-// smash/src/compress_only/co_interpose_mac.cpp - macOS DYLD interposition
+// smash/src/compress_only/co_interpose_mac.cpp — macOS measurement-only
 //
-// Uses __DATA,__interpose to replace malloc/free and syscalls.
-// Forwards allocations to system malloc, tracks pages, runs compression.
+// Uses __DATA,__interpose to intercept malloc/free, tracks pages in a
+// minimal hash table (no BootstrapAlloc), reports compression ratios at exit
+// via mach_vm_read. Same design as the Linux version but using macOS APIs.
 
 #ifdef __APPLE__
 
-#include "co_common.h"
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
+#include <mach/mach.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <lz4.h>
+#include <zstd.h>
 
 // ── DYLD interpose infrastructure ───────────────────────────────────────────
 
@@ -24,77 +36,68 @@ typedef struct {
 
 #define CO_ORIG(fn_type, wrapper) reinterpret_cast<fn_type>(co_ip_##wrapper.original)
 
-// ── VM region scanning (macOS) ──────────────────────────────────────────────
-// Enumerate Mach VM regions to find malloc-managed anonymous RW pages.
-// System malloc uses vm_allocate (Mach trap) for heap zones, which can't
-// be intercepted by __DATA,__interpose.
+// ── Page tracker (same as Linux version) ─────────────────────────────────────
 
-namespace co {
+static constexpr size_t kPageSize = 16384;  // macOS ARM64
+static constexpr size_t kTrackCap = 2 * 1024 * 1024;
 
-void scanVmRegions() {
-    auto& bootstrap = smash::BootstrapAlloc::instance();
-    size_t new_pages = 0;
+struct PageTracker {
+    std::atomic<uintptr_t>* slots = nullptr;
+    std::atomic<size_t> count{0};
 
-    mach_port_t task = mach_task_self();
-    vm_address_t addr = 0;
-    vm_size_t vmsize = 0;
-    uint32_t depth = 1;
-    struct vm_region_submap_info_64 info;
-    mach_msg_type_number_t count;
+    bool init() {
+        void* mem = mmap(nullptr, kTrackCap * sizeof(std::atomic<uintptr_t>),
+                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED) return false;
+        slots = static_cast<std::atomic<uintptr_t>*>(mem);
+        return true;
+    }
 
-    while (true) {
-        count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = vm_region_recurse_64(task, &addr, &vmsize, &depth,
-            reinterpret_cast<vm_region_recurse_info_t>(&info), &count);
-        if (kr != KERN_SUCCESS) break;
-
-        if (info.is_submap) { depth++; continue; }
-
-        bool is_rw = (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) ==
-                     (VM_PROT_READ | VM_PROT_WRITE);
-        unsigned tag = info.user_tag;
-        bool is_malloc = (tag == 1 || tag == 2 || tag == 3 || tag == 4 ||
-                          tag == 7 || tag == 8 || tag == 9 || tag == 12 || tag == 23);
-
-        if (is_rw && is_malloc && vmsize >= smash::kPageSize) {
-            uintptr_t region_end = addr + vmsize;
-            if (bootstrap.owns(reinterpret_cast<void*>(addr))) {
-                addr = region_end;
-                continue;
-            }
-            for (uintptr_t p = addr; p < region_end; p += smash::kPageSize) {
-                size_t idx = g_vm.trackPage(p);
-                if (idx > 0 && g_states.get(idx) == smash::PageState::EMPTY) {
-                    g_states.set(idx, smash::PageState::ACTIVE);
-                    new_pages++;
+    void track(uintptr_t page_addr) {
+        if (!slots || !page_addr) return;
+        size_t idx = (page_addr >> 14) % kTrackCap;  // 14 = log2(16384)
+        for (size_t probe = 0; probe < 128; ++probe) {
+            size_t i = (idx + probe) % kTrackCap;
+            uintptr_t cur = slots[i].load(std::memory_order_relaxed);
+            if (cur == page_addr) return;
+            if (cur == 0) {
+                uintptr_t expected = 0;
+                if (slots[i].compare_exchange_weak(expected, page_addr,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    count.fetch_add(1, std::memory_order_relaxed);
+                    return;
                 }
-                if (g_vm.committedPages() >= g_vm.totalPages() - 100)
-                    goto done;
+                if (expected == page_addr) return;
             }
         }
-        addr += vmsize;
     }
-done:
-    if (new_pages > 0)
-        g_track_count.fetch_add(new_pages, std::memory_order_relaxed);
+};
+
+// ── Globals ──────────────────────────────────────────────────────────────────
+
+static PageTracker g_tracker;
+static std::atomic<bool> g_inited{false};
+
+using malloc_fn  = void*(*)(size_t);
+using free_fn    = void(*)(void*);
+using calloc_fn  = void*(*)(size_t, size_t);
+using realloc_fn = void*(*)(void*, size_t);
+
+static inline void track_pages(void* ptr, size_t size) {
+    if (!ptr || !size || !g_inited.load(std::memory_order_relaxed)) return;
+    uintptr_t start = reinterpret_cast<uintptr_t>(ptr) & ~(uintptr_t)(kPageSize - 1);
+    uintptr_t end = (reinterpret_cast<uintptr_t>(ptr) + size - 1) & ~(uintptr_t)(kPageSize - 1);
+    for (uintptr_t p = start; p <= end; p += kPageSize)
+        g_tracker.track(p);
 }
 
-} // namespace co
-
-// ── malloc/free interposition ───────────────────────────────────────────────
-
-using malloc_fn   = void*(*)(size_t);
-using free_fn     = void(*)(void*);
-using calloc_fn   = void*(*)(size_t, size_t);
-using realloc_fn  = void*(*)(void*, size_t);
-using memalign_fn = int(*)(void**, size_t, size_t);
-using mmap_fn_t   = void*(*)(void*, size_t, int, int, int, off_t);
+// ── malloc/free/calloc/realloc wrappers ──────────────────────────────────────
 
 extern "C" void* co_malloc(size_t size);
 CO_INTERPOSE(co_malloc, malloc);
 extern "C" void* co_malloc(size_t size) {
     void* ptr = CO_ORIG(malloc_fn, co_malloc)(size);
-    co::trackMalloc(ptr, size);
+    track_pages(ptr, size);
     return ptr;
 }
 
@@ -108,8 +111,7 @@ extern "C" void* co_calloc(size_t count, size_t size);
 CO_INTERPOSE(co_calloc, calloc);
 extern "C" void* co_calloc(size_t count, size_t size) {
     void* ptr = CO_ORIG(calloc_fn, co_calloc)(count, size);
-    if (ptr && co::g_inited.load(std::memory_order_relaxed))
-        co::trackAllocation(ptr, count * size);
+    track_pages(ptr, count * size);
     return ptr;
 }
 
@@ -117,243 +119,155 @@ extern "C" void* co_realloc(void* old_ptr, size_t size);
 CO_INTERPOSE(co_realloc, realloc);
 extern "C" void* co_realloc(void* old_ptr, size_t size) {
     void* ptr = CO_ORIG(realloc_fn, co_realloc)(old_ptr, size);
-    if (ptr && co::g_inited.load(std::memory_order_relaxed))
-        co::trackAllocation(ptr, size);
+    track_pages(ptr, size);
     return ptr;
 }
+
+using posix_memalign_fn = int(*)(void**, size_t, size_t);
+using valloc_fn = void*(*)(size_t);
 
 extern "C" int co_posix_memalign(void** memptr, size_t alignment, size_t size);
 CO_INTERPOSE(co_posix_memalign, posix_memalign);
 extern "C" int co_posix_memalign(void** memptr, size_t alignment, size_t size) {
-    int ret = CO_ORIG(memalign_fn, co_posix_memalign)(memptr, alignment, size);
-    if (ret == 0 && *memptr && co::g_inited.load(std::memory_order_relaxed))
-        co::trackAllocation(*memptr, size);
+    int ret = CO_ORIG(posix_memalign_fn, co_posix_memalign)(memptr, alignment, size);
+    if (ret == 0 && *memptr) track_pages(*memptr, size);
     return ret;
 }
+
+extern "C" void* co_valloc(size_t size);
+CO_INTERPOSE(co_valloc, valloc);
+extern "C" void* co_valloc(size_t size) {
+    void* ptr = CO_ORIG(valloc_fn, co_valloc)(size);
+    track_pages(ptr, size);
+    return ptr;
+}
+
+using reallocf_fn = void*(*)(void*, size_t);
+using strdup_fn = char*(*)(const char*);
+
+extern "C" void* co_reallocf(void* old_ptr, size_t size);
+CO_INTERPOSE(co_reallocf, reallocf);
+extern "C" void* co_reallocf(void* old_ptr, size_t size) {
+    void* ptr = CO_ORIG(reallocf_fn, co_reallocf)(old_ptr, size);
+    track_pages(ptr, size);
+    return ptr;
+}
+
+extern "C" char* co_strdup(const char* s);
+CO_INTERPOSE(co_strdup, strdup);
+extern "C" char* co_strdup(const char* s) {
+    char* ptr = CO_ORIG(strdup_fn, co_strdup)(s);
+    if (ptr) track_pages(ptr, __builtin_strlen(s) + 1);
+    return ptr;
+}
+
+// ── mmap interposition (catches system malloc's internal allocations) ─────────
+
+using mmap_fn = void*(*)(void*, size_t, int, int, int, off_t);
 
 extern "C" void* co_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset);
 CO_INTERPOSE(co_mmap, mmap);
 extern "C" void* co_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
-    void* ret = CO_ORIG(mmap_fn_t, co_mmap)(addr, len, prot, flags, fd, offset);
-    if (ret != MAP_FAILED && co::g_inited.load(std::memory_order_relaxed)) {
-        if ((flags & MAP_ANON) && (prot & PROT_WRITE))
-            co::trackAllocation(ret, len);
-    }
+    void* ret = CO_ORIG(mmap_fn, co_mmap)(addr, len, prot, flags, fd, offset);
+    if (ret != MAP_FAILED && (flags & MAP_ANONYMOUS) && (prot & PROT_WRITE))
+        track_pages(ret, len);
     return ret;
 }
 
-// ── Syscall interposition ───────────────────────────────────────────────────
+// ── At-exit compression ratio report ─────────────────────────────────────────
 
-using read_fn_t = ssize_t(*)(int, void*, size_t);
-using write_fn_t = ssize_t(*)(int, const void*, size_t);
-using pread_fn_t = ssize_t(*)(int, void*, size_t, off_t);
-using pwrite_fn_t = ssize_t(*)(int, const void*, size_t, off_t);
-using readv_fn_t = ssize_t(*)(int, const struct iovec*, int);
-using writev_fn_t = ssize_t(*)(int, const struct iovec*, int);
-using recv_fn_t = ssize_t(*)(int, void*, size_t, int);
-using send_fn_t = ssize_t(*)(int, const void*, size_t, int);
-using poll_fn_t = int(*)(struct pollfd*, nfds_t, int);
-using kevent_fn_t = int(*)(int, const struct kevent*, int, struct kevent*, int, const struct timespec*);
+static void report_ratios() {
+    mach_port_t task = mach_task_self();
+    int lz4_bound = LZ4_compressBound(kPageSize);
+    size_t zstd_bound = ZSTD_compressBound(kPageSize);
+    size_t comp_sz = ((size_t)lz4_bound > zstd_bound) ? (size_t)lz4_bound : zstd_bound;
+    char* page_buf = (char*)mmap(nullptr, kPageSize, PROT_READ|PROT_WRITE,
+                                  MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    char* comp_buf = (char*)mmap(nullptr, comp_sz, PROT_READ|PROT_WRITE,
+                                  MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (page_buf == MAP_FAILED || comp_buf == MAP_FAILED) return;
 
-// Helper macros for common warm+pin+call+unpin pattern
-#define CO_SYSCALL_RW(name, fn_type, ...) \
-    extern "C" auto co_##name(__VA_ARGS__); \
-    CO_INTERPOSE(co_##name, name);
+    size_t pages_ok = 0, total_bytes = 0, lz4_bytes = 0, zstd1_bytes = 0;
+    size_t pages_scanned = 0;
 
-extern "C" ssize_t co_read(int fd, void* buf, size_t count);
-CO_INTERPOSE(co_read, read);
-extern "C" ssize_t co_read(int fd, void* buf, size_t count) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
-    ssize_t ret = CO_ORIG(read_fn_t, co_read)(fd, buf, count);
-    return ret;
-}
+    // Scan all anonymous RW VM regions via mach_vm_region_recurse.
+    // This catches pages from system malloc's mach_vm_allocate zones
+    // that our malloc interposition can't see.
+    vm_address_t addr = 0;
+    vm_size_t vmsize = 0;
+    uint32_t depth = 1;
+    struct vm_region_submap_info_64 info;
+    mach_msg_type_number_t count;
 
-extern "C" ssize_t co_write(int fd, const void* buf, size_t count);
-CO_INTERPOSE(co_write, write);
-extern "C" ssize_t co_write(int fd, const void* buf, size_t count) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
-    ssize_t ret = CO_ORIG(write_fn_t, co_write)(fd, buf, count);
-    return ret;
-}
+    while (pages_ok < 100000) {
+        count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = vm_region_recurse_64(task, &addr, &vmsize, &depth,
+            reinterpret_cast<vm_region_recurse_info_t>(&info), &count);
+        if (kr != KERN_SUCCESS) break;
 
-extern "C" ssize_t co_pread(int fd, void* buf, size_t count, off_t offset);
-CO_INTERPOSE(co_pread, pread);
-extern "C" ssize_t co_pread(int fd, void* buf, size_t count, off_t offset) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
-    ssize_t ret = CO_ORIG(pread_fn_t, co_pread)(fd, buf, count, offset);
-    return ret;
-}
+        if (info.is_submap) { depth++; continue; }
 
-extern "C" ssize_t co_pwrite(int fd, const void* buf, size_t count, off_t offset);
-CO_INTERPOSE(co_pwrite, pwrite);
-extern "C" ssize_t co_pwrite(int fd, const void* buf, size_t count, off_t offset) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && count) smash::vm::warmPages(buf, count, vm);
-    ssize_t ret = CO_ORIG(pwrite_fn_t, co_pwrite)(fd, buf, count, offset);
-    return ret;
-}
+        bool is_rw = (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) ==
+                     (VM_PROT_READ | VM_PROT_WRITE);
+        unsigned tag = info.user_tag;
+        bool is_malloc = (tag == 1 || tag == 2 || tag == 3 || tag == 4 ||
+                          tag == 7 || tag == 8 || tag == 9 || tag == 12 || tag == 23);
 
-extern "C" ssize_t co_readv(int fd, const struct iovec* iov, int iovcnt);
-CO_INTERPOSE(co_readv, readv);
-extern "C" ssize_t co_readv(int fd, const struct iovec* iov, int iovcnt) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) co::warmIovec(iov, iovcnt, vm);
-    ssize_t ret = CO_ORIG(readv_fn_t, co_readv)(fd, iov, iovcnt);
-    return ret;
-}
+        if (is_rw && is_malloc && vmsize >= kPageSize) {
+            for (vm_address_t p = addr; p < addr + vmsize && pages_ok < 100000; p += kPageSize) {
+                pages_scanned++;
+                vm_size_t out_size = 0;
+                vm_offset_t data_out = 0;
+                kr = vm_read(task, p, kPageSize, &data_out, (mach_msg_type_number_t*)&out_size);
+                if (kr != KERN_SUCCESS || out_size != kPageSize) continue;
+                memcpy(page_buf, (void*)data_out, kPageSize);
+                vm_deallocate(task, data_out, out_size);
 
-extern "C" ssize_t co_writev(int fd, const struct iovec* iov, int iovcnt);
-CO_INTERPOSE(co_writev, writev);
-extern "C" ssize_t co_writev(int fd, const struct iovec* iov, int iovcnt) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && iov && iovcnt > 0) co::warmIovec(iov, iovcnt, vm);
-    ssize_t ret = CO_ORIG(writev_fn_t, co_writev)(fd, iov, iovcnt);
-    return ret;
-}
+                bool zero = true;
+                for (size_t j = 0; j < kPageSize; j += 8)
+                    if (*(uint64_t*)(page_buf + j)) { zero = false; break; }
+                if (zero) continue;
 
-extern "C" ssize_t co_recv(int s, void* buf, size_t len, int flags);
-CO_INTERPOSE(co_recv, recv);
-extern "C" ssize_t co_recv(int s, void* buf, size_t len, int flags) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) smash::vm::warmPages(buf, len, vm);
-    ssize_t ret = CO_ORIG(recv_fn_t, co_recv)(s, buf, len, flags);
-    return ret;
-}
+                pages_ok++;
+                total_bytes += kPageSize;
 
-extern "C" ssize_t co_send(int s, const void* buf, size_t len, int flags);
-CO_INTERPOSE(co_send, send);
-extern "C" ssize_t co_send(int s, const void* buf, size_t len, int flags) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && buf && len) smash::vm::warmPages(buf, len, vm);
-    ssize_t ret = CO_ORIG(send_fn_t, co_send)(s, buf, len, flags);
-    return ret;
-}
+                int lz4_sz = LZ4_compress_default(page_buf, comp_buf, kPageSize, lz4_bound);
+                lz4_bytes += (lz4_sz > 0) ? (size_t)lz4_sz : kPageSize;
 
-extern "C" int co_poll(struct pollfd* fds, nfds_t nfds, int timeout);
-CO_INTERPOSE(co_poll, poll);
-extern "C" int co_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm && fds && nfds > 0) {
-        smash::vm::warmPages(fds, nfds * sizeof(struct pollfd), vm);
-    }
-    int ret = CO_ORIG(poll_fn_t, co_poll)(fds, nfds, timeout);
-    return ret;
-}
-
-extern "C" int co_kevent(int kq, const struct kevent* changelist, int nchanges,
-                          struct kevent* eventlist, int nevents,
-                          const struct timespec* timeout);
-CO_INTERPOSE(co_kevent, kevent);
-extern "C" int co_kevent(int kq, const struct kevent* changelist, int nchanges,
-                          struct kevent* eventlist, int nevents,
-                          const struct timespec* timeout) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm) {
-        if (changelist && nchanges > 0) {
-            smash::vm::warmPages(changelist, nchanges * sizeof(struct kevent), vm);
+                size_t z1 = ZSTD_compress(comp_buf, zstd_bound, page_buf, kPageSize, 1);
+                zstd1_bytes += ZSTD_isError(z1) ? kPageSize : z1;
+            }
         }
-        if (eventlist && nevents > 0) {
-            smash::vm::warmPages(eventlist, nevents * sizeof(struct kevent), vm);
-        }
+        addr += vmsize;
     }
-    int ret = CO_ORIG(kevent_fn_t, co_kevent)(kq, changelist, nchanges, eventlist, nevents, timeout);
-    return ret;
-}
 
-// ── Buffered I/O interposition ──────────────────────────────────────────────
+    munmap(page_buf, kPageSize);
+    munmap(comp_buf, comp_sz);
 
-static inline void warmFileBuffer(FILE* stream, smash::VmRegion* vm) {
-    if (!stream) return;
-    void* base = stream->_bf._base;
-    int size = stream->_bf._size;
-    if (base && size > 0) {
-        smash::vm::warmPages(base, size, vm);
+    if (total_bytes > 0) {
+        size_t tracked = g_tracker.count.load(std::memory_order_relaxed);
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg),
+            "[compress-only] tracked=%zu scanned=%zu nonzero=%zu data=%.1fMiB "
+            "lz4=%.2fx zstd1=%.2fx\n",
+            tracked, pages_scanned, pages_ok, total_bytes / (1024.0 * 1024.0),
+            (double)total_bytes / lz4_bytes,
+            (double)total_bytes / zstd1_bytes);
+        (void)!write(STDERR_FILENO, msg, n);
     }
 }
 
-using fread_fn_t = size_t(*)(void*, size_t, size_t, FILE*);
-using fgets_fn_t = char*(*)(char*, int, FILE*);
-using fgetc_fn_t = int(*)(FILE*);
-using fwrite_fn_t = size_t(*)(const void*, size_t, size_t, FILE*);
-using fflush_fn_t = int(*)(FILE*);
-
-extern "C" size_t co_fread(void* ptr, size_t size, size_t nitems, FILE* stream);
-CO_INTERPOSE(co_fread, fread);
-extern "C" size_t co_fread(void* ptr, size_t size, size_t nitems, FILE* stream) {
-    auto* vm = smash::g_smash_vm_region;
-    size_t total = size * nitems;
-    if (vm) {
-        if (ptr && total) smash::vm::warmPages(ptr, total, vm);
-        warmFileBuffer(stream, vm);
-    }
-    size_t ret = CO_ORIG(fread_fn_t, co_fread)(ptr, size, nitems, stream);
-    if (vm) {
-    }
-    return ret;
-}
-
-extern "C" char* co_fgets(char* str, int size, FILE* stream);
-CO_INTERPOSE(co_fgets, fgets);
-extern "C" char* co_fgets(char* str, int size, FILE* stream) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm) {
-        if (str && size > 0) smash::vm::warmPages(str, size, vm);
-        warmFileBuffer(stream, vm);
-    }
-    char* ret = CO_ORIG(fgets_fn_t, co_fgets)(str, size, stream);
-    if (vm) {
-    }
-    return ret;
-}
-
-extern "C" int co_fgetc(FILE* stream);
-CO_INTERPOSE(co_fgetc, fgetc);
-extern "C" int co_fgetc(FILE* stream) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm) warmFileBuffer(stream, vm);
-    int ret = CO_ORIG(fgetc_fn_t, co_fgetc)(stream);
-    return ret;
-}
-
-extern "C" int co_getc(FILE* stream);
-CO_INTERPOSE(co_getc, getc);
-extern "C" int co_getc(FILE* stream) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm) warmFileBuffer(stream, vm);
-    int ret = CO_ORIG(fgetc_fn_t, co_getc)(stream);
-    return ret;
-}
-
-extern "C" size_t co_fwrite(const void* ptr, size_t size, size_t nitems, FILE* stream);
-CO_INTERPOSE(co_fwrite, fwrite);
-extern "C" size_t co_fwrite(const void* ptr, size_t size, size_t nitems, FILE* stream) {
-    auto* vm = smash::g_smash_vm_region;
-    size_t total = size * nitems;
-    if (vm) {
-        if (ptr && total) smash::vm::warmPages(ptr, total, vm);
-        warmFileBuffer(stream, vm);
-    }
-    size_t ret = CO_ORIG(fwrite_fn_t, co_fwrite)(ptr, size, nitems, stream);
-    return ret;
-}
-
-extern "C" int co_fflush(FILE* stream);
-CO_INTERPOSE(co_fflush, fflush);
-extern "C" int co_fflush(FILE* stream) {
-    auto* vm = smash::g_smash_vm_region;
-    if (vm) warmFileBuffer(stream, vm);
-    int ret = CO_ORIG(fflush_fn_t, co_fflush)(stream);
-    return ret;
-}
-
-// ── Library initialization ──────────────────────────────────────────────────
+// ── Init/fini ────────────────────────────────────────────────────────────────
 
 __attribute__((constructor))
 static void co_init() {
-    co::init();
+    if (!g_tracker.init()) return;
+    g_inited.store(true, std::memory_order_release);
+}
+
+__attribute__((destructor))
+static void co_fini() {
+    report_ratios();
 }
 
 #endif // __APPLE__

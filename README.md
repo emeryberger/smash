@@ -45,6 +45,34 @@ These numbers come from `bench/run_paper_experiments.py --compress-only-only` wi
 ![AUC reduction](docs/figures/auc_reduction.png)
 ![Throughput](docs/figures/timing.png)
 
+## Why Not Just Use zswap?
+
+On well-provisioned servers, the Linux kernel's compression cache (zswap) is effectively inert: it only compresses pages evicted under memory pressure, and the kernel strongly prefers evicting file-backed pages over swapping anonymous heap data. Smash compresses proactively based on per-page access tracking — no pressure required.
+
+**Three-way comparison on SQLite (500K rows, EPYC 9R14, 1.5 TB RAM):**
+
+| Metric | glibc | glibc + zswap (cgroup pressure) | smash |
+|--------|:---:|:---:|:---:|
+| Post-cool RSS | 355 MiB | 209 MiB† | **121 MiB** |
+| Anonymous pages compressed | 0 | 5 MiB | **~234 MiB** |
+| Cold access p99 | 2 µs | **2342 µs** | **143 µs** |
+| Throughput | 96k ops/s | 91k ops/s | 88k ops/s |
+
+†Capped by cgroup MemoryHigh; kernel evicts file pages preferentially.
+
+Smash delivers equivalent memory savings to zswap-under-pressure with **16× better decompression latency** and zero configuration. See `docs/smash_vs_zswap_empirical.md` for full methodology.
+
+### Per-page compression ratio
+
+At scale, smash's allocator layout produces pages with the **same compressibility** as jemalloc — the advantage is not in per-page ratio but in which pages get compressed and when:
+
+| Workload | jemalloc | smash (no compression) |
+|----------|------:|------:|
+| Redis 1M keys × 2KB, 50% deleted (1.3 GiB) | 2.7× zstd-1 | 2.7× zstd-1 |
+| SQLite 500K rows (350 MiB) | 3.7× zstd-1 | 3.7× zstd-1 |
+
+Both allocators achieve identical codec ratios on the same data because the page content is dominated by application data (not allocator metadata). Smash's value is in **proactive cold-page identification and compression** — it achieves 58–88% RSS reduction by compressing cold pages that jemalloc (or any standard allocator + zswap) leaves uncompressed on well-provisioned servers.
+
 ## Building
 
 ### Prerequisites

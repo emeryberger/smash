@@ -54,18 +54,28 @@ inline bool commitPages(void* addr, size_t size) {
 }
 
 // Decommit pages (release physical backing but keep virtual reservation).
-inline void decommitPages(void* addr, size_t size) {
-    // SMASH_NO_DECOMMIT=1 — debugging knob to disable physical reclamation.
-    // Useful for diagnosing whether application crashes are caused by
-    // smash zeroing pages that the application still references via a
-    // use-after-free bug. With decommit off, freed pages keep their
-    // contents and the UAF reads stale-but-still-shaped data, like
-    // glibc would. Costs all RSS savings; only for diagnosis.
-    static const bool no_decommit = []{
-        const char* v = std::getenv("SMASH_NO_DECOMMIT");
-        return v && v[0] == '1';
+// Cached at first call (safe — decommitPages is first called during init
+// before the fault handler is active). NOT safe if first call is from the
+// compressor thread inside a signal context; warmupEnvStatics() must
+// trigger this before the compressor starts.
+inline int madvMode() {
+    static const int m = []{
+        const char* v = std::getenv("SMASH_MADV_FREE");
+        return (v && v[0] == '1') ? MADV_FREE : MADV_DONTNEED;
     }();
-    if (no_decommit) return;
+    return m;
+}
+
+inline bool noDecommitEnabled() {
+    static const bool v = []{
+        const char* e = std::getenv("SMASH_NO_DECOMMIT");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+inline void decommitPages(void* addr, size_t size) {
+    if (noDecommitEnabled()) return;
 #if defined(_WIN32)
     VirtualFree(addr, size, MEM_DECOMMIT);
 #elif defined(__linux__)
@@ -82,10 +92,7 @@ inline void decommitPages(void* addr, size_t size) {
     // the (possibly stale, possibly zero) underlying page is observed.
     // SMASH_MADV_FREE=1 selects the lazy path; default DONTNEED preserves the
     // current eager-reclaim RSS behavior.
-    static const int madv = []{
-        const char* v = std::getenv("SMASH_MADV_FREE");
-        return (v && v[0] == '1') ? MADV_FREE : MADV_DONTNEED;
-    }();
+    static const int madv = madvMode();
     madvise(addr, size, madv);
 #elif defined(__APPLE__)
     // MADV_FREE_REUSABLE tells the kernel to reclaim physical backing immediately.

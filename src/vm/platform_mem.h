@@ -13,9 +13,21 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace smash::vm {
+
+// Global bounds for smash's VmRegion. Set during init; protectPages/remapPages/
+// decommitPages assert all calls target addresses within this range.
+inline void* g_vm_bounds_base = nullptr;
+inline size_t g_vm_bounds_size = 0;
+inline void setVmBounds(void* base, size_t size) {
+    g_vm_bounds_base = base;
+    g_vm_bounds_size = size;
+}
 
 // Map anonymous private pages. Returns nullptr on failure.
 inline void* mapPages(size_t size) {
@@ -76,6 +88,21 @@ inline bool noDecommitEnabled() {
 
 inline void decommitPages(void* addr, size_t size) {
     if (noDecommitEnabled()) return;
+    // Bounds check: madvise(DONTNEED) on wrong address drops backing for
+    // libc/ld.so pages, causing mysterious SIGSEGV later.
+    if (g_vm_bounds_base && size <= 4096 * 64) {
+        auto a = reinterpret_cast<uintptr_t>(addr);
+        auto base = reinterpret_cast<uintptr_t>(g_vm_bounds_base);
+        if (a < base || a + size > base + g_vm_bounds_size) {
+            char buf[160];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash FATAL] decommitPages OOB: addr=%p size=%zu "
+                "vm=[%p, +%zu]\n",
+                addr, size, g_vm_bounds_base, g_vm_bounds_size);
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+            __builtin_trap();
+        }
+    }
 #if defined(_WIN32)
     VirtualFree(addr, size, MEM_DECOMMIT);
 #elif defined(__linux__)
@@ -107,6 +134,9 @@ inline void unmapPages(void* addr, size_t size) {
 #if defined(_WIN32)
     VirtualFree(addr, 0, MEM_RELEASE);
 #else
+    // Note: small unmaps outside VmRegion are legitimate — LargeAlloc
+    // falls back to direct mmap for oversized allocations, and deallocate
+    // unmaps them here. Do NOT trap on these.
     munmap(addr, size);
 #endif
 }
@@ -130,7 +160,32 @@ inline bool protectPages(void* addr, size_t size, bool read, bool write) {
     int prot = PROT_NONE;
     if (read) prot |= PROT_READ;
     if (write) prot |= PROT_WRITE;
+
+    // Bounds check: if VmRegion bounds are set, verify we're not accidentally
+    // mprotecting a page outside our arena (which would corrupt libc/ld.so).
+    if (g_vm_bounds_base && size <= 4096) {
+        auto a = reinterpret_cast<uintptr_t>(addr);
+        auto base = reinterpret_cast<uintptr_t>(g_vm_bounds_base);
+        if (a < base || a + size > base + g_vm_bounds_size) {
+            // Out of bounds! This is the bug. Trap with diagnostic.
+            char buf[160];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash FATAL] protectPages OOB: addr=%p size=%zu prot=%d "
+                "vm=[%p, +%zu]\n",
+                addr, size, prot, g_vm_bounds_base, g_vm_bounds_size);
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+            __builtin_trap();
+        }
+    }
+
+#if defined(__linux__)
+    // Direct syscall: the libc mprotect wrapper may access TLS (for errno)
+    // which can live on a smash-compressed page — causing infinite SIGSEGV
+    // recursion when called from the fault handler.
+    if (syscall(SYS_mprotect, addr, size, prot) == 0) return true;
+#else
     if (mprotect(addr, size, prot) == 0) return true;
+#endif
     int err = errno;
     static const bool trace = []{
         const char* v = getenv("SMASH_TRACE_MPROTECT_FAIL");
@@ -160,12 +215,57 @@ inline bool remapPages(void* addr, size_t size, bool read, bool write) {
     // VirtualProtect — fall back to a plain protect call.
     return protectPages(addr, size, read, write);
 #else
+    // Bounds check: MAP_FIXED destroys any existing mapping at the target.
+    // If addr is outside VmRegion, this would corrupt libc/ld.so mappings.
+    if (g_vm_bounds_base) {
+        auto a = reinterpret_cast<uintptr_t>(addr);
+        auto base = reinterpret_cast<uintptr_t>(g_vm_bounds_base);
+        if (a < base || a + size > base + g_vm_bounds_size) {
+            char buf[160];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash FATAL] remapPages OOB: addr=%p size=%zu "
+                "vm=[%p, +%zu]\n",
+                addr, size, g_vm_bounds_base, g_vm_bounds_size);
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+            __builtin_trap();
+        }
+    }
+
     int prot = PROT_NONE;
     if (read) prot |= PROT_READ;
     if (write) prot |= PROT_WRITE;
     void* p = mmap(addr, size, prot,
                    MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
     return p == addr;
+#endif
+}
+
+// Pin pages in physical memory (prevent swap/reclaim under cgroup pressure).
+// Returns true on success.  mlock counts against RLIMIT_MEMLOCK; most Linux
+// distros default to 64 KiB per-user which is too low — CAP_IPC_LOCK or
+// raising the limit is required for large regions.  Failures are silent.
+inline bool lockPages(void* addr, size_t size) {
+#if defined(_WIN32)
+    return VirtualLock(addr, size) != 0;
+#else
+    return mlock(addr, size) == 0;
+#endif
+}
+
+inline void unlockPages(void* addr, size_t size) {
+#if defined(_WIN32)
+    VirtualUnlock(addr, size);
+#else
+    munlock(addr, size);
+#endif
+}
+
+// Hint to the kernel that pages will be needed soon (raises LRU priority,
+// faults in pages that were swapped out).  Lighter than mlock — no hard pin,
+// just a strong keep-in-RAM signal.
+inline void willNeedPages(void* addr, size_t size) {
+#if !defined(_WIN32)
+    madvise(addr, size, MADV_WILLNEED);
 #endif
 }
 

@@ -216,6 +216,12 @@ set_target_properties(smash PROPERTIES
   OUTPUT_NAME "smash"
   PREFIX "lib"
 )
+# Bind all PLT entries at load time (no lazy binding). The SIGSEGV handler
+# must never trigger _dl_runtime_resolve — the dynamic linker's hash tables
+# may live on smash-compressed pages, causing infinite signal recursion.
+if(NOT APPLE)
+  target_link_options(smash PRIVATE "LINKER:-z,now")
+endif()
 
 # ── Ablation defines (override config.h defaults via -DSMASH_*=value) ────────
 # Numeric overrides (only when non-empty)

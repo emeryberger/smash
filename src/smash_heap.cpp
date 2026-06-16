@@ -207,6 +207,8 @@ thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
 __attribute__((tls_model("initial-exec")))
 thread_local int smash::g_full_mode_cached = -1;
 
+__attribute__((tls_model("initial-exec")))
+thread_local bool smash::g_compressor_thread = false;
 
 // free()-path last-span cache (see smash_heap.h). Starts empty: the [base,end)
 // range is [0,0) so no address can hit it before the first resolve, and the

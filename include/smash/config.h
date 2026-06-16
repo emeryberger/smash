@@ -670,7 +670,14 @@ inline size_t largeOnlyThreshold() {
 // threads (e.g. WiredTiger's eviction threads) that would crash on PROT_NONE.
 [[gnu::always_inline, gnu::hot]]
 inline bool isDeferredReclaimMode() {
-    return true;
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* env = getenv("SMASH_DEFERRED_RECLAIM");
+        v = (env && env[0] == '1') ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
 }
 
 inline int getDeferredReclaimDelay() {

@@ -81,4 +81,6 @@ jobs:
       # bench/run_quick_ci.py for the parsing + thresholds.
       - name: Run quick benchmarks
         working-directory: smash
+        env:
+          SMASH_FIXAV: "0"
         run: python3 bench/run_quick_ci.py --build-dir build

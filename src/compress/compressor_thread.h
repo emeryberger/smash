@@ -71,9 +71,11 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 
 namespace smash {
 
-// Compressor thread bypass flag (defined in smash_heap.h/cpp).
-extern __attribute__((tls_model("initial-exec")))
-    thread_local bool g_compressor_thread;
+// Compressor thread bypass flag. inline thread_local (C++17) gives a single
+// definition across all TUs — both libsmash.so and test executables that
+// include this header directly without linking smash_heap.cpp.
+inline __attribute__((tls_model("initial-exec")))
+    thread_local bool g_compressor_thread = false;
 
 // ── Optional remote-core store-drain barrier ───────────────────────────────
 // SMASH_PROT_READ_BARRIER=1 enables a syscall after mprotect(PROT_READ)

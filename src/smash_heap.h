@@ -88,12 +88,8 @@ extern __attribute__((tls_model("initial-exec")))
 extern __attribute__((tls_model("initial-exec")))
     thread_local int g_full_mode_cached;  // -1 = unknown, 0 = bypass, 1 = full
 
-// Set by the compressor/helper threads to route their malloc calls to the
-// system allocator. Prevents the compressor from allocating slab pages that
-// it will later compress (causing SIGSEGV recursion when libc code on the
-// compressor thread accesses its own allocations on compressed pages).
-extern __attribute__((tls_model("initial-exec")))
-    thread_local bool g_compressor_thread;
+// Compressor thread bypass flag — defined as inline thread_local in
+// compressor_thread.h (included above). Used here on the malloc fast path.
 
 // free()-path last-span cache. The dominant cost of free() at scale is the
 // single load from the 128 MB flat page→Span table (a near-random access that

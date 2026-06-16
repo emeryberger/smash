@@ -64,7 +64,7 @@ add_test(NAME test_compression COMMAND test_compression)
 # directly checks Phase-3 PROT_READ states (ACTIVE_MONITORING) which
 # don't exist under the soft-dirty path.
 set_tests_properties(test_compression PROPERTIES
-  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0")
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
 
 # Compression-ratio test (needs LZ4 + zstd): verifies the engine hits the
 # paper's claimed ratios (RQ2), not just "compressed > 0". In-process,
@@ -107,7 +107,7 @@ endif()
 add_test(NAME test_prefetch COMMAND test_prefetch)
 # Pin SMASH_SOFTDIRTY=0 — test directly drives PROT_READ-based Phase 3.
 set_tests_properties(test_prefetch PROPERTIES
-  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0")
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
 
 # Contention test (needs LZ4 + zstd + smash_heap.cpp)
 add_executable(test_contention
@@ -138,7 +138,7 @@ add_test(NAME test_fault_cycle COMMAND test_fault_cycle)
 # SMASH_COLD_TIMEOUT_SEC=1 sets cold_ticks_overridden, which bypasses the
 # CPU-pressure floor multiplier (see compressor_thread.h::phase2Range).
 set_tests_properties(test_fault_cycle PROPERTIES
-  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0;SMASH_COLD_TIMEOUT_SEC=1")
+  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0;SMASH_COLD_TIMEOUT_SEC=1;SMASH_FIXAV=0")
 
 # Interposition test: built without alloc8 linkage, run under DYLD_INSERT
 add_executable(interpose_test interpose_test.cpp)

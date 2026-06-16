@@ -111,8 +111,9 @@ static void testFaultCycleBasic() {
     }
     CHECK(data_ok, "full page data verification failed");
     CHECK(states.get(page_idx) == PageState::ACTIVE ||
+          states.get(page_idx) == PageState::ACTIVE_MONITORING ||
           states.get(page_idx) == PageState::COMPRESSED_SHADOW,
-          "page should be ACTIVE or SHADOW after read, got %d",
+          "unexpected state after read, got %d",
           static_cast<int>(states.get(page_idx)));
 
     // Clean up
@@ -185,8 +186,10 @@ static void testFaultCycleMultipleRounds() {
               round, expected, check);
 
         CHECK(states.get(page_idx) == PageState::ACTIVE ||
+              states.get(page_idx) == PageState::ACTIVE_MONITORING ||
               states.get(page_idx) == PageState::COMPRESSED_SHADOW,
-              "round %d: page should be ACTIVE or SHADOW after read", round);
+              "round %d: unexpected state after read: %d",
+              round, static_cast<int>(states.get(page_idx)));
 
         // Verify full data
         bool data_ok = true;

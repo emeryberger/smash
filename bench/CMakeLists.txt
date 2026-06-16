@@ -199,6 +199,12 @@ smash_add_standalone_bench(bench_coldhotmix bench_coldhotmix.cpp)
 # regime that discriminates a Lindy/Bayesian compress gate from blunt backoff.
 smash_add_standalone_bench(bench_zipf_reaccess bench_zipf_reaccess.cpp)
 
+# ML model serving scenario (multiple models, sparse activation)
+smash_add_standalone_bench(bench_model_serving bench_model_serving.cpp)
+
+# Concurrent builds scenario (multiple jobs with cold IR heaps)
+smash_add_standalone_bench(bench_concurrent_builds bench_concurrent_builds.cpp)
+
 # ── SQLite amalgamation (for bench_sqlite) ─────────────────────────────────
 FetchContent_Declare(
   sqlite3

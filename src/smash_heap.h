@@ -88,6 +88,9 @@ extern __attribute__((tls_model("initial-exec")))
 extern __attribute__((tls_model("initial-exec")))
     thread_local int g_full_mode_cached;  // -1 = unknown, 0 = bypass, 1 = full
 
+// Compressor thread bypass flag — defined as inline thread_local in
+// compressor_thread.h (included above). Used here on the malloc fast path.
+
 // free()-path last-span cache. The dominant cost of free() at scale is the
 // single load from the 128 MB flat page→Span table (a near-random access that
 // misses cache once the live set is large). Consecutive frees overwhelmingly
@@ -958,6 +961,16 @@ public:
         // a smash-allocated pointer leaking into passthrough mode causes
         // "invalid pointer" aborts when realloc/free reach the system.
         if (isPassthroughMode()) {
+            if (!g_system_alloc.malloc) g_system_alloc.resolve();
+            if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
+            return nullptr;
+        }
+
+        // Compressor threads route all allocations to the system allocator.
+        // This prevents the compressor from allocating slab pages that it
+        // will later compress — which causes SIGSEGV recursion when libc
+        // functions on the compressor thread access their own heap data.
+        if (g_compressor_thread) {
             if (!g_system_alloc.malloc) g_system_alloc.resolve();
             if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
             return nullptr;

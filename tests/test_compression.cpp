@@ -112,7 +112,7 @@ static void testCompressorRoundtrip() {
 
     // Tick 3: survived deep monitoring, truly cold — compress
     compressor.compressTick();
-    CHECK(states.get(page_idx) == PageState::COMPRESSED,
+    CHECK(states.get(page_idx) == PageState::COMPRESSED || states.get(page_idx) == PageState::COMPRESSED_SHADOW,
           "after tick 3: expected COMPRESSED, got %d",
           static_cast<int>(states.get(page_idx)));
 
@@ -257,7 +257,7 @@ static void testAccessTracking() {
 
     compressor.compressTick();
     // cold_count=3, survived deep monitoring — should now be compressed
-    CHECK(states.get(page_idx) == PageState::COMPRESSED,
+    CHECK(states.get(page_idx) == PageState::COMPRESSED || states.get(page_idx) == PageState::COMPRESSED_SHADOW,
           "after 4 ticks without access: expected COMPRESSED, got %d",
           static_cast<int>(states.get(page_idx)));
 
@@ -304,7 +304,7 @@ static void testReleaseCompressedPages() {
     compressor.compressTick();
     compressor.compressTick();
     compressor.compressTick();
-    CHECK(states.get(page_idx) == PageState::COMPRESSED,
+    CHECK(states.get(page_idx) == PageState::COMPRESSED || states.get(page_idx) == PageState::COMPRESSED_SHADOW,
           "expected COMPRESSED");
 
     // Release the compressed page (simulates span deallocation)

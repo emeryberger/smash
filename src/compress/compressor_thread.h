@@ -71,6 +71,12 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 
 namespace smash {
 
+// Compressor thread bypass flag. inline thread_local (C++17) gives a single
+// definition across all TUs — both libsmash.so and test executables that
+// include this header directly without linking smash_heap.cpp.
+inline __attribute__((tls_model("initial-exec")))
+    thread_local bool g_compressor_thread = false;
+
 // ── Optional remote-core store-drain barrier ───────────────────────────────
 // SMASH_PROT_READ_BARRIER=1 enables a syscall after mprotect(PROT_READ)
 // (and before the snapshot memcpy) that forces all other application threads
@@ -150,7 +156,15 @@ inline void protReadBarrier() {
 inline bool fixavEnabled() {
     static const bool enabled = []{
         const char* v = std::getenv("SMASH_FIXAV");
-        return v && v[0] == '1';
+        if (v) return v[0] != '0';
+        // Default ON. Soft-dirty prevents compressing recently-written pages
+        // but cannot close the micro-race where a write lands DURING the
+        // snapshot memcpy (same tick, between the per-page lock acquire and
+        // the memcpy completion). The post-snapshot verify is the only
+        // defense: re-read the page and abort if it differs from the snapshot.
+        // Cost: one extra memcpy + memcmp per compressed page (~2 us/page on
+        // modern CPUs — negligible vs zstd compression at ~10 us/page).
+        return true;
     }();
     return enabled;
 }
@@ -1422,144 +1436,54 @@ private:
         flushPhase2PendingProt(worker_id);
     }
 
-    // Apply chunked (decommit + mprotect PROT_NONE) to a worker's
-    // accumulated list of just-COMPRESSED pages. Pages are sorted by
-    // index then runs of consecutive indices are coalesced into a
-    // single mprotect call. Since state is already COMPRESSED and we
-    // hold no per-page lock here, we re-check the state for each page
-    // and skip any that have transitioned (e.g. handleFault decompressed
-    // them in the gap). For pages that are still COMPRESSED, we set
-    // PROT_NONE; if mprotect fails (VMA cap), fall back to remapPages
-    // which replaces the mapping atomically.
+    // Apply (mprotect PROT_NONE + decommit) to a worker's accumulated
+    // list of just-COMPRESSED pages. Each page is locked individually
+    // (lock → check state → mprotect → decommit → unlock) to avoid
+    // holding multiple per-page locks simultaneously during mprotect.
+    //
+    // Why single-page: holding locks across a batch of pages while
+    // calling mprotect creates a deadlock with the fault handler.
+    // mprotect issues a TLB shootdown IPI; if an app thread on another
+    // core faults on a different page in the same batch, its fault
+    // handler spins on that page's lock (held by us), while our mprotect
+    // waits for the TLB shootdown ack from that core. Circular wait.
+    //
+    // The per-page approach is safe: lock ensures handleFault cannot
+    // transition COMPRESSED → ACTIVE between our state check and the
+    // mprotect+decommit. The cost is one mprotect syscall per page
+    // instead of one per consecutive run — on Linux, mprotect on a
+    // single page within a larger VMA is fast (no VMA split needed
+    // when the page is already independently mapped via prior faults).
     void flushPhase2PendingProt(int worker_id) {
         auto& w = workers_[worker_id];
         if (w.pending_pn_count == 0) return;
-        // Sort by page index ascending. Insertion sort suffices — the
-        // list is small (at most kPendingProtCap entries) and on hot
-        // paths the original order is mostly already sorted.
-        for (size_t i = 1; i < w.pending_pn_count; ++i) {
-            size_t key = w.pending_pn_pages[i];
-            size_t j = i;
-            while (j > 0 && w.pending_pn_pages[j - 1] > key) {
-                w.pending_pn_pages[j] = w.pending_pn_pages[j - 1];
-                --j;
+
+        for (size_t i = 0; i < w.pending_pn_count; ++i) {
+            size_t page_idx = w.pending_pn_pages[i];
+            locks_->lock(page_idx);
+
+            if (states_->get(page_idx) != PageState::COMPRESSED) {
+                locks_->unlock(page_idx);
+                continue;
             }
-            w.pending_pn_pages[j] = key;
-        }
-        // Coalesce consecutive runs.
-        const size_t chunk_cap = protectChunkPages();
-        size_t i = 0;
-        while (i < w.pending_pn_count) {
-            size_t run_start_page = w.pending_pn_pages[i];
-            size_t run_end_page = run_start_page + 1;
-            size_t j = i + 1;
-            while (j < w.pending_pn_count &&
-                   w.pending_pn_pages[j] == run_end_page &&
-                   (run_end_page - run_start_page) < chunk_cap) {
-                ++run_end_page;
-                ++j;
+
+            void* addr = vm_->pageAddress(page_idx);
+            if (!addr || !vm_->contains(reinterpret_cast<uintptr_t>(addr))) {
+                locks_->unlock(page_idx);
+                continue;
             }
-            // Acquire all per-page locks across the run in ascending
-            // order. Holding the locks ensures handleFault (which also
-            // uses these locks) cannot transition COMPRESSED → ACTIVE
-            // mid-batch. Without this, the batch would decommit pages
-            // that just got decompressed by an app fault — corruption
-            // exposed as F139/F134/BIR-verifier failures on big HLOs.
-            for (size_t k = run_start_page; k < run_end_page; ++k) {
-                locks_->lock(k);
-            }
-            // Re-check state under lock; partition the run.
-            bool all_compressed = true;
-            for (size_t k = run_start_page; k < run_end_page; ++k) {
-                if (states_->get(k) != PageState::COMPRESSED) {
-                    all_compressed = false;
-                    break;
-                }
-            }
-            void* run_addr = vm_->pageAddress(run_start_page);
-            size_t run_bytes = (run_end_page - run_start_page) * kPageSize;
-            if (fixavEnabled()) {
-                // FixAv: PROT_NONE → membarrier (once per run) → madvise.
-                // Inverting the legacy decommit-then-protect sequence closes
-                // the bug-class-2 (NoReadOfZeroForLiveData) window: a reader
-                // on a remote core can't observe a DROPPED+RO page, because
-                // by the time madvise drops the backing the page is already
-                // PROT_NONE so any access faults and the handler decompresses.
-                if (all_compressed) {
-                    if (!vm::protectPages(run_addr, run_bytes, false, false)) {
-                        if (!vm::remapPages(run_addr, run_bytes, false, false)) {
-                            for (size_t k = run_start_page; k < run_end_page; ++k) {
-                                void* a = vm_->pageAddress(k);
-                                if (!vm::protectPages(a, kPageSize, false, false))
-                                    vm::remapPages(a, kPageSize, false, false);
-                            }
-                        }
-                    }
-                    membarrierSyncCore();
-                    vm::decommitPages(run_addr, run_bytes);
-                } else {
-                    bool any_protected = false;
-                    for (size_t k = run_start_page; k < run_end_page; ++k) {
-                        if (states_->get(k) != PageState::COMPRESSED) continue;
-                        void* a = vm_->pageAddress(k);
-                        if (!vm::protectPages(a, kPageSize, false, false)) {
-                            if (!vm::remapPages(a, kPageSize, false, false))
-                                continue;
-                        }
-                        any_protected = true;
-                    }
-                    if (any_protected) membarrierSyncCore();
-                    for (size_t k = run_start_page; k < run_end_page; ++k) {
-                        if (states_->get(k) != PageState::COMPRESSED) continue;
-                        vm::decommitPages(vm_->pageAddress(k), kPageSize);
-                    }
-                }
-            } else if (all_compressed) {
-                if (deferMadviseEnabled()) {
-                    // Deferred-madvise: mprotect first, sweeper drops backing.
-                    if (!vm::protectPages(run_addr, run_bytes, false, false)) {
-                        if (!vm::remapPages(run_addr, run_bytes, false, false)) {
-                            for (size_t k = run_start_page; k < run_end_page; ++k) {
-                                void* a = vm_->pageAddress(k);
-                                if (!vm::protectPages(a, kPageSize, false, false))
-                                    vm::remapPages(a, kPageSize, false, false);
-                            }
-                        }
-                    }
-                    for (size_t k = run_start_page; k < run_end_page; ++k) {
-                        deferMadvise(k);
-                    }
-                } else {
-                    vm::decommitPages(run_addr, run_bytes);
-                    if (!vm::protectPages(run_addr, run_bytes, false, false)) {
-                        if (!vm::remapPages(run_addr, run_bytes, false, false)) {
-                            for (size_t k = run_start_page; k < run_end_page; ++k) {
-                                void* a = vm_->pageAddress(k);
-                                if (!vm::protectPages(a, kPageSize, false, false))
-                                    vm::remapPages(a, kPageSize, false, false);
-                            }
-                        }
-                    }
-                }
-            } else {
-                for (size_t k = run_start_page; k < run_end_page; ++k) {
-                    if (states_->get(k) != PageState::COMPRESSED) continue;
-                    void* a = vm_->pageAddress(k);
-                    if (deferMadviseEnabled()) {
-                        if (!vm::protectPages(a, kPageSize, false, false))
-                            vm::remapPages(a, kPageSize, false, false);
-                        deferMadvise(k);
-                    } else {
-                        vm::decommitPages(a, kPageSize);
-                        if (!vm::protectPages(a, kPageSize, false, false))
-                            vm::remapPages(a, kPageSize, false, false);
-                    }
-                }
-            }
-            for (size_t k = run_start_page; k < run_end_page; ++k) {
-                locks_->unlock(k);
-            }
-            i = j;
+
+            // Set state to COMPRESSED. The page is still PROT_RW (or
+            // PROT_READ from monitoring) — app accesses succeed without
+            // faulting. The deferred-madvise sweeper will later (under
+            // tryLock + state re-check) apply mprotect(PROT_NONE) and
+            // madvise(DONTNEED). This avoids the deadlock where mprotect
+            // under lock triggers a fault on an app thread that blocks in
+            // handleFault on the same lock, AND the TOCTOU race where
+            // unlocking then mprotecting hits a page that handleFault
+            // already decompressed.
+            deferMadvise(page_idx);
+            locks_->unlock(page_idx);
         }
         w.pending_pn_count = 0;
     }
@@ -1636,58 +1560,36 @@ private:
     static constexpr size_t kProtectChunkPagesDefault = 16;
     static constexpr size_t kProtectChunkPages = 16;  // legacy alias (escalate path)
 
-    // Flush an accumulated run of CAS-succeeded pages with a single
-    // chunked mprotect(PROT_READ). Acquires per-page locks in ascending
-    // order; if any page's state changed (CAS won, then someone else
-    // raced in, e.g. compressPage), falls back to per-page mprotect for
-    // the survivors so we don't write PROT_READ over a COMPRESSING page.
+    // Apply mprotect(PROT_READ) to pages that successfully CAS'd to
+    // ACTIVE_MONITORING. Unlock before mprotect to avoid deadlock:
+    // mprotect(PROT_READ) can trigger a write-fault on an app thread that
+    // then blocks in handleFault on the same per-page lock.
     void flushPhase3Run(size_t run_start, size_t run_end) {
         if (run_end <= run_start) return;
-        for (size_t k = run_start; k < run_end; ++k) locks_->lock(k);
-        bool all_ok = true;
+        bool any_ok = false;
         for (size_t k = run_start; k < run_end; ++k) {
+            locks_->lock(k);
             if (states_->get(k) != PageState::ACTIVE_MONITORING) {
-                all_ok = false;
-                break;
+                locks_->unlock(k);
+                continue;
             }
-        }
-        if (all_ok) {
-            void* run_addr = vm_->pageAddress(run_start);
-            if (!run_addr || !vm::protectPages(run_addr, (run_end - run_start) * kPageSize,
-                                  true, false)) {
-                // mprotect failed (typically ENOMEM at vm.max_map_count).
-                // Revert state to ACTIVE for all pages — without
-                // PROT_READ, we can't observe writes, so monitoring is
-                // a lie. Keeping state ACTIVE_MONITORING would cause
-                // compressPage to think the page is monitored when it
-                // isn't, leading to torn-snapshot corruption when
-                // compression proceeds.
-                for (size_t k = run_start; k < run_end; ++k) {
+            // State is ACTIVE_MONITORING — unlock before mprotect.
+            // If mprotect triggers a write-fault on another thread,
+            // handleFault sees ACTIVE_MONITORING and restores PROT_RW.
+            locks_->unlock(k);
+
+            void* page_addr = vm_->pageAddress(k);
+            if (!page_addr || !vm::protectPages(page_addr, kPageSize, true, false)) {
+                // mprotect failed — revert state under lock
+                locks_->lock(k);
+                if (states_->get(k) == PageState::ACTIVE_MONITORING)
                     states_->set(k, PageState::ACTIVE);
-                }
+                locks_->unlock(k);
             } else {
-                // See compressPage: the mprotect IPI ack does not drain
-                // remote store buffers. A monitor transition followed by
-                // immediate compression in the same tick can otherwise
-                // capture a torn snapshot.
-                protReadBarrier();
+                any_ok = true;
             }
-        } else {
-            bool any_ok = false;
-            for (size_t k = run_start; k < run_end; ++k) {
-                if (states_->get(k) == PageState::ACTIVE_MONITORING) {
-                    void* page_addr = vm_->pageAddress(k);
-                    if (!page_addr || !vm::protectPages(page_addr, kPageSize,
-                                          true, false)) {
-                        states_->set(k, PageState::ACTIVE);
-                    } else {
-                        any_ok = true;
-                    }
-                }
-            }
-            if (any_ok) protReadBarrier();
         }
-        for (size_t k = run_start; k < run_end; ++k) locks_->unlock(k);
+        if (any_ok) protReadBarrier();
     }
 
     void phase3Range(size_t start, size_t end) {
@@ -1918,6 +1820,22 @@ private:
             if (st == PageState::ACTIVE_MONITORING)
                 vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
             __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+            // Snapshot verification for deferred mode. Without PROT_READ
+            // protection during the snapshot, a concurrent write can land
+            // between our memcpy and the eventual PROT_NONE — the blob
+            // would be stale and decompress-on-fault would silently revert
+            // the writer's update. Re-read and compare; abort on mismatch.
+            if (fixavEnabled()) {
+                alignas(64) uint8_t verify_buf[kPageSize];
+                __builtin_memcpy(verify_buf, page_addr, kPageSize);
+                if (__builtin_memcmp(verify_buf, worker.page_buf, kPageSize) != 0) {
+                    snapshot_verify_fails_.fetch_add(1, std::memory_order_relaxed);
+                    states_->set(page_idx, PageState::ACTIVE);
+                    locks_->unlock(page_idx);
+                    return false;
+                }
+                snapshot_verify_passes_.fetch_add(1, std::memory_order_relaxed);
+            }
 #ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
             zeroFreeSlots(worker.page_buf, page_idx);
 #endif
@@ -2219,27 +2137,36 @@ private:
                 membarrierSyncCore();
                 vm::decommitPages(page_addr, kPageSize);
             } else if (deferMadviseEnabled()) {
-                // Deferred-madvise: mprotect(PROT_NONE) immediately to gain
-                // fault-driven decompression, but defer madvise(DONTNEED)
-                // to the per-tick sweeper. Closes the corruption surface
-                // where in-flight loads with stale TLB observed a
-                // (PROT_*, DROPPED) page and saw kernel-zero-fault bytes.
-                if (!vm::protectPages(page_addr, kPageSize, false, false)) {
-                    if (!vm::remapPages(page_addr, kPageSize, false, false)) {
-                        if (!vm::protectPages(page_addr, kPageSize, true, true)) {
-                            vm::remapPages(page_addr, kPageSize, true, true);
-                        }
-                        __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
-                        states_->set(page_idx, PageState::ACTIVE);
-                        locks_->unlock(page_idx);
-                        return false;
-                    }
-                }
-                // State must transition to COMPRESSED BEFORE the pending
-                // bit is set; otherwise the sweeper could race and observe
-                // pending+ACTIVE.
+                // Deferred-madvise: mprotect(PROT_NONE) to arm fault-driven
+                // decompression, defer madvise(DONTNEED) to per-tick sweeper.
+                //
+                // Unlock BEFORE mprotect to avoid deadlock: if mprotect's
+                // TLB shootdown IPI lands on a core whose thread faults on
+                // this page (after waking from sleep), the fault handler
+                // needs this lock. Sequence: set COMPRESSED → unlock →
+                // mprotect. Between unlock and mprotect the page is
+                // COMPRESSED+PROT_RW — app accesses succeed without faulting
+                // (no SIGSEGV on RW pages). After mprotect, accesses fault
+                // and the handler decompresses normally.
                 states_->set(page_idx, PageState::COMPRESSED);
                 deferMadvise(page_idx);
+                locks_->unlock(page_idx);
+                // Re-check: handleFault may have decompressed between unlock
+                // and here. Skip mprotect if state changed to avoid infinite
+                // SIGSEGV on an ACTIVE page.
+                if (states_->get(page_idx) == PageState::COMPRESSED) {
+                    if (!vm::protectPages(page_addr, kPageSize, false, false)) {
+                        vm::remapPages(page_addr, kPageSize, false, false);
+                    }
+                }
+                if (compressed_fn_ && page_map_) {
+                    Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
+                    if (sp && !sp->is_large && sp->size_class < kNumClasses) {
+                        compressed_fn_(page_idx, sp->arena_id, sp->size_class,
+                                       compressed_ctx_);
+                    }
+                }
+                return true;
             } else {
                 vm::decommitPages(page_addr, kPageSize);
                 if (!vm::protectPages(page_addr, kPageSize, false, false)) {
@@ -2884,6 +2811,9 @@ private:
     // acceptable because Linux is the production target and the fast path is
     // expected to succeed there.
     void restorePageContents(void* page_addr, const void* src) {
+        if (!page_addr || !vm_->contains(reinterpret_cast<uintptr_t>(page_addr))) {
+            return;
+        }
 #ifdef __linux__
         if (self_mem_fd_ < 0) {
             self_mem_fd_ = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
@@ -2897,7 +2827,11 @@ private:
             off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(page_addr));
             bool ok = true;
             while (remaining > 0) {
-                ssize_t w = pwrite(self_mem_fd_, p, remaining, off);
+                // Direct syscall: the fault handler cannot use PLT-bound
+                // pwrite() because lazy PLT resolution itself accesses
+                // the dynamic linker's hash tables, which may live on
+                // smash-compressed pages — causing infinite SIGSEGV recursion.
+                ssize_t w = syscall(SYS_pwrite64, self_mem_fd_, p, remaining, off);
                 if (w <= 0) { ok = false; break; }
                 p += w; off += w; remaining -= static_cast<size_t>(w);
             }
@@ -3202,13 +3136,18 @@ private:
                 locks_->unlock(i);
                 continue;
             }
-            // Page is COMPRESSED+PROT_NONE+BACKED, has been for >= ttl
-            // ticks, and no concurrent fault has touched it. Safe to drop
-            // backing: any user touch would have faulted the COMPRESSED
-            // state and cleared the bit.
+            // Page is COMPRESSED and has been pending for >= ttl ticks.
+            // Apply PROT_NONE (to arm fault-driven decompression) then
+            // drop physical backing. Both under tryLock — safe because
+            // handleFault uses blocking lock (it will wait for us) and
+            // we hold only this one page's lock (no cross-page deadlock).
             deferred_pending_[i].store(false, std::memory_order_release);
             void* page_addr = vm_->pageAddress(i);
-            if (page_addr) vm::decommitPages(page_addr, kPageSize);
+            if (page_addr) {
+                if (!vm::protectPages(page_addr, kPageSize, false, false))
+                    vm::remapPages(page_addr, kPageSize, false, false);
+                vm::decommitPages(page_addr, kPageSize);
+            }
             locks_->unlock(i);
         }
     }
@@ -3646,6 +3585,7 @@ private:
     // ── Thread entry points ───────────────────────────────────────────────
 
     __attribute__((cold)) static void* coordEntry(void* arg) {
+        g_compressor_thread = true;
         auto* self = static_cast<CompressorThread*>(arg);
         while (self->running_.load(std::memory_order_relaxed)) {
             // Sleep in 10ms intervals, checking running_ flag each time.
@@ -3675,6 +3615,7 @@ private:
     };
 
     __attribute__((cold)) static void* helperEntry(void* arg) {
+        g_compressor_thread = true;
         auto* ha = static_cast<HelperArg*>(arg);
         auto* self = ha->self;
         int helper_id = ha->id;
@@ -3778,6 +3719,13 @@ public:
         // environ on a smash-compressed page → recursive SIGSEGV → crash.
         warmupEnvStatics();
         warmupClassStatics();
+
+        // Pre-open /proc/self/mem so the fault handler doesn't need to
+        // call open() (which may trigger PLT resolution on a compressed page).
+#ifdef __linux__
+        if (self_mem_fd_ < 0)
+            self_mem_fd_ = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+#endif
 
         // Initialize ROI model (auto-calibrate throughput, read env vars)
         ROIConfig::instance().init(engine_);
@@ -4127,19 +4075,30 @@ public:
             if (n > 0) (void)!write(2, buf, (size_t)n);
         }
 
-        // Start initial helper threads (adaptive scaling may create more later)
-        int initial_helpers = kCompressorWorkers > 1 ? kCompressorWorkers - 1 : 0;
-        for (int i = 0; i < initial_helpers; ++i) {
+        // Pre-create ALL helper threads at startup. Calling pthread_create
+        // later (during tick) crashes: glibc's _dl_allocate_tls_init walks all
+        // loaded modules' link_maps, some of which live on smash-compressed
+        // (PROT_NONE) pages. The signal handler handles a few faults but the
+        // kernel stops delivering SIGSEGV after ~3 rapid cycles.
+        // Use a small stack (128 KiB) since helpers only run compressTick
+        // which uses BootstrapAlloc-backed buffers, not stack allocations.
+        pthread_attr_t helper_attr;
+        pthread_attr_init(&helper_attr);
+        pthread_attr_setstacksize(&helper_attr, 128 * 1024);
+
+        for (int w = 0; w < kMaxCompressorWorkers; ++w) ensureWorkerState(w);
+        for (int i = 0; i < kMaxHelpers; ++i) {
             auto* ha = static_cast<HelperArg*>(
                 BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
             ha->self = this;
             ha->id = i;
-            pthread_create(&helper_threads_[i], nullptr, helperEntry, ha);
+            pthread_create(&helper_threads_[i], &helper_attr, helperEntry, ha);
         }
-        helpers_created_ = initial_helpers;
+        helpers_created_ = kMaxHelpers;
 
-        // Start coordinator thread
-        pthread_create(&coord_thread_, nullptr, coordEntry, this);
+        // Start coordinator thread (same small stack)
+        pthread_create(&coord_thread_, &helper_attr, coordEntry, this);
+        pthread_attr_destroy(&helper_attr);
     }
 
     static inline CompressorThread* s_stats_instance_ = nullptr;

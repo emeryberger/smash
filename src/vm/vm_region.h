@@ -322,6 +322,7 @@ public:
             total_pages_ = contig_pages_ + kTrackMaxPages;
             base_ = static_cast<char*>(vm::reservePages(region_size));
             if (!base_) return false;
+            vm::setVmBounds(base_, region_size);
         } else {
             // Compress-only mode: contiguous arena is unused; tracked pages
             // get indices 1..kTrackMaxPages-1 (index 0 reserved as sentinel).

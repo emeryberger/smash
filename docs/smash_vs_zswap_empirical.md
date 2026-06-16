@@ -4,28 +4,67 @@
 **zswap**: enabled, compressor=zstd, zpool=zbud, 4 GB swap file  
 **smash**: `SMASH_COLD_TIMEOUT_SEC=1`
 
-## Apples-to-Apples: SQLite 500K Rows
+## Full-Suite Three-Way Comparison (2026-06-14)
 
-The same workload (`bench_sqlite --rows 500000 --cool 10 --serve 20`) under three
-configurations. All use the same data, same query pattern (5% hot), same hardware.
+**System**: AMD EPYC 9R14, 192 vCPUs, 1.5 TB RAM, kernel 6.12, zswap zstd/zbud, 4 GB swap  
+**Methodology**: Per-workload cgroup `MemoryHigh` caps calibrated to smash's post-cool RSS + headroom.
+3 runs each. RSS measured via `getrusage` (SQLite/RocksDB) or `redis-cli INFO memory` / `/proc/PID/status`.
 
-| Metric | glibc | glibc + zswap (MemoryHigh=150M) | smash |
-|--------|:---:|:---:|:---:|
-| Peak RSS | 355 MiB | 209 MiB† | 455 MiB |
-| Post-cool RSS | 355 MiB | 209 MiB† | **121 MiB** |
-| Anon pages compressed | 0 | 4.7 MiB | **~234 MiB** |
-| Throughput | 96k ops/s | 91k ops/s | 88k ops/s |
-| Cold access p99 | 2 µs | **2342 µs** | **143 µs** |
+### SQLite (cap=150M)
 
-†RSS capped by cgroup MemoryHigh; the kernel evicts file pages preferentially over anonymous heap pages.
+| Config | Peak RSS | Min RSS | Throughput | Cold p99 | zswap pages |
+|--------|----------|---------|------------|----------|-------------|
+| glibc (baseline) | 355 MiB | 355 MiB | 96k ops/s | 1.8 µs | 0 |
+| glibc + zswap (MemoryHigh=150M) | 77 MiB | **32 MiB** | 90k ops/s | **2279 µs** | **0** |
+| smash | 455 MiB | **121 MiB** | 88k ops/s | **103 µs** | 0 |
 
-### Why zswap compresses so little
+zswap compressed **zero anonymous heap pages**. All 323 MiB of RSS reduction
+came from file page eviction (libsqlite.so, libc.so, ld.so code pages).
 
-Under `MemoryHigh=150M`, the kernel's reclaimer hit the limit 5090 times during
-the run. But only 4.7 MiB of anonymous pages entered swap — the rest of the
-reclaim targeted **file-backed pages** (libsqlite.so, libc.so, ld.so code pages).
-The kernel strongly prefers evicting reclaimable file pages over swapping anonymous
-heap data, even under aggressive pressure.
+### RocksDB (cap=80M)
+
+| Config | Peak RSS | Min RSS | Throughput | zswap pages |
+|--------|----------|---------|------------|-------------|
+| glibc (baseline) | 275 MiB | 275 MiB | 709k ops/s | 0 |
+| glibc + zswap (MemoryHigh=80M) | 27 MiB | 29 MiB | 688k ops/s | 64,374 |
+| smash | 289 MiB | **47 MiB** | 686k ops/s | 0 |
+
+Under the 80M cap, zswap did compress ~64k pages (~251 MiB) — RocksDB's SST
+page cache is file-backed and already reclaimable, so the kernel hit anonymous
+pages after exhausting file pages.
+
+### Redis (cap=160M)
+
+| Config | Peak RSS | Min RSS | Throughput | zswap pages |
+|--------|----------|---------|------------|-------------|
+| glibc (baseline) | 247 MiB | 247 MiB | 64k ops/s | 0 |
+| glibc + zswap (MemoryHigh=160M) | 91 MiB | 86 MiB | **20.5k ops/s** | 42,840 |
+| smash | 262 MiB | **108 MiB** | 50.3k ops/s | 0 |
+
+zswap compressed ~43k pages (~167 MiB) but **throughput collapsed** — 69%
+degradation from reclaim stalls during the GET phase. Smash degradation: 21%.
+
+### Memcached (cap=60M)
+
+| Config | Peak RSS | Min RSS | Throughput | zswap pages |
+|--------|----------|---------|------------|-------------|
+| glibc (baseline) | 232 MiB | 232 MiB | 202k ops/s | 0 |
+| glibc + zswap (MemoryHigh=60M) | 51 MiB | 51 MiB | 216k ops/s | 46,660 |
+| smash | 245 MiB | **28 MiB** | 205k ops/s | 0 |
+
+Smash achieves the lowest absolute RSS (28 MiB vs 51 MiB) with minimal throughput
+impact. zswap compressed ~47k pages (~182 MiB) without throughput loss — memcached's
+working set fits in the hot-set even under pressure.
+
+### Why zswap compresses so little on SQLite
+
+Under `MemoryHigh=150M`, the kernel's reclaimer evicted file-backed pages
+(libsqlite.so, libc.so, ld.so code pages) and compressed **zero** anonymous
+heap pages into zswap. The kernel strongly prefers evicting reclaimable file
+pages over swapping anonymous heap data, even under aggressive pressure. On
+workloads with large file-backed page caches (RocksDB SSTs, memcached's slab
+allocator), the kernel does eventually hit anonymous pages after exhausting file
+pages.
 
 ### Per-page compression ratio (measured via compress-only lib)
 
@@ -94,3 +133,61 @@ than glibc because compressed cold pages reduce memory-bus pressure on the hot s
 4. **Orthogonal to zswap**: smash and zswap target different page populations. smash
    compresses cold anonymous heap pages proactively. zswap compresses whatever the
    kernel's LRU evicts under pressure (mostly file pages). They could coexist.
+
+## Full-Suite Cgroup Comparison
+
+To produce an apples-to-apples comparison across all paper workloads, use
+`bench/bench_cgroup_comparison.py`. It runs each workload three ways:
+
+1. **glibc** (no cap) — baseline RSS
+2. **glibc + zswap** under `MemoryHigh=<smash_min + 20%>` — forces the kernel
+   reclaimer to shed as much memory as smash achieves
+3. **smash** (no cap) — proactive compression
+
+The cgroup cap per workload is calibrated so the kernel must reclaim roughly the
+same amount of RSS that smash compresses. This isolates the "how well does each
+approach reduce memory?" question from "how much pressure is applied?"
+
+### Why the kernel barely compresses anonymous pages
+
+Under cgroup `MemoryHigh` pressure, the kernel's reclaimer first targets:
+1. **Reclaimable slab** (dentry/inode caches)
+2. **File-backed pages** (mapped `.so` text, filesystem page cache, SST files)
+3. **Anonymous pages** (last resort — swaps to disk/zswap)
+
+Measured across all four workloads (2026-06-14): On SQLite, the kernel compressed
+**zero** anonymous pages — all RSS reduction was file page eviction. On RocksDB,
+memcached, and Redis, the kernel did eventually reach anonymous pages (43–64k
+pages compressed) but only after exhausting file-backed page cache. The pattern
+is consistent: file pages are always evicted first, anonymous heap last.
+
+### File page eviction: the gap
+
+Under cgroup pressure, the kernel evicts file-backed pages (clean page cache)
+before touching anonymous heap. This gives zswap+cgroup a "free" RSS reduction
+that has nothing to do with compression — it's the kernel dropping pages that
+can be re-read from disk on demand.
+
+Smash does not currently trigger this effect because it operates without memory
+pressure. File-backed pages stay fully cached while smash compresses heap pages.
+
+Two possible approaches to close the gap:
+
+1. **`posix_fadvise(POSIX_FADV_DONTNEED)`** on file-backed regions identified
+   via `/proc/self/maps` that haven't been accessed recently. Safe, non-
+   privileged, per-process. Re-access cost is a page fault from disk on access.
+
+2. **`madvise(MADV_COLD)`** (Linux 5.4+) on file-backed pages. Moves them to
+   the inactive LRU without immediately evicting — the kernel reclaims them
+   preferentially under even mild pressure. Lighter-touch than `FADV_DONTNEED`.
+
+Neither is implemented. The engineering question is whether the additional RSS
+savings (file-backed pages for typical server apps) justify the re-access latency.
+
+### Reproducing
+
+```bash
+# Requires Linux, cgroup v2, zswap enabled, swap active
+cd build
+python3 ../bench/bench_cgroup_comparison.py --apps sqlite,rocksdb,memcached,redis --runs 3
+```

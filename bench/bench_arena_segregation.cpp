@@ -83,10 +83,14 @@ static constexpr size_t kObjSize = 256;
 
 // ── Allocation sites (noinline for distinct return addresses) ────────────────
 
-__attribute__((noinline)) static void* alloc_json() { return malloc(kObjSize); }
-__attribute__((noinline)) static void* alloc_floats() { return malloc(kObjSize); }
-__attribute__((noinline)) static void* alloc_random() { return malloc(kObjSize); }
-__attribute__((noinline)) static void* alloc_ints() { return malloc(kObjSize); }
+// To get distinct return addresses visible to smash's __builtin_return_address,
+// each wrapper must have a real stack frame (not a tail-call). Writing to a
+// volatile AFTER malloc returns forces the compiler to use call+ret (not jmp).
+static volatile void* _site_a, *_site_b, *_site_c, *_site_d;
+__attribute__((noinline)) static void* alloc_json()   { void* p = malloc(kObjSize); _site_a = p; return p; }
+__attribute__((noinline)) static void* alloc_floats() { void* p = malloc(kObjSize); _site_b = p; return p; }
+__attribute__((noinline)) static void* alloc_random() { void* p = malloc(kObjSize); _site_c = p; return p; }
+__attribute__((noinline)) static void* alloc_ints()   { void* p = malloc(kObjSize); _site_d = p; return p; }
 
 // ── Fill patterns (realistic data types) ─────────────────────────────────────
 

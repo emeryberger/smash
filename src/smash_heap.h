@@ -1046,14 +1046,20 @@ public:
     // first `[[likely]]` returns directly without a function call.
     [[gnu::always_inline]]
     void* malloc(size_t size) {
+        // Capture caller RA early — used for arena routing on both paths.
+        // __builtin_return_address(0) here is the address that called malloc
+        // (the application code), since this function is the interposition entry.
+        uintptr_t caller_ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         if (fullMallocPath() && size > 0 && size <= kMaxSmallSize) [[likely]] {
             uint8_t sc = sizeToClass(size);
             if (ThreadCache* tc = currentThreadCache()) [[likely]] {
-                if (void* ptr = tc->allocate(sc)) [[likely]] return ptr;
+                uint8_t arena = callsiteArena(sc);
+                if (void* ptr = tc->allocate(sc, arena)) [[likely]] return ptr;
+                // Cache miss — refill from this arena's slab
+                if (void* ptr = tc->refill(sc, arena, &slab(arena, sc)))
+                    return ptr;
             }
         }
-        // Capture caller's return address for arena routing in slow path
-        uintptr_t caller_ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         return mallocSlow(size, caller_ra);
     }
 

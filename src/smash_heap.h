@@ -895,6 +895,22 @@ public:
             g_smash_vm_region = &vm_region_;
             g_smash_page_states_for_external = &page_states_;
 
+            // When external mmap tracking is active (SMASH_TRACK_EXTERNAL=1),
+            // tracked pages live at addresses OUTSIDE the contiguous arena, so
+            // the decommit/mprotect bounds guards in platform_mem.h would
+            // false-trap when the compressor reclaims a compressed external
+            // page. Register VmRegion::contains() so the guards accept a
+            // registered external page as in-bounds. Gated: only loosen the
+            // guard when tracking is actually on. (lookupIdx is a lock-free
+            // hash read → async-signal-safe.)
+            if (std::getenv("SMASH_TRACK_EXTERNAL") &&
+                std::getenv("SMASH_TRACK_EXTERNAL")[0] == '1') {
+                vm::setExternalPageCheck(+[](uintptr_t addr) -> bool {
+                    auto* r = g_smash_vm_region;
+                    return r && r->contains(addr);
+                });
+            }
+
             if constexpr (kMeasureCohorts) {
                 cohort_pages_len_ = vm_region_.totalPages();
                 cohort_pages_ = bootstrapArray<CohortPage>(cohort_pages_len_);

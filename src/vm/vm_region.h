@@ -430,7 +430,7 @@ public:
         }
 
         // Bump allocate from fresh pages (lock-free)
-        size_t start = next_page_.fetch_add(num_pages, std::memory_order_relaxed);
+        size_t start = next_page_.fetch_add(num_pages, std::memory_order_release);
         if (start + num_pages > contig_pages_) {
             next_page_.fetch_sub(num_pages, std::memory_order_relaxed);
             return nullptr;
@@ -555,7 +555,7 @@ public:
                 uintptr_t expected = 0;
                 if (track_hash_[s].key.compare_exchange_strong(
                         expected, key, std::memory_order_acq_rel)) {
-                    size_t idx = next_page_.fetch_add(1, std::memory_order_relaxed);
+                    size_t idx = next_page_.fetch_add(1, std::memory_order_release);
                     if (idx >= total_pages_) return 0;
                     track_reverse_[idx] = page_addr;
                     track_hash_[s].idx.store(idx, std::memory_order_release);
@@ -741,8 +741,10 @@ public:
     // capacity (total_pages_ minus the external-page tail). In tracking
     // mode the contiguous arena is unused, so the value is 0.
     size_t contigPages() const { return contig_pages_; }
+    size_t rawNextPage() const { return next_page_.load(std::memory_order_acquire); }
+
     size_t committedPages() const {
-        size_t bump = next_page_.load(std::memory_order_relaxed);
+        size_t bump = next_page_.load(std::memory_order_acquire);
         if (tracking_mode_) return bump;
         size_t ext = external_count_.load(std::memory_order_relaxed);
         if (ext == 0) return bump;

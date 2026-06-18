@@ -407,7 +407,14 @@ class SmashHeap {
         if (dladdr(reinterpret_cast<void*>(ra), &info) && info.dli_fbase) {
             uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
             uintptr_t offset = ra - base;
-            hash = static_cast<uint32_t>(offset ^ (offset >> 16));
+            // Full-avalanche integer hash: even offsets differing by 0x20
+            // produce completely different outputs. The old offset^(offset>>16)
+            // was a no-op for offsets < 64K (most functions in the same DSO).
+            uint32_t x = static_cast<uint32_t>(offset);
+            x ^= x >> 16; x *= 0x45d9f3bU;
+            x ^= x >> 16; x *= 0x45d9f3bU;
+            x ^= x >> 16;
+            hash = x;
         } else {
             // dladdr failed - use low 20 bits as fallback
             hash = static_cast<uint32_t>(ra & 0xFFFFF);
@@ -421,28 +428,20 @@ class SmashHeap {
 
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
-    uint8_t callsiteArena(uint8_t sc) {
+    uint8_t callsiteArena(uint8_t sc, uintptr_t ra) {
 #ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
+        (void)ra;
         uint8_t base = 0;
 #else
         // LLAMA-style stack hash [Maas et al., ASPLOS 2020]:
         // hash(return_address, stack_depth, object_size).
         //
-        // Return address (depth 0) identifies the immediate call site.
-        // Stack depth distinguishes calls through different wrapper chains
-        // that share the same immediate call site.
+        // The return address is captured at the malloc() entry point and
+        // passed here — this avoids __builtin_return_address depth issues
+        // when callsiteArena is inlined via LTO.
         //
-        // ASLR-resilient: we use stableCallsiteHash() which resolves the
-        // return address to an offset within its shared object via dladdr(),
-        // with caching to avoid repeated lookups.
-        //
-        // Stack depth stability: we compute (stack_base - frame_addr) / 16KB
-        // to get a coarse depth bucket. This is stable across runs because
-        // the stack grows down from a consistent base (pthread-allocated
-        // stack top) and the distance represents call depth, not absolute
-        // address. The /16KB quantization absorbs minor variations in frame
-        // sizes between runs.
-        uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        // ASLR-resilient: stableCallsiteHash() resolves the return address
+        // to an offset within its shared object via dladdr(), with caching.
         uint32_t stable_ra = stableCallsiteHash(ra);
 
         // Compute stable stack depth bucket. Thread stacks grow downward
@@ -457,9 +456,18 @@ class SmashHeap {
         uint8_t depth_bucket = static_cast<uint8_t>(
             ((stack_base - frame) >> 14) & 0xFF);
 
+        // Mix with murmur3 finalizer to spread closely-spaced addresses
+        // across arenas. Without this, adjacent noinline functions (differing
+        // by ~32 bytes in .text) hash to the same arena because the low bits
+        // of a simple XOR don't change enough.
         uintptr_t h = static_cast<uintptr_t>(stable_ra) ^
                       (static_cast<uintptr_t>(depth_bucket) << 8) ^
                       static_cast<uintptr_t>(sc);
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33;
         if (cpuArenaHash()) {
             // CPU-indexed routing. Mix the running CPU (not a per-thread id)
             // into the arena hash so the number of distinct lanes tracks the
@@ -1001,12 +1009,14 @@ public:
         uint8_t sc = sizeToClass(size);
         if (sc < kNumClasses) {
             ThreadCache* tc = getOrCreateThreadCache();
-            void* ptr = tc->allocate(sc);
-            if (!ptr) ptr = tc->refill(sc, &slab(callsiteArena(sc), sc));
+            uintptr_t ra_for_arena = caller_ra ? caller_ra :
+                reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+            uint8_t arena = callsiteArena(sc, ra_for_arena);
+            void* ptr = tc->allocate(sc, arena);
+            if (!ptr) ptr = tc->refill(sc, arena, &slab(arena, sc));
             if constexpr (kMeasureCohorts) {
                 if (ptr) {
-                    uintptr_t ra = caller_ra ? caller_ra :
-                        reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+                    uintptr_t ra = ra_for_arena;
                     uint32_t ra32 = static_cast<uint32_t>(ra ^ (ra >> 32));
                     stampCohort(ptr, ra32);
                 }
@@ -1036,14 +1046,19 @@ public:
     // first `[[likely]]` returns directly without a function call.
     [[gnu::always_inline]]
     void* malloc(size_t size) {
+        // Capture caller RA early — used for arena routing on both paths.
+        // __builtin_return_address(0) here is the address that called malloc
+        // (the application code), since this function is the interposition entry.
+        uintptr_t caller_ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         if (fullMallocPath() && size > 0 && size <= kMaxSmallSize) [[likely]] {
             uint8_t sc = sizeToClass(size);
             if (ThreadCache* tc = currentThreadCache()) [[likely]] {
-                if (void* ptr = tc->allocate(sc)) [[likely]] return ptr;
+                uint8_t arena = callsiteArena(sc, caller_ra);
+                if (void* ptr = tc->allocate(sc, arena)) [[likely]] return ptr;
+                if (void* ptr = tc->refill(sc, arena, &slab(arena, sc)))
+                    return ptr;
             }
         }
-        // Capture caller's return address for arena routing in slow path
-        uintptr_t caller_ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         return mallocSlow(size, caller_ra);
     }
 
@@ -1110,9 +1125,10 @@ public:
         }
         if (span->is_large) [[unlikely]] { large_alloc_.deallocate(span); return; }
         const auto sc = span->size_class;
+        const uint8_t arena = span->arena_id;
         ThreadCache* tc = currentThreadCache();
         if (!tc) [[unlikely]] return freeSlow(ptr);
-        if (!tc->deallocate(sc, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, ptr); }
+        if (!tc->deallocate(sc, arena, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, arena, ptr); }
     }
 
     // Cold path: full free() semantics for every mode. Never inlined.
@@ -1152,9 +1168,9 @@ public:
                 // Smash-owned pointer slipped in before passthrough was active.
                 if (sp->is_large) { large_alloc_.deallocate(sp); return; }
                 ThreadCache* tc = getOrCreateThreadCache();
-                if (!tc->deallocate(sp->size_class, ptr)) {
+                if (!tc->deallocate(sp->size_class, sp->arena_id, ptr)) {
                     tc->drain(sp->size_class, slabs_, &page_map_);
-                    tc->deallocate(sp->size_class, ptr);
+                    tc->deallocate(sp->size_class, sp->arena_id, ptr);
                 }
                 return;
             }
@@ -1222,8 +1238,9 @@ public:
         }
         if (span->is_large) { large_alloc_.deallocate(span); return; }
         uint8_t sc = span->size_class;
+        uint8_t arena = span->arena_id;
         ThreadCache* tc = getOrCreateThreadCache();
-        if (!tc->deallocate(sc, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, ptr); }
+        if (!tc->deallocate(sc, arena, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, arena, ptr); }
     }
 
     void* memalign(size_t alignment, size_t size) {

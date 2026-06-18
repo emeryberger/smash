@@ -1842,7 +1842,21 @@ private:
         } else {
             // Standard mode. Make the page readable: it may be PROT_READ
             // (Phase 3 monitoring) or PROT_NONE (deep monitoring).
+            // CRITICAL: unlock before mprotect to prevent deadlock.
+            // mprotect issues a TLB-shootdown IPI; if an app thread on
+            // another core faults (write to now-PROT_READ page), its fault
+            // handler would block on this page's lock — while our mprotect
+            // waits for the TLB shootdown ack from that core. Circular wait.
+            // Re-check state after re-locking (page may have been freed).
+            locks_->unlock(page_idx);
             vm::protectPages(page_addr, kPageSize, true, false);  // PROT_READ
+            locks_->lock(page_idx);
+            if (states_->get(page_idx) != PageState::COMPRESSING) {
+                // State changed while unlocked — abort
+                vm::protectPages(page_addr, kPageSize, true, true);  // restore PROT_RW
+                locks_->unlock(page_idx);
+                return false;
+            }
             // Force any in-flight stores on remote cores to retire before
             // we snapshot. mprotect's IPI ack does NOT guarantee the
             // remote store buffers have drained; without this barrier,
@@ -4110,6 +4124,7 @@ public:
         if (!self || !self->states_ || !self->vm_) return;
         size_t empty = 0, active = 0, monitor = 0, compressing = 0,
                compressed = 0, shadow = 0, total = self->vm_->committedPages();
+        size_t raw_bump = self->vm_->rawNextPage();
         for (size_t i = 0; i < total; ++i) {
             switch (self->states_->get(i)) {
             case PageState::EMPTY: ++empty; break;
@@ -4130,11 +4145,12 @@ public:
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
-            "  tier_up=%llu/%llu\n",
+            "  tier_up=%llu/%llu  bump=%zu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
-            (unsigned long long)tier_attempts);
+            (unsigned long long)tier_attempts,
+            raw_bump);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.

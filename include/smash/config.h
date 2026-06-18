@@ -674,7 +674,11 @@ inline bool isDeferredReclaimMode() {
     int v = cached.load(std::memory_order_relaxed);
     if (v < 0) [[unlikely]] {
         const char* env = getenv("SMASH_DEFERRED_RECLAIM");
-        v = (env && env[0] == '1') ? 1 : 0;
+        // Default ON: the non-deferred path holds the page lock during
+        // mprotect(PROT_READ) which deadlocks with concurrent app faults.
+        // Deferred mode avoids mprotect during compression (memcpy at PROT_RW),
+        // deferring PROT_NONE to the sweeper (which uses tryLock).
+        v = (env && env[0] == '0') ? 0 : 1;
         cached.store(v, std::memory_order_relaxed);
     }
     return v == 1;

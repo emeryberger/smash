@@ -21,15 +21,34 @@ class Slab;
 class PageMap;
 
 class ThreadCache {
+    // Per-(lane, size-class) cache. The cache has kCacheLanes independent lanes;
+    // each arena maps to a lane via (arena % kCacheLanes). With kCacheLanes=4
+    // and typical runtime arenas=4-8, most arenas get a dedicated lane (or share
+    // with at most one other). This enforces page-level segregation by call site
+    // while keeping total footprint bounded.
+    //
+    // Depth per lane = kThreadCacheMaxPerClass / kCacheLanes (= 4 with defaults).
+    // Total = kCacheLanes * kNumClasses * depth * 8 = 64 * 36 * 4 * 8 = 72 KB
+    // (same as the old flat kNumClasses * 256 * 8 = 72 KB).
+    // Shallow depth (4) trades refill frequency for segregation quality.
+    static constexpr int kCacheLanes = 64;
+    static constexpr int kPerLaneDepth = kThreadCacheMaxPerClass / kCacheLanes;
+    static_assert(kPerLaneDepth >= 4, "per-lane cache too shallow");
+
     struct ClassCache {
-        void* ptrs[kThreadCacheMaxPerClass];
+        void* ptrs[kPerLaneDepth];
         uint32_t count;
     };
 
-    ClassCache caches_[kNumClasses];
+    // Indexed as caches_[lane * kNumClasses + sc]
+    ClassCache caches_[kCacheLanes * kNumClasses];
+
+    static int idx(uint8_t arena, uint8_t sc) {
+        int lane = arena & (kCacheLanes - 1);
+        return lane * kNumClasses + sc;
+    }
 
 public:
-    // Used by ThreadCachePool for recycling
     ThreadCache* pool_next;
 
     ThreadCache() {
@@ -37,36 +56,66 @@ public:
         pool_next = nullptr;
     }
 
-    // Allocate from thread cache. Returns nullptr if cache is empty for this class.
-    void* allocate(uint8_t sc) {
-        auto& c = caches_[sc];
+    // Allocate from the arena-specific bucket for this size class.
+    void* allocate(uint8_t sc, uint8_t arena) {
+        auto& c = caches_[idx(arena, sc)];
         if (c.count > 0) [[likely]] {
             return c.ptrs[--c.count];
         }
         return nullptr;
     }
 
-    // Free to thread cache. Returns false if cache is full for this class.
-    bool deallocate(uint8_t sc, void* ptr) {
-        auto& c = caches_[sc];
-        if (c.count < kThreadCacheMaxPerClass) [[likely]] {
+    // Legacy: allocate without arena (scans all arenas, returns first hit).
+    // Used only by paths that don't have arena context.
+    void* allocate(uint8_t sc) {
+        for (int a = 0; a < kMaxArenas; ++a) {
+            auto& c = caches_[idx(a, sc)];
+            if (c.count > 0) return c.ptrs[--c.count];
+        }
+        return nullptr;
+    }
+
+    // Free to the correct arena bucket. Returns false if full.
+    bool deallocate(uint8_t sc, uint8_t arena, void* ptr) {
+        auto& c = caches_[idx(arena, sc)];
+        if (c.count < kPerLaneDepth) [[likely]] {
             c.ptrs[c.count++] = ptr;
             return true;
         }
         return false;
     }
 
+    // Legacy deallocate without arena (uses arena 0).
+    bool deallocate(uint8_t sc, void* ptr) {
+        return deallocate(sc, 0, ptr);
+    }
+
+    bool isFull(uint8_t sc, uint8_t arena) const {
+        return caches_[idx(arena, sc)].count >= kPerLaneDepth;
+    }
+
     bool isFull(uint8_t sc) const {
-        return caches_[sc].count >= kThreadCacheMaxPerClass;
+        return isFull(sc, 0);
+    }
+
+    bool isEmpty(uint8_t sc, uint8_t arena) const {
+        return caches_[idx(arena, sc)].count == 0;
     }
 
     bool isEmpty(uint8_t sc) const {
-        return caches_[sc].count == 0;
+        for (int a = 0; a < kMaxArenas; ++a)
+            if (caches_[idx(a, sc)].count > 0) return false;
+        return true;
     }
 
-    // Refill this cache for size class `sc` by batch-allocating from the slab.
-    // Returns a pointer to one allocated object (or nullptr).
-    void* refill(uint8_t sc, Slab* slab);
+    // Refill this cache for (arena, sc) by batch-allocating from the slab.
+    void* refill(uint8_t sc, uint8_t arena, Slab* slab);
+
+    // Legacy refill (for callers that pass the slab directly)
+    void* refill(uint8_t sc, Slab* slab) {
+        // Determine arena from slab index — not available here, use arena 0
+        return refill(sc, 0, slab);
+    }
 
     // Drain cache for size class `sc`, routing pointers to their arena's slab.
     void drain(uint8_t sc, Slab* all_slabs, PageMap* page_map);
@@ -76,10 +125,12 @@ public:
 
     // Reset for reuse from pool
     void reset() {
-        // All caches should already be drained
         __builtin_memset(caches_, 0, sizeof(caches_));
         pool_next = nullptr;
     }
+
+    // Expose per-arena depth for batch sizing
+    static constexpr int perLaneDepth() { return kPerLaneDepth; }
 };
 
 // Pool of thread caches for reuse across threads

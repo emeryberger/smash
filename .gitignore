@@ -1,2 +1,30 @@
 *.pem
 .claude/settings.local.json
+
+# Build directories
+build/
+build_check/
+build*/
+CMakeFiles/
+Testing/
+cmake-build-*/
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.a
+*.d
+
+# IDE
+.idea/
+.vscode/
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Misc
+*.log
+*.core

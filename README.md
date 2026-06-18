@@ -45,6 +45,21 @@ These numbers come from `bench/run_paper_experiments.py --compress-only-only` wi
 ![AUC reduction](docs/figures/auc_reduction.png)
 ![Throughput](docs/figures/timing.png)
 
+### Four-way allocator comparison (redis-benchmark, 50 clients)
+
+Measured with `redis-benchmark -c 50 -n 200000 -t get` on Redis with 200K×1KB keys after 15s cooling. Uses the standard `redis-benchmark` tool (pipelined, multi-connection) — NOT single-threaded socket loops which bottleneck on the client.
+
+| Allocator | Peak RSS | Cool RSS | Reduction | GET (cold→warm) | GET (warm) | p50 |
+|-----------|----------|----------|-----------|-----------------|------------|-----|
+| glibc | 222 MB | 222 MB | 0% | 49,875 rps | 61,425 rps | 0.39 ms |
+| jemalloc | 224 MB | 224 MB | 0% | 45,589 rps | 45,746 rps | 0.58 ms |
+| mimalloc | 217 MB | 217 MB | 0% | 53,505 rps | 56,738 rps | 0.46 ms |
+| **smash** | 232 MB | **28 MB** | **87.7%** | **54,765 rps** | **58,754 rps** | 0.47 ms |
+
+Smash achieves 87.7% RSS reduction with only 4% warm-throughput overhead vs glibc (59K vs 61K rps). Cold-access throughput is competitive with mimalloc and faster than jemalloc — the decompression cost is amortized across pages (16 objects/page) and pipelined by the fault handler's prefetch.
+
+Reproduce: `python3 bench/bench_redis_4way.py` (from the build directory with `libsmash.so`).
+
 ## Why Not Just Use zswap?
 
 On well-provisioned servers, the Linux kernel's compression cache (zswap) is effectively inert: it only compresses pages evicted under memory pressure, and the kernel strongly prefers evicting file-backed pages over swapping anonymous heap data. Smash compresses proactively based on per-page access tracking — no pressure required.

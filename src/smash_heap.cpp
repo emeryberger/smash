@@ -83,11 +83,11 @@ static void smash_print_banner() {
 
 namespace smash {
 
-void* ThreadCache::refill(uint8_t sc, Slab* slab) {
-    // Batch-allocate from slab into our cache
-    auto& c = caches_[sc];
+void* ThreadCache::refill(uint8_t sc, uint8_t arena, Slab* slab) {
+    // Batch-allocate from slab into the arena-specific lane
+    auto& c = caches_[idx(arena, sc)];
     size_t batch = kThreadCacheBatchSize;
-    if (batch > kThreadCacheMaxPerClass) batch = kThreadCacheMaxPerClass;
+    if (batch > static_cast<size_t>(kPerLaneDepth)) batch = kPerLaneDepth;
 
     size_t got = slab->allocateBatch(c.ptrs, batch);
     if (got == 0) return nullptr;

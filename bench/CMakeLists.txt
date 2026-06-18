@@ -205,6 +205,10 @@ smash_add_standalone_bench(bench_model_serving bench_model_serving.cpp)
 # Concurrent builds scenario (multiple jobs with cold IR heaps)
 smash_add_standalone_bench(bench_concurrent_builds bench_concurrent_builds.cpp)
 
+# Arena segregation vs. mixed-page compression advantage
+smash_add_standalone_bench(bench_arena_segregation bench_arena_segregation.cpp)
+target_link_libraries(bench_arena_segregation PRIVATE lz4_static libzstd_static)
+
 # ── SQLite amalgamation (for bench_sqlite) ─────────────────────────────────
 FetchContent_Declare(
   sqlite3

@@ -29,6 +29,29 @@ inline void setVmBounds(void* base, size_t size) {
     g_vm_bounds_size = size;
 }
 
+// Optional predicate for externally-tracked pages (SMASH_TRACK_EXTERNAL=1).
+// Such pages are app-direct mmap regions registered with the VmRegion; their
+// addresses are legitimately OUTSIDE the contiguous [g_vm_bounds_base, +size)
+// arena, so the bounds guards below would false-trap on them. When external
+// tracking is active VmRegion sets this to its contains() check; the guards
+// treat an address as in-bounds if it is either inside the contiguous arena OR
+// a registered external page. Null (default) → contiguous-only, no behavior
+// change for the common case. Must be async-signal-safe (lock-free hash read).
+inline bool (*g_external_page_check)(uintptr_t addr) = nullptr;
+inline void setExternalPageCheck(bool (*fn)(uintptr_t)) {
+    g_external_page_check = fn;
+}
+
+// True if [addr, addr+size) is a legitimate smash decommit/mprotect target:
+// inside the contiguous arena, or (when tracking) a registered external page.
+inline bool vmAddrAllowed(uintptr_t a, size_t size) {
+    auto base = reinterpret_cast<uintptr_t>(g_vm_bounds_base);
+    if (a >= base && a + size <= base + g_vm_bounds_size) return true;
+    // External page: per-page granular ops (size<=kPageSize); check the page.
+    if (g_external_page_check && g_external_page_check(a)) return true;
+    return false;
+}
+
 // Map anonymous private pages. Returns nullptr on failure.
 inline void* mapPages(size_t size) {
 #if defined(_WIN32)
@@ -92,8 +115,7 @@ inline void decommitPages(void* addr, size_t size) {
     // libc/ld.so pages, causing mysterious SIGSEGV later.
     if (g_vm_bounds_base && size <= 4096 * 64) {
         auto a = reinterpret_cast<uintptr_t>(addr);
-        auto base = reinterpret_cast<uintptr_t>(g_vm_bounds_base);
-        if (a < base || a + size > base + g_vm_bounds_size) {
+        if (!vmAddrAllowed(a, size)) {
             char buf[160];
             int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash FATAL] decommitPages OOB: addr=%p size=%zu "
@@ -165,8 +187,7 @@ inline bool protectPages(void* addr, size_t size, bool read, bool write) {
     // mprotecting a page outside our arena (which would corrupt libc/ld.so).
     if (g_vm_bounds_base && size <= 4096) {
         auto a = reinterpret_cast<uintptr_t>(addr);
-        auto base = reinterpret_cast<uintptr_t>(g_vm_bounds_base);
-        if (a < base || a + size > base + g_vm_bounds_size) {
+        if (!vmAddrAllowed(a, size)) {
             // Out of bounds! This is the bug. Trap with diagnostic.
             char buf[160];
             int n = smash::safe_snprintf(buf, sizeof(buf),
@@ -219,8 +240,7 @@ inline bool remapPages(void* addr, size_t size, bool read, bool write) {
     // If addr is outside VmRegion, this would corrupt libc/ld.so mappings.
     if (g_vm_bounds_base) {
         auto a = reinterpret_cast<uintptr_t>(addr);
-        auto base = reinterpret_cast<uintptr_t>(g_vm_bounds_base);
-        if (a < base || a + size > base + g_vm_bounds_size) {
+        if (!vmAddrAllowed(a, size)) {
             char buf[160];
             int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash FATAL] remapPages OOB: addr=%p size=%zu "

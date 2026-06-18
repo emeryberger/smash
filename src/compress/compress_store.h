@@ -23,6 +23,29 @@
 namespace smash {
 
 class CompressStore {
+    // Pin mode for CompressStore regions — prevents the kernel from evicting
+    // compressed blobs under cgroup memory pressure.  Without pinning, a
+    // cgroup MemoryHigh cap pushes CompressStore pages into swap, and
+    // decompression then requires swap-in + decompress (double-fault latency).
+    //
+    // Modes:
+    //   kOff       — no pinning (default when not under cgroup pressure)
+    //   kMlock     — mlock() each region; hard pin, immune to reclaim
+    //   kWillNeed  — madvise(MADV_WILLNEED) after each store(); soft hint
+    enum class PinMode : uint8_t { kOff = 0, kMlock = 1, kWillNeed = 2 };
+
+    PinMode pin_mode_ = PinMode::kOff;
+
+    static PinMode detectPinMode() {
+        const char* v = std::getenv("SMASH_MLOCK_STORE");
+        if (v) {
+            if (v[0] == '0') return PinMode::kOff;
+            if (v[0] == '2') return PinMode::kWillNeed;
+            return PinMode::kMlock;  // "1" or any truthy value
+        }
+        return PinMode::kOff;
+    }
+
     // In-band free-slot header.  When a blob is released we overwrite the
     // first 16 bytes with this header and link the slot into its region's
     // free list.  Future allocations check the free list first before
@@ -64,7 +87,7 @@ class CompressStore {
 
     // Allocate a kRegionSize-aligned region so regionOf() can derive
     // the Region* from any interior pointer via address masking.
-    static Region* newRegion() {
+    Region* newRegion() {
         // Over-allocate to guarantee alignment: request 2x and trim.
         void* raw = vm::mapPages(kRegionSize * 2);
         if (!raw) return nullptr;
@@ -86,6 +109,13 @@ class CompressStore {
         r->live_bytes.store(0, std::memory_order_relaxed);
         r->free_head = 0;
         r->next = nullptr;
+
+        if (pin_mode_ == PinMode::kMlock) {
+            if (!vm::lockPages(r->base, kRegionSize)) {
+                // mlock failed (RLIMIT_MEMLOCK too low) — degrade to willneed
+                pin_mode_ = PinMode::kWillNeed;
+            }
+        }
         return r;
     }
 
@@ -96,18 +126,20 @@ class CompressStore {
         return reinterpret_cast<Region*>(addr & ~(kRegionSize - 1));
     }
 
-    // Reset a fully-empty region: decommit data pages.
+    // Reset a fully-empty region: unlock and decommit data pages.
     // Caller must hold the shard lock.
-    static void resetRegion(Region* r) {
-        // Decommit data pages (skip header to keep Region struct alive).
+    void resetRegion(Region* r) {
         size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
         size_t decommit_start = (kDataStart + page_size - 1) & ~(page_size - 1);
         if (decommit_start < r->capacity) {
+            if (pin_mode_ == PinMode::kMlock)
+                vm::unlockPages(r->base + decommit_start,
+                                r->capacity - decommit_start);
             vm::decommitPages(r->base + decommit_start,
                               r->capacity - decommit_start);
         }
         r->offset.store(kDataStart, std::memory_order_relaxed);
-        r->free_head = 0;  // any free-list nodes lived in the data we just decommitted
+        r->free_head = 0;
         // live_bytes is already 0
     }
 
@@ -172,7 +204,7 @@ class CompressStore {
         return nullptr;
     }
 
-    static void* bumpAlloc(Shard& shard, size_t size, size_t* out_alloc_size)
+    void* bumpAlloc(Shard& shard, size_t size, size_t* out_alloc_size)
             SMASH_REQUIRES(shard.lock) {
         // Try current region's free list first.  In re-tier scenarios
         // (release X's old blob, then immediately allocate X's new blob)
@@ -232,6 +264,7 @@ class CompressStore {
 
 public:
     void init() {
+        pin_mode_ = detectPinMode();
         for (int s = 0; s < kCompressStoreShards; ++s)
             shards_[s].current = newRegion();
     }
@@ -273,6 +306,8 @@ public:
         if (ptr) {
             __builtin_memcpy(ptr, data, size);
             *alloc_size = actual_size;
+            if (pin_mode_ == PinMode::kWillNeed)
+                vm::willNeedPages(ptr, actual_size);
         } else {
             *alloc_size = 0;
         }

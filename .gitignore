@@ -28,3 +28,9 @@ __pycache__/
 # Misc
 *.log
 *.core
+
+# TLC model-checker scratch (can grow to hundreds of GB; regenerated per run)
+model/states/
+model/*_TTrace_*.tla
+model/*_TTrace_*.bin
+*.toolbox/

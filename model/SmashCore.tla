@@ -169,7 +169,16 @@ AppLoop:
             \* leave it "free" on exit — equivalent to acquire-do-release with
             \* no observable intermediate state. (823515f introduced a double
             \* lock[target] assignment here that broke PlusCal translation.)
-            if state[target] = "ACTIVE"
+            \* free() fires on ANY allocated (non-EMPTY) page, including a
+            \* COMPRESSED one (PROT_NONE) or a MONITORING one (PROT_READ): the
+            \* real free path does NOT decompress, so a non-RW page can be
+            \* routed through decommit with its protection intact. This is what
+            \* makes the BuggyMode freelist-PROT_NONE violation *reachable*; the
+            \* historical guard state="ACTIVE" only (always PROT_RW) latently
+            \* hid the very bug this model exists to demonstrate.
+            if state[target] /= "EMPTY"
+               /\ target \notin freeList
+               /\ target \notin decommitQ
                /\ releases[target] < MaxReleases
                /\ lock[target] = "free" then
                 state[target]    := "EMPTY";
@@ -526,7 +535,9 @@ FaultHandle(self) == /\ pc[self] = "FaultHandle"
                                      dp, cp >>
 
 AppFree(self) == /\ pc[self] = "AppFree"
-                 /\ IF state[target[self]] = "ACTIVE"
+                 /\ IF state[target[self]] /= "EMPTY"
+                       /\ target[self] \notin freeList
+                       /\ target[self] \notin decommitQ
                        /\ releases[target[self]] < MaxReleases
                        /\ lock[target[self]] = "free"
                        THEN /\ state' = [state EXCEPT ![target[self]] = "EMPTY"]

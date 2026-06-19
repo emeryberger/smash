@@ -76,6 +76,34 @@ efficient than the iterator above by avoiding multiple atomic inc_ref/dec_ref pe
 codebase already knows this iterator is a hot-path inefficiency. The container swap is a cheap
 complement to (or stopgap for) migrating callers to that visitor.
 
+### Microbenchmark: heap cost per iterator, by backing container
+
+Standalone repro `tools/stack_deque_vs_vector.cpp` instruments global `operator new` and times the
+iterator's exact lifetime (construct a `std::stack` of `void*` ≈ `RefPtr<Expr>`, push `depth`
+elements for the DFS, pop them all), repeated 100k times. **Measured on cloudnew with libstdc++
+11.5 (the same stdlib walrus is built with):**
+
+| stack depth | **deque (default)** | `std::vector` backing | `SmallVector<…,8>` backing |
+|------------:|--------------------:|----------------------:|---------------------------:|
+| 1 | **576 B, 2 allocs** | 8 B, 1 alloc  | **0 B, 0 allocs** |
+| 2 | **576 B, 2 allocs** | 24 B, 2 allocs | **0 B, 0 allocs** |
+| 3 | **576 B, 2 allocs** | 56 B, 3 allocs | **0 B, 0 allocs** |
+| 5 | **576 B, 2 allocs** | 120 B, 4 allocs | **0 B, 0 allocs** |
+
+(per-iterator heap bytes + allocation calls; `sizeof(RefPtr<Expr>)` = 8 B.)
+
+Takeaways, confirming the DHAT finding from first principles:
+- **`std::deque` costs a flat 576 B + 2 mallocs on *every* construction, independent of depth** —
+  libstdc++'s deque eagerly allocates a 512-byte data chunk **plus the 64-byte map-of-pointers**
+  (the exact 64-byte block DHAT flagged ~88% cold). At depth 1–5 the live payload is only 8–40 B,
+  so **~93–99 % of the 576 B is fixed overhead.**
+- **`std::vector`**: 8–120 B, scales with depth — already a ~5–70× reduction and no fixed overhead.
+- **`SmallVector<…,8>`**: **0 heap bytes / 0 allocations** for any depth ≤ 8 — the whole stack lives
+  in the iterator's inline buffer, eliminating heap traffic on the per-instruction
+  `isDynamicOffsetAP` path entirely. (libstdc++ deque chunk size is `_GLIBCXX_DEQUE_BUF_SIZE`,
+  here 512 B; other stdlibs differ in the constant but not in the "deque always heap-allocates a
+  chunk+map" behavior.)
+
 ## Other candidates seen (tiny HLO, lower volume — verify at scale)
 
 - `boost::log::v2s_mt_posix::attribute_value_set` (~840 B): hot prefix + cold tail

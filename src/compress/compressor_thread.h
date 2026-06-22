@@ -2536,7 +2536,28 @@ private:
         const size_t num_chunks_range = (end - start + kChunkSize - 1) / kChunkSize;
         size_t chunk_base = start / kChunkSize;
 
+        // Mid-loop VMA budget. This is the dominant VMA-creating path in the
+        // default deferred-reclaim mode: each reclaimed shadow page gets its
+        // own mprotect(PROT_NONE) (lines below), splitting ~1 VMA per page with
+        // no coalescing. Phase B runs every tick and is gated only by the
+        // COARSE tick-start defer_phases check — so within a single tick it can
+        // reclaim thousands of pages and blow past vm.max_map_count before the
+        // next tick's guard runs. That exhaustion made mprotect return ENOMEM;
+        // the restore fallback then bailed (no crash) but left the page
+        // unrestorable, so the faulting access re-faulted forever → LIVELOCK
+        // (observed on 3M-row in-memory sqlite: stuck at 2M rows, VMAs pinned
+        // at the 65531 cap). Bound VMA creation WITHIN the loop: read the live
+        // count once, charge +1 per reclaim, and stop reclaiming new pages once
+        // within cfg_vma_margin_ of the cap. Un-reclaimed pages stay
+        // COMPRESSED_SHADOW (still accessible, no fault) and are reclaimed a
+        // later tick once fault-driven decompression has merged VMAs back.
+        long vma_now = readVmaCount();
+        const long vma_cap = vmaMaxMapCount() - cfg_vma_margin_;
+        long reclaimed_since_resync = 0;
+        constexpr long kVmaResyncReclaims = 256;
+
         for (size_t c = 0; c < num_chunks_range; ++c) {
+            if (vma_cap > 0 && vma_now >= vma_cap) break;  // VMA budget exhausted
             size_t ci = chunk_base + c;
             if (ci >= num_chunks_) break;
             uint64_t mask = live_chunks_[ci];
@@ -2544,6 +2565,7 @@ private:
             size_t page_base = ci * kChunkSize;
 
             while (mask) {
+                if (vma_cap > 0 && vma_now >= vma_cap) break;  // VMA budget
                 int bit = __builtin_ctzll(mask);
                 mask &= mask - 1;
                 size_t i = page_base + bit;
@@ -2634,6 +2656,14 @@ private:
                     states_->set(i, PageState::COMPRESSED);
                 }
                 locks_->unlock(i);
+                // Charge this reclaim against the VMA budget. The PROT_NONE
+                // above splits ~1 VMA; resync to the real count periodically
+                // to absorb merges from concurrent fault-driven decompression.
+                ++vma_now;
+                if (++reclaimed_since_resync >= kVmaResyncReclaims) {
+                    vma_now = readVmaCount();
+                    reclaimed_since_resync = 0;
+                }
             }
         }
     }
@@ -2866,8 +2896,29 @@ private:
 #endif
         // Fallback: legacy commit-then-copy (has a small readable-but-empty
         // window; only reached off the Linux fast path).
-        if (!vm::commitPages(page_addr, kPageSize)) {
-            vm::remapPages(page_addr, kPageSize, true, true);
+        //
+        // SAFETY: the memcpy below stores directly into page_addr, so the page
+        // MUST be writable first. Under VMA exhaustion (vm.max_map_count hit by
+        // per-page mprotect on a heavily hot/cold-interleaved workload, e.g.
+        // large in-memory SQLite) BOTH commitPages (mprotect) and remapPages
+        // (mmap) fail with ENOMEM. Memcpy-ing into a still-PROT_NONE page is a
+        // wild store → SIGSEGV. Verify writability and bail on failure: leave
+        // the page PROT_NONE / COMPRESSED so the access simply re-faults (the
+        // caller keeps the per-page lock; the data is still recoverable from the
+        // blob). Degrade, don't crash.
+        if (!vm::commitPages(page_addr, kPageSize) &&
+            !vm::remapPages(page_addr, kPageSize, true, true)) {
+            static std::atomic<uint64_t> warned{0};
+            if (warned.fetch_add(1, std::memory_order_relaxed) == 0) {
+                char buf[160];
+                int n = smash::safe_snprintf(buf, sizeof(buf),
+                    "[smash WARN] restorePageContents: cannot make page %p "
+                    "writable (mprotect/mmap ENOMEM — likely vm.max_map_count "
+                    "exhausted); skipping restore to avoid wild-store crash\n",
+                    page_addr);
+                if (n > 0) (void)!::write(2, buf, (size_t)n);
+            }
+            return;  // page stays PROT_NONE+COMPRESSED → access re-faults; no crash
         }
         __builtin_memcpy(page_addr, src, kPageSize);
     }
@@ -3131,38 +3182,138 @@ private:
     // The per-page lock provides ordering against handleFault and
     // releaseCompressedPages, both of which clear the pending bit BEFORE
     // any state transition out of COMPRESSED.
+    // Max contiguous pages coalesced into one mprotect/madvise in the sweeper.
+    // A single mprotect(PROT_NONE) over a contiguous run produces ONE VMA split
+    // instead of one-per-page. Without this, a workload that compresses many
+    // scattered cold pages (e.g. large in-memory SQLite) exhausts
+    // vm.max_map_count (~65530 default): each per-page mprotect splits a VMA,
+    // and once the cap is hit every subsequent mprotect/mmap/pwrite fails with
+    // ENOMEM, which used to crash restorePageContents()'s fallback memcpy.
+    // 512 pages = 2 MiB bounds the per-batch lock-hold time.
+    static constexpr size_t kSweepCoalesceMax = 512;
+
+    // vm.max_map_count, read once. Cap on VMAs per process; each per-page
+    // mprotect(PROT_NONE) splits a VMA toward this limit.
+    static long vmaMaxMapCount() {
+        static const long cap = []{
+            FILE* f = fopen("/proc/sys/vm/max_map_count", "r");
+            if (!f) return 65530L;
+            long n = 65530;
+            if (fscanf(f, "%ld", &n) != 1) n = 65530;
+            fclose(f);
+            return n;
+        }();
+        return cap;
+    }
+
+    // Current VMA count for this process (lines in /proc/self/maps). Linux
+    // only; returns 0 elsewhere so callers treat the budget as unbounded.
+    static long readVmaCount() {
+#ifdef __linux__
+        FILE* f = fopen("/proc/self/maps", "r");
+        if (!f) return 0;
+        long n = 0;
+        char buf[4096];
+        while (fgets(buf, sizeof(buf), f)) ++n;
+        fclose(f);
+        return n;
+#else
+        return 0;
+#endif
+    }
+
     void sweepDeferredMadvise() {
         if (!deferMadviseEnabled() || !deferred_pending_) return;
         const uint32_t now = tick_counter_;
         const uint32_t ttl = deferMadviseTicks();
         const size_t total = vm_->committedPages();
-        for (size_t i = 0; i < total; ++i) {
-            if (!deferred_pending_[i].load(std::memory_order_acquire)) continue;
-            if (now - deferred_queue_tick_[i] < ttl) continue;
-            if (!locks_->tryLock(i)) continue;  // contended — try next tick
-            if (!deferred_pending_[i].load(std::memory_order_acquire)) {
-                locks_->unlock(i);
-                continue;
+
+        // Mid-sweep VMA budget. This sweep is where deferred-madvise mode
+        // actually issues mprotect(PROT_NONE) — each contiguous run splits
+        // ~1 VMA. It runs EVERY tick (not gated by the tick-start defer_phases
+        // guard), so on a hot/cold-interleaved workload (large in-memory
+        // sqlite) it can split thousands of VMAs within a single tick and blow
+        // past vm.max_map_count before the next tick's guard ever runs. When
+        // that happened, mprotect started returning ENOMEM; the restore
+        // fallback then bailed (no wild-store crash) but left the page
+        // unrestorable → the faulting access re-faulted forever → LIVELOCK.
+        //
+        // Fix: bound VMA creation WITHIN the sweep. Read the live count once,
+        // estimate +1 per run we apply, and stop arming new PROT_NONE regions
+        // once we're within cfg_vma_margin_ of the cap. Pages left unswept stay
+        // COMPRESSED+pending and are picked up a later tick, by which point
+        // fault-driven decompression (which mprotect(PROT_RW)s pages and MERGES
+        // their VMAs back) has freed headroom. Re-sync the real count every
+        // kVmaResyncRuns runs to correct estimate drift (merges/other mmaps).
+        long vma_now = readVmaCount();
+        const long vma_cap = vmaMaxMapCount() - cfg_vma_margin_;
+        long applied_since_resync = 0;
+        constexpr long kVmaResyncRuns = 256;
+
+        // Buffer of page indices in the current contiguous run we hold locks on.
+        size_t run[kSweepCoalesceMax];
+        size_t i = 0;
+        while (i < total) {
+            // VMA budget: stop arming new PROT_NONE regions when near the cap.
+            // Leave remaining pending pages for a later tick (no crash, no
+            // livelock — they're still COMPRESSED and fault-decompress fine).
+            if (vma_cap > 0 && vma_now >= vma_cap) break;
+
+            // Find the start of an eligible run.
+            if (!deferred_pending_[i].load(std::memory_order_acquire) ||
+                (now - deferred_queue_tick_[i] < ttl)) { ++i; continue; }
+
+            // Greedily extend a CONTIGUOUS run of eligible+lockable pages.
+            // Locks are acquired in strictly ascending page-index order, and
+            // handleFault only ever holds a single page lock (blocking), so
+            // there is no cross-page deadlock. Pages that fail any check break
+            // the run (so the mprotect range stays contiguous AND uniform).
+            size_t n = 0;
+            size_t j = i;
+            while (j < total && n < kSweepCoalesceMax) {
+                if (!deferred_pending_[j].load(std::memory_order_acquire) ||
+                    (now - deferred_queue_tick_[j] < ttl))
+                    break;                         // not eligible → end run
+                if (!locks_->tryLock(j)) break;    // contended → end run
+                // Re-check under lock; on mismatch drop this page and end run.
+                if (!deferred_pending_[j].load(std::memory_order_acquire) ||
+                    states_->get(j) != PageState::COMPRESSED) {
+                    // Defensively clear a stale pending bit; state moved on.
+                    deferred_pending_[j].store(false, std::memory_order_release);
+                    locks_->unlock(j);
+                    break;
+                }
+                run[n++] = j;
+                ++j;
             }
-            if (states_->get(i) != PageState::COMPRESSED) {
-                // State moved without clearing the bit — defensively reset.
-                deferred_pending_[i].store(false, std::memory_order_release);
-                locks_->unlock(i);
-                continue;
+
+            if (n == 0) { ++i; continue; }
+
+            // All `n` pages [run[0]..run[n-1]] are contiguous, COMPRESSED, and
+            // locked by us. Clear their pending bits, then issue ONE
+            // mprotect(PROT_NONE) + ONE madvise over the whole 4 KiB*n range —
+            // a single VMA split instead of n.
+            for (size_t k = 0; k < n; ++k)
+                deferred_pending_[run[k]].store(false, std::memory_order_release);
+            void* base = vm_->pageAddress(run[0]);
+            if (base) {
+                size_t bytes = n * kPageSize;
+                if (!vm::protectPages(base, bytes, false, false))
+                    vm::remapPages(base, bytes, false, false);
+                vm::decommitPages(base, bytes);
+                // One contiguous PROT_NONE run splits at most ~2 VMAs (a slice
+                // out of the middle of a larger RW region). Charge 2 to stay
+                // conservative; resync to the real count periodically.
+                vma_now += 2;
+                if (++applied_since_resync >= kVmaResyncRuns) {
+                    vma_now = readVmaCount();
+                    applied_since_resync = 0;
+                }
             }
-            // Page is COMPRESSED and has been pending for >= ttl ticks.
-            // Apply PROT_NONE (to arm fault-driven decompression) then
-            // drop physical backing. Both under tryLock — safe because
-            // handleFault uses blocking lock (it will wait for us) and
-            // we hold only this one page's lock (no cross-page deadlock).
-            deferred_pending_[i].store(false, std::memory_order_release);
-            void* page_addr = vm_->pageAddress(i);
-            if (page_addr) {
-                if (!vm::protectPages(page_addr, kPageSize, false, false))
-                    vm::remapPages(page_addr, kPageSize, false, false);
-                vm::decommitPages(page_addr, kPageSize);
-            }
-            locks_->unlock(i);
+            for (size_t k = 0; k < n; ++k)
+                locks_->unlock(run[k]);
+
+            i = j;  // resume after the run (j == run[n-1]+1, or the break point)
         }
     }
 
@@ -3204,28 +3355,28 @@ private:
         // Phase 3 (PROT_READ monitor) entirely when we're close — better
         // to lose RSS savings than corrupt the host application.
         //
-        // Re-check every kVmaCheckEveryNTicks ticks; this is a cheap
-        // /proc read but we don't need it every second.
-        static const long max_map_count = []{
-            FILE* f = fopen("/proc/sys/vm/max_map_count", "r");
-            if (!f) return 65530L;
-            long n = 65530;
-            if (fscanf(f, "%ld", &n) != 1) n = 65530;
-            fclose(f);
-            return n;
-        }();
-        constexpr long kVmaSafetyMargin = 8192;       // 8K VMA headroom
-        constexpr int kVmaCheckEveryNTicks = 4;
-        if ((tick_counter_ % kVmaCheckEveryNTicks) == 0) {
-            FILE* f = fopen("/proc/self/maps", "r");
-            if (f) {
-                long n = 0;
-                char buf[4096];
-                while (fgets(buf, sizeof(buf), f)) ++n;
-                fclose(f);
-                vma_count_cached_ = n;
-            }
-        }
+        // This tick-start check is the COARSE guard; the sweep itself
+        // (sweepDeferredMadvise, where deferred-madvise mode actually issues
+        // the mprotect(PROT_NONE) that splits VMAs) has its own mid-loop budget
+        // so it can't blow past the cap WITHIN a single tick. See that function.
+        //
+        // VMA headroom kept below max_map_count. The guard's ONLY job is to
+        // leave enough free VMA slots that fault-driven decompression (which
+        // calls mprotect(PROT_RW) and tends to MERGE VMAs back, net-reducing
+        // count) can always proceed — NOT to prevent every possible overshoot.
+        //
+        // The margin must NOT clip a workload whose natural cold-page working
+        // set fits under the cap. Measured: 500K in-memory sqlite plateaus at
+        // ~47.8K VMAs (73% of the 65530 cap) and is perfectly safe — a 20K
+        // margin (trip @ 45,530) wrongly clipped it and cut its RSS reduction
+        // from +24% to −29% vs glibc. An 8K margin (trip @ 57,530) clears that
+        // plateau with room while still tripping 3M sqlite (which needs >65.5K
+        // VMAs and would otherwise crash/livelock) before the cap. Read once at
+        // startup into cfg_vma_margin_ (env SMASH_VMA_MARGIN); never call getenv
+        // on the per-tick path.
+        const long max_map_count = vmaMaxMapCount();
+        const long kVmaSafetyMargin = cfg_vma_margin_;
+        vma_count_cached_ = readVmaCount();
         if (vma_count_cached_ + kVmaSafetyMargin >= max_map_count) {
             // Can't safely fragment more VMAs — defer compression for
             // the remainder of this tick. Phase 1 (access tracking)
@@ -4000,6 +4151,7 @@ public:
     bool cfg_no_monitor_ = false;
     int cfg_phase3_skip_thresh_ = 20;
     int cfg_defer_phases_ms_ = 0;
+    long cfg_vma_margin_ = 8192;   // SMASH_VMA_MARGIN; see VMA-cap guard in tick()
 
     void warmupClassStatics() {
         const char* v;
@@ -4013,6 +4165,8 @@ public:
         cfg_phase3_skip_thresh_ = v ? std::atoi(v) : 20;
         v = std::getenv("SMASH_DEFER_PHASES_MS");
         cfg_defer_phases_ms_ = v ? std::atoi(v) : 0;
+        v = std::getenv("SMASH_VMA_MARGIN");
+        cfg_vma_margin_ = v ? std::atol(v) : 8192L;
         // Touch remaining statics to force their initialization:
         (void)std::getenv("SMASH_PROTECT_CHUNK_PAGES");
         (void)std::getenv("SMASH_P2_CHUNK");

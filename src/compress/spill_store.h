@@ -257,6 +257,22 @@ public:
 
     bool ready() const { return ready_; }
 
+    // Reset to the uninitialized state WITHOUT touching the fd/mapping (the
+    // caller owns those and unmaps/closes them separately). Used post-fork to
+    // forget the inherited parent spill so the child can re-init lazily. Safe
+    // because SpillStore holds no resources of its own beyond the (caller-owned)
+    // fd/mapping/metadata pointers.
+    void reset() {
+        for (int s = 0; s < kCompressStoreShards; ++s) shards_[s].current = nullptr;
+        fd_ = -1;
+        map_base_ = nullptr;
+        map_size_ = 0;
+        num_slots_ = 0;
+        regions_ = nullptr;
+        next_slot_.store(0, std::memory_order_relaxed);
+        ready_ = false;
+    }
+
     // Bytes of metadata the caller must allocate for `regions_metadata`,
     // given a planned mapping size. Exposed so the caller can size the
     // anonymous metadata array before init().

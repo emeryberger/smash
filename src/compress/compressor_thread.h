@@ -12,6 +12,7 @@
 
 #include "smash/config.h"
 #include "compress_store.h"
+#include "spill_store.h"
 #include "compress_engine.h"
 #include "compression_roi.h"
 #include "../vm/vm_region.h"
@@ -53,8 +54,16 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 #include <sys/uio.h>          // process_vm_readv
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>         // mmap/munmap for the spill mapping
+#include <sys/vfs.h>          // statfs — reject tmpfs/ramfs spill dirs
 #include <sys/syscall.h>      // SYS_membarrier
 #include <linux/membarrier.h> // MEMBARRIER_CMD_*
+#ifndef TMPFS_MAGIC
+#define TMPFS_MAGIC 0x01021994
+#endif
+#ifndef RAMFS_MAGIC
+#define RAMFS_MAGIC 0x858458f6
+#endif
 #endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -265,6 +274,18 @@ class CompressorThread {
     PageLockTable* locks_ = nullptr;
     CompressStore* store_ = nullptr;
     CompressEngine* engine_ = nullptr;      // shared: dict training, dict lookup
+
+    // File-backed spill for very-cold blobs (SMASH_SPILL). When ready, very-cold
+    // deep-tier blobs are stored here (clean, kernel-evictable page cache)
+    // instead of anonymous RAM. Lazily set up on first very-cold store; all
+    // null/!ready means the feature is off and behavior is byte-identical.
+    SpillStore spill_;
+    int spill_fd_ = -1;                 // unlinked spill file
+    void* spill_map_ = nullptr;         // MAP_SHARED mapping base
+    size_t spill_map_size_ = 0;         // mapping size
+    SpillStore::Region* spill_meta_ = nullptr;  // out-of-band region metadata (bootstrap)
+    bool spill_init_done_ = false;      // one-shot setup attempted (success or give-up)
+    std::atomic<size_t> spilled_count_{0};  // live kTierSpilled pages (fork fast-path guard)
     PageMap* page_map_ = nullptr;
     vm::FaultHandler* fault_handler_ = nullptr;
 
@@ -323,6 +344,12 @@ class CompressorThread {
         // very_cold_ticks=60 fires multiple times per page) this saves
         // serious wall time.
         kTierFastTried = 3,
+        // Blob lives in the file-backed SpillStore (SMASH_SPILL): a very-cold
+        // deep-tier blob whose bytes were moved out of anonymous RAM into the
+        // spill file so the kernel can evict them as clean page cache.
+        // compressed_[i].data still points at the bytes (into the spill mmap),
+        // so decompress is unchanged; only the RELEASE path dispatches on this.
+        kTierSpilled = 4,
     };
     uint8_t* page_tier_ = nullptr;
     // Per-page recompression count: bumped on every COMPRESSED → ACTIVE
@@ -937,6 +964,45 @@ public:
         // in the child since PFNs and privilege may differ; reset the cache.
         if (page_idle_fd_ >= 0)  { close(page_idle_fd_);  page_idle_fd_ = -1; }
         idle_read_ok_ = -1;
+        // Spill file: the child inherited the parent's MAP_SHARED mapping of the
+        // (unlinked) parent spill file plus the in-memory SpillStore offsets/
+        // free-list, which are process-local. Continuing to use them would
+        // corrupt both processes' bump cursors, and the parent may hole-punch a
+        // region out from under the child. So before dropping the inherited
+        // mapping, copy every kTierSpilled blob's bytes back into the child's
+        // COW-private anonymous CompressStore and re-tag it kTierDeep — a plain
+        // byte copy (no decompress needed; comp_size/algo are preserved). Then
+        // unmap and reset so the child lazily creates its OWN spill later.
+        // Guarded by spilled_count_ so the common (no-spill) fork pays nothing.
+        if (spill_.ready() && spilled_count_.load(std::memory_order_relaxed) > 0
+            && store_ && compressed_) {
+            size_t committed = vm_ ? vm_->committedPages() : 0;
+            for (size_t i = 0; i < committed; ++i) {
+                if (!page_tier_ || page_tier_[i] != kTierSpilled) continue;
+                void* src = compressed_[i].data;
+                size_t csz = compressed_[i].compressedSize();
+                if (src && spill_.contains(src)) {
+                    size_t new_alloc = 0;
+                    void* dst = store_->store(src, csz, &new_alloc, i);
+                    if (dst) {
+                        compressed_[i].set(dst, csz, new_alloc,
+                                           compressed_[i].algorithm());
+                        page_tier_[i] = kTierDeep;
+                    }
+                    // If the anonymous store also fails (OOM), leave it tagged
+                    // kTierSpilled pointing at the soon-to-be-unmapped blob; an
+                    // access would fault — but this is an extreme OOM edge and
+                    // far rarer than the wild-store it replaces.
+                }
+            }
+        }
+        spilled_count_.store(0, std::memory_order_relaxed);
+        if (spill_map_) { munmap(spill_map_, spill_map_size_); spill_map_ = nullptr; }
+        if (spill_fd_ >= 0) { close(spill_fd_); spill_fd_ = -1; }
+        spill_map_size_ = 0;
+        spill_meta_ = nullptr;
+        spill_.reset();                // forget inherited parent spill, !ready
+        spill_init_done_ = false;      // allow the child to re-init lazily
 #endif
     }
 private:
@@ -3222,6 +3288,101 @@ private:
 #endif
     }
 
+    // True if `dir` is a real-disk filesystem (NOT tmpfs/ramfs). A spill file on
+    // a RAM-backed fs defeats the purpose (it costs RAM/swap, not disk).
+    static bool isRealDiskDir(const char* dir) {
+#ifdef __linux__
+        struct statfs sfs;
+        if (statfs(dir, &sfs) != 0) return false;
+        auto t = static_cast<unsigned long>(sfs.f_type);
+        if (t == TMPFS_MAGIC || t == RAMFS_MAGIC) return false;
+        return true;
+#else
+        (void)dir;
+        return false;
+#endif
+    }
+
+    // One-shot setup of the file-backed spill store. Runs on the compressor
+    // thread (never the signal handler), so open/statfs/fallocate/mmap and a
+    // BootstrapAlloc metadata array are all fine. On ANY failure it gives up
+    // permanently (spill_init_done_ = true, spill_ stays !ready) and the caller
+    // falls back to anonymous storage — never crashes. Returns spill_.ready().
+    bool ensureSpillReady() {
+#ifdef __linux__
+        if (spill_.ready()) return true;
+        if (spill_init_done_) return false;   // already tried and gave up
+        spill_init_done_ = true;
+        if (!cfg_spill_) return false;
+
+        // Pick a real-disk directory. SMASH_SPILL_DIR wins if it's real disk;
+        // else /var/tmp (FHS persistent, real disk by convention — NOT /tmp,
+        // commonly tmpfs), else cwd. Reject tmpfs/ramfs (see isRealDiskDir).
+        const char* dir = nullptr;
+        if (cfg_spill_dir_ && isRealDiskDir(cfg_spill_dir_)) {
+            dir = cfg_spill_dir_;
+        } else if (isRealDiskDir("/var/tmp")) {
+            dir = "/var/tmp";
+        } else if (isRealDiskDir(".")) {
+            dir = ".";
+        }
+        if (!dir) return false;   // no real-disk dir available → disable
+
+        // Create unique file, then unlink immediately: the inode is freed on
+        // close/exit/crash, guaranteeing cleanup and no stray files.
+        char path[4096];
+        int n = smash::safe_snprintf(path, sizeof(path), "%s/smash-spill.%d.XXXXXX",
+                                     dir, (int)getpid());
+        if (n <= 0 || (size_t)n >= sizeof(path)) return false;
+        int fd = mkostemp(path, O_CLOEXEC);
+        if (fd < 0) return false;
+        unlink(path);
+
+        // Size the file to the cap, rounded down to whole 16 MB regions.
+        size_t region = SpillStore::regionSize();
+        size_t cap = (size_t)(cfg_spill_max_mb_ > 0 ? cfg_spill_max_mb_ : 1024)
+                     * 1024 * 1024;
+        size_t map_size = (cap / region) * region;
+        if (map_size < region) map_size = region;
+        // Pre-fallocate REAL blocks (not sparse) so ENOSPC surfaces here as a
+        // failure rather than as SIGBUS on a later write through the mapping.
+        if (fallocate(fd, 0, 0, (off_t)map_size) != 0) {
+            close(fd);
+            return false;   // disk too full to reserve → disable, fall back
+        }
+        void* map = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED) {
+            close(fd);
+            return false;
+        }
+        // Out-of-band region metadata from BootstrapAlloc (never freed; fine —
+        // one-shot, bounded by map_size/16MB entries, e.g. 64 for a 1 GiB cap).
+        size_t meta_bytes = SpillStore::metadataBytesFor(map_size);
+        void* meta = BootstrapAlloc::instance().allocate(
+            meta_bytes, alignof(SpillStore::Region));
+        if (!meta) {
+            munmap(map, map_size);
+            close(fd);
+            return false;
+        }
+        if (!spill_.init(fd, map, map_size,
+                         reinterpret_cast<SpillStore::Region*>(meta),
+                         map_size / region)) {
+            munmap(map, map_size);
+            close(fd);
+            return false;
+        }
+        spill_fd_ = fd;
+        spill_map_ = map;
+        spill_map_size_ = map_size;
+        spill_meta_ = reinterpret_cast<SpillStore::Region*>(meta);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     void sweepDeferredMadvise() {
         if (!deferMadviseEnabled() || !deferred_pending_) return;
         const uint32_t now = tick_counter_;
@@ -4152,6 +4313,10 @@ public:
     int cfg_phase3_skip_thresh_ = 20;
     int cfg_defer_phases_ms_ = 0;
     long cfg_vma_margin_ = 8192;   // SMASH_VMA_MARGIN; see VMA-cap guard in tick()
+    bool cfg_spill_ = false;       // SMASH_SPILL: file-back very-cold blobs
+    bool cfg_spill_pageout_ = false; // SMASH_SPILL_PAGEOUT: MADV_PAGEOUT accelerant
+    long cfg_spill_max_mb_ = 1024; // SMASH_SPILL_MAX_MB: spill file size cap (default 1 GiB)
+    const char* cfg_spill_dir_ = nullptr;  // SMASH_SPILL_DIR (else /var/tmp, cwd)
 
     void warmupClassStatics() {
         const char* v;
@@ -4167,6 +4332,13 @@ public:
         cfg_defer_phases_ms_ = v ? std::atoi(v) : 0;
         v = std::getenv("SMASH_VMA_MARGIN");
         cfg_vma_margin_ = v ? std::atol(v) : 8192L;
+        v = std::getenv("SMASH_SPILL");
+        cfg_spill_ = v && v[0] == '1';
+        v = std::getenv("SMASH_SPILL_PAGEOUT");
+        cfg_spill_pageout_ = v && v[0] == '1';
+        v = std::getenv("SMASH_SPILL_MAX_MB");
+        cfg_spill_max_mb_ = v ? std::atol(v) : 1024L;
+        cfg_spill_dir_ = std::getenv("SMASH_SPILL_DIR");  // may be null
         // Touch remaining statics to force their initialization:
         (void)std::getenv("SMASH_PROTECT_CHUNK_PAGES");
         (void)std::getenv("SMASH_P2_CHUNK");

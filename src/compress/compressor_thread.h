@@ -2383,9 +2383,23 @@ private:
             return false;
         }
 
+        // File-backed spill (SMASH_SPILL): this is the very-cold (deep-tier)
+        // recompression — the natural point to move the blob out of anonymous
+        // RAM into the spill file so the kernel can evict it as clean page
+        // cache. Try the spill store first; on any miss (feature off, file
+        // exhausted, not yet ready) fall back to the anonymous CompressStore.
         size_t new_alloc_size = 0;
-        void* new_data = store_->store(worker.compress_buf, new_comp_size,
-                                       &new_alloc_size, page_idx);
+        void* new_data = nullptr;
+        bool spilled = false;
+        if (cfg_spill_ && ensureSpillReady()) {
+            new_data = spill_.store(worker.compress_buf, new_comp_size,
+                                    &new_alloc_size, page_idx);
+            spilled = (new_data != nullptr);
+        }
+        if (!new_data) {
+            new_data = store_->store(worker.compress_buf, new_comp_size,
+                                     &new_alloc_size, page_idx);
+        }
         if (!new_data) {
             states_->set(page_idx, PageState::COMPRESSED);
             locks_->unlock(page_idx);
@@ -2398,7 +2412,14 @@ private:
         // acquisition and sees the new blob.
         compressed_[page_idx].set(new_data, new_comp_size, new_alloc_size,
                                   target_algo);
-        if (page_tier_) page_tier_[page_idx] = kTierDeep;
+        if (page_tier_) {
+            if (spilled) {
+                page_tier_[page_idx] = kTierSpilled;
+                spilled_count_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                page_tier_[page_idx] = kTierDeep;
+            }
+        }
 
         states_->set(page_idx, PageState::COMPRESSED);
         locks_->unlock(page_idx);
@@ -2526,7 +2547,7 @@ private:
                 releaseFaultSlot(slot);
 
                 // Release compressed blob (sharded by page index)
-                store_->release(compressed_[adj].data, compressed_[adj].alloc_size, adj);
+                releaseBlob(adj);
                 compressed_[adj] = {};
 
                 // Restore to active
@@ -2690,8 +2711,7 @@ private:
 
                 if (!content_matches) {
                     // Page was modified before we set PROT_READ — discard
-                    store_->release(compressed_[i].data,
-                                    compressed_[i].alloc_size, i);
+                    releaseBlob(i);
                     compressed_[i] = {};
                     shadow_tick_[i] = 0;
                     if (page_tier_) page_tier_[i] = kTierNone;
@@ -3381,6 +3401,22 @@ private:
 #else
         return false;
 #endif
+    }
+
+    // Release the compressed blob for page_idx to the correct store. A
+    // kTierSpilled blob lives in the file-backed SpillStore; everything else is
+    // in the anonymous CompressStore. Centralizes the discriminator so no
+    // release site has to special-case spill. Does NOT clear compressed_[] or
+    // page_tier_ — callers already do that as today.
+    void releaseBlob(size_t page_idx) {
+        if (page_tier_ && page_tier_[page_idx] == kTierSpilled) {
+            spill_.release(compressed_[page_idx].data,
+                           compressed_[page_idx].alloc_size, page_idx);
+            spilled_count_.fetch_sub(1, std::memory_order_relaxed);
+        } else {
+            store_->release(compressed_[page_idx].data,
+                            compressed_[page_idx].alloc_size, page_idx);
+        }
     }
 
     void sweepDeferredMadvise() {
@@ -4621,8 +4657,7 @@ public:
                     compressed_[i].compressedSize(), kPageSize, algo, sc);
                 restorePageContents(page_addr, fault_slots_[slot].buf);
                 releaseFaultSlot(slot);
-                store_->release(compressed_[i].data,
-                                compressed_[i].alloc_size, i);
+                releaseBlob(i);
                 compressed_[i] = {};
                 if (page_tier_) page_tier_[i] = kTierNone;
                 states_->set(i, PageState::ACTIVE);
@@ -4773,8 +4808,7 @@ public:
             releaseFaultSlot(slot);
 
             // Release compressed blob (sharded store)
-            store_->release(compressed_[page_idx].data,
-                           compressed_[page_idx].alloc_size, page_idx);
+            releaseBlob(page_idx);
             compressed_[page_idx] = {};
             if (page_tier_) page_tier_[page_idx] = kTierNone;
 
@@ -4913,8 +4947,7 @@ public:
             // Discard the shadow blob, restore to ACTIVE.
             void* page_addr = vm_->pageAddress(page_idx);
             vm::protectPages(page_addr, kPageSize, true, true);
-            store_->release(compressed_[page_idx].data,
-                            compressed_[page_idx].alloc_size, page_idx);
+            releaseBlob(page_idx);
             compressed_[page_idx] = {};
             if (shadow_tick_) shadow_tick_[page_idx] = 0;
             if (page_tier_) page_tier_[page_idx] = kTierNone;
@@ -4946,7 +4979,7 @@ public:
             PageState st = states_->get(i);
             if ((st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW)
                 && compressed_[i].data) {
-                store_->release(compressed_[i].data, compressed_[i].alloc_size, i);
+                releaseBlob(i);
                 compressed_[i] = {};
             }
             if (shadow_tick_) shadow_tick_[i] = 0;

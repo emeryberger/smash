@@ -1333,6 +1333,20 @@ private:
                     // Regardless of upgrade outcome, this slot was visited
                     // — no further work this tick for this page.
                 }
+                // File-backed spill (SMASH_SPILL): once a page is very-cold and
+                // its tier is resolved (deep, or fast-tried-and-kept), relocate
+                // its blob from anonymous RAM into the spill file so the kernel
+                // can evict it as clean page cache. Decoupled from the zstd-9
+                // upgrade on purpose: the upgrade's 80%-savings gate rejects the
+                // large majority of pages (measured: 0/131072 upgrades succeed
+                // on a realistic cold set), so gating spill on a successful
+                // upgrade would almost never fire. Age + terminal-tier is the
+                // right trigger.
+                if (cfg_spill_ && st == PageState::COMPRESSED &&
+                    cold_count_[i] >= cfg.very_cold_ticks && page_tier_ &&
+                    (page_tier_[i] == kTierDeep || page_tier_[i] == kTierFastTried)) {
+                    maybeSpillPage(i);
+                }
                 if (st == PageState::COMPRESSED || st == PageState::COMPRESSING)
                     return;
             } else if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) {
@@ -3420,6 +3434,54 @@ private:
     // in the anonymous CompressStore. Centralizes the discriminator so no
     // release site has to special-case spill. Does NOT clear compressed_[] or
     // page_tier_ — callers already do that as today.
+    // Relocate a very-cold page's compressed blob from the anonymous
+    // CompressStore into the file-backed SpillStore (clean, kernel-evictable
+    // page cache). Plain byte copy of the existing blob — no recompression, no
+    // savings gate. Holds the per-page lock so it's serialized against the
+    // fault handler (which reads compressed_[i].data under the same lock).
+    // Best-effort: on spill exhaustion / not-ready it leaves the page anonymous.
+    void maybeSpillPage(size_t page_idx) {
+        if (!ensureSpillReady()) return;
+        if (!locks_->tryLock(page_idx)) return;  // contended → try a later tick
+        // Re-check under lock: still COMPRESSED, still a terminal anonymous tier.
+        if (states_->get(page_idx) != PageState::COMPRESSED ||
+            !page_tier_ ||
+            (page_tier_[page_idx] != kTierDeep &&
+             page_tier_[page_idx] != kTierFastTried)) {
+            locks_->unlock(page_idx);
+            return;
+        }
+        void* old_data = compressed_[page_idx].data;
+        size_t old_alloc = compressed_[page_idx].alloc_size;
+        size_t csz = compressed_[page_idx].compressedSize();
+        CompressAlgo algo = compressed_[page_idx].algorithm();
+        if (!old_data || spill_.contains(old_data)) {  // nothing to do / already spilled
+            locks_->unlock(page_idx);
+            return;
+        }
+        size_t new_alloc = 0;
+        void* new_data = spill_.store(old_data, csz, &new_alloc, page_idx);
+        if (!new_data) { locks_->unlock(page_idx); return; }  // spill full → keep anon
+        compressed_[page_idx].set(new_data, csz, new_alloc, algo);
+        page_tier_[page_idx] = kTierSpilled;
+        spilled_count_.fetch_add(1, std::memory_order_relaxed);
+#ifdef __linux__
+        if (cfg_spill_pageout_) {
+            auto a = reinterpret_cast<uintptr_t>(new_data);
+            uintptr_t s = a & ~(uintptr_t)(kPageSize - 1);
+            size_t len = (a + csz) - s;
+            len = (len + kPageSize - 1) & ~(size_t)(kPageSize - 1);
+            (void)madvise(reinterpret_cast<void*>(s), len, MADV_PAGEOUT);
+        }
+#endif
+        locks_->unlock(page_idx);
+        // Release the old anonymous blob outside the page lock is unnecessary
+        // (release takes the shard lock, not the page lock); do it here while we
+        // still hold nothing that conflicts. Safe: we already repointed
+        // compressed_[page_idx], so no fault can reach old_data.
+        store_->release(old_data, old_alloc, page_idx);
+    }
+
     void releaseBlob(size_t page_idx) {
         if (page_tier_ && page_tier_[page_idx] == kTierSpilled) {
             spill_.release(compressed_[page_idx].data,
@@ -4515,15 +4577,17 @@ public:
             std::memory_order_relaxed);
         uint64_t tier_success = self->tier_upgrade_success_.load(
             std::memory_order_relaxed);
-        char buf[384];
+        size_t spilled = self->spilled_count_.load(std::memory_order_relaxed);
+        char buf[416];
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
-            "  tier_up=%llu/%llu  bump=%zu\n",
+            "  tier_up=%llu/%llu  spilled=%zu  bump=%zu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
             (unsigned long long)tier_attempts,
+            spilled,
             raw_bump);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's

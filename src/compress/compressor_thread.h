@@ -2395,6 +2395,18 @@ private:
             new_data = spill_.store(worker.compress_buf, new_comp_size,
                                     &new_alloc_size, page_idx);
             spilled = (new_data != nullptr);
+#ifdef __linux__
+            // Optional accelerant: push the just-written blob page(s) out to the
+            // file now (MADV_PAGEOUT) rather than waiting for memory pressure.
+            // Page-align the range. Best-effort; ignore failure.
+            if (spilled && cfg_spill_pageout_) {
+                auto a = reinterpret_cast<uintptr_t>(new_data);
+                uintptr_t start = a & ~(uintptr_t)(kPageSize - 1);
+                size_t len = (a + new_comp_size) - start;
+                len = (len + kPageSize - 1) & ~(size_t)(kPageSize - 1);
+                (void)madvise(reinterpret_cast<void*>(start), len, MADV_PAGEOUT);
+            }
+#endif
         }
         if (!new_data) {
             new_data = store_->store(worker.compress_buf, new_comp_size,
@@ -4717,6 +4729,14 @@ public:
         // for a real heap-use-after-free in the host application).
         trace_msg("stopping fault handler...");
         if (fault_handler_) fault_handler_->stop();
+        // Release the spill mapping + fd. drainAllForShutdown() already
+        // decompressed every spilled page back to RW and released its blob, so
+        // nothing references the mapping now. The file was unlinked at creation,
+        // so closing the fd frees its disk blocks. (BootstrapAlloc metadata is
+        // never freed — bounded and process is exiting.)
+        if (spill_map_) { munmap(spill_map_, spill_map_size_); spill_map_ = nullptr; }
+        if (spill_fd_ >= 0) { close(spill_fd_); spill_fd_ = -1; }
+        spill_.reset();
         trace_msg("stop() complete");
     }
 

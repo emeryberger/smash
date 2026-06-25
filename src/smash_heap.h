@@ -68,6 +68,14 @@ extern VmRegion* g_smash_vm_region;
 // Same lifetime contract as g_smash_vm_region.
 extern PageStateTable* g_smash_page_states_for_external;
 
+// Global pointer to the PageLockTable, used by the munmap / Mach VM
+// DEALLOCATE interposers to serialize external-page untracking against a
+// compressor worker mid-snapshot. Without this lock the worker's
+// memcpy(page_buf, page_addr, kPageSize) in compressPage can race a concurrent
+// munmap that tears down the mapping → SIGSEGV (full-mode external-page race;
+// see model/SmashExternalRace.{lean,tla}). Same lifetime as the above.
+extern PageLockTable* g_smash_page_locks_for_external;
+
 // Profile-driven skip flag for external page tracking. Set by the
 // compressor when loading a profile that marks external pages as hot.
 // When true, mmap interposers skip the per-page tracking loop entirely,
@@ -894,6 +902,10 @@ public:
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
             g_smash_page_states_for_external = &page_states_;
+            // Publish the lock table so the munmap / Mach VM deallocate
+            // interposers can serialize external-page untracking against a
+            // compressor worker's snapshot read (full-mode external-page race).
+            g_smash_page_locks_for_external = &page_locks_;
 
             // When external mmap tracking is active (SMASH_TRACK_EXTERNAL=1),
             // tracked pages live at addresses OUTSIDE the contiguous arena, so

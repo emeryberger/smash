@@ -1179,10 +1179,14 @@ inline void deregisterLinuxExternalRange(smash::VmRegion* vm, void* base, size_t
     auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
                & ~(uintptr_t{smash::kPageSize} - 1);
     for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        size_t idx = vm->pageIndex(p);
-        if (idx == 0) continue;
-        smash::g_smash_page_states_for_external->set(idx, smash::PageState::EMPTY);
-        vm->untrackExternalPage(p);
+        // Untrack UNDER the per-page lock so a compressor worker mid-snapshot on
+        // this external page can't race the real munmap (in the caller, AFTER
+        // this returns) and read an unmapped page. Proven necessary +
+        // deadlock-free by model/SmashExternalRace.{lean,tla}: no
+        // mprotect/munmap is performed while the per-page lock is held.
+        vm->untrackExternalPageLocked(p,
+            smash::g_smash_page_locks_for_external,
+            smash::g_smash_page_states_for_external);
     }
 }
 

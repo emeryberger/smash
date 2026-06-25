@@ -193,6 +193,11 @@ smash::VmRegion* smash::g_smash_vm_region = nullptr;
 // gate every state mutation on this being non-null.
 smash::PageStateTable* smash::g_smash_page_states_for_external = nullptr;
 
+// See header. Published alongside g_smash_page_states_for_external so the
+// munmap / Mach VM deallocate interposers can take the per-page lock while
+// untracking an external page, serializing against compressPage's snapshot.
+smash::PageLockTable* smash::g_smash_page_locks_for_external = nullptr;
+
 // g_smash_skip_external_tracking is now an inline variable defined in
 // compress/compressor_thread.h (single definition across libsmash and the
 // compress-only build); no separate definition needed here.
@@ -1137,11 +1142,15 @@ inline void deregisterExternalRange(smash::VmRegion* vm, void* base, size_t len)
     auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
                & ~(uintptr_t{smash::kPageSize} - 1);
     for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        size_t idx = vm->pageIndex(p);
-        if (idx == 0) continue;
-        if (smash::g_smash_page_states_for_external)
-            smash::g_smash_page_states_for_external->set(idx, smash::PageState::EMPTY);
-        vm->untrackExternalPage(p);
+        // Untrack UNDER the per-page lock: serializes against a compressor
+        // worker that may be mid-snapshot on this external page, so the real
+        // munmap (in the caller, AFTER this returns) can't pull the mapping out
+        // from under the worker's memcpy. Proven necessary + deadlock-free by
+        // model/SmashExternalRace.{lean,tla}. No mprotect/munmap is done while
+        // the lock is held here.
+        vm->untrackExternalPageLocked(p,
+            smash::g_smash_page_locks_for_external,
+            smash::g_smash_page_states_for_external);
     }
 }
 

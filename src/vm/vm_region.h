@@ -175,13 +175,25 @@ class VmRegion {
         // Decommit the pages (release physical backing).
         vm::decommitPages(e->addr, e->num_pages * kPageSize);
 
-        // NOW add to free list (safe - pages are decommitted and PROT_RW)
+        // NOW add to free list (safe - pages are decommitted and PROT_RW).
+        // CRITICAL: newFreeRun() POPS shard.free_pool (the FreeRun recycle
+        // stack), which is guarded by shard.lock — the SAME lock that guards
+        // free_list and that recycleFreeRun (called from allocatePages) holds
+        // when it PUSHES free_pool. This runs on the decommit thread; before
+        // 2026-06-25 newFreeRun was called OUTSIDE the lock here, so the
+        // decommit-thread pop raced the app-thread locked push on free_pool,
+        // corrupting that singly-linked stack into a cycle → newFreeRun /
+        // allocatePages free-list walks spun forever (full-mode LargeAlloc
+        // spin-livelock). All free_pool/free_list mutations for a shard MUST
+        // hold shard.lock. Proven by model/SmashFreePoolRace.{lean,tla}.
+        // Deadlock-safe: newFreeRun's only nested lock is BootstrapAlloc's
+        // expand_lock_ (taken after, never before, shard.lock) — no inversion.
         FreeShard& shard = shards_[e->shard_idx];
-        FreeRun* run = newFreeRun(shard);
-        run->page_index = e->page_index;
-        run->page_count = e->num_pages;
         {
             LockGuard guard(shard.lock);
+            FreeRun* run = newFreeRun(shard);
+            run->page_index = e->page_index;
+            run->page_count = e->num_pages;
             run->next = shard.free_list;
             shard.free_list = run;
         }

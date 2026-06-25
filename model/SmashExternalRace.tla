@@ -28,6 +28,11 @@
  * documented TLB-shootdown-vs-page-lock deadlock (compressor_thread.h:1925).
  *
  * Safety invariant (NoUnmappedRead): a worker never snapshots an unmapped page.
+ *
+ * TLC results (run with `-deadlock`; this is a terminating model, not reactive):
+ *   _unlocked_buggy.cfg : Invariant NoUnmappedRead is VIOLATED (crash trace).
+ *   _locked_fixed.cfg   : No error — NoUnmappedRead AND MutualExclusion hold.
+ * This agrees with SmashExternalRace.lean (machine-checked, zero axioms).
  *)
 
 EXTENDS TLC

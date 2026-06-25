@@ -644,6 +644,42 @@ public:
         }
     }
 
+    // Untrack an external page UNDER ITS PER-PAGE LOCK, the serialization the
+    // formal model (model/SmashExternalRace.{lean,tla}) proves is required to
+    // make external munmap safe against a concurrent compressor worker.
+    //
+    // The compressor worker compresses an external page by snapshotting it:
+    //   tryLock(idx); check ACTIVE; state=COMPRESSING; memcpy(buf, pageAddress(idx), kPageSize)
+    // all UNDER lock[idx]. If munmap clears state + tears down the mapping
+    // WITHOUT that lock (the pre-fix bug), the worker's memcpy reads an unmapped
+    // page → SIGSEGV. By taking lock[idx] here we cannot run while the worker
+    // holds it mid-snapshot; and the worker re-loads pageAddress(idx) under the
+    // lock and bails when we've cleared track_reverse_ to 0.
+    //
+    // DEADLOCK SAFETY: this holds only a per-page lock and does NOT perform any
+    // mprotect / TLB-shootdown / real_munmap while holding it — the caller does
+    // real_munmap AFTER this returns. So it cannot reintroduce the
+    // TLB-shootdown-vs-page-lock deadlock documented in compressor_thread.h.
+    // (locks/states are passed in to avoid a header dependency cycle.)
+    void untrackExternalPageLocked(uintptr_t page_addr,
+                                   PageLockTable* locks,
+                                   PageStateTable* states) {
+        if (tracking_mode_ || !track_hash_) return;
+        size_t idx = pageIndex(page_addr);
+        if (idx == 0) return;                       // not tracked
+        if (locks) locks->lock(idx);
+        if (states) states->set(idx, PageState::EMPTY);
+        untrackExternalPage(page_addr);             // tombstone the hash slot
+        // Clear the reverse map so pageAddress(idx) returns nullptr — a worker
+        // that observes the page post-untrack gets null and skips it instead of
+        // dereferencing a stale (soon-to-be-unmapped) address.
+        if (idx >= contig_pages_) {
+            size_t local = idx - contig_pages_;
+            if (local < kTrackMaxPages) track_reverse_[local] = 0;
+        }
+        if (locks) locks->unlock(idx);
+    }
+
     bool contains(uintptr_t addr) const {
         if (tracking_mode_) {
             return lookupIdx(addr) != 0;

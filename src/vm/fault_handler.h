@@ -81,29 +81,24 @@ inline int& faultWasWrite() {
 #endif
 
 // Per-thread recursion depth for the SIGSEGV/SIGBUS handler (bounded re-entry
-// guard — see signalHandler). This is read/written INSIDE the handler on
-// EVERY platform (unlike faultWasWrite, which is Linux-only there), so it must
-// be signal-safe to access with no lazy initialization:
+// guard — see signalHandler). LINUX ONLY.
 //
-//   * A C++ `thread_local` (function-local static) emits a per-thread
-//     lazy-init guard; the FIRST access on a given thread runs that guard,
-//     and running it inside the signal handler traps SIGILL on macOS (the
-//     same guard that forces faultWasWrite to stay untouched-on-macOS; here
-//     the CI symptom was bench_sqlite dying -4 in the decompress phase).
-//   * The general-dynamic TLS model routes through __tls_get_addr, which is
-//     not async-signal-safe and recurses to a stack overflow on Linux.
+// The unbounded recursion this guards against is a Linux mechanism: a fault
+// inside libc's __dtoa/__Balloc malloc path re-enters the SA_NODEFER handler
+// on a fresh address each time, and the default-model TLS access itself
+// recurses via __tls_get_addr → stack overflow. On macOS we must NOT touch
+// any TLS from inside the signal handler at all: the first per-thread access
+// routes through the dyld thread-local resolver, whose lazy init traps SIGILL
+// in a signal context (the same reason faultWasWrite is kept untouched on
+// macOS; adding this guard there made bench_sqlite die -4 in CI). macOS
+// therefore keeps master's guard-free handler, which is stable in CI.
 //
-// A C-style `__thread int` sidesteps BOTH: it is zero-initialized by the
-// loader with no guard code, and (being a plain scalar with static storage
-// duration in a load-time library) resolves without __tls_get_addr. Use the
-// initial-exec model on Linux to guarantee the static-offset access; macOS
-// __thread already resolves directly for a DYLD-inserted dylib.
+// initial-exec so the static-offset access needs no __tls_get_addr; __thread
+// (C-style) has no lazy-init guard.
 #if defined(__linux__)
 inline __thread __attribute__((tls_model("initial-exec"))) int g_fault_depth = 0;
-#else
-inline __thread int g_fault_depth = 0;
-#endif
 inline int& faultDepth() { return g_fault_depth; }
+#endif
 
 #if defined(__APPLE__) || defined(__linux__)
 
@@ -185,14 +180,23 @@ class FaultHandler {
 
     static void signalHandler(int sig, siginfo_t* info, void* ucontext) {
         int saved_errno = errno;
+        // Bounded re-entry guard is LINUX ONLY — see faultDepth() decl for why
+        // macOS must not touch TLS in the handler. On macOS depthOk is always
+        // true (master's guard-free behavior); the Linux path caps recursion.
+#if defined(__linux__)
         int& depth = faultDepth();
-        if (isKernelFault(info) && instance_ && instance_->callback_ &&
-            depth < kMaxFaultDepth) {
+        const bool depthOk = depth < kMaxFaultDepth;
+#else
+        const bool depthOk = true;
+#endif
+        if (isKernelFault(info) && instance_ && instance_->callback_ && depthOk) {
+#if defined(__linux__)
             ++depth;
             struct DepthGuard {
                 int& d;
                 ~DepthGuard() { --d; }
             } depth_guard{depth};
+#endif
             uintptr_t addr = reinterpret_cast<uintptr_t>(info->si_addr);
             // Classify read vs write for the soft-dirty ROI re-dirty signal.
             // x86-64: bit 1 of the page-fault error code (gregs[REG_ERR]) is the

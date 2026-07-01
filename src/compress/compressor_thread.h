@@ -315,6 +315,21 @@ class CompressorThread {
     std::atomic<uint64_t> tier_upgrade_attempts_{0};
     std::atomic<uint64_t> tier_upgrade_success_{0};
 
+    // JIT tier-selection telemetry (answers "is the ROI model actually
+    // choosing zstd-9 vs zstd-1, or is the deep tier dead weight?").
+    //   tier_sel_fast_/deep_:  what the ROI/UCB model SELECTED before any
+    //                          ratio-driven fallback.
+    //   tier_used_fast_/deep_: the tier actually stored, AFTER the fast→deep
+    //                          escalation that fires when zstd-1's ratio is
+    //                          poor (see is_fast_tier fallback in compressPage).
+    //   tier_escalations_:     fast selected but escalated to deep on poor ratio.
+    // Reset together with the per-tick page counters in resetStats().
+    std::atomic<uint64_t> tier_sel_fast_{0};
+    std::atomic<uint64_t> tier_sel_deep_{0};
+    std::atomic<uint64_t> tier_used_fast_{0};
+    std::atomic<uint64_t> tier_used_deep_{0};
+    std::atomic<uint64_t> tier_escalations_{0};
+
     // SMASH_SNAPSHOT_VERIFY telemetry. Counts of page snapshots that were
     // re-read after the snapshot memcpy. *_fails_ increments when the
     // re-read differs from the snapshot — a store retired in our window
@@ -1877,6 +1892,14 @@ private:
         int zstd_level = profile->zstd_level;
         bool is_fast_tier = (zstd_level != 0 && zstd_level != kZstdDeepLevel)
                           || (algo == CompressAlgo::LZ4);
+        // Telemetry: record the tier the model SELECTED, before any
+        // ratio-driven escalation to deep. selected_fast is the snapshot used
+        // below to detect a fast→deep escalation.
+        const bool selected_fast = is_fast_tier;
+        if (selected_fast)
+            tier_sel_fast_.fetch_add(1, std::memory_order_relaxed);
+        else
+            tier_sel_deep_.fetch_add(1, std::memory_order_relaxed);
         // Prefer dictionary for deep-tier zstd if trained. Dictionaries are
         // keyed by real slab size_class only — large-alloc buckets sit above
         // kNumClasses and bypass the dict path.
@@ -2173,6 +2196,15 @@ private:
         compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
         if (page_tier_) {
             page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
+        }
+        // JIT telemetry: tier actually stored, plus fast→deep escalations
+        // (fast selected but its ratio was poor, so we re-ran at zstd-9).
+        if (is_fast_tier) {
+            tier_used_fast_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            tier_used_deep_.fetch_add(1, std::memory_order_relaxed);
+            if (selected_fast)
+                tier_escalations_.fetch_add(1, std::memory_order_relaxed);
         }
         // v6 profile: track compression count for thrash rate calculation
         if (have_span && sc < kTotalBucketsPerArena) {
@@ -4593,6 +4625,29 @@ public:
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
         if (n > 0) (void)!write(2, buf, (size_t)n);
+
+        // JIT tier-selection telemetry: how often the ROI model chose the
+        // deep (zstd-9) tier vs the fast (zstd-1/LZ4) tier, and how many fast
+        // selections escalated to deep on poor ratio. If sel_deep+escalations
+        // is ~0, the JIT tiering is effectively a no-op for this workload.
+        uint64_t sel_fast = self->tier_sel_fast_.load(std::memory_order_relaxed);
+        uint64_t sel_deep = self->tier_sel_deep_.load(std::memory_order_relaxed);
+        uint64_t used_fast = self->tier_used_fast_.load(std::memory_order_relaxed);
+        uint64_t used_deep = self->tier_used_deep_.load(std::memory_order_relaxed);
+        uint64_t escal = self->tier_escalations_.load(std::memory_order_relaxed);
+        uint64_t sel_tot = sel_fast + sel_deep;
+        uint64_t used_tot = used_fast + used_deep;
+        char tbuf[256];
+        int tn = smash::safe_snprintf(tbuf, sizeof(tbuf),
+            "[smash tiers] [%s] pid=%d selected: fast=%llu deep=%llu (deep %.1f%%)"
+            "  used: fast=%llu deep=%llu (deep %.1f%%)  escalations=%llu\n",
+            ts, (int)getpid(),
+            (unsigned long long)sel_fast, (unsigned long long)sel_deep,
+            sel_tot ? 100.0 * (double)sel_deep / (double)sel_tot : 0.0,
+            (unsigned long long)used_fast, (unsigned long long)used_deep,
+            used_tot ? 100.0 * (double)used_deep / (double)used_tot : 0.0,
+            (unsigned long long)escal);
+        if (tn > 0) (void)!write(2, tbuf, (size_t)tn);
 
         // SMASH_BUCKET_STATS=1: dump per-(arena, size_class) stats
         static const bool bucket_stats = []{

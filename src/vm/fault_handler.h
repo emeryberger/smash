@@ -80,6 +80,26 @@ inline int& faultWasWrite() {
 }
 #endif
 
+// Per-thread recursion depth for the SIGSEGV/SIGBUS handler (bounded re-entry
+// guard — see signalHandler). LINUX ONLY.
+//
+// The unbounded recursion this guards against is a Linux mechanism: a fault
+// inside libc's __dtoa/__Balloc malloc path re-enters the SA_NODEFER handler
+// on a fresh address each time, and the default-model TLS access itself
+// recurses via __tls_get_addr → stack overflow. On macOS we must NOT touch
+// any TLS from inside the signal handler at all: the first per-thread access
+// routes through the dyld thread-local resolver, whose lazy init traps SIGILL
+// in a signal context (the same reason faultWasWrite is kept untouched on
+// macOS; adding this guard there made bench_sqlite die -4 in CI). macOS
+// therefore keeps master's guard-free handler, which is stable in CI.
+//
+// initial-exec so the static-offset access needs no __tls_get_addr; __thread
+// (C-style) has no lazy-init guard.
+#if defined(__linux__)
+inline __thread __attribute__((tls_model("initial-exec"))) int g_fault_depth = 0;
+inline int& faultDepth() { return g_fault_depth; }
+#endif
+
 #if defined(__APPLE__) || defined(__linux__)
 
 // Signal-based fault handler for macOS and Linux.
@@ -143,9 +163,40 @@ class FaultHandler {
         return info->si_code > 0;
     }
 
+    // Bounded re-entrancy guard. The SIGSEGV/SIGBUS handlers are installed
+    // with SA_NODEFER (deliberate: a legitimate decompress can itself fault
+    // once, e.g. prefetching an adjacent compressed page, and that nested
+    // fault must be handled). But if callback_ (handleFault) faults on a
+    // DIFFERENT address every time — e.g. when the originating fault came
+    // from inside libc's __dtoa/__Balloc malloc path while formatting a
+    // float — the per-page reentrancy guard never matches and the handler
+    // recurses without bound until it overflows the signal stack
+    // ("Could not determine thread index for stack guard region").
+    // Cap the depth: past kMaxFaultDepth nested kernel faults on one thread
+    // we stop trying to handle and let the fault chain to the previous
+    // disposition, producing a clean crash with a real backtrace instead of
+    // a stack-overflow. 2 allows one legitimate nested decompress fault.
+    static constexpr int kMaxFaultDepth = 2;
+
     static void signalHandler(int sig, siginfo_t* info, void* ucontext) {
         int saved_errno = errno;
-        if (isKernelFault(info) && instance_ && instance_->callback_) {
+        // Bounded re-entry guard is LINUX ONLY — see faultDepth() decl for why
+        // macOS must not touch TLS in the handler. On macOS depthOk is always
+        // true (master's guard-free behavior); the Linux path caps recursion.
+#if defined(__linux__)
+        int& depth = faultDepth();
+        const bool depthOk = depth < kMaxFaultDepth;
+#else
+        const bool depthOk = true;
+#endif
+        if (isKernelFault(info) && instance_ && instance_->callback_ && depthOk) {
+#if defined(__linux__)
+            ++depth;
+            struct DepthGuard {
+                int& d;
+                ~DepthGuard() { --d; }
+            } depth_guard{depth};
+#endif
             uintptr_t addr = reinterpret_cast<uintptr_t>(info->si_addr);
             // Classify read vs write for the soft-dirty ROI re-dirty signal.
             // x86-64: bit 1 of the page-fault error code (gregs[REG_ERR]) is the

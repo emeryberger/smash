@@ -81,29 +81,29 @@ inline int& faultWasWrite() {
 #endif
 
 // Per-thread recursion depth for the SIGSEGV/SIGBUS handler (bounded re-entry
-// guard — see signalHandler). Same header-safe, PLATFORM-SPLIT TLS idiom as
-// faultWasWrite() above, and for the same load-bearing reasons:
-//   Linux: initial-exec, because this counter is read/written INSIDE the
-//     signal handler. Under the default model __tls_get_addr lazily allocates
-//     the dynamic TLS block (back into smash, not async-signal-safe), faults,
-//     re-enters the handler, and recurses until the stack overflows — the
-//     exact failure this guard exists to prevent (core-dump backtrace was a
-//     repeating __tls_get_addr / signalHandler / __restore_rt cycle on Linux
-//     under LD_PRELOAD).
-//   macOS: DEFAULT model — Apple's linker miscompiles initial-exec on a
-//     function-local static in a DYLD_INSERT_LIBRARIES dylib into a
-//     descriptor sequence that traps SIGILL in the handler (see faultWasWrite).
+// guard — see signalHandler). This is read/written INSIDE the handler on
+// EVERY platform (unlike faultWasWrite, which is Linux-only there), so it must
+// be signal-safe to access with no lazy initialization:
+//
+//   * A C++ `thread_local` (function-local static) emits a per-thread
+//     lazy-init guard; the FIRST access on a given thread runs that guard,
+//     and running it inside the signal handler traps SIGILL on macOS (the
+//     same guard that forces faultWasWrite to stay untouched-on-macOS; here
+//     the CI symptom was bench_sqlite dying -4 in the decompress phase).
+//   * The general-dynamic TLS model routes through __tls_get_addr, which is
+//     not async-signal-safe and recurses to a stack overflow on Linux.
+//
+// A C-style `__thread int` sidesteps BOTH: it is zero-initialized by the
+// loader with no guard code, and (being a plain scalar with static storage
+// duration in a load-time library) resolves without __tls_get_addr. Use the
+// initial-exec model on Linux to guarantee the static-offset access; macOS
+// __thread already resolves directly for a DYLD-inserted dylib.
 #if defined(__linux__)
-inline int& faultDepth() {
-    static thread_local __attribute__((tls_model("initial-exec"))) int v = 0;
-    return v;
-}
+inline __thread __attribute__((tls_model("initial-exec"))) int g_fault_depth = 0;
 #else
-inline int& faultDepth() {
-    static thread_local int v = 0;
-    return v;
-}
+inline __thread int g_fault_depth = 0;
 #endif
+inline int& faultDepth() { return g_fault_depth; }
 
 #if defined(__APPLE__) || defined(__linux__)
 

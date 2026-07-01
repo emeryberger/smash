@@ -484,6 +484,23 @@ inline constexpr int kZstdFastLevel = 1;            // fast tier (replaces LZ4)
 inline constexpr int kZstdNormalLevel = 3;
 inline constexpr int kZstdDeepLevel = 9;
 
+// Deep tier (zstd-9), compile-time gated. DISABLED by default: measurements
+// across the whole benchmark suite (sqlite/rocksdb/leveldb/redis/memcached/
+// bench_rss) show the deep tier is never ROI-selected and never wins a
+// recompression upgrade, and the fast->deep ratio-gate escalation (which does
+// fire, e.g. ~32% of rocksdb pages) yields no RSS benefit — zstd-9's larger
+// match window needs input >4KB to help, but smash compresses per-page, so
+// z9/z1 blob size is ~1.0 on real heap pages. libsmash therefore ships as
+// single-tier zstd-1. The deep-tier code is retained (not deleted) behind this
+// flag so two-tier can be restored for future work (e.g. multi-page
+// compression, where zstd-9's window could finally pay). Build with
+// -DSMASH_ENABLE_DEEP_TIER to re-enable the second tier.
+#ifdef SMASH_ENABLE_DEEP_TIER
+inline constexpr bool kDeepTierEnabled = true;
+#else
+inline constexpr bool kDeepTierEnabled = false;
+#endif
+
 // Tiered recompression (in development): when true, the compressor scans
 // COMPRESSED pages and upgrades fast-tier blobs (zstd-1 by default, LZ4
 // when SMASH_USE_LZ4) to deep-tier (zstd-9) once a page has stayed cold

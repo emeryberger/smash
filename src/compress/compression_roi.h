@@ -340,32 +340,37 @@ private:
         fast.ratio_scale_den = 1;
         profiles[num_profiles++] = fast;
 
-        // Deep-tier profile (zstd at kZstdDeepLevel).
-        // Scale the observed fast-tier ratio to estimate deep-tier ratio.
-        uint8_t scale_num = 1, scale_den = 1;
-        if (cal_.fast_ratio_zeros > 0.001 && cal_.deep_ratio_zeros > 0.001) {
-            double fast_sav = 1.0 - cal_.fast_ratio_zeros;
-            double deep_sav = 1.0 - cal_.deep_ratio_zeros;
-            if (fast_sav > 0.01) {
-                double scale = deep_sav / fast_sav;
-                if      (scale >= 1.5)  { scale_num = 3;  scale_den = 2; }
-                else if (scale >= 1.3)  { scale_num = 4;  scale_den = 3; }
-                else if (scale >= 1.1)  { scale_num = 11; scale_den = 10; }
+        // Deep-tier profile (zstd at kZstdDeepLevel). Gated off by default —
+        // see kDeepTierEnabled in config.h. When disabled, num_profiles stays
+        // 1 and selectProfile() short-circuits to profiles[0] (zstd-1), so the
+        // system is single-tier.
+        if constexpr (kDeepTierEnabled) {
+            // Scale the observed fast-tier ratio to estimate deep-tier ratio.
+            uint8_t scale_num = 1, scale_den = 1;
+            if (cal_.fast_ratio_zeros > 0.001 && cal_.deep_ratio_zeros > 0.001) {
+                double fast_sav = 1.0 - cal_.fast_ratio_zeros;
+                double deep_sav = 1.0 - cal_.deep_ratio_zeros;
+                if (fast_sav > 0.01) {
+                    double scale = deep_sav / fast_sav;
+                    if      (scale >= 1.5)  { scale_num = 3;  scale_den = 2; }
+                    else if (scale >= 1.3)  { scale_num = 4;  scale_den = 3; }
+                    else if (scale >= 1.1)  { scale_num = 11; scale_den = 10; }
+                }
             }
-        }
 
-        AlgoProfile deep{};
-        deep.algo = CompressAlgo::ZSTD;
-        deep.zstd_level = kZstdDeepLevel;
-        deep.comp_mbs_hi   = cal_.deep_comp_hi;
-        deep.comp_mbs_lo   = cal_.deep_comp_lo;
-        deep.decomp_mbs_hi = cal_.deep_decomp_hi;
-        deep.decomp_mbs_lo = cal_.deep_decomp_lo;
-        deep.min_cold_ticks = static_cast<uint8_t>(
-            very_cold_ticks > 255 ? 255 : very_cold_ticks);
-        deep.ratio_scale_num = scale_num;
-        deep.ratio_scale_den = scale_den;
-        profiles[num_profiles++] = deep;
+            AlgoProfile deep{};
+            deep.algo = CompressAlgo::ZSTD;
+            deep.zstd_level = kZstdDeepLevel;
+            deep.comp_mbs_hi   = cal_.deep_comp_hi;
+            deep.comp_mbs_lo   = cal_.deep_comp_lo;
+            deep.decomp_mbs_hi = cal_.deep_decomp_hi;
+            deep.decomp_mbs_lo = cal_.deep_decomp_lo;
+            deep.min_cold_ticks = static_cast<uint8_t>(
+                very_cold_ticks > 255 ? 255 : very_cold_ticks);
+            deep.ratio_scale_num = scale_num;
+            deep.ratio_scale_den = scale_den;
+            profiles[num_profiles++] = deep;
+        }
     }
 
     void calibrate(CompressEngine* engine) {

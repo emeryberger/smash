@@ -1312,7 +1312,13 @@ private:
             // incrementing for COMPRESSED pages in phase1Range, so this
             // threshold is reliable.
             if constexpr (kTieredRecompression) {
-                if (st == PageState::COMPRESSED &&
+                // Deep (zstd-9) upgrade of an already-compressed fast blob.
+                // Gated off by default (kDeepTierEnabled): measured to win
+                // 0/111810 upgrades on real heap pages (z9/z1 ~1.0), so it is
+                // pure wasted CPU. The spill trigger below is independent and
+                // still runs.
+                if (kDeepTierEnabled &&
+                    st == PageState::COMPRESSED &&
                     cold_count_[i] >= cfg.very_cold_ticks &&
                     page_tier_ && page_tier_[i] == kTierFast) {
                     tier_upgrade_attempts_.fetch_add(1,
@@ -1342,9 +1348,13 @@ private:
                 // on a realistic cold set), so gating spill on a successful
                 // upgrade would almost never fire. Age + terminal-tier is the
                 // right trigger.
+                // Terminal tiers: deep-enabled builds spill kTierDeep/
+                // kTierFastTried; single-tier (deep disabled) builds never
+                // leave kTierFast, so accept it as terminal there.
                 if (cfg_spill_ && st == PageState::COMPRESSED &&
                     cold_count_[i] >= cfg.very_cold_ticks && page_tier_ &&
-                    (page_tier_[i] == kTierDeep || page_tier_[i] == kTierFastTried)) {
+                    (page_tier_[i] == kTierDeep || page_tier_[i] == kTierFastTried ||
+                     (!kDeepTierEnabled && page_tier_[i] == kTierFast))) {
                     maybeSpillPage(i);
                 }
                 if (st == PageState::COMPRESSED || st == PageState::COMPRESSING)
@@ -2081,7 +2091,12 @@ private:
         // If fast tier failed the ratio gate, fall back to deep compression.
         // zstd-9 often compresses 30-50% better than zstd-1/LZ4 due to
         // better match finding and larger search window.
-        if (is_fast_tier &&
+        // Gated off by default (kDeepTierEnabled): on real heap pages zstd-9
+        // ~= zstd-1 (z9/z1 blob ratio ~1.0), so a page that fails the gate at
+        // zstd-1 almost always fails it at zstd-9 too — the retry is wasted
+        // CPU with no RSS gain (measured: ~32% of rocksdb pages escalate, 0
+        // net RSS benefit). Single-tier leaves such pages uncompressed.
+        if (kDeepTierEnabled && is_fast_tier &&
             (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio))) {
             algo = CompressAlgo::ZSTD;
             zstd_level = kZstdDeepLevel;

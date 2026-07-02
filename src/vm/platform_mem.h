@@ -15,6 +15,17 @@
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
+// MADV_COLD / MADV_PAGEOUT are stable kernel ABI constants (Linux 5.4+) but
+// only appear in <sys/mman.h> from glibc 2.31. We build release artifacts on
+// an older glibc (manylinux, glibc 2.28) for drop-in portability, so define
+// the fallbacks here. The values are fixed by the kernel ABI; the call is a
+// best-effort hint and no-ops on kernels that don't support it.
+#ifndef MADV_COLD
+#define MADV_COLD 20
+#endif
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
 #endif
 #endif
 

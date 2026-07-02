@@ -1,0 +1,243 @@
+name: Release
+
+# Produces drop-in libsmash binaries for every supported platform and
+# attaches them to the GitHub Release:
+#
+#   libsmash-linux-x86_64.so    (glibc 2.17 floor — AL2023, Ubuntu 20.04+,
+#   libsmash-linux-aarch64.so    Debian 11+, RHEL/CentOS 7+, Fedora, …)
+#   libsmash-macos-arm64.dylib   (Apple Silicon)
+#
+# Linux artifacts are built inside manylinux2014 containers so they import
+# only glibc ≤ 2.17 symbols. Combined with smash's exported-symbol version
+# script (src/smash_version_script.map.in, which re-exports malloc/new/stat
+# at the higher GLIBC_2.33/2.34 versions modern binaries request), this makes
+# a single .so per arch interpose correctly across distros without rebuilding.
+#
+# lz4 and zstd are statically linked (see CMakeLists.txt), so there are no
+# third-party shared-library runtime dependencies beyond libc/libstdc++/libdl/
+# libpthread, all of which ship with every target distro.
+
+on:
+  release:
+    types: [published]
+  # Manual trigger: build the artifacts without (or before) cutting a release.
+  # When run this way the binaries are uploaded as workflow artifacts only;
+  # the release-upload job is skipped (it is gated on a release event).
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (tag/branch/SHA) to build"
+        required: false
+        default: ""
+
+permissions:
+  contents: write          # needed to upload assets to the Release
+
+jobs:
+  # ── Linux x86-64 and ARM64 inside manylinux_2_28 (glibc 2.28) ─────────────
+  # glibc 2.28 (AlmaLinux 8 base) is the drop-in floor: it covers AL2023
+  # (2.34), Ubuntu 20.04+ (2.31), Debian 11+ (2.31), RHEL/Rocky/Alma 8+
+  # (2.28), and Fedora. We deliberately do NOT use manylinux2014 (glibc 2.17,
+  # CentOS 7): its kernel headers and stdlib are too old to compile smash
+  # (missing sys/random.h, MADV_FREE/PAGEOUT, C++20 <concepts>).
+  build-linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            manylinux_arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            manylinux_arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      # IMPORTANT: we check out and run actions ON THE HOST runner (modern
+      # glibc), NOT inside the manylinux container. The manylinux glibc is
+      # older than actions/checkout's bundled Node needs — using the image as
+      # a job `container:` makes every JS action die with "GLIBC_x not found".
+      # Instead, only the *build* runs inside the container (via docker run on
+      # the bind-mounted workspace), so the artifact gets the manylinux glibc
+      # floor while checkout/upload run on the host.
+      - name: Checkout smash
+        uses: actions/checkout@v4
+        with:
+          path: smash
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Checkout alloc8 (sibling dir)
+        uses: actions/checkout@v4
+        with:
+          repository: emeryberger/alloc8
+          path: alloc8
+
+      - name: Build libsmash inside manylinux_2_28 (glibc 2.28)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work \
+            quay.io/pypa/manylinux_2_28_${{ matrix.manylinux_arch }} \
+            bash -euo pipefail -c '
+              # manylinux ships gcc-toolset (C++20-capable) on PATH; cmake/
+              # ninja via the bundled CPython pip.
+              /opt/python/cp312-cp312/bin/python -m pip install --upgrade cmake ninja >/dev/null
+              ln -sf /opt/python/cp312-cp312/bin/cmake /usr/local/bin/cmake
+              ln -sf /opt/python/cp312-cp312/bin/ninja /usr/local/bin/ninja
+              cmake --version; gcc --version
+              # Point at the sibling alloc8 checkout (no network fetch of
+              # alloc8; lz4/zstd are still FetchContent. Library only.
+              cmake -S smash -B smash/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DALLOC8_DIR=/work/alloc8 \
+                -DSMASH_BUILD_TESTS=OFF \
+                -DSMASH_BUILD_BENCH=OFF
+              cmake --build smash/build --target smash -j
+              # Build runs as container root; make outputs world-readable so
+              # the host steps (objdump, upload-artifact) can read them.
+              chmod -R a+rX smash/build
+            '
+
+      - name: Stage artifact and verify glibc floor
+        working-directory: smash
+        run: |
+          mkdir -p out
+          cp build/libsmash.so "out/libsmash-linux-${{ matrix.arch }}.so"
+          # Fail loudly if the glibc floor regressed above 2.28 — that would
+          # silently break drop-in use on older distros (RHEL/Alma/Rocky 8).
+          # Only IMPORTED (undefined, "*UND*") symbols set the floor; smash
+          # deliberately *exports* re-export aliases at GLIBC_2.33/2.34 via its
+          # version script (so it out-versions modern libc's malloc/stat/new),
+          # and those defined symbols must NOT count against the import floor.
+          FLOOR=2.28
+          echo "=== imported GLIBC version requirements (UND only) ==="
+          objdump -T "out/libsmash-linux-${{ matrix.arch }}.so" \
+            | grep '\*UND\*' | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' \
+            | sort -u -V | tee glibc_versions.txt
+          # The highest required version must not sort above the floor.
+          MAXREQ=$(sort -V glibc_versions.txt | tail -1)
+          HIGHEST=$(printf '%s\n%s\n' "$FLOOR" "$MAXREQ" | sort -V | tail -1)
+          if [ "$HIGHEST" != "$FLOOR" ]; then
+            echo "::error::libsmash imports glibc $MAXREQ > floor $FLOOR — drop-in portability regressed"
+            exit 1
+          fi
+          echo "Highest imported glibc symbol: $MAXREQ (floor $FLOOR) — OK"
+          echo "=== shared library dependencies (should be only libc/libstdc++/libdl/libpthread/libm) ==="
+          ldd "out/libsmash-linux-${{ matrix.arch }}.so" || true
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsmash-linux-${{ matrix.arch }}
+          path: smash/out/libsmash-linux-${{ matrix.arch }}.so
+          if-no-files-found: error
+
+  # ── macOS arm64 (Apple Silicon) ──────────────────────────────────────────
+  build-macos:
+    name: macos-arm64
+    runs-on: macos-14
+    steps:
+      - name: Checkout smash
+        uses: actions/checkout@v4
+        with:
+          path: smash
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Checkout alloc8 (sibling dir)
+        uses: actions/checkout@v4
+        with:
+          repository: emeryberger/alloc8
+          path: alloc8
+
+      - name: Configure
+        working-directory: smash
+        # arm64-only: smash defaults to arm64+arm64e for full
+        # DYLD_INSERT_LIBRARIES coverage of Apple system binaries, but a
+        # user-built arm64e slice cannot be codesigned/loaded without
+        # Apple's ARMA entitlement. arm64 is the drop-in slice for ordinary
+        # (non-PAC) applications.
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DALLOC8_DIR="$GITHUB_WORKSPACE/alloc8" \
+            -DSMASH_BUILD_TESTS=OFF \
+            -DSMASH_BUILD_BENCH=OFF \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build libsmash
+        working-directory: smash
+        run: cmake --build build --target smash -j
+
+      - name: Stage artifact
+        working-directory: smash
+        run: |
+          mkdir -p out
+          cp build/libsmash.dylib out/libsmash-macos-arm64.dylib
+          echo "=== architectures ==="
+          lipo -info out/libsmash-macos-arm64.dylib
+          echo "=== dependencies ==="
+          otool -L out/libsmash-macos-arm64.dylib
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsmash-macos-arm64
+          path: smash/out/libsmash-macos-arm64.dylib
+          if-no-files-found: error
+
+  # ── Attach all artifacts to the Release (release events only) ─────────────
+  publish:
+    name: publish-to-release
+    needs: [build-linux, build-macos]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten and checksum
+        run: |
+          mkdir -p release
+          find dist -type f \( -name '*.so' -o -name '*.dylib' \) -exec cp {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          echo "=== release assets ==="
+          ls -l
+          cat SHA256SUMS.txt
+
+      - name: Upload assets to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # append_body so a hand-written release note isn't clobbered; this
+          # adds the platform usage block (incl. the macOS quarantine step,
+          # which is required because the dylib is ad-hoc-signed and the
+          # browser tags downloads with com.apple.quarantine).
+          append_body: true
+          body: |
+
+            ## Usage
+
+            **Linux** (`libsmash-linux-{x86_64,aarch64}.so`)
+            ```sh
+            LD_PRELOAD=./libsmash-linux-x86_64.so SMASH_LARGE_ONLY=1 ./your_program
+            ```
+
+            **macOS** (`libsmash-macos-arm64.dylib`, Apple Silicon)
+            ```sh
+            # Required once after downloading: clear the quarantine flag the
+            # browser adds, or dyld refuses the ad-hoc-signed dylib with
+            # "library load disallowed by system policy".
+            xattr -d com.apple.quarantine libsmash-macos-arm64.dylib
+
+            DYLD_INSERT_LIBRARIES=./libsmash-macos-arm64.dylib ./your_program
+            ```
+            Note: macOS strips `DYLD_*` for SIP-protected system binaries
+            (e.g. `/bin/*`), so interposition applies to your own binaries.
+
+            Verify integrity against `SHA256SUMS.txt`.
+          files: |
+            release/libsmash-linux-x86_64.so
+            release/libsmash-linux-aarch64.so
+            release/libsmash-macos-arm64.dylib
+            release/SHA256SUMS.txt

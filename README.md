@@ -240,11 +240,34 @@ The `bench_deps` target builds:
 DYLD_INSERT_LIBRARIES=./build/libsmash.dylib DYLD_FORCE_FLAT_NAMESPACE=1 ./your_application
 ```
 
+If you downloaded `libsmash-macos-arm64.dylib` from a [release](https://github.com/emeryberger/smash/releases) (rather than building locally), clear the quarantine flag your browser adds first — otherwise dyld rejects the ad-hoc-signed dylib with *"library load disallowed by system policy"*:
+
+```bash
+xattr -d com.apple.quarantine libsmash-macos-arm64.dylib
+```
+
+Note: macOS strips `DYLD_*` environment variables for SIP-protected system binaries (e.g. `/bin/*`), so interposition applies to your own binaries, not Apple system tools.
+
 ### Linux
 
 ```bash
 LD_PRELOAD=./build/libsmash.so ./your_application
 ```
+
+### Cold timeout (why a quick test may show 0% reduction)
+
+Smash only compresses a page after it has stayed **untouched for the cold timeout** — `SMASH_COLD_TIMEOUT_SEC` seconds (default **10**). A short program that allocates, idles for less than that, then exits or touches the data again will show little or no RSS reduction, because nothing has been idle long enough to compress yet. This is expected: Smash targets long-running services whose working set goes cold for far longer than the threshold.
+
+For a quick local demonstration, lower the threshold so compression fires within a few seconds:
+
+```bash
+# macOS
+SMASH_COLD_TIMEOUT_SEC=2 DYLD_INSERT_LIBRARIES=./build/libsmash.dylib ./your_application
+# Linux
+SMASH_COLD_TIMEOUT_SEC=2 LD_PRELOAD=./build/libsmash.so ./your_application
+```
+
+(The CI's `bench_rss` smoke test sets `SMASH_COLD_TIMEOUT_SEC=2` for exactly this reason.)
 
 ### Large-Only Mode
 

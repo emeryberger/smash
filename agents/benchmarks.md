@@ -10,7 +10,7 @@
 | Quick CI regression | `python3 bench/run_quick_ci.py` | bench_rss + bench_sqlite --quick |
 | Paper claims verification | `python3 bench/verify_paper_claims.py` | In-process apps, both modes |
 | Allocation speed | `bash bench/run_alloc_speed.sh` | Throughput comparison |
-| Standalone RSS comparison | `./bench/bench_rss_standalone` | Direct RSS measurement |
+| Standalone RSS comparison | `DYLD_INSERT_LIBRARIES=./libsmash.dylib ./bench/bench_rss` (or `LD_PRELOAD=` on Linux) | Direct RSS measurement via the standard malloc API |
 | Figure generation | `python3 bench/plot_results.py <results.json>` | From paper_results/ JSON |
 | Key env var for all runners | `SMASH_COLD_TIMEOUT_SEC=1` | Speed up cooling for faster bench cycles |
 

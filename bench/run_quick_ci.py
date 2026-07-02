@@ -68,16 +68,14 @@ def smash_env(libsmash: Path, base_env: dict[str, str]) -> dict[str, str]:
     return e
 
 
-def check_bench_rss(build_dir: Path) -> tuple[bool, str]:
-    """bench_rss is linked against smash directly, no preload needed."""
-    # Pin the cold-tick floor to its default (= no override means no
-    # CPU-pressure multiplier kicks in). Without this, on a busy CI runner
-    # the multiplier would push the floor up to 32 s and the 10 s
-    # bench_rss window wouldn't see any compression.
-    env = dict(os.environ)
+def check_bench_rss(build_dir: Path, libsmash: Path) -> tuple[bool, str]:
+    """bench_rss uses the standard malloc API; smash interposes via preload."""
+    # Pin the cold timeout low so the sampling window sees compression;
+    # bench_rss auto-sizes its window to cold_timeout + 5 s.
+    env = smash_env(libsmash, dict(os.environ))
     env.setdefault("SMASH_COLD_TIMEOUT_SEC", "2")
     out = run([str(build_dir / "bench" / "bench_rss")], env=env)
-    # Check BEST reduction across the entire window (t=1..10).
+    # Check BEST reduction across the entire window.
     # On busy CI runners, timing jitter can cause the t=10 snapshot to
     # catch a brief decompression spike. The peak reduction proves the
     # compressor achieved its target at some point during the run.
@@ -144,7 +142,7 @@ def main() -> int:
     print("=" * 60)
     print("bench_rss")
     print("=" * 60)
-    results.append(check_bench_rss(build))
+    results.append(check_bench_rss(build, libsmash))
     print()
 
     print("=" * 60)

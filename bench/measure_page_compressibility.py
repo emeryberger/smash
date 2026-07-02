@@ -142,7 +142,7 @@ def run_workload(binary, args, preload=None, cool_sec=5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", type=Path, default=Path("bench/bench_rss_standalone"))
+    ap.add_argument("--binary", type=Path, default=Path("bench/bench_rss"))
     ap.add_argument("--args", default="--total-mb 64 --alloc-size 4096 --wait 15")
     ap.add_argument("--cool", type=int, default=8,
                     help="Seconds to wait before measuring (let pages go cold)")

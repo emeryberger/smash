@@ -130,26 +130,15 @@ smash_add_bench(bench_dict_experiment bench_dict_experiment.cpp)
 # Algorithm comparison: WKdm vs LZ4 vs zstd, multi-page compression
 smash_add_bench(bench_algo_compare bench_algo_compare.cpp)
 
-# RSS reduction over time
-add_executable(bench_rss
-  bench_rss.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
-  # smash_heap.cpp uses the allocation-free safe_* printf wrappers (vsnprintf_),
-  # whose definition lives in the vendored printf.cpp — link it here, else the
-  # build fails at link with "undefined reference to vsnprintf_".
-  ${printf_SOURCE_DIR}/printf.cpp
-)
-target_include_directories(bench_rss PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
-target_link_libraries(bench_rss PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
+# RSS reduction over time. Uses the standard malloc/free API and links NO
+# smash internals — run it under DYLD_INSERT_LIBRARIES / LD_PRELOAD to
+# exercise smash (or with no preload for a system-malloc baseline). This
+# mirrors real application use and avoids compiling a second static copy of
+# the allocator into the benchmark.
+add_executable(bench_rss bench_rss.cpp)
+target_link_libraries(bench_rss PRIVATE ${CMAKE_DL_LIBS})
 if(APPLE)
-  target_compile_options(bench_rss PRIVATE -ftls-model=initial-exec)
-endif()
-
-# RSS reduction — standalone (no smash link; use LD_PRELOAD to test any allocator)
-add_executable(bench_rss_standalone bench_rss_standalone.cpp)
-target_link_libraries(bench_rss_standalone PRIVATE ${CMAKE_DL_LIBS})
-if(APPLE)
-  set_target_properties(bench_rss_standalone PROPERTIES OSX_ARCHITECTURES "arm64")
+  set_target_properties(bench_rss PROPERTIES OSX_ARCHITECTURES "arm64")
 endif()
 
 # Allocation speed — standalone (threadtest, larson, linux-scalability)

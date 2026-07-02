@@ -39,6 +39,15 @@ static constexpr size_t kPageSize =
     4096;
 #endif
 
+// zstd level used to gauge each allocator's page compressibility. This is a
+// fixed measurement instrument (not smash's runtime tier): smash ships
+// single-tier zstd-1, so we measure at level 1 to match the deployed codec.
+// Overridable at build time via -DBENCH_ALLOC_ZSTD_LEVEL=N.
+#ifndef BENCH_ALLOC_ZSTD_LEVEL
+#define BENCH_ALLOC_ZSTD_LEVEL 1
+#endif
+static constexpr int kZstdLevel = BENCH_ALLOC_ZSTD_LEVEL;
+
 static std::mt19937 g_rng(42);
 
 // ── Application-realistic fill functions ─────────────────────────────
@@ -281,7 +290,7 @@ static PageStats compressPage(const void* page) {
         static_cast<int>(kPageSize), static_cast<int>(sizeof(comp_buf)));
     s.ratio_lz4 = lz4_size > 0 ? static_cast<double>(lz4_size) / kPageSize : 1.0;
 
-    size_t zstd_size = ZSTD_compress(comp_buf, sizeof(comp_buf), page, kPageSize, 9);
+    size_t zstd_size = ZSTD_compress(comp_buf, sizeof(comp_buf), page, kPageSize, kZstdLevel);
     s.ratio_zstd = !ZSTD_isError(zstd_size) ? static_cast<double>(zstd_size) / kPageSize : 1.0;
 
     return s;

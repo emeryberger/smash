@@ -70,11 +70,22 @@ def smash_env(libsmash: Path, base_env: dict[str, str]) -> dict[str, str]:
 
 def check_bench_rss(build_dir: Path, libsmash: Path) -> tuple[bool, str]:
     """bench_rss uses the standard malloc API; smash interposes via preload."""
-    # Pin the cold timeout low so the sampling window sees compression;
-    # bench_rss auto-sizes its window to cold_timeout + 5 s.
+    # Pin the cold timeout low so the sampling window sees compression.
+    #
+    # Sample for a generous 20 s rather than bench_rss's default
+    # cold_timeout + 5 s (= 7 s). Reclaiming a page is a multi-tick pipeline
+    # in the default deferred-reclaim mode: cold detection → compress →
+    # COMPRESSED_SHADOW → Phase B reclaim (decommit), each gated on the 1 s
+    # compressor tick. On a loaded CI runner those ticks slip, so the genuine
+    # reclaim can land after the 7 s window even though it completes in ~6 s
+    # on an unloaded machine. (Before the macOS deep-monitoring fix, the 7 s
+    # window happened to catch the escalation's phantom PROT_NONE RSS drop —
+    # a task_info reporting artifact with zero actual reclaim — which masked
+    # how tight the window was for the real pipeline.) The best-reduction gate
+    # is unchanged; we just give the real reclaim enough wall-clock to occur.
     env = smash_env(libsmash, dict(os.environ))
     env.setdefault("SMASH_COLD_TIMEOUT_SEC", "2")
-    out = run([str(build_dir / "bench" / "bench_rss")], env=env)
+    out = run([str(build_dir / "bench" / "bench_rss"), "--wait", "20"], env=env)
     # Check BEST reduction across the entire window.
     # On busy CI runners, timing jitter can cause the t=10 snapshot to
     # catch a brief decompression spike. The peak reduction proves the

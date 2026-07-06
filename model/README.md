@@ -27,7 +27,20 @@ machine-checked Lean 4 formalizations of the corresponding safety properties.
   and procmem restores; concrete counterexample for the split restore.
 - `SmashCore.lean` — inductive invariant `WF ⇒ SafetyInv` (fixed mode preserved
   by every transition); buggy mode reaches `state = ACTIVE ∧ pageProt = PROT_NONE`,
-  violating `ActiveImpliesRW`.
+  violating `ActiveImpliesRW`. Single page, atomic whole-operation transitions.
+- `SmashCoreConc.lean` — the **concurrent** strengthening of `SmashCore.lean`.
+  Removes the single-page / atomic-operation abstraction: the state is
+  `Sys ι := ι → Page` for an *arbitrary* index type `ι` (unbounded pages), and
+  `Step` is a nondeterministic relation ("some thread fires some enabled
+  transition on some page; all other pages unchanged") whose reachable closure
+  is *every* interleaving of *any* number of threads — the thing bounded model
+  checking can only sample. Multi-step compressor operations are modeled as
+  separate steps, so intermediate states are observable to concurrent threads.
+  Proves `reachable_safe`: `SafetyInv` holds for every page in every reachable
+  state of the fixed system, for all interleavings, unbounded in both pages and
+  threads. `buggy_reachable_violates` exhibits the pre-fix decommit trace.
+  Machine-checked; both headline theorems depend only on `propext` (no `sorry`,
+  no `Classical.choice`, no `native_decide`).
 
 ## The Bug (Found May 2024)
 
@@ -192,7 +205,8 @@ Lean formalizations (machine-checked safety, independent of TLC):
 |-----------|--------|
 | `SmashThreadCreate.lean` | pre-create-workers ⇒ `threadCreateSafe` (inductive invariant) |
 | `SmashRestoreRace.lean` | coherence inv ⇒ `NoStaleRead` (atomic, procmem); split ⇒ concrete violation |
-| `SmashCore.lean` | `WF ⇒ SafetyInv`, `WF` preserved by all fixed-mode transitions; buggy trace ⇒ violation |
+| `SmashCore.lean` | `WF ⇒ SafetyInv`, `WF` preserved by all fixed-mode transitions; buggy trace ⇒ violation (single page, atomic ops) |
+| `SmashCoreConc.lean` | `reachable_safe`: `SafetyInv` for every page in every reachable state of the concurrent system — unbounded pages, unbounded threads, all interleavings; buggy trace ⇒ violation |
 
 Note: the historical table referenced `SmashSnapshotRace4` and `SmashCoreBuggy`;
 those files were never committed (the compress-side races are now subsumed by

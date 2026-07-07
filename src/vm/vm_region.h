@@ -297,6 +297,68 @@ class VmRegion {
     std::atomic<size_t> external_slot_next_{0};
     std::atomic<size_t> external_count_{0};
 
+    // ── External-mapping EXTENT registry (large-mapping fast path) ──────────
+    // A single application-direct mmap larger than kExtentThresholdPages is
+    // registered as ONE extent record instead of kTrackMaxPages hash inserts.
+    // Registration then costs O(1) hash work (a slot-block bump + a
+    // track_reverse_ fill) rather than O(pages) probes, and — critically —
+    // lookups for such pages are served by a short linear scan over the
+    // (tiny) extent list instead of an open-addressing probe through a hash
+    // the arena would otherwise flood.  See agents/extent-registration-design.md
+    // for the prototype + measurements (registration O(1) in arena size;
+    // hybrid lookup 2.5 ns vs 8.2 ns hash-flooded).
+    //
+    // Extents share the SAME index space and external_slot_next_ bump counter
+    // as hash-tracked pages, and still populate track_reverse_ for every page,
+    // so pageAddress()/committedPages()/the PageState+PageLock tables and the
+    // per-page-locked untrack path all work UNCHANGED.  The extent list is a
+    // pure address/index→(base,block) accelerator layered on top; the proven
+    // munmap-vs-compressor lock discipline (untrackExternalPageLocked) is
+    // untouched.
+    //
+    // Concurrency: the array is append-mostly (one entry per large mmap, rare).
+    // Slots are published by bumping ext_extent_count_ with release AFTER the
+    // record is fully written; readers load it with acquire and scan
+    // [0, count).  `live` flips false on munmap (relaxed store — readers that
+    // race see either value; a stale `true` still routes to track_reverse_,
+    // which the locked untrack has already zeroed, so the reader gets nullptr).
+    struct Extent {
+        uintptr_t base;              // page-aligned start address (0 = unused)
+        size_t    first_index;       // global page index of `base`
+        size_t    npages;
+        std::atomic<bool> live;      // false after munmap
+    };
+    static constexpr size_t kMaxExtents = 256;  // distinct large external mmaps
+    Extent* extents_ = nullptr;                 // bootstrap-allocated array
+    std::atomic<size_t> ext_extent_count_{0};   // published extent count
+    Spinlock ext_register_lock_;                // serializes registration writes
+
+    // Find the live extent covering `addr` (or nullptr). Lock-free linear scan.
+    const Extent* findExtentByAddr(uintptr_t addr) const {
+        if (!extents_) return nullptr;
+        size_t n = ext_extent_count_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i) {
+            const Extent& e = extents_[i];
+            if (!e.live.load(std::memory_order_relaxed)) continue;
+            uintptr_t end = e.base + e.npages * kPageSize;
+            if (addr >= e.base && addr < end) return &e;
+        }
+        return nullptr;
+    }
+    // Find the extent owning global index `idx` (live or not — callers that
+    // need liveness check it themselves; pageAddress relies on track_reverse_
+    // having been zeroed by the locked untrack for dead pages).
+    const Extent* findExtentByIndex(size_t idx) const {
+        if (!extents_) return nullptr;
+        size_t n = ext_extent_count_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i) {
+            const Extent& e = extents_[i];
+            if (idx >= e.first_index && idx < e.first_index + e.npages)
+                return &e;
+        }
+        return nullptr;
+    }
+
     // Flat direct page-index → Span* table. Sized to total_pages_ entries
     // (8 B each) and mmap'd with MAP_NORESERVE so we only pay RSS for the
     // committed slice (~6K pages → ~48 KB resident for a 100 MB heap).
@@ -308,6 +370,14 @@ class VmRegion {
     size_t page_to_span_bytes_ = 0;  // total mapped bytes (for cleanup / sizing)
 
     size_t lookupIdx(uintptr_t addr) const {
+        // Large external mappings live in the extent list — check it first.
+        // The list is tiny (one entry per large mmap) and, for a big arena,
+        // this avoids an open-addressing probe through a hash that arena would
+        // otherwise flood. A dead extent returns 0 (page no longer tracked).
+        if (const Extent* e = findExtentByAddr(addr)) {
+            size_t page_off = (addr - e->base) >> kPageShift;
+            return e->first_index + page_off;
+        }
         if (!track_hash_) return 0;
         uintptr_t key = addr >> kPageShift;
         if (key == 0) return 0;
@@ -341,6 +411,13 @@ public:
             BootstrapAlloc::instance().allocateZeroed(
                 kTrackMaxPages * sizeof(uintptr_t), 8));
         if (!track_hash_ || !track_reverse_) return false;
+
+        // Extent registry for large external mappings (zeroed → base=0,
+        // live=false, count=0). Bootstrap-allocated once; never freed.
+        extents_ = static_cast<Extent*>(
+            BootstrapAlloc::instance().allocateZeroed(
+                kMaxExtents * sizeof(Extent), alignof(Extent)));
+        if (!extents_) return false;
 
         if (!tracking_mode_) {
             // Full mode: reserve contiguous VM region. total_pages_ covers
@@ -660,6 +737,54 @@ public:
         return 0;
     }
 
+    // Register a whole external mapping as ONE extent — the O(1)-registration
+    // path for large single mmaps (DB buffer pool, GC heap). Reserves a
+    // contiguous block of `npages` external indices with a single
+    // external_slot_next_ bump, fills track_reverse_ for the block, publishes
+    // the extent, and bumps external_count_ so the compressor iterates the new
+    // pages. Returns the first global index (>= contig_pages_), or 0 on failure
+    // (wrong mode, extent table full, index budget exhausted, or already inside
+    // the contiguous arena).
+    //
+    // Unlike trackExternalPage(), this does NOT touch track_hash_ at all: extent
+    // pages are resolved via the extent list (findExtentByAddr/ByIndex), so a
+    // huge arena never floods the hash. This is the fix for the per-page probe
+    // storm that wedged mariadbd startup on a multi-GiB buffer pool.
+    size_t trackExternalRange(uintptr_t base_addr, size_t npages) {
+        if (tracking_mode_ || !track_hash_ || !extents_ || npages == 0) return 0;
+        // Skip if the range starts inside smash's own contiguous arena.
+        auto b = reinterpret_cast<uintptr_t>(base_);
+        if (base_addr >= b && base_addr < b + contig_pages_ * kPageSize)
+            return 0;
+
+        LockGuard guard(ext_register_lock_);
+        size_t ecount = ext_extent_count_.load(std::memory_order_relaxed);
+        if (ecount >= kMaxExtents) return 0;               // extent table full
+        // Reserve the index block. Bail if it would exceed the slot budget
+        // (keeps external indices inside [contig_pages_, +kTrackMaxPages)).
+        size_t local = external_slot_next_.load(std::memory_order_relaxed);
+        if (local + npages > kTrackMaxPages) return 0;
+        external_slot_next_.store(local + npages, std::memory_order_relaxed);
+        size_t first_index = contig_pages_ + local;
+
+        // Fill reverse map for every page BEFORE publishing the extent, so a
+        // reader that sees the extent always resolves pageAddress() correctly.
+        for (size_t p = 0; p < npages; ++p)
+            track_reverse_[local + p] = base_addr + p * kPageSize;
+
+        Extent& e = extents_[ecount];
+        e.base = base_addr;
+        e.first_index = first_index;
+        e.npages = npages;
+        e.live.store(true, std::memory_order_relaxed);
+        // Publish: release so the record + reverse fills are visible before a
+        // reader observes the incremented count.
+        ext_extent_count_.store(ecount + 1, std::memory_order_release);
+        // Make the pages visible to the compressor's committedPages() range.
+        external_count_.fetch_add(npages, std::memory_order_release);
+        return first_index;
+    }
+
     // Untrack a previously-registered external page (e.g. on munmap /
     // vm_deallocate). Marks the hash slot as freed (key = ~0ULL — a
     // tombstone — so the open-addressing probe skips past it but treats it
@@ -709,14 +834,35 @@ public:
         if (locks) locks->lock(idx);
         if (states) states->set(idx, PageState::EMPTY);
         untrackExternalPage(page_addr);             // tombstone the hash slot
+                                                    // (no-op for extent pages)
         // Clear the reverse map so pageAddress(idx) returns nullptr — a worker
         // that observes the page post-untrack gets null and skips it instead of
-        // dereferencing a stale (soon-to-be-unmapped) address.
+        // dereferencing a stale (soon-to-be-unmapped) address. This is the
+        // load-bearing safety step for BOTH hash- and extent-tracked pages
+        // (proven for the per-page discipline in model/SmashExternalRace).
         if (idx >= contig_pages_) {
             size_t local = idx - contig_pages_;
             if (local < kTrackMaxPages) track_reverse_[local] = 0;
         }
         if (locks) locks->unlock(idx);
+
+        // Extent bookkeeping (outside the per-page lock — it only affects
+        // lookup routing, not the proven snapshot-safety step above). When the
+        // page belongs to an extent, mark the extent dead so findExtentByAddr
+        // stops resolving it. Idempotent across the per-page calls that make up
+        // a full-mapping munmap. pageAddress()/contains() already return
+        // null/false for the individual page via the zeroed track_reverse_, so
+        // this is a routing cleanup, not a correctness dependency.
+        if (extents_ && idx >= contig_pages_) {
+            size_t n = ext_extent_count_.load(std::memory_order_acquire);
+            for (size_t i = 0; i < n; ++i) {
+                Extent& e = extents_[i];
+                if (idx >= e.first_index && idx < e.first_index + e.npages) {
+                    e.live.store(false, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
     }
 
     bool contains(uintptr_t addr) const {
@@ -821,6 +967,12 @@ public:
     // mmap interposer can cheaply reject a single mapping that could never fit
     // — see registerLinuxExternalRange().
     static constexpr size_t externalSlotCapacity() { return kTrackMaxPages; }
+
+    // A mapping is "large" (extent-eligible) at or above this page count. 1 MiB
+    // at 4 KiB pages / 64 pages at 16 KiB — matches the spirit of
+    // kLargeAllocVmThreshold: big single arenas, not the many small mmaps the
+    // per-page hash serves well. Public so the mmap interposer routes on it.
+    static constexpr size_t kExtentThresholdPages = (1u << 20) / kPageSize;
     // Remaining unclaimed external slots (approximate; races with concurrent
     // tracking but only used as a fast pre-filter, never for correctness).
     size_t externalSlotsRemaining() const {

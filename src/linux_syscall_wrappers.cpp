@@ -1160,32 +1160,42 @@ inline void registerLinuxExternalRange(smash::VmRegion* vm, void* base, size_t l
     if (!smash::g_smash_page_states_for_external) return;
 
     size_t npages = (len + smash::kPageSize - 1) / smash::kPageSize;
+    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
 
-    // Oversized single mapping guard. A mapping larger than the entire
-    // external-page slot budget can never be fully tracked, and such mappings
-    // are invariably app-managed arenas (a DB buffer pool, a JVM/GC heap) that
-    // the application keeps warm — so compressing them is counterproductive
-    // AND the registration loop would burn O(slot-budget) work inside the
-    // caller's mmap() (observed wedging mariadbd startup for minutes on a
-    // 6 GiB InnoDB buffer pool). Skip the whole mapping rather than tracking a
-    // useless prefix. Logged once so the coverage gap is never silent.
-    if (npages > vm->externalSlotCapacity()) {
+    // Large single mapping → ONE extent record (O(1) registration, no per-page
+    // hash flooding). This is the fix for the multi-GiB InnoDB-buffer-pool
+    // case: the old per-page loop either burned O(pages) hash probes here
+    // inside the caller's mmap() or (post the earlier guard) skipped the
+    // mapping entirely, losing all compression coverage. The extent path
+    // registers the whole arena cheaply and lets the compressor cool + compress
+    // it — the measured ~39% RSS win now extends past the old 512 MiB cap.
+    if (npages >= smash::VmRegion::kExtentThresholdPages) {
+        size_t first_idx = vm->trackExternalRange(start, npages);
+        if (first_idx != 0) {
+            smash::g_smash_page_states_for_external->setRange(
+                first_idx, npages, smash::PageState::ACTIVE);
+            return;
+        }
+        // trackExternalRange failed (extent table full or index budget
+        // exhausted) — a mapping this large can't be usefully page-tracked
+        // either, so skip it. Logged once; never a silent coverage gap.
         static std::atomic<bool> warned{false};
         bool expected = false;
         if (warned.compare_exchange_strong(expected, true,
                                            std::memory_order_relaxed)) {
-            char buf[192];
+            char buf[200];
             int n = smash::safe_snprintf(buf, sizeof(buf),
-                "[smash] SMASH_TRACK_EXTERNAL: skipping mmap of %zu pages "
-                "(> %zu slot budget) at %p — likely an app-managed arena kept "
-                "warm; not compressible. Further such skips are silent.\n",
-                npages, vm->externalSlotCapacity(), base);
+                "[smash] SMASH_TRACK_EXTERNAL: skipping large mmap of %zu pages "
+                "at %p (extent table full or index budget exhausted). Further "
+                "such skips are silent.\n",
+                npages, base);
             if (n > 0) (void)!::write(2, buf, (size_t)n);
         }
         return;
     }
 
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
+    // Small mapping → per-page hash (the many-small-mmaps case the hash serves
+    // well; keeps the extent list short so its linear scan stays fast).
     auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
                & ~(uintptr_t{smash::kPageSize} - 1);
     for (uintptr_t p = start; p < end; p += smash::kPageSize) {

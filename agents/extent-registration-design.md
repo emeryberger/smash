@@ -74,7 +74,43 @@ hash. Best of both: O(1) big-arena registration + full coverage + **2.5 ns
 lookup (faster than today's 8.2 ns)** because the arena no longer pollutes the
 hash.
 
-## Lifting into `vm_region.h` (production plan — NOT yet done)
+## Production lift status (branch `proto/extent-registration`, 2026-07-07)
+
+The hybrid IS implemented in `vm_region.h` (`trackExternalRange` +
+`findExtentByAddr` + `lookupIdx` extent-first) and validated end-to-end on
+cloudnew MariaDB under `SMASH_TRACK_EXTERNAL=1`:
+
+**What works (the scalability goal):**
+- No crash; **17/17 ctest pass**; clean shutdown.
+- Tracks pools FAR past the old 512 MiB / 128K-slot cap: 2 GiB (76K compressed
+  pages) and 4 GiB (85K) both register + compress. Impossible before (hash
+  capped / PR#53 skipped them). Registration is O(1) in arena size.
+- A concurrency bug found + fixed here: `trackExternalRange` must reserve its
+  index block with `external_slot_next_.fetch_add(npages)`, not a non-atomic
+  load+store — the small-mapping hash path bumps the same counter without the
+  extent lock, and interleaving aliased `track_reverse_` slots → SEGV_MAPERR
+  in the compressor snapshot. (Fixed; that was the fill-time crash.)
+
+**What does NOT yet work (open regression — RSS reclaim):**
+- End-to-end RSS reduction is **0%** on the extent path vs **38%** on master
+  (hash) for the SAME 512 MiB MariaDB workload (A/B, identical script).
+- Evidence: extent compresses only ~70K pages vs master's ~138K; and during
+  cool the sweeper calls `madvise(DONTNEED)` ~1000/s (strace-confirmed) yet
+  total RSS stays flat — i.e. decommit runs but memory isn't released / is
+  immediately re-faulted. A single giant contiguous VMA (the pool) behaves
+  differently under the deferred-madvise sweeper than the hash path's
+  scattered per-page external indices. Root cause NOT yet isolated.
+- Hypotheses to test next: (a) sweeper coalesced-run mprotect(PROT_NONE) on the
+  pool VMA is undone by InnoDB/Phase-1 access-tracking re-touch → thrash;
+  (b) extent pages only half-register as ACTIVE (70K vs 131K) so half the pool
+  is never a compression candidate; (c) `madvise` address/length off-by-region
+  so it targets already-zero pages. Need a sweeper decommit-vs-refault counter
+  in the stats line + per-VMA smaps RSS to disambiguate.
+
+**Conclusion:** prototype + registration/scalability lift are proven; the
+reclaim path needs more work before this branch is mergeable. Do NOT merge yet.
+
+## Lifting into `vm_region.h` (original plan — registration DONE, reclaim OPEN)
 
 Touch points that must learn about extents (all currently hash-only):
 `lookupIdx`, `trackExternalPage` (→ add `trackExternalRange`), `pageIndex`,

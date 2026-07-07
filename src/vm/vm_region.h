@@ -345,19 +345,6 @@ class VmRegion {
         }
         return nullptr;
     }
-    // Find the extent owning global index `idx` (live or not — callers that
-    // need liveness check it themselves; pageAddress relies on track_reverse_
-    // having been zeroed by the locked untrack for dead pages).
-    const Extent* findExtentByIndex(size_t idx) const {
-        if (!extents_) return nullptr;
-        size_t n = ext_extent_count_.load(std::memory_order_acquire);
-        for (size_t i = 0; i < n; ++i) {
-            const Extent& e = extents_[i];
-            if (idx >= e.first_index && idx < e.first_index + e.npages)
-                return &e;
-        }
-        return nullptr;
-    }
 
     // Flat direct page-index → Span* table. Sized to total_pages_ entries
     // (8 B each) and mmap'd with MAP_NORESERVE so we only pay RSS for the

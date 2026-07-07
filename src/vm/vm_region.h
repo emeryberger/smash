@@ -607,6 +607,17 @@ public:
     // logic processes external pages without modification.
     size_t trackExternalPage(uintptr_t page_addr) {
         if (tracking_mode_ || !track_hash_) return 0;
+        // Slot budget exhausted? Bail BEFORE touching the hash. Without this
+        // early-out, a mapping larger than the slot budget (e.g. a multi-GiB
+        // InnoDB buffer pool) keeps CAS-inserting keys — which succeed (line
+        // below) and only THEN discover local >= kTrackMaxPages — permanently
+        // polluting the table. Once the table fills, every further page probes
+        // the full kTrackHashCap before failing, turning registration into
+        // O(pages × cap): a single 6 GiB mmap wedged mariadbd startup for
+        // minutes. Reading external_slot_next_ up front caps total tracking
+        // work at O(kTrackMaxPages) regardless of how many pages arrive.
+        if (external_slot_next_.load(std::memory_order_relaxed) >= kTrackMaxPages)
+            return 0;
         // Page already covered by smash's own contiguous arena? Skip.
         auto b = reinterpret_cast<uintptr_t>(base_);
         if (page_addr >= b && page_addr < b + contig_pages_ * kPageSize)
@@ -805,6 +816,17 @@ public:
     // capacity (total_pages_ minus the external-page tail). In tracking
     // mode the contiguous arena is unused, so the value is 0.
     size_t contigPages() const { return contig_pages_; }
+
+    // Total external-page slot budget (compile-time constant). Exposed so the
+    // mmap interposer can cheaply reject a single mapping that could never fit
+    // — see registerLinuxExternalRange().
+    static constexpr size_t externalSlotCapacity() { return kTrackMaxPages; }
+    // Remaining unclaimed external slots (approximate; races with concurrent
+    // tracking but only used as a fast pre-filter, never for correctness).
+    size_t externalSlotsRemaining() const {
+        size_t used = external_slot_next_.load(std::memory_order_relaxed);
+        return used >= kTrackMaxPages ? 0 : kTrackMaxPages - used;
+    }
     size_t rawNextPage() const { return next_page_.load(std::memory_order_acquire); }
 
     size_t committedPages() const {

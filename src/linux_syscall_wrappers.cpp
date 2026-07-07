@@ -1159,6 +1159,32 @@ inline void registerLinuxExternalRange(smash::VmRegion* vm, void* base, size_t l
     // Safety check: page_states must be initialized
     if (!smash::g_smash_page_states_for_external) return;
 
+    size_t npages = (len + smash::kPageSize - 1) / smash::kPageSize;
+
+    // Oversized single mapping guard. A mapping larger than the entire
+    // external-page slot budget can never be fully tracked, and such mappings
+    // are invariably app-managed arenas (a DB buffer pool, a JVM/GC heap) that
+    // the application keeps warm — so compressing them is counterproductive
+    // AND the registration loop would burn O(slot-budget) work inside the
+    // caller's mmap() (observed wedging mariadbd startup for minutes on a
+    // 6 GiB InnoDB buffer pool). Skip the whole mapping rather than tracking a
+    // useless prefix. Logged once so the coverage gap is never silent.
+    if (npages > vm->externalSlotCapacity()) {
+        static std::atomic<bool> warned{false};
+        bool expected = false;
+        if (warned.compare_exchange_strong(expected, true,
+                                           std::memory_order_relaxed)) {
+            char buf[192];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash] SMASH_TRACK_EXTERNAL: skipping mmap of %zu pages "
+                "(> %zu slot budget) at %p — likely an app-managed arena kept "
+                "warm; not compressible. Further such skips are silent.\n",
+                npages, vm->externalSlotCapacity(), base);
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+        }
+        return;
+    }
+
     auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
     auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
                & ~(uintptr_t{smash::kPageSize} - 1);

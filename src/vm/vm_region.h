@@ -760,11 +760,21 @@ public:
         LockGuard guard(ext_register_lock_);
         size_t ecount = ext_extent_count_.load(std::memory_order_relaxed);
         if (ecount >= kMaxExtents) return 0;               // extent table full
-        // Reserve the index block. Bail if it would exceed the slot budget
-        // (keeps external indices inside [contig_pages_, +kTrackMaxPages)).
-        size_t local = external_slot_next_.load(std::memory_order_relaxed);
-        if (local + npages > kTrackMaxPages) return 0;
-        external_slot_next_.store(local + npages, std::memory_order_relaxed);
+        // Reserve the index block ATOMICALLY. trackExternalPage() (the small-
+        // mapping hash path) bumps external_slot_next_ with fetch_add(1) and
+        // does NOT hold ext_register_lock_, so a non-atomic load+store here
+        // could interleave with it and hand two pages the same local index —
+        // aliasing their track_reverse_ slots and leaving one page pointing at
+        // the wrong (or an unmapped) address → SEGV_MAPERR in the compressor's
+        // snapshot. fetch_add(npages) reserves the block against both paths.
+        size_t local = external_slot_next_.fetch_add(npages, std::memory_order_relaxed);
+        if (local + npages > kTrackMaxPages) {
+            // Over-budget: we already consumed the counter, but those indices
+            // are never published (no extent, no reverse fill, external_count_
+            // not bumped) so the compressor never visits them. Leaving the
+            // counter advanced only forecloses a few slots — acceptable.
+            return 0;
+        }
         size_t first_index = contig_pages_ + local;
 
         // Fill reverse map for every page BEFORE publishing the extent, so a

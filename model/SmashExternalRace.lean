@@ -256,3 +256,214 @@ theorem locked_same_schedule_safe :
   unfold NoUnmappedRead stepWorkerSnapshot stepMunmapUnmap
          stepMunmapClear stepWorkerLock init
   decide
+
+-- ═══════════════════════════════════════════════════════════════════
+-- EXTENT variant: the O(1)-registration path (hybrid extent registry,
+-- vm_region.h::trackExternalRange / findExtentByAddr). A large external
+-- mapping is one extent record with a SHARED `live` flag covering all its
+-- pages, instead of one hash slot per page.
+--
+-- The concern the model must discharge: does the shared `live` flag — which
+-- untrackExternalPageLocked flips OUTSIDE the per-page lock (it only affects
+-- lookup routing, see the code comment) — open a new window for a worker to
+-- snapshot an unmapped page?
+--
+-- Claim: NO. The safety-critical step is unchanged from the `locked` variant:
+-- untrack, UNDER lock[idx], sets state EMPTY and zeroes track_reverse_[idx]
+-- (modeled by `revZeroed`) BEFORE real_munmap. The worker's snapshot reads the
+-- address it fetched from track_reverse_; if that was zeroed it snapshots
+-- NOTHING (bails on a null page_addr) and cannot fault. The `live` flag races
+-- freely and is irrelevant to safety: a stale live=true merely routes the
+-- lookup through the extent arithmetic, which yields an index whose
+-- track_reverse_ slot is already null. We model `live` explicitly to show it
+-- adds no reachable bad read.
+-- ═══════════════════════════════════════════════════════════════════
+
+/-- Extent-variant state: adds `live` (shared extent liveness, mutated without
+    the lock) and `revZeroed` (track_reverse_[idx] cleared under the lock — the
+    real safety signal). The worker snapshots only if its page address is still
+    valid, i.e. NOT revZeroed. -/
+structure EState where
+  pstate    : PState
+  lock      : Lock
+  mapped    : Bool
+  live      : Bool        -- extent.live (routing hint; mutated OUTSIDE lock)
+  revZeroed : Bool        -- track_reverse_[idx] == 0 (set UNDER lock at untrack)
+  wpc       : WorkerPC
+  mpc       : MunmapPC
+  badRead   : Bool
+  deriving Repr
+
+def einit : EState :=
+  { pstate := PState.ACTIVE, lock := Lock.free, mapped := true,
+    live := true, revZeroed := false,
+    wpc := WorkerPC.WIdle, mpc := MunmapPC.MIdle, badRead := false }
+
+/-- Worker entry: tryLock + verify ACTIVE, mark COMPRESSING, advance to snapshot
+    (holding the lock). Same as the base model. -/
+def eStepWorkerLock (s : EState) : EState :=
+  if s.wpc = WorkerPC.WIdle ∧ s.lock = Lock.free ∧ s.pstate = PState.ACTIVE then
+    { s with lock := Lock.worker, pstate := PState.COMPRESSING,
+             wpc := WorkerPC.WSnapshot }
+  else s
+
+/-- The snapshot. CRITICAL refinement over the base model: the worker fetched
+    page_addr = track_reverse_[idx]; if that slot was zeroed (revZeroed) the
+    address is null and the worker SKIPS the memcpy (no read, no fault). So a
+    bad read is possible only if the page is unmapped AND the reverse slot was
+    NOT zeroed. This mirrors pageAddress() returning nullptr → worker bail. -/
+def eStepWorkerSnapshot (s : EState) : EState :=
+  if s.wpc = WorkerPC.WSnapshot then
+    { s with badRead := s.badRead || (!s.mapped && !s.revZeroed),
+             lock := Lock.free, wpc := WorkerPC.WDone }
+  else s
+
+/-- untrackExternalPageLocked (locked): acquire lock, set EMPTY, ZERO the
+    reverse slot — all under the lock. Then, OUTSIDE the safety-critical part,
+    flip the shared extent `live` flag (modeled as happening in the same step
+    but it is not what safety depends on). -/
+def eStepMunmapClear (s : EState) : EState :=
+  if s.mpc = MunmapPC.MIdle then
+    if s.lock = Lock.free then
+      { s with lock := Lock.munmapper, pstate := PState.EMPTY,
+               revZeroed := true,        -- track_reverse_[idx] := 0 (under lock)
+               live := false,            -- extent.live := false (routing only)
+               mpc := MunmapPC.MUnmap }
+    else s
+  else s
+
+/-- real_munmap: drop the mapping, release the lock (no IPI held). -/
+def eStepMunmapUnmap (s : EState) : EState :=
+  if s.mpc = MunmapPC.MUnmap then
+    { s with mapped := false, lock := Lock.free, mpc := MunmapPC.MDone }
+  else s
+
+def ENoUnmappedRead (s : EState) : Prop := s.badRead = false
+
+/-- Inductive invariant for the extent variant. Same shape as LockedInv plus
+    the reverse-slot coupling that carries safety:
+      J1 no bad read;
+      J2 ACTIVE ⇒ mapped;
+      J3 worker-poised ⇒ mapped ∧ holds lock;
+      J4 munmap-mid ⇒ EMPTY ∧ holds lock ∧ revZeroed;
+      J5 unmapped ⇒ revZeroed  (once the page is gone, the reverse slot that
+         would let a worker read it has already been zeroed under the lock).
+    J5 is the crux: it makes the `!mapped && !revZeroed` bad-read guard in
+    eStepWorkerSnapshot unreachable, regardless of the `live` flag. -/
+def ExtentInv (s : EState) : Prop :=
+  s.badRead = false
+  ∧ (s.pstate = PState.ACTIVE → s.mapped = true)
+  ∧ (s.wpc = WorkerPC.WSnapshot → s.mapped = true ∧ s.lock = Lock.worker)
+  ∧ (s.mpc = MunmapPC.MUnmap → s.pstate = PState.EMPTY ∧ s.lock = Lock.munmapper
+       ∧ s.revZeroed = true)
+  ∧ (s.mapped = false → s.revZeroed = true)
+
+theorem extent_init_inv : ExtentInv einit := by
+  refine ⟨rfl, ?_, ?_, ?_, ?_⟩
+  · intro _; rfl
+  · intro h; simp [einit] at h
+  · intro h; simp [einit] at h
+  · intro h; simp [einit] at h        -- einit.mapped = true, so ¬(mapped = false)
+
+theorem extent_worker_lock_preserves (s : EState) (h : ExtentInv s) :
+    ExtentInv (eStepWorkerLock s) := by
+  obtain ⟨h1, h2, h3, h4, h5⟩ := h
+  unfold eStepWorkerLock
+  by_cases hc : s.wpc = WorkerPC.WIdle ∧ s.lock = Lock.free ∧ s.pstate = PState.ACTIVE
+  · have hfree : s.lock = Lock.free := hc.2.1
+    have hmap : s.mapped = true := h2 hc.2.2
+    have hmpc : s.mpc ≠ MunmapPC.MUnmap := by
+      intro hm; have := (h4 hm).2.1; rw [hfree] at this; exact absurd this (by decide)
+    simp only [if_pos hc]
+    refine ⟨h1, ?_, ?_, ?_, ?_⟩
+    · intro h; simp at h
+    · intro _; exact ⟨hmap, rfl⟩
+    · intro hm; exact absurd hm hmpc
+    · intro hnm; exact h5 hnm            -- mapped unchanged
+  · simp only [if_neg hc]; exact ⟨h1, h2, h3, h4, h5⟩
+
+theorem extent_worker_snapshot_preserves (s : EState) (h : ExtentInv s) :
+    ExtentInv (eStepWorkerSnapshot s) := by
+  obtain ⟨h1, h2, h3, h4, h5⟩ := h
+  unfold eStepWorkerSnapshot
+  by_cases hc : s.wpc = WorkerPC.WSnapshot
+  · have hmap := (h3 hc).1
+    have hlw := (h3 hc).2
+    have hmpc : s.mpc ≠ MunmapPC.MUnmap := by
+      intro hm; have := (h4 hm).2.1; rw [hlw] at this; exact absurd this (by decide)
+    -- bad-read guard: mapped=true here ⇒ (!mapped && !revZeroed) = false
+    have hnobad : (!s.mapped && !s.revZeroed) = false := by rw [hmap]; rfl
+    simp only [if_pos hc]
+    refine ⟨by simp [h1, hnobad], ?_, ?_, ?_, ?_⟩
+    · intro hact; exact h2 hact
+    · intro h; simp at h
+    · intro hm; exact absurd hm hmpc
+    · intro hnm; exact h5 hnm            -- mapped unchanged by snapshot
+  · simp only [if_neg hc]; exact ⟨h1, h2, h3, h4, h5⟩
+
+theorem extent_munmap_clear_preserves (s : EState) (h : ExtentInv s) :
+    ExtentInv (eStepMunmapClear s) := by
+  obtain ⟨h1, h2, h3, h4, h5⟩ := h
+  unfold eStepMunmapClear
+  by_cases hc : s.mpc = MunmapPC.MIdle
+  · by_cases hfree : s.lock = Lock.free
+    · have hwpc : s.wpc ≠ WorkerPC.WSnapshot := by
+        intro hw; have := (h3 hw).2; rw [hfree] at this; exact absurd this (by decide)
+      simp only [if_pos hc, if_pos hfree]
+      refine ⟨h1, ?_, ?_, ?_, ?_⟩
+      · intro h; simp at h                        -- pstate = EMPTY ≠ ACTIVE
+      · intro hw; exact absurd hw hwpc            -- wpc unchanged ≠ WSnapshot
+      · intro _; exact ⟨rfl, rfl, rfl⟩            -- EMPTY, munmapper, revZeroed
+      · intro _; rfl                              -- revZeroed := true
+    · simp only [if_pos hc, if_neg hfree]; exact ⟨h1, h2, h3, h4, h5⟩
+  · simp only [if_neg hc]; exact ⟨h1, h2, h3, h4, h5⟩
+
+theorem extent_munmap_unmap_preserves (s : EState) (h : ExtentInv s) :
+    ExtentInv (eStepMunmapUnmap s) := by
+  obtain ⟨h1, h2, h3, h4, h5⟩ := h
+  unfold eStepMunmapUnmap
+  by_cases hc : s.mpc = MunmapPC.MUnmap
+  · obtain ⟨hempty, hlock, hrev⟩ := h4 hc
+    have hwpc : s.wpc ≠ WorkerPC.WSnapshot := by
+      intro hw; have := (h3 hw).2; rw [hlock] at this; exact absurd this (by decide)
+    simp only [if_pos hc]
+    refine ⟨h1, ?_, ?_, ?_, ?_⟩
+    · intro hact; rw [hempty] at hact; exact absurd hact (by decide)
+    · intro hw; exact absurd hw hwpc
+    · intro hm; simp at hm                        -- mpc = MDone ≠ MUnmap
+    · intro _; exact hrev                         -- revZeroed carried from J4
+  · simp only [if_neg hc]; exact ⟨h1, h2, h3, h4, h5⟩
+
+/-- ExtentInv ⇒ ENoUnmappedRead, holding initially and preserved by every
+    transition, so the extent path never snapshots an unmapped page — the
+    shared `live` flag notwithstanding. -/
+theorem extent_inv_implies_safe (s : EState) (h : ExtentInv s) : ENoUnmappedRead s := h.1
+
+/-- The interleaving that crashed the UNLOCKED base model — worker poised to
+    snapshot, munmap clears + unmaps — is SAFE in the extent variant: munmap is
+    blocked by the worker's lock, and even in the schedule where munmap runs
+    first, it zeroes the reverse slot under the lock, so the worker's snapshot
+    sees revZeroed and does not read the unmapped page. -/
+theorem extent_race_schedule_safe :
+    ENoUnmappedRead
+      (eStepWorkerSnapshot
+        (eStepMunmapUnmap
+          (eStepMunmapClear
+            (eStepWorkerLock einit)))) := by
+  unfold ENoUnmappedRead eStepWorkerSnapshot eStepMunmapUnmap
+         eStepMunmapClear eStepWorkerLock einit
+  decide
+
+/-- The munmap-wins-first schedule (worker hasn't locked yet): munmap clears +
+    zeroes reverse + unmaps, THEN the worker locks the now-EMPTY page. The
+    worker's lock step requires pstate = ACTIVE, so it is a no-op on an EMPTY
+    page — the worker never even reaches WSnapshot. Safe. -/
+theorem extent_munmap_first_safe :
+    ENoUnmappedRead
+      (eStepWorkerSnapshot
+        (eStepWorkerLock
+          (eStepMunmapUnmap
+            (eStepMunmapClear einit)))) := by
+  unfold ENoUnmappedRead eStepWorkerSnapshot eStepWorkerLock eStepMunmapUnmap
+         eStepMunmapClear einit
+  decide

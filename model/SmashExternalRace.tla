@@ -37,7 +37,7 @@
 
 EXTENDS TLC
 
-CONSTANTS Variant   \* "unlocked" | "locked"
+CONSTANTS Variant   \* "unlocked" | "locked" | "extent"
 
 VARIABLES
     pstate,   \* "ACTIVE" | "COMPRESSING" | "EMPTY"
@@ -45,17 +45,19 @@ VARIABLES
     mapped,   \* BOOLEAN — physical backing still mmap'd?
     wpc,      \* "WIdle" | "WSnapshot" | "WDone"
     mpc,      \* "MIdle" | "MUnmap" | "MDone"
+    revZeroed,\* BOOLEAN — track_reverse_[idx] cleared UNDER lock (extent variant)
     badRead   \* BOOLEAN ghost — worker read an UNMAPPED page (the crash)
 
-vars == << pstate, lock, mapped, wpc, mpc, badRead >>
+vars == << pstate, lock, mapped, wpc, mpc, revZeroed, badRead >>
 
 Init ==
-    /\ pstate  = "ACTIVE"
-    /\ lock    = "free"
-    /\ mapped  = TRUE
-    /\ wpc     = "WIdle"
-    /\ mpc     = "MIdle"
-    /\ badRead = FALSE
+    /\ pstate    = "ACTIVE"
+    /\ lock      = "free"
+    /\ mapped    = TRUE
+    /\ wpc       = "WIdle"
+    /\ mpc       = "MIdle"
+    /\ revZeroed = FALSE
+    /\ badRead   = FALSE
 
 \* --- Compressor worker ------------------------------------------------------
 
@@ -67,40 +69,48 @@ WorkerLock ==
     /\ lock'   = "worker"
     /\ pstate' = "COMPRESSING"
     /\ wpc'    = "WSnapshot"
-    /\ UNCHANGED << mapped, mpc, badRead >>
+    /\ UNCHANGED << mapped, mpc, revZeroed, badRead >>
 
 \* The snapshot read memcpy(buf, page_addr, kPageSize). If the page was
 \* unmapped, this is a wild read -> badRead (the SIGSEGV). Then unlock.
+\* EXTENT variant: page_addr comes from track_reverse_; if that slot was zeroed
+\* under the lock (revZeroed), page_addr is null and the worker SKIPS the read.
+\* So a bad read needs unmapped AND ~revZeroed.
 WorkerSnapshot ==
     /\ wpc = "WSnapshot"
-    /\ badRead' = (badRead \/ ~mapped)
+    /\ badRead' = (badRead \/ (~mapped /\ (Variant # "extent" \/ ~revZeroed)))
     /\ lock'    = "free"
     /\ wpc'     = "WDone"
-    /\ UNCHANGED << pstate, mapped, mpc >>
+    /\ UNCHANGED << pstate, mapped, mpc, revZeroed >>
 
 \* --- munmap interposer ------------------------------------------------------
 
 \* deregisterLinuxExternalRange: set EMPTY + untrack.
 \*   unlocked: fires regardless of the lock (the bug).
 \*   locked:   only when the lock is free; acquires it (the fix).
+\* "locked" and "extent" both take the per-page lock before clearing state.
+\* "extent" additionally zeroes track_reverse_[idx] (revZeroed) under that lock —
+\* the load-bearing safety step — while flipping extent.live is routing-only and
+\* not modeled as a separate variable (it does not gate the worker's read).
 MunmapClear ==
     /\ mpc = "MIdle"
-    /\ IF Variant = "locked"
+    /\ IF Variant \in {"locked", "extent"}
          THEN /\ lock = "free"
               /\ lock' = "munmapper"
          ELSE /\ lock' = lock
-    /\ pstate' = "EMPTY"
-    /\ mpc'    = "MUnmap"
+    /\ pstate'    = "EMPTY"
+    /\ revZeroed' = (Variant = "extent")   \* clear reverse slot under lock
+    /\ mpc'       = "MUnmap"
     /\ UNCHANGED << mapped, wpc, badRead >>
 
-\* real_munmap: tear down the mapping. locked variant releases the lock here
+\* real_munmap: tear down the mapping. locked/extent release the lock here
 \* (no IPI held under the lock -> deadlock-free).
 MunmapUnmap ==
     /\ mpc = "MUnmap"
     /\ mapped' = FALSE
-    /\ lock'   = IF Variant = "locked" THEN "free" ELSE lock
+    /\ lock'   = IF Variant \in {"locked", "extent"} THEN "free" ELSE lock
     /\ mpc'    = "MDone"
-    /\ UNCHANGED << pstate, wpc, badRead >>
+    /\ UNCHANGED << pstate, wpc, revZeroed, badRead >>
 
 Next ==
     \/ WorkerLock
@@ -124,6 +134,7 @@ TypeOK ==
     /\ mapped \in BOOLEAN
     /\ wpc \in {"WIdle", "WSnapshot", "WDone"}
     /\ mpc \in {"MIdle", "MUnmap", "MDone"}
+    /\ revZeroed \in BOOLEAN
     /\ badRead \in BOOLEAN
 
 \* Mutual exclusion (locked variant): the worker's snapshot critical section and

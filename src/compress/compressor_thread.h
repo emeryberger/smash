@@ -3696,7 +3696,16 @@ private:
         // Re-claim SIGUSR2 each tick so Firefox / other runtimes that
         // also install a SIGUSR2 handler can't permanently displace ours.
         // Cheap: one sigaction-read + one branch.
-        {
+        //
+        // OFF BY DEFAULT: stealing SIGUSR2 from a host that uses it for its
+        // own control plane breaks that app. MariaDB, for example, sends
+        // SIGUSR2 (its THR_KILL_SIGNAL) to end its signal thread during
+        // shutdown; if smash has overwritten the disposition with its stats
+        // dumper, that thread never exits and mysqld_main hangs forever in
+        // wait_for_signal_thread_to_end(). The SIGUSR2 stats dump is a
+        // debugging convenience, not core function — opt in with
+        // SMASH_STATS_SIGNAL=1 (which also gates the initial install).
+        if (statsSignalEnabled()) {
             struct sigaction current{};
             sigaction(SIGUSR2, nullptr, &current);
             if (current.sa_handler != &CompressorThread::sigusr1Handler) {
@@ -4058,8 +4067,32 @@ private:
 
     // ── Thread entry points ───────────────────────────────────────────────
 
+    // Block all asynchronous signals on smash's own compressor/helper threads.
+    // A process-directed signal (kill(getpid(), N) / sigqueue) is delivered to
+    // an ARBITRARY thread that does not block it. If a smash background thread
+    // is chosen, the host application's own handler/waiter never sees it. This
+    // breaks apps that use process-directed signals for their control plane —
+    // e.g. MariaDB sends SIGUSR2 to wake its signal thread during shutdown; if
+    // a smash thread absorbs it, mysqld_main hangs forever in
+    // wait_for_signal_thread_to_end(). Blocking here forces every async signal
+    // to a host thread. SIGSEGV/SIGBUS/SIGABRT/SIGFPE/SIGILL are left unblocked:
+    // they are synchronous (thread-directed at the faulting instruction) and
+    // cannot be meaningfully rerouted; the fault handler must still see a
+    // genuine fault on this thread, and a real abort/FPE should still fire.
+    static void blockAsyncSignalsOnSelf() {
+        sigset_t set;
+        sigfillset(&set);
+        sigdelset(&set, SIGSEGV);
+        sigdelset(&set, SIGBUS);
+        sigdelset(&set, SIGABRT);
+        sigdelset(&set, SIGFPE);
+        sigdelset(&set, SIGILL);
+        pthread_sigmask(SIG_BLOCK, &set, nullptr);
+    }
+
     __attribute__((cold)) static void* coordEntry(void* arg) {
         g_compressor_thread = true;
+        blockAsyncSignalsOnSelf();
         auto* self = static_cast<CompressorThread*>(arg);
         while (self->running_.load(std::memory_order_relaxed)) {
             // Sleep in 10ms intervals, checking running_ flag each time.
@@ -4090,6 +4123,7 @@ private:
 
     __attribute__((cold)) static void* helperEntry(void* arg) {
         g_compressor_thread = true;
+        blockAsyncSignalsOnSelf();
         auto* ha = static_cast<HelperArg*>(arg);
         auto* self = ha->self;
         int helper_id = ha->id;
@@ -4506,12 +4540,20 @@ public:
         // to stderr. Lets us observe whether smash is actually compressing
         // anything during a Firefox run without rebuilding. Use SIGUSR2 (not
         // SIGUSR1) because Firefox installs a SIGUSR1 handler of its own.
+        //
+        // OFF BY DEFAULT (opt in with SMASH_STATS_SIGNAL=1). Claiming SIGUSR2
+        // hijacks it from hosts that use it for their own control plane —
+        // e.g. MariaDB sends SIGUSR2 to end its signal thread at shutdown, so
+        // stealing it hangs mysqld_main forever. The env-var check is cached
+        // once; the tests that drive the SIGUSR2 stats path set it explicitly.
         s_stats_instance_ = this;
-        struct sigaction sa{};
-        sa.sa_handler = &CompressorThread::sigusr1Handler;
-        sa.sa_flags = SA_RESTART;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGUSR2, &sa, nullptr);
+        if (statsSignalEnabled()) {
+            struct sigaction sa{};
+            sa.sa_handler = &CompressorThread::sigusr1Handler;
+            sa.sa_flags = SA_RESTART;
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGUSR2, &sa, nullptr);
+        }
 
         // SMASH_STATS=1: also emit a stats line on every normal process
         // exit. atexit handlers are inherited across fork(), so each child
@@ -4592,6 +4634,18 @@ public:
     static inline CompressorThread* s_stats_instance_ = nullptr;
     static inline CompressorThread* s_stop_instance_ = nullptr;
     static inline bool s_debug_enabled_ = false;
+
+    // SMASH_STATS_SIGNAL=1 opts into installing the SIGUSR2 stats-dump handler
+    // (and the per-tick reclaim). OFF by default so smash never hijacks
+    // SIGUSR2 from a host application that uses it for its own control plane
+    // (e.g. MariaDB's signal thread → shutdown hang). Cached once.
+    static bool statsSignalEnabled() {
+        static const bool enabled = []{
+            const char* v = std::getenv("SMASH_STATS_SIGNAL");
+            return v && v[0] == '1';
+        }();
+        return enabled;
+    }
 
     static void sigusr1Handler(int) {
         auto* self = s_stats_instance_;

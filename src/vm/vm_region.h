@@ -12,6 +12,7 @@
 #include <new>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 #include "smash/config.h"
 #include "platform_mem.h"
@@ -200,6 +201,21 @@ class VmRegion {
     }
 
     static void* decommitThreadEntry(void* arg) {
+        // Block asynchronous signals so a process-directed signal (e.g. an
+        // app's shutdown SIGUSR2/SIGTERM) is never absorbed by this smash
+        // background thread instead of reaching a host application thread.
+        // SIGSEGV/SIGBUS/SIGABRT/SIGFPE/SIGILL left unblocked (synchronous /
+        // fatal). Mirrors CompressorThread::blockAsyncSignalsOnSelf().
+        {
+            sigset_t set;
+            sigfillset(&set);
+            sigdelset(&set, SIGSEGV);
+            sigdelset(&set, SIGBUS);
+            sigdelset(&set, SIGABRT);
+            sigdelset(&set, SIGFPE);
+            sigdelset(&set, SIGILL);
+            pthread_sigmask(SIG_BLOCK, &set, nullptr);
+        }
         auto* self = static_cast<VmRegion*>(arg);
         while (self->decommit_running_.load(std::memory_order_relaxed)) {
             // Drain the queue

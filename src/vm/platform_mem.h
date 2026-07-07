@@ -158,6 +158,18 @@ inline void decommitPages(void* addr, size_t size) {
     // MADV_FREE_REUSABLE tells the kernel to reclaim physical backing immediately.
     // Must be called while pages are still accessible (PROT_READ or PROT_RW);
     // fails with EPERM on PROT_NONE pages.
+    //
+    // GOTCHA (macOS RSS reporting): MADV_FREE_REUSABLE is the ONLY way to
+    // actually drop physical pages here. mprotect(PROT_NONE) does NOT reclaim —
+    // but task_info's resident_size (what `ps`/Activity Monitor/getCurrentRSSBytes
+    // report) DROPS anyway when a page goes PROT_NONE, then JUMPS back when it
+    // returns to PROT_RW. That phantom drop-and-rebound is pure reporting noise,
+    // not real memory movement. Do not read a PROT_NONE-induced RSS dip as a
+    // reclaim win, and do not "fix" RSS by mprotecting instead of madvising.
+    // This artifact caused a visible RSS "bounce" in bench_rss (a PROT_NONE
+    // deep-monitoring arm one tick before compression); see the __APPLE__ block
+    // in CompressorThread::escalateToDeepMonitoring. On Linux MADV_DONTNEED both
+    // reclaims and updates VmRSS truthfully, so none of this applies there.
     madvise(addr, size, MADV_FREE_REUSABLE);
 #endif
 }

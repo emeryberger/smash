@@ -1,0 +1,76 @@
+=== Arena Segregation Benchmark ===
+Object size: 256, page size: 4096, objects/page: 16
+
+Allocating 131072 objects (32768 per site, strictly interleaved)...
+Total data: 32.0 MB, Peak RSS: 214.4 MB
+
+Cooling 8s (all objects untouched)...
+  cool t=4s: RSS=214.4 MB
+  cool t=8s: RSS=195.3 MB
+Post-cool RSS: 195.3 MB (8.9% reduction from peak)
+
+Serve phase: accessing JSON+INTS (hot), FLOATS+RANDOM stay compressed...
+  t=4s: RSS=214.0 MB  ops=262144
+  t=8s: RSS=214.0 MB  ops=524288
+  t=12s: RSS=214.0 MB  ops=786432
+
+Cold re-access: reading 1000 FLOATS objects...
+  Cold access: 1000 objects in 951 us (1.0 us/obj)
+
+--- Segregation ---
+Total pages: 8192 (hot: 4096, cold: 4096)
+Homogeneous (>=75% single site): 8192 (100%)
+Fully mixed (4 sites, none >40%): 0 (0%)
+
+--- Compression Ratios (lower = better) ---
+                LZ4   zstd-1   zstd-9
+All pages     0.551    0.437    0.436
+Hot pages     0.547    0.325    0.324
+Cold pages    0.555    0.549    0.548
+
+--- Per-Site Ratios (homogeneous pages only) ---
+Site            LZ4   zstd-1   zstd-9  Hot?
+json          0.089    0.061    0.057  HOT
+floats        0.105    0.095    0.093  cold
+random        1.004    1.002    1.002  cold
+ints          1.004    0.590    0.591  HOT
+
+--- Performance ---
+Serve: 1.3 sec, 616951 ops/sec (hot object accesses)
+Cold re-access: 1.0 us/object (decompression cost if compressed)
+
+--- RSS ---
+Peak: 214.4 MB, Post-cool: 214.0 MB (0.2% reduction)
+
+METRIC total_data_mb 32.0
+METRIC peak_rss_mb 214.4
+METRIC post_cool_rss_mb 214.0
+METRIC rss_reduction_pct 0.2
+METRIC serve_sec 1.27
+METRIC ops_per_sec 616951
+METRIC cold_access_us_per_obj 1.0
+METRIC homogeneity_pct 100.0
+METRIC fully_mixed_pct 0.0
+METRIC hot_pages 4096
+METRIC cold_pages 4096
+METRIC avg_lz4 0.551
+METRIC avg_zstd1 0.437
+METRIC avg_zstd9 0.436
+METRIC hot_lz4 0.547
+METRIC cold_lz4 0.555
+METRIC hot_zstd1 0.325
+METRIC cold_zstd1 0.549
+METRIC hot_zstd9 0.324
+METRIC cold_zstd9 0.548
+METRIC json_lz4 0.089
+METRIC json_zstd1 0.061
+METRIC json_zstd9 0.057
+METRIC floats_lz4 0.105
+METRIC floats_zstd1 0.095
+METRIC floats_zstd9 0.093
+METRIC random_lz4 1.004
+METRIC random_zstd1 1.002
+METRIC random_zstd9 1.002
+METRIC ints_lz4 1.004
+METRIC ints_zstd1 0.590
+METRIC ints_zstd9 0.591

@@ -1,0 +1,15 @@
+METRIC fill_time_sec 2.21
+METRIC peak_rss_mb 424.0
+METRIC post_cool_rss_mb 424.0
+METRIC cool_reduction_pct 0.0
+METRIC cool_auc_mb_sec 5087.4
+METRIC steady_rss_mb 627.2
+METRIC min_rss_mb 424.0
+METRIC rss_reduction_pct 32.4
+METRIC serve_auc_mb_sec 13251.0
+METRIC ops_per_sec 96475
+METRIC hot_p50_us 0.58
+METRIC hot_p99_us 71.83
+METRIC cold_p50_us 0.92
+METRIC cold_p99_us 2.83
+METRIC post_reaccess_rss_mb 627.2

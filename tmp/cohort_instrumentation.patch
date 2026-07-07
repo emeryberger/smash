@@ -1,0 +1,530 @@
+diff --git a/src/compress/compressor_thread.h b/src/compress/compressor_thread.h
+index 002b6d1..68a0529 100644
+--- a/src/compress/compressor_thread.h
++++ b/src/compress/compressor_thread.h
+@@ -448,14 +448,19 @@ class CompressorThread {
+     static constexpr size_t kBucketTableLen = kNumArenas * kTotalBucketsPerArena;
+ 
+     // Cohort measurement (kMeasureCohorts).  Points to SmashHeap's CohortPage
+-    // array — opaque here to avoid circular include.  Layout matches
+-    // SmashHeap::CohortPage: {uint32_t first_tid, uint32_t first_ra,
+-    //                          uint8_t mixed_tid, uint8_t mixed_ra}.
++    // array — opaque here to avoid circular include.  Layout MUST match
++    // SmashHeap::CohortPage byte-for-byte (see smash_heap.h).
++    static constexpr uint8_t kCohortRaSlots = 4;
++    static constexpr uint8_t kCohortRaOverflow = 0xFF;
+     struct CohortPage {
+         uint32_t first_tid;
+-        uint32_t first_ra;
++        uint32_t ra_slots[kCohortRaSlots];
++        uint32_t fault_count;
++        uint64_t hot_bits;
++        uint8_t  n_ra;
++        uint8_t  size_class;
+         uint8_t  mixed_tid;
+-        uint8_t  mixed_ra;
++        uint8_t  ever_compressed;
+     };
+     CohortPage* cohort_pages_ = nullptr;
+     size_t cohort_pages_len_ = 0;
+@@ -3696,7 +3701,16 @@ private:
+         // Re-claim SIGUSR2 each tick so Firefox / other runtimes that
+         // also install a SIGUSR2 handler can't permanently displace ours.
+         // Cheap: one sigaction-read + one branch.
+-        {
++        //
++        // OFF BY DEFAULT: stealing SIGUSR2 from a host that uses it for its
++        // own control plane breaks that app. MariaDB, for example, sends
++        // SIGUSR2 (its THR_KILL_SIGNAL) to end its signal thread during
++        // shutdown; if smash has overwritten the disposition with its stats
++        // dumper, that thread never exits and mysqld_main hangs forever in
++        // wait_for_signal_thread_to_end(). The SIGUSR2 stats dump is a
++        // debugging convenience, not core function — opt in with
++        // SMASH_STATS_SIGNAL=1 (which also gates the initial install).
++        if (statsSignalEnabled()) {
+             struct sigaction current{};
+             sigaction(SIGUSR2, nullptr, &current);
+             if (current.sa_handler != &CompressorThread::sigusr1Handler) {
+@@ -4019,47 +4033,147 @@ private:
+     void tallyCohorts(size_t committed) {
+         if (!cohort_pages_ || cohort_pages_len_ == 0) return;
+         size_t lim = committed < cohort_pages_len_ ? committed : cohort_pages_len_;
+-        size_t active_total = 0, active_mixed_tid = 0, active_mixed_ra = 0;
+-        size_t comp_total = 0, comp_mixed_tid = 0, comp_mixed_ra = 0;
+-        size_t all_total = 0, all_mixed_tid = 0, all_mixed_ra = 0;
++
++        // ── Routing purity ────────────────────────────────────────────────
++        // n_ra histogram: pages holding exactly 1..4 distinct call sites, or
++        // >4 (overflow).  pure = n_ra==1.  A perfectly-routing allocator has
++        // pure==100%.
++        size_t all_total = 0, all_mixed_tid = 0;
++        size_t nra_hist[6] = {0};        // idx 1..4 = that count; idx 5 = overflow
++        size_t comp_total = 0, comp_pure = 0;
++
++        // Per-size-class purity: does mixing correlate with object size?
++        // Index kNumClasses is the aggregate bucket for large allocations
++        // (size_class == kCohortLargeSc, 0xFE).
++        static constexpr uint8_t kCohortLargeSc = 0xFE;
++        static constexpr size_t kLargeBucket = kNumClasses;
++        size_t sc_pages[kNumClasses + 1] = {0};
++        size_t sc_pure[kNumClasses + 1] = {0};
++
++        // ── Hot/cold mixing ───────────────────────────────────────────────
++        // For pages that ever faulted back from COMPRESSED, hot_bits is the
++        // set of 256 B sub-blocks observed hot.  popcount/64 estimates the hot
++        // fraction; the histogram buckets pages by that fraction.  Also track
++        // hot-fraction and fault rate per size class.
++        size_t faulted_pages = 0;
++        size_t hotfrac_hist[5] = {0};    // <20,20-40,40-60,60-80,>=80 %
++        size_t sc_faulted[kNumClasses + 1] = {0};
++        uint64_t sc_faults[kNumClasses + 1] = {0};
++        uint64_t sc_hotblocks[kNumClasses + 1] = {0};  // Σ popcount(hot_bits)
++
+         for (size_t i = 0; i < lim; ++i) {
+             auto& cp = cohort_pages_[i];
+             if (cp.first_tid == 0) continue;
+             all_total++;
+             if (cp.mixed_tid) all_mixed_tid++;
+-            if (cp.mixed_ra) all_mixed_ra++;
++
++            uint8_t nra = cp.n_ra;
++            bool pure = (nra == 1);
++            if (nra == kCohortRaOverflow) nra_hist[5]++;
++            else if (nra >= 1 && nra <= 4) nra_hist[nra]++;
++
++            uint8_t raw_sc = cp.size_class;
++            size_t sc = (raw_sc == kCohortLargeSc) ? kLargeBucket
++                        : (raw_sc < kNumClasses ? raw_sc : kNumClasses + 1);
++            if (sc <= kLargeBucket) {
++                sc_pages[sc]++;
++                if (pure) sc_pure[sc]++;
++            }
++
+             PageState st = states_->get(i);
+-            if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+-                active_total++;
+-                if (cp.mixed_tid) active_mixed_tid++;
+-                if (cp.mixed_ra) active_mixed_ra++;
+-            } else if (st == PageState::COMPRESSED) {
++            if (st == PageState::COMPRESSED) { cp.ever_compressed = 1; }
++            if (cp.ever_compressed) {
+                 comp_total++;
+-                if (cp.mixed_tid) comp_mixed_tid++;
+-                if (cp.mixed_ra) comp_mixed_ra++;
++                if (pure) comp_pure++;
++            }
++
++            if (cp.fault_count > 0) {
++                faulted_pages++;
++                int blocks = __builtin_popcountll(cp.hot_bits);
++                // 16 KiB page = 64 blocks; 4 KiB page = 16 blocks.
++                int nblk = static_cast<int>(kPageSize >> 8);
++                double frac = nblk > 0 ? (double)blocks / nblk : 0.0;
++                int b = frac < 0.2 ? 0 : frac < 0.4 ? 1 : frac < 0.6 ? 2
++                        : frac < 0.8 ? 3 : 4;
++                hotfrac_hist[b]++;
++                if (sc <= kLargeBucket) {
++                    sc_faulted[sc]++;
++                    sc_faults[sc] += cp.fault_count;
++                    sc_hotblocks[sc] += blocks;
++                }
+             }
+         }
++
+         auto pct = [](size_t n, size_t d) -> double {
+             return d > 0 ? 100.0 * n / d : 0.0;
+         };
++        size_t pure_pages = nra_hist[1];
++
+         fprintf(stderr,
+-            "[cohort] committed=%zu stamped=%zu  "
+-            "all=%zu mixed_tid=%zu(%.1f%%) mixed_ra=%zu(%.1f%%)  "
+-            "active=%zu mixed_tid=%zu(%.1f%%) mixed_ra=%zu(%.1f%%)  "
+-            "compressed=%zu mixed_tid=%zu(%.1f%%) mixed_ra=%zu(%.1f%%)\n",
+-            committed, all_total,
++            "[cohort] stamped=%zu mixed_tid=%zu(%.1f%%)  "
++            "ROUTING-PURITY: pure(1-site)=%zu(%.1f%%) "
++            "n_ra{1=%zu 2=%zu 3=%zu 4=%zu >4=%zu}  "
++            "compressed_pages=%zu pure=%.1f%%\n",
+             all_total, all_mixed_tid, pct(all_mixed_tid, all_total),
+-            all_mixed_ra, pct(all_mixed_ra, all_total),
+-            active_total, active_mixed_tid, pct(active_mixed_tid, active_total),
+-            active_mixed_ra, pct(active_mixed_ra, active_total),
+-            comp_total, comp_mixed_tid, pct(comp_mixed_tid, comp_total),
+-            comp_mixed_ra, pct(comp_mixed_ra, comp_total));
++            pure_pages, pct(pure_pages, all_total),
++            nra_hist[1], nra_hist[2], nra_hist[3], nra_hist[4], nra_hist[5],
++            comp_total, pct(comp_pure, comp_total));
++
++        fprintf(stderr,
++            "[cohort] HOT/COLD-MIX: faulted_pages=%zu(%.1f%% of live) "
++            "hotfrac{<20%%=%zu 20-40=%zu 40-60=%zu 60-80=%zu >=80=%zu}\n",
++            faulted_pages, pct(faulted_pages, all_total),
++            hotfrac_hist[0], hotfrac_hist[1], hotfrac_hist[2],
++            hotfrac_hist[3], hotfrac_hist[4]);
++
++        // Per-size-class breakdown (only classes with live pages).  Purity
++        // and hot-fraction vs object size — the size-correlation the task asks
++        // for.  bytes/obj from the size-class table.
++        for (size_t sc = 0; sc <= kLargeBucket; ++sc) {
++            if (sc_pages[sc] == 0) continue;
++            int nblk = static_cast<int>(kPageSize >> 8);
++            double hotfrac = sc_faulted[sc] > 0
++                ? pct(sc_hotblocks[sc], (size_t)sc_faulted[sc] * nblk) : 0.0;
++            char szbuf[16];
++            if (sc == kLargeBucket) __builtin_snprintf(szbuf, sizeof(szbuf), "large");
++            else __builtin_snprintf(szbuf, sizeof(szbuf), "%uB", classSize((uint8_t)sc));
++            fprintf(stderr,
++                "[cohort]   sc=%zu (%s): pages=%zu pure=%.1f%% "
++                "faulted=%zu(%.1f%%) faults=%llu hotfrac=%.1f%%\n",
++                sc, szbuf, sc_pages[sc], pct(sc_pure[sc], sc_pages[sc]),
++                sc_faulted[sc], pct(sc_faulted[sc], sc_pages[sc]),
++                (unsigned long long)sc_faults[sc], hotfrac);
++        }
+     }
+ 
+     // ── Thread entry points ───────────────────────────────────────────────
+ 
++    // Block all asynchronous signals on smash's own compressor/helper threads.
++    // A process-directed signal (kill(getpid(), N) / sigqueue) is delivered to
++    // an ARBITRARY thread that does not block it. If a smash background thread
++    // is chosen, the host application's own handler/waiter never sees it. This
++    // breaks apps that use process-directed signals for their control plane —
++    // e.g. MariaDB sends SIGUSR2 to wake its signal thread during shutdown; if
++    // a smash thread absorbs it, mysqld_main hangs forever in
++    // wait_for_signal_thread_to_end(). Blocking here forces every async signal
++    // to a host thread. SIGSEGV/SIGBUS are left unblocked: they are
++    // synchronous (thread-directed at the faulting instruction) and cannot be
++    // meaningfully rerouted; the fault handler must still see a genuine fault
++    // on this thread.
++    static void blockAsyncSignalsOnSelf() {
++        sigset_t set;
++        sigfillset(&set);
++        sigdelset(&set, SIGSEGV);
++        sigdelset(&set, SIGBUS);
++        sigdelset(&set, SIGABRT);   // leave abort/fatal paths intact
++        sigdelset(&set, SIGFPE);
++        sigdelset(&set, SIGILL);
++        pthread_sigmask(SIG_BLOCK, &set, nullptr);
++    }
++
+     __attribute__((cold)) static void* coordEntry(void* arg) {
+         g_compressor_thread = true;
++        blockAsyncSignalsOnSelf();
+         auto* self = static_cast<CompressorThread*>(arg);
+         while (self->running_.load(std::memory_order_relaxed)) {
+             // Sleep in 10ms intervals, checking running_ flag each time.
+@@ -4090,6 +4204,7 @@ private:
+ 
+     __attribute__((cold)) static void* helperEntry(void* arg) {
+         g_compressor_thread = true;
++        blockAsyncSignalsOnSelf();
+         auto* ha = static_cast<HelperArg*>(arg);
+         auto* self = ha->self;
+         int helper_id = ha->id;
+@@ -4506,12 +4621,20 @@ public:
+         // to stderr. Lets us observe whether smash is actually compressing
+         // anything during a Firefox run without rebuilding. Use SIGUSR2 (not
+         // SIGUSR1) because Firefox installs a SIGUSR1 handler of its own.
++        //
++        // OFF BY DEFAULT (opt in with SMASH_STATS_SIGNAL=1). Claiming SIGUSR2
++        // hijacks it from hosts that use it for their own control plane —
++        // e.g. MariaDB sends SIGUSR2 to end its signal thread at shutdown, so
++        // stealing it hangs mysqld_main forever. The env-var check is cached
++        // once; the tests that drive the SIGUSR2 stats path set it explicitly.
+         s_stats_instance_ = this;
+-        struct sigaction sa{};
+-        sa.sa_handler = &CompressorThread::sigusr1Handler;
+-        sa.sa_flags = SA_RESTART;
+-        sigemptyset(&sa.sa_mask);
+-        sigaction(SIGUSR2, &sa, nullptr);
++        if (statsSignalEnabled()) {
++            struct sigaction sa{};
++            sa.sa_handler = &CompressorThread::sigusr1Handler;
++            sa.sa_flags = SA_RESTART;
++            sigemptyset(&sa.sa_mask);
++            sigaction(SIGUSR2, &sa, nullptr);
++        }
+ 
+         // SMASH_STATS=1: also emit a stats line on every normal process
+         // exit. atexit handlers are inherited across fork(), so each child
+@@ -4593,6 +4716,18 @@ public:
+     static inline CompressorThread* s_stop_instance_ = nullptr;
+     static inline bool s_debug_enabled_ = false;
+ 
++    // SMASH_STATS_SIGNAL=1 opts into installing the SIGUSR2 stats-dump handler
++    // (and the per-tick reclaim). OFF by default so smash never hijacks
++    // SIGUSR2 from a host application that uses it for its own control plane
++    // (e.g. MariaDB's signal thread → shutdown hang). Cached once.
++    static bool statsSignalEnabled() {
++        static const bool enabled = []{
++            const char* v = std::getenv("SMASH_STATS_SIGNAL");
++            return v && v[0] == '1';
++        }();
++        return enabled;
++    }
++
+     static void sigusr1Handler(int) {
+         auto* self = s_stats_instance_;
+         if (!self || !self->states_ || !self->vm_) return;
+@@ -4946,6 +5081,24 @@ public:
+             uint8_t prev_rc = recompress_count_[page_idx];
+             if (prev_rc < 255) recompress_count_[page_idx] = prev_rc + 1;
+ 
++            // Cohort hot/cold sampling.  A fault back from COMPRESSED is
++            // direct evidence this page held a *hot* object the compressor
++            // mis-judged cold.  The faulting address's sub-page offset tells
++            // us *which* part of the page is hot; record it at 256 B
++            // granularity (64 blocks/page on 16 KiB pages, or a subset on
++            // 4 KiB).  popcount(hot_bits)/blocks estimates the hot fraction —
++            // a proxy for hot/cold mixing on the page.  Async-signal-safe:
++            // plain stores to a bootstrap-allocated array, no locks/malloc.
++            if constexpr (kMeasureCohorts) {
++                if (cohort_pages_ && page_idx < cohort_pages_len_) {
++                    auto& cp = cohort_pages_[page_idx];
++                    cp.fault_count++;
++                    size_t off = addr - reinterpret_cast<uintptr_t>(page_addr);
++                    size_t block = (off & (kPageSize - 1)) >> 8;  // 256 B blocks
++                    if (block < 64) cp.hot_bits |= (uint64_t{1} << block);
++                }
++            }
++
+             // Soft-dirty ROI: classify this decompress as a WRITE re-dirty (the
+             // blob was genuinely invalidated → real churn) vs a READ fault (the
+             // blob would have survived → not a re-dirty), using the hardware
+diff --git a/src/smash_heap.h b/src/smash_heap.h
+index 2ea085c..add209f 100644
+--- a/src/smash_heap.h
++++ b/src/smash_heap.h
+@@ -357,14 +357,35 @@ class SmashHeap {
+ #endif
+ 
+     // Cohort measurement arrays (kMeasureCohorts only).  Per-page tracking
+-    // of first allocating thread ID and RA hash; a "mixed" flag per axis
+-    // flips when a second distinct value is seen.  Bootstrap-allocated once
+-    // compression is initialized.
++    // used to empirically quantify (1) call-site routing purity and (2)
++    // hot/cold object mixing.  Bootstrap-allocated once compression is
++    // initialized.  Measurement only — no behavioral effect.
++    //
++    // Routing purity: a page is "pure" if every object on it came from the
++    // same call site (ra_slots holds up to 4 distinct call-site hashes; n_ra
++    // saturates at kCohortRaOverflow to mark >4).  100% pure routing would
++    // mean n_ra==1 for every page.
++    //
++    // Hot/cold mixing: fault_count / hot_bits are written by the SIGSEGV
++    // fault handler (compressor side) when a COMPRESSED page is re-accessed —
++    // i.e. the compressor mis-judged it cold.  hot_bits is a 256 B-granularity
++    // bitmap of which sub-blocks of the page faulted back, sampled from the
++    // fault address; its popcount estimates the hot fraction of the page.
++    //
++    // IMPORTANT: this struct layout is mirrored in
++    // CompressorThread::CohortPage (compressor_thread.h) to avoid a circular
++    // include.  The two MUST stay byte-identical.
++    static constexpr uint8_t kCohortRaSlots = 4;
++    static constexpr uint8_t kCohortRaOverflow = 0xFF;
+     struct CohortPage {
+-        uint32_t first_tid;
+-        uint32_t first_ra;
+-        uint8_t  mixed_tid;
+-        uint8_t  mixed_ra;
++        uint32_t first_tid;                 // first stamping thread (cohort id)
++        uint32_t ra_slots[kCohortRaSlots];  // distinct call-site hashes (0=empty)
++        uint32_t fault_count;               // decompress-faults on this page (churn)
++        uint64_t hot_bits;                  // 256B sub-block hot bitmap (fault addrs)
++        uint8_t  n_ra;                       // distinct call sites (saturates at 0xFF)
++        uint8_t  size_class;                 // size class of objects on this page
++        uint8_t  mixed_tid;                  // >1 distinct thread stamped
++        uint8_t  ever_compressed;            // page reached COMPRESSED at least once
+     };
+     CohortPage* cohort_pages_ = nullptr;
+     size_t cohort_pages_len_ = 0;
+@@ -719,6 +740,8 @@ private:
+     static void releaseHook(size_t page_idx, size_t page_count, void* ctx) {
+         auto* self = static_cast<SmashHeap*>(ctx);
+         self->compressor_.releaseCompressedPages(page_idx, page_count);
++        if constexpr (kMeasureCohorts)
++            self->resetCohort(page_idx, page_count);
+     }
+ 
+     void startCompression() {
+@@ -734,6 +757,15 @@ private:
+         }();
+         if (no_compressor) return;
+         fault_handler_.start(faultCallback, this);
++        // SMASH_ONLY_FAULT_HANDLER=1: install the fault handler but do NOT
++        // start the compressor coordinator/helper threads. Diagnostic only —
++        // isolates "SIGSEGV/SIGBUS handler install" from "compressor threads +
++        // per-tick SIGUSR2 reclaim" when bisecting host-app shutdown hangs.
++        static const bool only_fault = [] {
++            const char* v = std::getenv("SMASH_ONLY_FAULT_HANDLER");
++            return v && v[0] == '1';
++        }();
++        if (only_fault) return;
+         compressor_.start();
+     }
+ 
+@@ -968,7 +1000,7 @@ public:
+         return tc;
+     }
+ 
+-    void stampCohort(void* ptr, uint32_t ra_hash) {
++    void stampCohort(void* ptr, uint32_t ra_hash, uint8_t sc) {
+         if constexpr (!kMeasureCohorts) return;
+         if (!cohort_pages_) return;
+         uintptr_t pa = reinterpret_cast<uintptr_t>(ptr);
+@@ -981,8 +1013,72 @@ public:
+             next_ctid.fetch_add(1, std::memory_order_relaxed);
+         if (cp.first_tid == 0) cp.first_tid = ctid;
+         else if (cp.first_tid != ctid) cp.mixed_tid = 1;
+-        if (cp.first_ra == 0) cp.first_ra = ra_hash;
+-        else if (cp.first_ra != ra_hash) cp.mixed_ra = 1;
++        cp.size_class = sc;
++        if (ra_hash == 0) ra_hash = 1;  // reserve 0 as "empty slot"
++        // Record the distinct call-site set (up to kCohortRaSlots).  This is
++        // the raw data for routing purity: n_ra==1 ⇒ page is single-call-site.
++        if (cp.n_ra != kCohortRaOverflow) {
++            for (uint8_t k = 0; k < kCohortRaSlots; ++k) {
++                if (cp.ra_slots[k] == ra_hash) return;      // already recorded
++                if (cp.ra_slots[k] == 0) {                   // free slot
++                    cp.ra_slots[k] = ra_hash;
++                    cp.n_ra = static_cast<uint8_t>(k + 1);
++                    return;
++                }
++            }
++            cp.n_ra = kCohortRaOverflow;  // >kCohortRaSlots distinct call sites
++        }
++    }
++
++    // Stamp every page of a large allocation.  Large allocs dominate the
++    // footprint of DB/KV workloads (page caches, arenas) and are precisely
++    // where hot/cold mixing matters, so they must be tracked even though each
++    // large alloc trivially owns its pages (routing purity per page == 1).
++    // Marked with size_class = kCohortLargeSc so the tally aggregates them
++    // separately from slab size classes.
++    static constexpr uint8_t kCohortLargeSc = 0xFE;
++    void stampCohortLarge(void* ptr, size_t size, uint32_t ra_hash) {
++        if constexpr (!kMeasureCohorts) return;
++        if (!cohort_pages_ || !ptr) return;
++        uintptr_t pa = reinterpret_cast<uintptr_t>(ptr);
++        if (!vm_region_.contains(pa)) return;   // only VmRegion-backed larges
++        size_t idx = vm_region_.pageIndex(pa);
++        size_t npages = (size + kPageSize - 1) / kPageSize;
++        if (ra_hash == 0) ra_hash = 1;
++        for (size_t i = idx; i < idx + npages && i < cohort_pages_len_; ++i) {
++            auto& cp = cohort_pages_[i];
++            static std::atomic<uint32_t> next_ctid{1};
++            thread_local uint32_t ctid =
++                next_ctid.fetch_add(1, std::memory_order_relaxed);
++            if (cp.first_tid == 0) cp.first_tid = ctid;
++            else if (cp.first_tid != ctid) cp.mixed_tid = 1;
++            cp.size_class = kCohortLargeSc;
++            if (cp.n_ra != kCohortRaOverflow) {
++                bool found = false;
++                for (uint8_t k = 0; k < kCohortRaSlots; ++k) {
++                    if (cp.ra_slots[k] == ra_hash) { found = true; break; }
++                    if (cp.ra_slots[k] == 0) {
++                        cp.ra_slots[k] = ra_hash;
++                        cp.n_ra = static_cast<uint8_t>(k + 1);
++                        found = true;
++                        break;
++                    }
++                }
++                if (!found) cp.n_ra = kCohortRaOverflow;
++            }
++        }
++    }
++
++    // Reset a page's cohort record when its span is released.  VM page
++    // indices are reused across arenas/call-sites over time (releasePages →
++    // free list → re-bump), so without this reset the distinct-call-site set
++    // would conflate live co-residency with temporal reuse.  Called from the
++    // release hook so the measurement reflects the *live* cohort only.
++    void resetCohort(size_t page_idx, size_t page_count) {
++        if constexpr (!kMeasureCohorts) return;
++        if (!cohort_pages_) return;
++        for (size_t i = page_idx; i < page_idx + page_count && i < cohort_pages_len_; ++i)
++            cohort_pages_[i] = CohortPage{};
+     }
+ 
+     // Out-of-line cold path for everything malloc() can't handle on the
+@@ -1046,7 +1142,7 @@ public:
+                 if (ptr) {
+                     uintptr_t ra = ra_for_arena;
+                     uint32_t ra32 = static_cast<uint32_t>(ra ^ (ra >> 32));
+-                    stampCohort(ptr, ra32);
++                    stampCohort(ptr, ra32, sc);
+                 }
+             }
+             if (ptr && isEagerZeroMode())
+@@ -1064,6 +1160,11 @@ public:
+                 "[smash debug] large_alloc_.allocate(%zu) returned NULL\n", size);
+             if (n > 0) (void)!::write(STDERR_FILENO, dbg, n);
+         }
++        if constexpr (kMeasureCohorts) {
++            uint32_t ra32 = static_cast<uint32_t>(
++                ra_for_arena ^ (ra_for_arena >> 32));
++            stampCohortLarge(ptr, size, ra32);
++        }
+         if (ptr && isEagerZeroMode()) __builtin_memset(ptr, 0, size);
+         return ptr;
+     }
+@@ -1082,9 +1183,22 @@ public:
+             uint8_t sc = sizeToClass(size);
+             if (ThreadCache* tc = currentThreadCache()) [[likely]] {
+                 uint8_t arena = callsiteArena(sc, caller_ra);
+-                if (void* ptr = tc->allocate(sc, arena)) [[likely]] return ptr;
+-                if (void* ptr = tc->refill(sc, arena, &slab(arena, sc)))
++                if (void* ptr = tc->allocate(sc, arena)) [[likely]] {
++                    if constexpr (kMeasureCohorts) {
++                        uint32_t ra32 = static_cast<uint32_t>(
++                            caller_ra ^ (caller_ra >> 32));
++                        stampCohort(ptr, ra32, sc);
++                    }
++                    return ptr;
++                }
++                if (void* ptr = tc->refill(sc, arena, &slab(arena, sc))) {
++                    if constexpr (kMeasureCohorts) {
++                        uint32_t ra32 = static_cast<uint32_t>(
++                            caller_ra ^ (caller_ra >> 32));
++                        stampCohort(ptr, ra32, sc);
++                    }
+                     return ptr;
++                }
+             }
+         }
+         return mallocSlow(size, caller_ra);
+diff --git a/src/vm/vm_region.h b/src/vm/vm_region.h
+index d7f55ba..3c6bd6f 100644
+--- a/src/vm/vm_region.h
++++ b/src/vm/vm_region.h
+@@ -12,6 +12,7 @@
+ #include <new>
+ #include <sys/mman.h>
+ #include <pthread.h>
++#include <signal.h>
+ #include <unistd.h>
+ #include "smash/config.h"
+ #include "platform_mem.h"
+@@ -200,6 +201,21 @@ class VmRegion {
+     }
+ 
+     static void* decommitThreadEntry(void* arg) {
++        // Block asynchronous signals so a process-directed signal (e.g. an
++        // app's shutdown SIGUSR2/SIGTERM) is never absorbed by this smash
++        // background thread instead of reaching a host application thread.
++        // SIGSEGV/SIGBUS/SIGABRT/SIGFPE/SIGILL left unblocked (synchronous /
++        // fatal). Mirrors CompressorThread::blockAsyncSignalsOnSelf().
++        {
++            sigset_t set;
++            sigfillset(&set);
++            sigdelset(&set, SIGSEGV);
++            sigdelset(&set, SIGBUS);
++            sigdelset(&set, SIGABRT);
++            sigdelset(&set, SIGFPE);
++            sigdelset(&set, SIGILL);
++            pthread_sigmask(SIG_BLOCK, &set, nullptr);
++        }
+         auto* self = static_cast<VmRegion*>(arg);
+         while (self->decommit_running_.load(std::memory_order_relaxed)) {
+             // Drain the queue

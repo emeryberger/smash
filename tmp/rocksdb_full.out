@@ -1,0 +1,13 @@
+METRIC compression none
+METRIC fill_sec 0.54
+METRIC peak_rss_mb 400.9
+METRIC cool_rss_mb 400.9
+METRIC serve_rss_mb 423.0
+METRIC min_rss_mb 400.9
+METRIC ops_per_sec 890570
+METRIC hot_p50_us 0.96
+METRIC hot_p99_us 1.79
+METRIC cold_sec 0.051
+METRIC cold_p50_us 0.79
+METRIC cold_p99_us 6.58
+METRIC cold_rss_mb 423.1

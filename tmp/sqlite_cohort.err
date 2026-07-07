@@ -1,0 +1,264 @@
+=== SQLite In-Memory Benchmark ===
+Rows: 250000, Hot: 12500 (top 5% by id), Cool: 5s, Serve: 10s
+
+  Inserted 100000/250000 rows...
+  Inserted 200000/250000 rows...
+[cohort] stamped=27 mixed_tid=2(7.4%)  ROUTING-PURITY: pure(1-site)=25(92.6%) n_ra{1=25 2=2 3=0 4=0 >4=0}  compressed_pages=0 pure=0.0%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=3 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=6 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+Filled 250000 rows in 1.15s
+Peak RSS after fill: 276.3 MB
+
+Cooling phase: 5 seconds (no access, waiting for compression)...
+  t= 1s: RSS=278.1 MB
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=0 pure=0.0%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 2s: RSS=278.1 MB
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=0 pure=0.0%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 3s: RSS=278.1 MB
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=0 pure=0.0%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 4s: RSS=278.8 MB
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=0 pure=0.0%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 5s: RSS=278.9 MB
+Post-cooling RSS: 278.9 MB (-0.9% reduction from peak)
+
+Serve phase: 10 seconds (hot-only, ids 237500..249999)...
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=20 pure=90.0%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 1s: RSS=286.0 MB  ops=92487
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=27 pure=92.6%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 2s: RSS=294.1 MB  ops=97235
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=28 pure=92.9%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 3s: RSS=302.1 MB  ops=92228
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=28 pure=92.9%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 4s: RSS=314.3 MB  ops=102620
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=28 pure=92.9%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 5s: RSS=323.1 MB  ops=104737
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=28 pure=92.9%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 6s: RSS=328.1 MB  ops=102462
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=28 pure=92.9%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 7s: RSS=336.8 MB  ops=101891
+  t= 8s: RSS=345.0 MB  ops=97303
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=28 pure=92.9%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t= 9s: RSS=353.3 MB  ops=99269
+[cohort] stamped=36 mixed_tid=6(16.7%)  ROUTING-PURITY: pure(1-site)=33(91.7%) n_ra{1=33 2=3 3=0 4=0 >4=0}  compressed_pages=28 pure=92.9%
+[cohort] HOT/COLD-MIX: faulted_pages=0(0.0% of live) hotfrac{<20%=0 20-40=0 40-60=0 60-80=0 >=80=0}
+[cohort]   sc=0 (16B): pages=5 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=1 (32B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=2 (48B): pages=3 pure=66.7% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=3 (64B): pages=2 pure=50.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=4 (80B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=5 (96B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=7 (128B): pages=1 pure=0.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=8 (160B): pages=12 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=12 (320B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=16 (640B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=19 (1024B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=21 (1536B): pages=2 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=26 (3584B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+[cohort]   sc=27 (4096B): pages=1 pure=100.0% faulted=0(0.0%) faults=0 hotfrac=0.0%
+  t=10s: RSS=361.4 MB  ops=97292
+
+Cold re-access: querying 12500 old rows (ids 0..124999)...
+Cold query p50/p99: 0.9 / 1.3 us
+Post re-access RSS: 361.6 MB
+
+Results:
+  Fill time: 1.15s
+  Peak RSS: 361.4 MB
+  Post-cooling RSS: 278.9 MB (-0.9% reduction)
+  Steady-state RSS: 361.4 MB
+  Min serve RSS: 278.9 MB (22.8% reduction)
+  Ops/sec: 98752
+  Hot p50/p99: 0.58 / 67.62 us
+  Cold p50/p99: 0.9 / 1.3 us

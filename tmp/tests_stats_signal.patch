@@ -1,0 +1,36 @@
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index bb710f4..bdf593e 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -220,6 +220,7 @@ function(add_mode_compression_test test_name large_only)
+         "SMASH_LARGE_ONLY=${large_only}"
+         "SMASH_DEFER_PHASES_MS=0"
+         "SMASH_COLD_TIMEOUT_SEC=1"
++        "SMASH_STATS_SIGNAL=1"
+         $<TARGET_FILE:mode_compression_test>
+     )
+   else()
+@@ -230,6 +231,7 @@ function(add_mode_compression_test test_name large_only)
+         "SMASH_LARGE_ONLY=${large_only}"
+         "SMASH_DEFER_PHASES_MS=0"
+         "SMASH_COLD_TIMEOUT_SEC=1"
++        "SMASH_STATS_SIGNAL=1"
+         $<TARGET_FILE:mode_compression_test>
+     )
+   endif()
+@@ -259,6 +261,7 @@ if(APPLE)
+       "SMASH_LARGE_ONLY=0"
+       "SMASH_DEFER_PHASES_MS=0"
+       "SMASH_COLD_TIMEOUT_SEC=1"
++      "SMASH_STATS_SIGNAL=1"
+       $<TARGET_FILE:syscall_efault_test>
+   )
+ else()
+@@ -269,6 +272,7 @@ else()
+       "SMASH_LARGE_ONLY=0"
+       "SMASH_DEFER_PHASES_MS=0"
+       "SMASH_COLD_TIMEOUT_SEC=1"
++      "SMASH_STATS_SIGNAL=1"
+       # SMASH_SOFTDIRTY=0: this test relies on the deterministic
+       # PROT_READ Phase-3 timing to drive the buffer to COMPRESSED
+       # before the syscall. Soft-dirty's pagemap-read sees the

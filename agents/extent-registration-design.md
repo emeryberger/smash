@@ -91,24 +91,44 @@ cloudnew MariaDB under `SMASH_TRACK_EXTERNAL=1`:
   extent lock, and interleaving aliased `track_reverse_` slots → SEGV_MAPERR
   in the compressor snapshot. (Fixed; that was the fill-time crash.)
 
-**What does NOT yet work (open regression — RSS reclaim):**
-- End-to-end RSS reduction is **0%** on the extent path vs **38%** on master
-  (hash) for the SAME 512 MiB MariaDB workload (A/B, identical script).
-- Evidence: extent compresses only ~70K pages vs master's ~138K; and during
-  cool the sweeper calls `madvise(DONTNEED)` ~1000/s (strace-confirmed) yet
-  total RSS stays flat — i.e. decommit runs but memory isn't released / is
-  immediately re-faulted. A single giant contiguous VMA (the pool) behaves
-  differently under the deferred-madvise sweeper than the hash path's
-  scattered per-page external indices. Root cause NOT yet isolated.
-- Hypotheses to test next: (a) sweeper coalesced-run mprotect(PROT_NONE) on the
-  pool VMA is undone by InnoDB/Phase-1 access-tracking re-touch → thrash;
-  (b) extent pages only half-register as ACTIVE (70K vs 131K) so half the pool
-  is never a compression candidate; (c) `madvise` address/length off-by-region
-  so it targets already-zero pages. Need a sweeper decommit-vs-refault counter
-  in the stats line + per-VMA smaps RSS to disambiguate.
+**What does NOT work — and the ROOT CAUSE (isolated 2026-07-07):**
+End-to-end RSS reduction is **0%** on the extent path vs **38%** on master
+(hash) for the SAME 512 MiB MariaDB workload. Chased with layered diagnostics
+(all since reverted): the extent is **never registered** (`trackExternalRange`
+called 0 times), and no `mmap`/`mmap64` ≥64 MB ever reaches smash's interposer.
 
-**Conclusion:** prototype + registration/scalability lift are proven; the
-reclaim path needs more work before this branch is mergeable. Do NOT merge yet.
+`strace -e trace=mmap` on mariadbd shows InnoDB commits the buffer pool as:
+```
+mmap(0x7..., 536870912, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0)
+```
+i.e. **one 512 MB `MAP_FIXED` anonymous RW mmap** — which *passes* smash's
+anon+writable filter, yet **never reaches the libc-symbol `mmap` interposer**
+(the raw pre-filter log fired 0 times). InnoDB reserves address space with
+`PROT_NONE` mmaps, then commits with a `MAP_FIXED` mmap issued through a path
+that bypasses `LD_PRELOAD` symbol interposition (direct `syscall`/inlined). So
+smash **cannot see the pool at all** via the mmap interposer — on the extent
+branch OR on master.
+
+**This corrects the earlier "39% = smash compressed MariaDB's buffer pool"
+claim — it was WRONG.** smaps proves the pool VMA stays fully resident
+(513 MB / 512 MB) under both builds. The pages smash actually tracks + the
+~38% master reduction come from InnoDB's OTHER large allocations (the
+109 MB / 128 MB metadata/log mmaps that DO go through libc `mmap`), NOT the
+buffer pool. So MariaDB's buffer pool has never been smash-compressible via
+TRACK_EXTERNAL; the win was always on adjacent structures.
+
+**Implication for the extent work:** the extent registry is correct and proven
+(registration O(1), tracks 2G/4G *when it sees the mmap*, formal-safe), but it
+does not help MariaDB because the pool bypasses interposition. To compress a DB
+buffer pool would require interposing the **commit** path (`mprotect` of a
+prior PROT_NONE reservation, or `MAP_FIXED`-over-reservation via a
+non-symbol-interposable route) — a much larger change, out of scope here.
+
+**Conclusion:** extent registration/scalability + safety proof are done and
+sound. The MariaDB RSS goal is blocked by an interposition gap unrelated to
+extents. Branch is a valid foundation for the general "large single anonymous
+arena that IS mmap-interposed" case (e.g. an app with a big scratch buffer via
+libc malloc/mmap), but NOT mergeable as a MariaDB win. Do NOT merge as-is.
 
 ## Lifting into `vm_region.h` (original plan — registration DONE, reclaim OPEN)
 

@@ -1,0 +1,66 @@
+=== SQLite In-Memory Benchmark ===
+Rows: 500000, Hot: 25000 (top 5% by id), Cool: 12s, Serve: 25s
+
+  Inserted 100000/500000 rows...
+  Inserted 200000/500000 rows...
+  Inserted 300000/500000 rows...
+  Inserted 400000/500000 rows...
+  Inserted 500000/500000 rows...
+Filled 500000 rows in 2.21s
+Peak RSS after fill: 424.0 MB
+
+Cooling phase: 12 seconds (no access, waiting for compression)...
+  t= 1s: RSS=424.0 MB
+  t= 2s: RSS=424.0 MB
+  t= 3s: RSS=424.0 MB
+  t= 4s: RSS=424.0 MB
+  t= 5s: RSS=424.0 MB
+  t= 6s: RSS=424.0 MB
+  t= 7s: RSS=424.0 MB
+  t= 8s: RSS=424.0 MB
+  t= 9s: RSS=424.0 MB
+  t=10s: RSS=424.0 MB
+  t=11s: RSS=424.0 MB
+  t=12s: RSS=424.0 MB
+Post-cooling RSS: 424.0 MB (0.0% reduction from peak)
+
+Serve phase: 25 seconds (hot-only, ids 475000..499999)...
+  t= 1s: RSS=432.4 MB  ops=99610
+  t= 2s: RSS=440.6 MB  ops=96968
+  t= 3s: RSS=448.8 MB  ops=97575
+  t= 4s: RSS=456.9 MB  ops=95049
+  t= 5s: RSS=464.8 MB  ops=93692
+  t= 6s: RSS=472.7 MB  ops=94420
+  t= 7s: RSS=481.0 MB  ops=97938
+  t= 8s: RSS=489.1 MB  ops=97167
+  t= 9s: RSS=497.5 MB  ops=99563
+  t=10s: RSS=505.7 MB  ops=96659
+  t=11s: RSS=514.0 MB  ops=98706
+  t=12s: RSS=522.2 MB  ops=98440
+  t=13s: RSS=530.2 MB  ops=95270
+  t=14s: RSS=538.6 MB  ops=97636
+  t=15s: RSS=546.9 MB  ops=98310
+  t=16s: RSS=555.0 MB  ops=94397
+  t=17s: RSS=562.8 MB  ops=92128
+  t=18s: RSS=571.0 MB  ops=99419
+  t=19s: RSS=579.0 MB  ops=94241
+  t=20s: RSS=587.0 MB  ops=97704
+  t=21s: RSS=595.1 MB  ops=94911
+  t=22s: RSS=602.9 MB  ops=94559
+  t=23s: RSS=611.0 MB  ops=95246
+  t=24s: RSS=618.9 MB  ops=94184
+  t=25s: RSS=627.2 MB  ops=98087
+
+Cold re-access: querying 25000 old rows (ids 0..249999)...
+Cold query p50/p99: 0.9 / 2.8 us
+Post re-access RSS: 627.2 MB
+
+Results:
+  Fill time: 2.21s
+  Peak RSS: 627.2 MB
+  Post-cooling RSS: 424.0 MB (0.0% reduction)
+  Steady-state RSS: 627.2 MB
+  Min serve RSS: 424.0 MB (32.4% reduction)
+  Ops/sec: 96475
+  Hot p50/p99: 0.58 / 71.83 us
+  Cold p50/p99: 0.9 / 2.8 us

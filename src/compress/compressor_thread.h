@@ -1602,6 +1602,29 @@ private:
             // PFN vanished (page swapped/migrated) → fall through to PROT_NONE.
         }
 #endif
+#if defined(__APPLE__)
+        // macOS + deferred-reclaim: skip the PROT_NONE deep-monitoring arm.
+        //
+        // On macOS, mprotect(PROT_NONE) does NOT reclaim physical pages (only
+        // MADV_FREE_REUSABLE does, and that requires PROT_RW) — but task_info's
+        // resident_size DROPS anyway, a pure reporting artifact. In the default
+        // deferred-reclaim path the very next tick compresses the page, which
+        // flips it back to PROT_RW to snapshot it and then HOLDS it PROT_RW for
+        // the whole COMPRESSED_SHADOW window before Phase B does the real
+        // MADV_FREE_REUSABLE reclaim. Net effect on the RSS graph: a phantom
+        // drop at the escalation tick, an immediate re-inflate at the compress
+        // tick, then the true drop at Phase B — the "bounce" the user saw.
+        //
+        // The escalation's only purpose is pre-compression READ detection. In
+        // deferred-reclaim mode that value is near-zero: the shadow page is kept
+        // PROT_RW, so reads during shadow never fault, and Phase B classifies
+        // survival by content-compare (writes), not reads. Dropping the arm here
+        // removes the phantom flip and yields a monotonic RSS curve; a genuinely
+        // read-hot page is still caught by the fault handler once Phase B has
+        // reclaimed it. Non-deferred mode keeps the arm (it reclaims eagerly, so
+        // there is no shadow re-inflate to avoid).
+        if (isDeferredReclaimMode()) return;
+#endif
         locks_->lock(page_idx);
         if (states_->get(page_idx) == PageState::ACTIVE_MONITORING) {
             void* page_addr = vm_->pageAddress(page_idx);

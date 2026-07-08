@@ -194,6 +194,23 @@ target_include_directories(smash PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# Clang Thread Safety Analysis (https://clang.llvm.org/docs/ThreadSafetyAnalysis.html).
+# Off by default (annotations in src/util/thread_safety.h are no-ops without it).
+# Enable with -DSMASH_THREAD_SAFETY=ON under clang to statically prove that
+# GUARDED_BY fields (e.g. VmRegion::FreeShard free_list/free_pool) are only
+# touched while their lock is held, and REQUIRES functions are called locked.
+# -Werror so a lock-discipline regression (like the 2026-06-25 free_pool race)
+# fails the build instead of returning as a runtime livelock.
+option(SMASH_THREAD_SAFETY "Enable clang -Wthread-safety static analysis (clang only)" OFF)
+if(SMASH_THREAD_SAFETY)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(smash PRIVATE -Wthread-safety -Werror=thread-safety)
+    message(STATUS "Clang Thread Safety Analysis ENABLED (-Wthread-safety -Werror)")
+  else()
+    message(WARNING "SMASH_THREAD_SAFETY=ON ignored: -Wthread-safety needs clang")
+  endif()
+endif()
+
 # On Linux, link against alloc8 components manually instead of alloc8::interpose
 # to avoid the INTERFACE version script and use Smash's instead (includes syscall wrappers)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

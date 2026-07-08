@@ -83,9 +83,16 @@ class VmRegion {
     static constexpr size_t kFreeShardMask = kNumFreeShards - 1;
 
     struct alignas(64) FreeShard {  // cache-line aligned
-        FreeRun* free_list = nullptr;
-        FreeRun* free_pool = nullptr;
         Spinlock lock;
+        // free_list AND free_pool are the two singly-linked stacks a shard
+        // owns; BOTH must only ever be touched while `lock` is held. An
+        // unlocked pop of free_pool from the decommit thread (vs a locked push
+        // from allocatePages) once corrupted the stack into a cycle → spin-
+        // livelock (fixed 2026-06-25, model/SmashFreePoolRace). GUARDED_BY lets
+        // clang -Wthread-safety re-prove that invariant at compile time so the
+        // regression can't silently return.
+        FreeRun* free_list SMASH_GUARDED_BY(lock) = nullptr;
+        FreeRun* free_pool SMASH_GUARDED_BY(lock) = nullptr;
     };
     FreeShard shards_[kNumFreeShards];
 
@@ -96,7 +103,7 @@ class VmRegion {
         return idx;
     }
 
-    FreeRun* newFreeRun(FreeShard& shard) {
+    FreeRun* newFreeRun(FreeShard& shard) SMASH_REQUIRES(shard.lock) {
         if (shard.free_pool) {
             FreeRun* r = shard.free_pool;
             shard.free_pool = r->next;
@@ -106,7 +113,7 @@ class VmRegion {
             BootstrapAlloc::instance().allocate(sizeof(FreeRun), alignof(FreeRun)));
     }
 
-    void recycleFreeRun(FreeRun* r, FreeShard& shard) {
+    void recycleFreeRun(FreeRun* r, FreeShard& shard) SMASH_REQUIRES(shard.lock) {
         r->next = shard.free_pool;
         shard.free_pool = r;
     }

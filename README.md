@@ -9,7 +9,7 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 ### Key Features
 
 - **Transparent compression**: No application changes required, works via malloc interposition.
-- **ROI-driven algorithm selection**: A return-on-investment model picks zstd-1 (fast tier) or zstd-9 (deep tier) per page at compression time, weighing observed compressibility and observed compression cost against the page's accumulated cold time.
+- **ROI-driven compression gate**: A return-on-investment model decides *whether* each cold page is worth compressing, weighing its observed compressibility and observed compression cost against its accumulated cold time. libsmash ships **single-tier** (zstd-1); a second deep tier (zstd-9) exists behind a compile flag (`-DSMASH_ENABLE_DEEP_TIER`) but is **off by default** — on real per-page heap data zstd-9 gives ~1.0× the blob size of zstd-1 (its larger match window needs >4 KiB input), so the second tier costs CPU with no RSS gain. See [Compression tiers](#compression-tiers).
 - **Per-origin learning**: Compression-ratio and compression-cost statistics are kept per `(arena, size class)`, so call-site arena routing translates directly into more accurate ROI decisions.
 - **Adaptive worker pool**: The compressor scales its active worker count each tick using Little's Law (`N = ⌈λ/μ⌉`), so an idle process uses one worker and a bulk-allocation phase uses several.
 
@@ -19,7 +19,7 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 
 2. **Access tracking**: A background compressor thread periodically sets active pages to read-only (`mprotect PROT_READ`). Write faults mark pages as "accessed"; pages without writes across multiple intervals are considered cold.
 
-3. **Compression**: Cold pages are compressed with zstd-1 or zstd-9, selected by the ROI model based on the page's `(arena, size class)` observed ratio and the per-tier observed compression cost. Physical backing is released (`MADV_FREE_REUSABLE` on macOS, `MADV_DONTNEED` on Linux); compressed data is stored in a separate sharded region.
+3. **Compression**: Cold pages that clear the ROI gate are compressed with zstd-1 (the default single tier), the decision keyed on the page's `(arena, size class)` observed ratio and observed compression cost. Physical backing is released (`MADV_FREE_REUSABLE` on macOS, `MADV_DONTNEED` on Linux); compressed data is stored in a separate sharded region. The algorithm chosen at compress time is final — there is no later upgrade path; a page stays as-is until it is decompressed by an access.
 
 4. **Decompression**: When the application accesses a compressed page, a SIGSEGV/SIGBUS handler recommits the page, decompresses the data, and resumes execution transparently.
 
@@ -334,13 +334,13 @@ All runtime behavior is controlled via `SMASH_*` environment variables read once
 |----------|---------|--------|
 | `SMASH_COLD_TIMEOUT_SEC=N` | 2 | Minimum cold-time floor (seconds) before fast-tier compression considered. CPU-pressure adaptive cap raises this on busy systems. |
 | `SMASH_COLD_TICKS=N` | 2 | Override the fast-tier cold-tick threshold directly (alternative to `SMASH_COLD_TIMEOUT_SEC`). |
-| `SMASH_VERY_COLD_TICKS=N` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile. `9999` disables the deep tier entirely (fast tier only). |
+| `SMASH_VERY_COLD_TICKS=N` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile. Only takes effect when the deep tier is compiled in (`-DSMASH_ENABLE_DEEP_TIER`); the default single-tier build ignores it. |
 | `SMASH_USE_LZ4=1` | unset | Use LZ4 as the fast tier instead of zstd-1. zstd-1 is the default (higher ratio at comparable throughput on the measured workloads); LZ4 trades ratio for speed. |
 | `SMASH_ROI_THRESHOLD=N` | 1024 | Bytes-saved-per-microsecond cutoff for the ROI model. |
 | `SMASH_MIN_COMPRESS_RATIO=F` | 0.75 | Reject compressed page unless `comp_size < F × original_size`. |
 | `SMASH_RECOMPRESS_BACKOFF=0` | 1 (active) | Disable per-bucket recompression-thrash back-off (ablation switch); phase 2 then ignores `recompress_count_` and bucket EMAs. |
 
-**Tier-selection bandit (opt-in, experimental):**
+**Tier-selection bandit (opt-in, experimental — only meaningful with the deep tier compiled in via `-DSMASH_ENABLE_DEEP_TIER`; a no-op in the default single-tier build):**
 
 | Variable | Default | Effect |
 |----------|---------|--------|
@@ -544,13 +544,14 @@ python3 bench/verify_paper_claims.py --apps redis,memcached
 │                    │                 │       │
 │  ┌─────────────────▼─────────────────▼─────┐ │
 │  │         CompressEngine                   │ │
-│  │  zstd-1 (fast) │ zstd-9 (deep)           │ │
-│  │  [opt-in: LZ4 fast tier, zstd+dict]      │ │
+│  │  zstd-1 (default single tier)            │ │
+│  │  [opt-in: zstd-9 deep tier, LZ4, +dict]  │ │
 │  └──────────────────────────────────────────┘ │
 └─────────────────────────────────────────────┘
 ```
 
-The compressor's two tiers are **zstd-1** (fast) and **zstd-9** (deep), chosen per page by the ROI model. **LZ4** is available as an alternate fast tier (opt-in via `SMASH_USE_LZ4`) and dictionary compression (zstd+dict) is opt-in via dictionary training; neither is on by default.
+<a name="compression-tiers"></a>
+**Compression tiers.** libsmash ships **single-tier**: every compressed page uses **zstd-1**, and the ROI model only decides *whether* a page is worth compressing (not which algorithm). A second **zstd-9 "deep" tier** exists in the code but is compiled out unless you build with `-DSMASH_ENABLE_DEEP_TIER`: on real per-page heap data zstd-9's larger match window needs >4 KiB of input to help, so per-4 KiB-page it produces ~1.0× the blob size of zstd-1 — pure CPU cost with no RSS benefit (measured: ~32 % of RocksDB pages escalate under the ratio gate, 0 net RSS gain). When the deep tier is enabled, the ROI model picks zstd-1 vs zstd-9 per page from the `(arena, size class)` observed ratio and per-tier cost, and `SMASH_VERY_COLD_TICKS` gates the deep tier. **LZ4** is available as an alternate fast tier (opt-in via `SMASH_USE_LZ4`) and dictionary compression (zstd+dict) is opt-in via dictionary training; neither is on by default. There is no in-place upgrade path — the algorithm chosen when a page is first compressed is final until the page is decompressed by an access.
 
 ## Configuration
 
@@ -559,8 +560,9 @@ Key tuning constants in `include/smash/config.h`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `kCompressIntervalMs` | 1000 | Compression scan interval (ms) |
-| `kColdTicksDefault` | 10 | Ticks without access before fast-tier compression considered (override via `SMASH_COLD_TIMEOUT_SEC` or `SMASH_COLD_TICKS`) |
-| `kVeryColdTicks` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile in the ROI model (override via `SMASH_VERY_COLD_TICKS`) |
+| `kColdTicksDefault` | 10 | Ticks without access before compression considered (override via `SMASH_COLD_TIMEOUT_SEC` or `SMASH_COLD_TICKS`) |
+| `kVeryColdTicks` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile — only relevant when the deep tier is enabled (`-DSMASH_ENABLE_DEEP_TIER`), off by default (override via `SMASH_VERY_COLD_TICKS`) |
+| `kDeepTierEnabled` | false | Second compression tier (zstd-9). Off by default; enable at build time with `-DSMASH_ENABLE_DEEP_TIER` |
 | `kMinCompressRatio` | 0.75 | Only keep compressed if < 75% of original |
 | `kPrefetchWindow` | 2 | Pages prefetched in each direction on fault |
 | `kDictTrainSamples` | 0 | Pages before dictionary training (disabled by default) |

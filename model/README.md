@@ -20,6 +20,21 @@ machine-checked Lean 4 formalizations of the corresponding safety properties.
   `_procmem_fixed.cfg` — the decompress-on-fault TOCTOU model (see below).
 - `SmashThreadCreate.tla` / `.cfg` / `_fixed.cfg` — the pthread_create-time
   TLS-fault model.
+- `SmashDeferredProtNone.tla` + `_guarded_buggy.cfg` / `_unconditional_fixed.cfg`
+  — the deferred-reclaim compress-snapshot PROT_NONE crash (root-caused
+  2026-07-08, full-mode rocksdb SIGSEGV/livelock; fixed in PR #55). A monitoring
+  ESCALATOR arms `PROT_NONE` on a page whose state reads `ACTIVE`
+  (escalateToDeepMonitoring), and the compressor's deferred-branch snapshot read
+  restored `PROT_RW` only for a captured state of `ACTIVE_MONITORING` — so it read
+  a `PROT_NONE` page directly and faulted. `guarded` (pre-fix) violates
+  `NoProtNoneRead`; `unconditional` (the fix — restore `PROT_RW` before every
+  snapshot) satisfies it. `NoStaleRead` holds in BOTH variants (the page is still
+  backed, so the fix recovers live data — the crash was a fault, not corruption).
+  This is precisely `SmashCore`'s `ActiveImpliesRW` broken by a transition
+  `SmashCore` never modeled (the escalation arm); this model adds the arm AND the
+  consumer read, and checks safety AT THE READ. TLC (run with `-deadlock`):
+  `_guarded_buggy` → `NoProtNoneRead is violated`; `_unconditional_fixed` → No
+  error.
 
 ### Lean 4 (machine-checked, `lean <file>.lean`)
 - `SmashThreadCreate.lean` — pre-create-workers safety.
@@ -41,6 +56,17 @@ machine-checked Lean 4 formalizations of the corresponding safety properties.
   threads. `buggy_reachable_violates` exhibits the pre-fix decommit trace.
   Machine-checked; both headline theorems depend only on `propext` (no `sorry`,
   no `Classical.choice`, no `native_decide`).
+- `SmashDeferredProtNone.lean` — companion to `SmashDeferredProtNone.tla`. The
+  deferred-reclaim compress-snapshot `PROT_NONE` crash (PR #55). `FixedInv`
+  (`badRead = false ∧ backed`) is an inductive invariant of the `unconditional`
+  variant (init + escalate/capture/snapshot preservation) ⇒ `fixed_inv_implies_safe`
+  (`NoProtNoneRead`). `BackedInv` is a variant-generic invariant ⇒
+  `backed_inv_implies_safe` (`NoStaleRead` in BOTH variants — the fix recovers
+  live data, not decommitted zeros). `guarded_violates_safe` exhibits the exact
+  crash trace (escalate arms PROT_NONE → worker captures ACTIVE → snapshot reads
+  under PROT_NONE), and `guarded_crash_is_fault_not_corruption` shows that crash
+  is a fault (`NoStaleRead` still holds). All five headline theorems depend on
+  **zero axioms** (no `sorry`, `Classical.choice`, or `native_decide`).
 
 ## The Bug (Found May 2024)
 

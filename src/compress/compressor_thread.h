@@ -1927,11 +1927,23 @@ private:
         }
 
         if (deferred) {
-            // Deferred mode: ensure page is PROT_RW (may have been PROT_READ
-            // from Phase 3 monitoring). Restore before copy so background
-            // threads can't fault on this page while it's in SHADOW state.
-            if (st == PageState::ACTIVE_MONITORING)
-                vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
+            // Deferred mode: ensure the page is PROT_RW before the snapshot
+            // read below. This mprotect is UNCONDITIONAL (was previously gated
+            // on st==ACTIVE_MONITORING) because an ACTIVE page can also be
+            // physically PROT_NONE here: escalateToDeepMonitoring arms
+            // PROT_NONE for pre-compression read detection, and other
+            // deferred-path producers can leave a still-backed page PROT_NONE
+            // while its state reads ACTIVE. Reading such a page directly
+            // SIGSEGVs the worker (handleFault's reentrancy guard re-raises it
+            // fatally). The page is always still backed here (never madvise'd
+            // away while ACTIVE), so restoring PROT_RW recovers the live
+            // contents; a no-op mprotect on an already-RW page is cheap. This
+            // also matches the non-deferred path, which does
+            // unlock->mprotect(PROT_READ)->relock before its snapshot. We hold
+            // the per-page lock; LOOSENING protection to PROT_RW cannot fault
+            // an app thread, so there is no TLB-shootdown-vs-page-lock deadlock
+            // (that hazard only applies to TIGHTENING protection).
+            vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
             __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
             // Snapshot verification for deferred mode. Without PROT_READ
             // protection during the snapshot, a concurrent write can land

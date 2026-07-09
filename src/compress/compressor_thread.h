@@ -323,6 +323,10 @@ class CompressorThread {
     std::atomic<uint64_t> snapshot_verify_fails_{0};
     std::atomic<uint64_t> snapshot_verify_passes_{0};
 
+    // Pages found entirely zero at compress time and stored as the no-blob
+    // sentinel (data=nullptr, algo=NONE) instead of a CompressStore slot.
+    std::atomic<uint64_t> zero_pages_{0};
+
     // Per-page metadata (allocated from bootstrap, indexed by VmRegion page index)
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
@@ -1134,6 +1138,19 @@ private:
 
     // Zero freed slots in the scratch buffer before compression.
     // All freed slots are zeroed here (deferred from free() to avoid critical-path overhead).
+    // True iff the (page-aligned) snapshot buffer is entirely zero.
+    // Non-zero pages exit at the first non-zero 64-byte group.
+    static bool pageIsAllZero(const void* buf) {
+        auto* p = static_cast<const uint64_t*>(buf);
+        constexpr size_t kWords = kPageSize / sizeof(uint64_t);
+        for (size_t i = 0; i < kWords; i += 8) {
+            uint64_t acc = p[i] | p[i + 1] | p[i + 2] | p[i + 3] |
+                           p[i + 4] | p[i + 5] | p[i + 6] | p[i + 7];
+            if (acc != 0) return false;
+        }
+        return true;
+    }
+
     void zeroFreeSlots(void* page_buf, size_t page_idx) {
         if (!page_map_) return;
         void* page_addr = vm_->pageAddress(page_idx);
@@ -2069,8 +2086,21 @@ private:
             }
         }
 
+        // All-zero fast path. zeroFreeSlots() above zeroes every freed slot
+        // in the snapshot, so a page whose live objects have all been freed
+        // — plus any page the application itself zeroed — is entirely zero
+        // here. Compressing it wastes CPU and a CompressStore slot (the
+        // blob's live bytes also keep its 16 MiB region from ever draining
+        // empty and being decommitted). Record a no-blob sentinel instead:
+        // data=nullptr, comp_size=0, algo=NONE. Every decompress path
+        // funnels through CompressEngine::decompress / decompressWithDCtx,
+        // whose NONE case restores the page with memset(0). Detection is
+        // one pass of 64-bit loads over the snapshot; non-zero pages exit
+        // at the first non-zero word.
+        const bool zero_page = pageIsAllZero(worker.page_buf);
+
         // Collect sample for dictionary training (page data in worker's buf)
-        collectDictSample(page_idx, sc, worker.page_buf);
+        if (!zero_page) collectDictSample(page_idx, sc, worker.page_buf);
 
         size_t max_comp = CompressEngine::maxCompressedSizeAny(kPageSize);
         size_t comp_size = 0;
@@ -2079,8 +2109,12 @@ private:
         // Try-both experiment (opt-in): when dict is selected, also try plain
         // ZSTD and keep the smaller result. Doubles compression CPU for
         // very-cold pages, so only enable for experiments.
+        if (zero_page) {
+            // Zero page: skip the codec entirely; the sentinel recorded
+            // below carries all the information.
+        }
 #ifdef SMASH_DICT_TRY_BOTH
-        if (algo == CompressAlgo::ZSTD_DICT && worker.compress_buf2) {
+        else if (algo == CompressAlgo::ZSTD_DICT && worker.compress_buf2) {
             size_t dict_size = worker.compress(worker.page_buf, worker.compress_buf,
                                                kPageSize, max_comp, CompressAlgo::ZSTD_DICT,
                                                sc, zstd_level, engine_);
@@ -2113,9 +2147,9 @@ private:
                     worker.compress_buf2 = tmp;
                 }
             }
-        } else
+        }
 #endif
-        {
+        else {
             comp_size = worker.compress(worker.page_buf, worker.compress_buf,
                                         kPageSize, max_comp, algo, sc,
                                         zstd_level, engine_);
@@ -2131,7 +2165,7 @@ private:
         // zstd-1 almost always fails it at zstd-9 too — the retry is wasted
         // CPU with no RSS gain (measured: ~32% of rocksdb pages escalate, 0
         // net RSS benefit). Single-tier leaves such pages uncompressed.
-        if (kDeepTierEnabled && is_fast_tier &&
+        if (!zero_page && kDeepTierEnabled && is_fast_tier &&
             (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio))) {
             algo = CompressAlgo::ZSTD;
             zstd_level = kZstdDeepLevel;
@@ -2146,7 +2180,8 @@ private:
             std::chrono::duration_cast<std::chrono::microseconds>(
                 comp_t1 - comp_t0).count());
 
-        if (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio)) {
+        if (!zero_page &&
+            (comp_size == 0 || comp_size > static_cast<size_t>(kPageSize * min_ratio))) {
             // Not worth compressing; record poor ratio and cost for the
             // tier we actually ran, then restore the page.
             if (have_span && sc < kTotalBucketsPerArena) {
@@ -2175,24 +2210,30 @@ private:
             return false;
         }
 
-        // Store compressed data (sharded by page_idx)
+        // Store compressed data (sharded by page_idx). Zero pages store
+        // nothing — the sentinel recorded below carries all the information.
         size_t alloc_size = 0;
-        void* stored = store_->store(worker.compress_buf, comp_size, &alloc_size, page_idx);
-        if (!stored) {
-            if (!deferred) {
-                if (!vm::protectPages(page_addr, kPageSize, true, true)) {
-                    vm::remapPages(page_addr, kPageSize, true, true);
+        void* stored = nullptr;
+        if (!zero_page) {
+            stored = store_->store(worker.compress_buf, comp_size, &alloc_size, page_idx);
+            if (!stored) {
+                if (!deferred) {
+                    if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                        vm::remapPages(page_addr, kPageSize, true, true);
+                    }
+                    __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
                 }
-                __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+                states_->set(page_idx, PageState::ACTIVE);
+                locks_->unlock(page_idx);
+                return false;
             }
-            states_->set(page_idx, PageState::ACTIVE);
-            locks_->unlock(page_idx);
-            return false;
         }
 
         // Record successful compression ratio and observed cost in the
         // per-(arena, bucket) bucket so future ROI decisions use real data.
-        if (have_span && sc < kTotalBucketsPerArena) {
+        // Zero pages are excluded: they say nothing about the codec's
+        // behavior on this bucket's live data and would skew the ROI model.
+        if (!zero_page && have_span && sc < kTotalBucketsPerArena) {
             worker.sc_stats[stats_idx].record(comp_size, kPageSize);
             int tier = is_fast_tier ? 0 : 1;
             worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
@@ -2219,13 +2260,19 @@ private:
             }
         }
 
-        // Record compressed page info (with algo in top 2 bits)
-        compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
+        // Record compressed page info (with algo in top 2 bits). Zero pages
+        // record the no-blob sentinel; decompress restores them via memset.
+        if (zero_page) {
+            compressed_[page_idx].set(nullptr, 0, 0, CompressAlgo::NONE);
+            zero_pages_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
+        }
         if (page_tier_) {
             page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
         }
         // v6 profile: track compression count for thrash rate calculation
-        if (have_span && sc < kTotalBucketsPerArena) {
+        if (!zero_page && have_span && sc < kTotalBucketsPerArena) {
             worker.sc_stats[stats_idx].compress_count.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -2370,6 +2417,14 @@ private:
         size_t old_comp_size = old_info.compressedSize();
         size_t old_alloc_size = old_info.alloc_size;
         void* old_data = old_info.data;
+
+        // Zero-page sentinel (no blob): nothing to recompress — it already
+        // occupies zero store bytes. Mark deep so phase 2 stops selecting it.
+        if (!old_data) {
+            if (page_tier_) page_tier_[page_idx] = kTierDeep;
+            locks_->unlock(page_idx);
+            return false;
+        }
 
         // No-op if already at target tier.
         if (old_algo == target_algo && target_algo != CompressAlgo::ZSTD_DICT) {
@@ -3533,6 +3588,8 @@ private:
     }
 
     void releaseBlob(size_t page_idx) {
+        // Zero-page sentinel: no blob was ever stored.
+        if (!compressed_[page_idx].data) return;
         if (page_tier_ && page_tier_[page_idx] == kTierSpilled) {
             spill_.release(compressed_[page_idx].data,
                            compressed_[page_idx].alloc_size, page_idx);
@@ -4686,12 +4743,13 @@ public:
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
-            "  tier_up=%llu/%llu  spilled=%zu  bump=%zu\n",
+            "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
             (unsigned long long)tier_attempts,
             spilled,
+            (unsigned long long)self->zero_pages_.load(std::memory_order_relaxed),
             raw_bump);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's

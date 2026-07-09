@@ -137,6 +137,12 @@ public:
     size_t decompress(const void* src, void* dst, size_t src_size, size_t dst_capacity,
                       CompressAlgo algo, uint8_t size_class = 0) {
         switch (algo) {
+        case CompressAlgo::NONE:
+            // All-zero-page sentinel (compressor_thread.h zero-page fast
+            // path): no blob is stored; the page contents are all zeros.
+            (void)src; (void)src_size;
+            __builtin_memset(dst, 0, dst_capacity);
+            return dst_capacity;
         case CompressAlgo::LZ4: {
             int result = LZ4_decompress_safe(
                 static_cast<const char*>(src),
@@ -292,6 +298,11 @@ public:
                               size_t src_size, size_t dst_capacity,
                               CompressAlgo algo, uint8_t size_class = 0) {
         switch (algo) {
+        case CompressAlgo::NONE:
+            // All-zero-page sentinel — restore by zero-fill (safe for the
+            // signal-handler path: no context, no allocation).
+            __builtin_memset(dst, 0, dst_capacity);
+            return dst_capacity;
         case CompressAlgo::LZ4: {
             int result = LZ4_decompress_safe(
                 static_cast<const char*>(src),

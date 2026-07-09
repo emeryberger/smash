@@ -248,7 +248,24 @@ class VmRegion {
                 std::memory_order_acq_rel, std::memory_order_relaxed)) {
             return;
         }
-        pthread_create(&decommit_thread_, nullptr, decommitThreadEntry, this);
+        if (pthread_create(&decommit_thread_, nullptr, decommitThreadEntry, this) != 0) {
+            // EAGAIN under thread exhaustion. Without the rollback,
+            // decommit_running_ claims a drainer exists while nothing ever
+            // pops the MPSC queue: freed runs never reach the free list
+            // (allocation starvation) and are never madvise'd (RSS never
+            // drops). Roll back so the next release retries creation, and
+            // drain whatever is queued right now inline (the exchange-based
+            // drain is safe from any thread).
+            decommit_running_.store(false, std::memory_order_release);
+            DecommitEntry* batch =
+                decommit_head_.exchange(nullptr, std::memory_order_acquire);
+            while (batch) {
+                DecommitEntry* next = batch->next;
+                processDecommitEntry(batch);
+                recycleDecommitEntry(batch);
+                batch = next;
+            }
+        }
     }
 
     void ensureDecommitThreadStarted() {

@@ -130,6 +130,14 @@ extern __attribute__((tls_model("initial-exec")))
 extern __attribute__((tls_model("initial-exec")))
     thread_local uint32_t g_free_cache_skip;
 
+// Stack-depth sentinel for callsiteArena()'s LLAMA-style hash (first
+// allocation's frame, reset when a deeper frame is seen). Runs on every
+// malloc; file-scope initial-exec TLS keeps it a direct tpidr_el0 + offset
+// load instead of the __tls_get_addr call a function-local thread_local
+// in an inline function would emit.
+extern __attribute__((tls_model("initial-exec")))
+    thread_local uintptr_t g_arena_stack_base;
+
 // Repopulate interval for the free() last-span cache (see above). Read once
 // from SMASH_FREE_CACHE_REPOP (default kFreeCacheRepopDefault); 1 = always
 // repopulate. Exposed as a runtime knob so the policy can be swept without
@@ -145,15 +153,20 @@ extern __attribute__((tls_model("initial-exec")))
 // more on the synthetic no-locality case with no real-suite gain and slower
 // phase adoption, so 8 is the Pareto knee.
 inline constexpr uint32_t kFreeCacheRepopDefault = 8;
+// Hand-rolled lazy init (not a magic static): the guard-variable acquire-load
+// measured at 7-10 % of free()'s CPU elsewhere (see config.h getSmashMode()).
+// 0 = uninitialised sentinel; valid intervals are >= 1.
 [[gnu::always_inline]]
 inline uint32_t freeCacheRepopInterval() {
-    static const uint32_t interval = [] {
+    static std::atomic<uint32_t> cached{0};
+    uint32_t interval = cached.load(std::memory_order_relaxed);
+    if (interval == 0) [[unlikely]] {
         const char* v = std::getenv("SMASH_FREE_CACHE_REPOP");
-        if (!v) return kFreeCacheRepopDefault;
-        long n = std::atol(v);
-        return (n >= 1 && n <= (1L << 20)) ? static_cast<uint32_t>(n)
-                                           : kFreeCacheRepopDefault;
-    }();
+        long n = v ? std::atol(v) : 0;
+        interval = (n >= 1 && n <= (1L << 20)) ? static_cast<uint32_t>(n)
+                                               : kFreeCacheRepopDefault;
+        cached.store(interval, std::memory_order_relaxed);
+    }
     return interval;
 }
 
@@ -177,11 +190,16 @@ inline ThreadCache*& currentThreadCache() { return g_thread_cache; }
 // CPU count). See the deferred-free work for the actual contention fix.
 [[gnu::always_inline]]
 inline bool cpuArenaHash() {
-    static const bool on = [] {
-        const char* v = std::getenv("SMASH_CPU_ARENA");
-        return v && v[0] == '1';   // default OFF; opt in with SMASH_CPU_ARENA=1
-    }();
-    return on;
+    // Hand-rolled lazy init (not a magic static) — this runs on every malloc,
+    // so the guard-variable acquire-load would sit on the hot path.
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* e = std::getenv("SMASH_CPU_ARENA");
+        v = (e && e[0] == '1') ? 1 : 0;  // default OFF; opt in with SMASH_CPU_ARENA=1
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
 }
 
 // True iff a free()-path diagnostic env var is set (SMASH_COUNT_FREE counts
@@ -191,12 +209,17 @@ inline bool cpuArenaHash() {
 // steady-state cost is a single predictable branch.
 [[gnu::always_inline]]
 inline bool freeDiagnosticsActive() {
-    static const bool active = [] {
+    // Hand-rolled lazy init (not a magic static) — this runs on every free,
+    // so the guard-variable acquire-load would sit on the hot path.
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
         const char* c = std::getenv("SMASH_COUNT_FREE");
         const char* t = std::getenv("SMASH_TRACE_FOREIGN_FREE");
-        return (c && c[0] == '1') || (t && t[0] == '1');
-    }();
-    return active;
+        v = ((c && c[0] == '1') || (t && t[0] == '1')) ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
 }
 
 // SMASH_PASSTHROUGH=1: smash passes all malloc/free to system allocator.
@@ -455,14 +478,14 @@ class SmashHeap {
         // Compute stable stack depth bucket. Thread stacks grow downward
         // from a fixed base. We use the distance from a sentinel (first
         // allocation's frame) as an approximation of stack depth.
-        static thread_local uintptr_t stack_base = 0;
+        // (g_arena_stack_base: file-scope initial-exec TLS, see declaration.)
         uintptr_t frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-        if (stack_base == 0 || frame > stack_base) {
-            stack_base = frame;  // reset on new thread or deeper call
+        if (g_arena_stack_base == 0 || frame > g_arena_stack_base) {
+            g_arena_stack_base = frame;  // reset on new thread or deeper call
         }
         // Depth bucket: (base - frame) / 16KB, truncated to 8 bits
         uint8_t depth_bucket = static_cast<uint8_t>(
-            ((stack_base - frame) >> 14) & 0xFF);
+            ((g_arena_stack_base - frame) >> 14) & 0xFF);
 
         // Mix with murmur3 finalizer to spread closely-spaced addresses
         // across arenas. Without this, adjacent noinline functions (differing

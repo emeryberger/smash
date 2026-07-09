@@ -146,10 +146,15 @@ void drainRangeToSlabs(void** ptrs, size_t start, size_t n,
     // next lock holder applies it. Removes the per-arena slab lock from the
     // contended cross-thread-free path (Larson @ high thread counts). Off uses
     // the blocking resolved path for A/B comparison.
-    static const bool defer_free = [] {
+    // Hand-rolled lazy init (not a magic static): drains run on the
+    // cross-thread-free path, so skip the guard-variable acquire-load.
+    static std::atomic<int> defer_free_cached{-1};
+    int defer_free = defer_free_cached.load(std::memory_order_relaxed);
+    if (defer_free < 0) [[unlikely]] {
         const char* v = std::getenv("SMASH_DEFER_FREE");
-        return !v || v[0] != '0';
-    }();
+        defer_free = (!v || v[0] != '0') ? 1 : 0;
+        defer_free_cached.store(defer_free, std::memory_order_relaxed);
+    }
     for (int a = 0; a < total_arenas; ++a) {
         if (counts[a] == 0) continue;
         Slab& slab = all_slabs[a * kNumClasses + sc];
@@ -232,6 +237,9 @@ thread_local uint64_t smash::g_free_cache_gen = ~0ULL;
 
 __attribute__((tls_model("initial-exec")))
 thread_local uint32_t smash::g_free_cache_skip = 0;
+
+__attribute__((tls_model("initial-exec")))
+thread_local uintptr_t smash::g_arena_stack_base = 0;
 
 // ── Syscall interposition for kernel buffer compatibility ────────────────────
 //

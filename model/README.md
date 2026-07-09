@@ -18,6 +18,16 @@ machine-checked Lean 4 formalizations of the corresponding safety properties.
   with integer pages, cannot use SYMMETRY and blows up).
 - `SmashRestoreRace.tla` + `_atomic.cfg` / `_split_buggy.cfg` /
   `_procmem_fixed.cfg` — the decompress-on-fault TOCTOU model (see below).
+
+  **Zero-page sentinel note.** The all-zero-page fast path (no blob stored;
+  `algo=NONE`, restore via `memset(0)`) sits *below* this model's abstraction
+  and needs no model change: `snapshot` is the page's logical value at
+  compress time (here: zero), and restore is `backing := snapshot` regardless
+  of the mechanism (codec vs. memset). The zero path funnels through the same
+  `restorePageContents()` populate-before-readable ordering, so the verified
+  `procmem` variant covers it. Likewise `SmashCore`'s `hasBlob` maps to
+  "`compressed_[]` entry recorded" — the sentinel *is* a recorded entry, so
+  `BlobIntegrity` is unaffected.
 - `SmashThreadCreate.tla` / `.cfg` / `_fixed.cfg` — the pthread_create-time
   TLS-fault model.
 - `SmashDeferredProtNone.tla` + `_guarded_buggy.cfg` / `_unconditional_fixed.cfg`

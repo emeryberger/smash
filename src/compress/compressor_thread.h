@@ -926,10 +926,14 @@ public:
     // the parent before fork()). Wait briefly for any in-flight tick to
     // finish. We cap the wait so a stuck tick can never deadlock fork().
     void pauseForFork() {
-        paused_.store(true, std::memory_order_release);
+        // seq_cst store + seq_cst load: the Dekker pairing with coordEntry's
+        // in_tick_-then-paused_ sequence (see the comment there). Plain
+        // release/acquire does NOT forbid the store-load reordering this
+        // handshake relies on.
+        paused_.store(true, std::memory_order_seq_cst);
         // Coordinator wakes on its 10 ms tick boundary. Give it a few of
         // those (~50 ms total) to drain in_tick_ before we let fork proceed.
-        for (int i = 0; i < 50 && in_tick_.load(std::memory_order_acquire); ++i)
+        for (int i = 0; i < 50 && in_tick_.load(std::memory_order_seq_cst); ++i)
             usleep(1000);
     }
 
@@ -4115,9 +4119,16 @@ private:
                 BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
             ha->self = this;
             ha->id = helper_id;
-            pthread_create(&helper_threads_[helper_id], nullptr, helperEntry, ha);
+            // EAGAIN under thread exhaustion: stop scaling up rather than
+            // counting a helper that does not exist (dispatch would wait
+            // forever for its generation ack; stop() would join garbage).
+            if (pthread_create(&helper_threads_[helper_id], nullptr, helperEntry, ha) != 0)
+                break;
             helpers_created_++;
         }
+        // Never claim more active workers than threads that actually exist
+        // (coordinator + created helpers).
+        if (n_needed > helpers_created_ + 1) n_needed = helpers_created_ + 1;
 
         active_workers_ = n_needed;
     }
@@ -4205,8 +4216,26 @@ private:
             // Skip the tick if a fork is in progress. The atfork prepare
             // handler set paused_ and is waiting for in_tick_ to be 0;
             // entering tick() now would race the impending fork().
-            if (self->paused_.load(std::memory_order_acquire)) continue;
-            self->in_tick_.store(true, std::memory_order_release);
+            //
+            // Dekker-style ordering: PUBLISH in_tick_ = true FIRST, then
+            // check paused_; pauseForFork() does the mirror image (store
+            // paused_, then read in_tick_). With both stores and loads
+            // sequentially consistent, at least one side observes the
+            // other's store: either we see paused_ and skip (clearing
+            // in_tick_), or prepare sees in_tick_ and waits the tick out.
+            // The previous check-then-set order had a TOCTOU window: the
+            // coordinator reads paused_ == false, prepare then sets
+            // paused_ and reads in_tick_ == 0 (not stored yet), fork()
+            // proceeds while tick() runs holding page/store locks — and
+            // the child inherits those spinlocks locked forever. Modeled
+            // in model/SmashForkPause.tla (the check-then-set cfg
+            // reproduces the violation; this order passes) and proved in
+            // model/SmashForkPause.lean.
+            self->in_tick_.store(true, std::memory_order_seq_cst);
+            if (self->paused_.load(std::memory_order_seq_cst)) {
+                self->in_tick_.store(false, std::memory_order_release);
+                continue;
+            }
             self->tick();
             self->in_tick_.store(false, std::memory_order_release);
         }
@@ -4715,17 +4744,35 @@ public:
         pthread_attr_setstacksize(&helper_attr, 128 * 1024);
 
         for (int w = 0; w < kMaxCompressorWorkers; ++w) ensureWorkerState(w);
+        int created = 0;
         for (int i = 0; i < kMaxHelpers; ++i) {
             auto* ha = static_cast<HelperArg*>(
                 BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
             ha->self = this;
             ha->id = i;
-            pthread_create(&helper_threads_[i], &helper_attr, helperEntry, ha);
+            // Under thread/memory exhaustion pthread_create returns EAGAIN.
+            // Record only the helpers that actually exist: helpers_created_
+            // drives both the adaptive worker cap and stop()'s joins, and
+            // joining a never-created pthread_t{} is undefined behavior.
+            if (pthread_create(&helper_threads_[i], &helper_attr, helperEntry, ha) != 0)
+                break;
+            ++created;
         }
-        helpers_created_ = kMaxHelpers;
+        helpers_created_ = created;
 
-        // Start coordinator thread (same small stack)
-        pthread_create(&coord_thread_, &helper_attr, coordEntry, this);
+        // Start coordinator thread (same small stack). Without it nothing
+        // ever ticks: roll back running_ so the helpers (which loop on it)
+        // exit, stop() early-returns instead of joining a never-created
+        // handle, and the library degrades to a plain allocator instead of
+        // crashing at shutdown.
+        if (pthread_create(&coord_thread_, &helper_attr, coordEntry, this) != 0) {
+            running_.store(false, std::memory_order_release);
+            char buf[128];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash WARN] pthread_create(coordinator) failed; "
+                "compression disabled\n");
+            if (n > 0) (void)!write(2, buf, (size_t)n);
+        }
         pthread_attr_destroy(&helper_attr);
     }
 

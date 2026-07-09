@@ -37,6 +37,17 @@ machine-checked Lean 4 formalizations of the corresponding safety properties.
   `BlobIntegrity` is unaffected.
 - `SmashThreadCreate.tla` / `.cfg` / `_fixed.cfg` — the pthread_create-time
   TLS-fault model.
+- `SmashForkPause.tla` + `_checkthenset_buggy.cfg` / `_setthencheck_fixed.cfg`
+  — the compressor fork-pause handshake (coordEntry / pauseForFork).
+  `tick()` holds per-page and CompressStore shard spinlocks, so fork() must
+  never fire mid-tick (the child inherits the locks locked, no owner). The
+  pre-fix coordinator order — check `paused` THEN set `inTick` — is a TOCTOU:
+  prepare can set `paused` and observe `inTick = 0` inside the gap, and
+  fork() proceeds concurrently with tick() (`NoForkDuringTick` violated).
+  The fixed Dekker-style order — publish `inTick` FIRST, then check `paused`,
+  backing off if set — passes. Both sides use seq_cst in the code; the model
+  assumes SC. The 50 ms cap on the prepare wait is intentionally not modeled
+  (deliberate best-effort deadlock-avoidance tradeoff).
 - `SmashDeferredProtNone.tla` + `_guarded_buggy.cfg` / `_unconditional_fixed.cfg`
   — the deferred-reclaim compress-snapshot PROT_NONE crash (root-caused
   2026-07-08, full-mode rocksdb SIGSEGV/livelock; fixed in PR #55). A monitoring
@@ -55,6 +66,10 @@ machine-checked Lean 4 formalizations of the corresponding safety properties.
 
 ### Lean 4 (machine-checked, `lean <file>.lean`)
 - `SmashThreadCreate.lean` — pre-create-workers safety.
+- `SmashForkPause.lean` — companion to `SmashForkPause.tla`. Inductive
+  invariant `WFP` ⇒ `reachable_safe` (fixed ordering: fork never fires
+  mid-tick, every reachable state); `buggy_reachable_violates` exhibits the
+  check-then-set TOCTOU trace concretely.
 - `SmashRestoreRace.lean` — coherence invariant ⇒ `NoStaleRead` for the atomic
   and procmem restores; concrete counterexample for the split restore.
 - `SmashCore.lean` — inductive invariant `WF ⇒ SafetyInv` (fixed mode preserved

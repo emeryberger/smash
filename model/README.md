@@ -9,7 +9,14 @@ machine-checked Lean 4 formalizations of the corresponding safety properties.
 - `SmashCore.tla` / `.cfg` — the allocator↔compressor PROT/state model. A single
   `BuggyMode` constant selects fixed (`FALSE`) vs. pre-fix (`TRUE`) behaviour;
   there is no separate `*Buggy.tla` file. Run the buggy demonstration with
-  `SmashCore_buggy.cfg` (`BuggyMode = TRUE`).
+  `SmashCore_buggy.cfg` (`BuggyMode = TRUE`). Phase 2's compress-finish models
+  all three outcomes: immediate reclaim (`COMPRESSED`), deferred reclaim
+  (`COMPRESSED_SHADOW`), and the ratio-gate failure (`kMinCompressRatio` not
+  met → no blob stored, `PROT_RW` restored, back to `ACTIVE`, cold streak
+  consumed via `coldCount := 0` — compressPage's gate-failure path with the
+  per-page fail-count backoff). The failure branch also exists in
+  `SmashCoreSym.tla`'s `CompCompress` and as `compressFail` / `p2Fail` in the
+  Lean modules.
 - `SmashCoreSym.tla` / `.cfg` / `_buggy.cfg` — **symmetry-reduced** companion to
   `SmashCore.tla`. `Pages` / `AppThreads` / `Compressors` are model-valued
   constants and the compressor's integer cursor is replaced by a

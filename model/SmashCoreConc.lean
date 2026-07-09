@@ -175,6 +175,15 @@ def p2Defer (p : Page) : Page :=
     { p with state := COMPRESSED_SHADOW, pageProt := PROT_RW, hasBlob := true }
   else p
 
+-- Compressor Phase 2, finish (ratio-gate failure): COMPRESSING → ACTIVE.
+-- No blob is stored (hasBlob stays false); PROT_RW is restored BEFORE the
+-- state flips to ACTIVE in the code — modeled atomically here because the
+-- per-page lock is held across both, so no thread observes the intermediate.
+def p2Fail (p : Page) : Page :=
+  if p.state = COMPRESSING then
+    { p with state := ACTIVE, pageProt := PROT_RW }
+  else p
+
 -- Compressor Phase 3 CAS: ACTIVE → ACTIVE_MONITORING (protection NOT yet changed;
 -- the intermediate MONITORING+PROT_RW state is observable to other threads).
 def p3CAS (p : Page) : Page :=
@@ -206,6 +215,7 @@ inductive Trans (buggy : Bool) : Page → Page → Prop where
   | p2Read   (p : Page) : Trans buggy p (p2Read p)
   | p2Reclaim(p : Page) : Trans buggy p (p2Reclaim p)
   | p2Defer  (p : Page) : Trans buggy p (p2Defer p)
+  | p2Fail   (p : Page) : Trans buggy p (p2Fail p)
   | p3CAS    (p : Page) : Trans buggy p (p3CAS p)
   | p3Prot   (p : Page) : Trans buggy p (p3Prot p)
   | pbReclaim(p : Page) : Trans buggy p (pbReclaim p)
@@ -281,6 +291,9 @@ theorem p2Reclaim_wf (p : Page) (h : WF p) : WF (p2Reclaim p) := by
 theorem p2Defer_wf (p : Page) (h : WF p) : WF (p2Defer p) := by
   unfold WF p2Defer at *; cases hs : p.state <;> simp_all
 
+theorem p2Fail_wf (p : Page) (h : WF p) : WF (p2Fail p) := by
+  unfold WF p2Fail at *; cases hs : p.state <;> simp_all
+
 theorem p3CAS_wf (p : Page) (h : WF p) : WF (p3CAS p) := by
   unfold WF p3CAS at *; cases hs : p.state <;> simp_all
 
@@ -307,6 +320,7 @@ theorem trans_wf {p q : Page} (h : Trans false p q) (hp : WF p) : WF q := by
   | p2Read    => exact p2Read_wf _ hp
   | p2Reclaim => exact p2Reclaim_wf _ hp
   | p2Defer   => exact p2Defer_wf _ hp
+  | p2Fail    => exact p2Fail_wf _ hp
   | p3CAS     => exact p3CAS_wf _ hp
   | p3Prot    => exact p3Prot_wf _ hp
   | pbReclaim => exact pbReclaim_wf _ hp

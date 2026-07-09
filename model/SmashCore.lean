@@ -161,6 +161,15 @@ def compressDefer (p : Page) : Page :=
     { p with state := PState.COMPRESSED_SHADOW, pageProt := Prot.PROT_RW, hasBlob := true }
   else p
 
+/-- compressPage ratio-gate failure (kMinCompressRatio): no blob is stored,
+    PROT_RW is restored and the page returns to ACTIVE.  The cold-streak /
+    fail-count backoff that schedules the next attempt is not part of the
+    per-page safety state (it is modeled as coldCount in the TLA+ module). -/
+def compressFail (p : Page) : Page :=
+  if (p.state = PState.ACTIVE ∨ p.state = PState.ACTIVE_MONITORING) ∧ p.onFreeList = false then
+    { p with state := PState.ACTIVE, pageProt := Prot.PROT_RW }
+  else p
+
 def phaseBReclaim (p : Page) : Page :=
   if p.state = PState.COMPRESSED_SHADOW then
     { p with state := PState.COMPRESSED, pageProt := Prot.PROT_NONE, hasPhysical := false }
@@ -194,6 +203,9 @@ theorem compressReclaim_pres (p : Page) (h : WF p) : WF (compressReclaim p) := b
 
 theorem compressDefer_pres (p : Page) (h : WF p) : WF (compressDefer p) := by
   unfold WF compressDefer at *; cases hs : p.state <;> simp_all
+
+theorem compressFail_pres (p : Page) (h : WF p) : WF (compressFail p) := by
+  unfold WF compressFail at *; cases hs : p.state <;> simp_all
 
 theorem phaseBReclaim_pres (p : Page) (h : WF p) : WF (phaseBReclaim p) := by
   unfold WF phaseBReclaim at *; cases hs : p.state <;> simp_all

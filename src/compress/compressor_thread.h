@@ -358,6 +358,13 @@ class CompressorThread {
     // Saturating uint8_t — the bucket EMA captures values above ~6 anyway.
     uint8_t* recompress_count_ = nullptr;
 
+    // Per-page count of ratio-gate failures (compressPage attempts whose
+    // output exceeded min_compress_ratio). Feeds the same exponential
+    // effective-floor backoff as recompress_count_, but is reset ONLY by a
+    // real access to the page — an idle incompressible page's contents
+    // cannot change, so cold-streak decay must not re-arm eager retries.
+    uint8_t* compress_fail_count_ = nullptr;
+
     // ── Soft-dirty ROI per-page state (SMASH_SOFTDIRTY_ROI) ─────────────────
     // write_clean_streak_: consecutive ticks a page's soft-dirty (write) bit
     // stayed UNSET. Distinct from cold_count_ (which also resets on reads under
@@ -1248,6 +1255,9 @@ private:
 #endif
                 if (accessed) {
                     cold_count_[i] = 0;
+                    // Access can change contents — the incompressibility
+                    // verdict behind the ratio-gate backoff is stale.
+                    compress_fail_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
                 } else {
                     if (cold_count_[i] < 255) cold_count_[i]++;
@@ -1493,7 +1503,13 @@ private:
                         }
                     }
                 }
-                uint32_t shift32 = static_cast<uint32_t>(rc) + bucket_bias;
+                // Ratio-gate failures back off through the same shift: each
+                // failed attempt doubles the idle streak required before the
+                // next try (see compressPage's gate-failure path, which also
+                // resets cold_count_ so the streak restarts from zero).
+                uint32_t fails = compress_fail_count_
+                    ? compress_fail_count_[i] : 0;
+                uint32_t shift32 = static_cast<uint32_t>(rc) + bucket_bias + fails;
                 if (shift32 > kMaxBackoffShift) shift32 = kMaxBackoffShift;
                 uint64_t wide_floor = static_cast<uint64_t>(profile_floor) << shift32;
                 if (wide_floor > kMaxEffectiveFloorTicks)
@@ -2170,6 +2186,17 @@ private:
                 }
                 __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
             }
+            // Ratio-gate backoff. Without it, an idle incompressible page
+            // stays at cold_count_ >= floor and is re-selected EVERY tick:
+            // ~10 µs of mprotect + snapshot + codec + restore per tick,
+            // forever. Consume the cold streak (restart from zero) and bump
+            // the per-page fail count, which doubles the effective floor
+            // for the next attempt (see phase2Range). The count resets only
+            // on a real access — an idle page's contents cannot change, so
+            // retries stay capped at one per kMaxEffectiveFloorTicks streak.
+            if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
+                compress_fail_count_[page_idx]++;
+            cold_count_[page_idx] = 0;
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             return false;
@@ -2792,6 +2819,7 @@ private:
                     shadow_tick_[i] = 0;
                     if (page_tier_) page_tier_[i] = kTierNone;
                     cold_count_[i] = 0;
+                    compress_fail_count_[i] = 0;  // contents changed
                     vm::protectPages(page_addr, kPageSize, true, true);
                     states_->set(i, PageState::ACTIVE);
                     locks_->unlock(i);
@@ -4185,6 +4213,7 @@ public:
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
+        compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
         // Soft-dirty ROI per-page arrays: only allocate when the gate is on
         // (~2 bytes/page = ~32 MiB at full VM otherwise wasted). Read the env
         // directly here — ROIConfig::init() runs later in this function, so the
@@ -5002,6 +5031,7 @@ public:
 
             states_->set(page_idx, PageState::ACTIVE);
             cold_count_[page_idx] = 0;
+            compress_fail_count_[page_idx] = 0;  // access → verdict stale
             locks_->unlock(page_idx);
 
             // Recompression-thrash signal. The act of faulting back from
@@ -5103,6 +5133,7 @@ public:
             }
             states_->set(page_idx, PageState::ACTIVE);
             cold_count_[page_idx] = 0;
+            compress_fail_count_[page_idx] = 0;
             locks_->unlock(page_idx);
             return true;
         }
@@ -5140,6 +5171,7 @@ public:
             if (shadow_tick_) shadow_tick_[page_idx] = 0;
             if (page_tier_) page_tier_[page_idx] = kTierNone;
             cold_count_[page_idx] = 0;
+            compress_fail_count_[page_idx] = 0;  // write → contents changed
             if (recompress_count_[page_idx] < 255)
                 recompress_count_[page_idx]++;
             states_->set(page_idx, PageState::ACTIVE);
@@ -5174,6 +5206,7 @@ public:
             states_->set(i, PageState::EMPTY);
             cold_count_[i] = 0;
             recompress_count_[i] = 0;
+            compress_fail_count_[i] = 0;
             accessed_[i].store(false, std::memory_order_relaxed);
             locks_->unlock(i);
         }

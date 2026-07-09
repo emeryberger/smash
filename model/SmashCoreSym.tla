@@ -202,9 +202,13 @@ CompColdScan(c) ==
         /\ UNCHANGED << state, pageProt, lock, hasBlob, hasPhysical,
                         releases, decommitQ, freeList >>
 
-\* Phase 2: compress a cold ACTIVE/MONITORING page.  Two outcomes:
+\* Phase 2: compress a cold ACTIVE/MONITORING page.  Three outcomes:
 \*   immediate reclaim   -> COMPRESSED, PROT_NONE, drop physical
 \*   deferred reclaim     -> COMPRESSED_SHADOW, PROT_RW, keep physical
+\*   ratio-gate failure   -> ACTIVE, PROT_RW, no blob stored; the cold
+\*                           streak is consumed (coldCount := 0) so the
+\*                           per-page fail-count backoff restarts the wait
+\*                           (compressPage's kMinCompressRatio gate path).
 CompCompress(c) ==
     \E p \in Pages :
         /\ state[p] \in {"ACTIVE","ACTIVE_MONITORING"}
@@ -216,11 +220,18 @@ CompCompress(c) ==
               /\ pageProt'    = [pageProt    EXCEPT ![p] = "PROT_NONE"]
               /\ hasBlob'     = [hasBlob     EXCEPT ![p] = TRUE]
               /\ hasPhysical' = [hasPhysical EXCEPT ![p] = FALSE]
+              /\ coldCount'   = coldCount
            \/ /\ state'       = [state       EXCEPT ![p] = "COMPRESSED_SHADOW"]
               /\ pageProt'    = [pageProt    EXCEPT ![p] = "PROT_RW"]
               /\ hasBlob'     = [hasBlob     EXCEPT ![p] = TRUE]
               /\ hasPhysical' = hasPhysical
-        /\ UNCHANGED << lock, coldCount, accessed, releases, decommitQ, freeList >>
+              /\ coldCount'   = coldCount
+           \/ /\ state'       = [state       EXCEPT ![p] = "ACTIVE"]
+              /\ pageProt'    = [pageProt    EXCEPT ![p] = "PROT_RW"]
+              /\ hasBlob'     = hasBlob
+              /\ hasPhysical' = hasPhysical
+              /\ coldCount'   = [coldCount   EXCEPT ![p] = 0]
+        /\ UNCHANGED << lock, accessed, releases, decommitQ, freeList >>
 
 \* Phase 3: set up monitoring on an ACTIVE page: -> ACTIVE_MONITORING + PROT_READ.
 CompMonitor(c) ==

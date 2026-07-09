@@ -325,6 +325,16 @@ Tick:
                     state[cp]    := "COMPRESSED_SHADOW";
                     pageProt[cp] := "PROT_RW";
                     hasBlob[cp]  := TRUE;
+                or
+                    \* Ratio-gate failure (kMinCompressRatio): the blob is
+                    \* discarded (never stored), PROT_RW is restored and the
+                    \* page returns to ACTIVE. The cold streak is consumed
+                    \* (coldCount := 0) so the per-page fail-count backoff
+                    \* restarts the wait before the next attempt
+                    \* (compressPage's gate-failure path).
+                    state[cp]     := "ACTIVE";
+                    pageProt[cp]  := "PROT_RW";
+                    coldCount[cp] := 0;
                 end either;
                 lock[cp] := "free";
             end if;
@@ -710,14 +720,19 @@ P2CompressFinish(self) == /\ pc[self] = "P2CompressFinish"
                                 /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_NONE"]
                                 /\ hasBlob' = [hasBlob EXCEPT ![cp[self]] = TRUE]
                                 /\ hasPhysical' = [hasPhysical EXCEPT ![cp[self]] = FALSE]
+                                /\ UNCHANGED coldCount
                              \/ /\ state' = [state EXCEPT ![cp[self]] = "COMPRESSED_SHADOW"]
                                 /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_RW"]
                                 /\ hasBlob' = [hasBlob EXCEPT ![cp[self]] = TRUE]
-                                /\ UNCHANGED hasPhysical
+                                /\ UNCHANGED << hasPhysical, coldCount >>
+                             \/ /\ state' = [state EXCEPT ![cp[self]] = "ACTIVE"]
+                                /\ pageProt' = [pageProt EXCEPT ![cp[self]] = "PROT_RW"]
+                                /\ coldCount' = [coldCount EXCEPT ![cp[self]] = 0]
+                                /\ UNCHANGED << hasBlob, hasPhysical >>
                           /\ lock' = [lock EXCEPT ![cp[self]] = "free"]
                           /\ pc' = [pc EXCEPT ![self] = "P2Next"]
-                          /\ UNCHANGED << coldCount, accessed, releases, 
-                                          decommitQ, freeList, target, ap, dp, 
+                          /\ UNCHANGED << accessed, releases,
+                                          decommitQ, freeList, target, ap, dp,
                                           cp >>
 
 P3Start(self) == /\ pc[self] = "P3Start"

@@ -156,17 +156,28 @@ inline constexpr uint32_t kFreeCacheRepopDefault = 8;
 // Hand-rolled lazy init (not a magic static): the guard-variable acquire-load
 // measured at 7-10 % of free()'s CPU elsewhere (see config.h getSmashMode()).
 // 0 = uninitialised sentinel; valid intervals are >= 1.
+// The getenv/parse init bodies below are OUTLINED into cold, noinline
+// helpers. The hot readers are always_inline'd into malloc()/free(); with
+// the init code written inline in the [[unlikely]] branch, GCC keeps it in
+// the hot function body (bigger frame, extra spills across every call
+// site) — measured +1.7 ns/op (9.7 → 11.4) on the direct-linked x86-64
+// bench_throughput single-alloc/free loop. Outlining restores a minimal
+// hot body: one relaxed load, one predicted branch, cold call on first use.
+[[gnu::cold, gnu::noinline]]
+inline uint32_t freeCacheRepopIntervalInit(std::atomic<uint32_t>& cached) {
+    const char* v = std::getenv("SMASH_FREE_CACHE_REPOP");
+    long n = v ? std::atol(v) : 0;
+    uint32_t interval = (n >= 1 && n <= (1L << 20)) ? static_cast<uint32_t>(n)
+                                                    : kFreeCacheRepopDefault;
+    cached.store(interval, std::memory_order_relaxed);
+    return interval;
+}
+
 [[gnu::always_inline]]
 inline uint32_t freeCacheRepopInterval() {
-    static std::atomic<uint32_t> cached{0};
+    static std::atomic<uint32_t> cached{0};   // constant-init: no guard
     uint32_t interval = cached.load(std::memory_order_relaxed);
-    if (interval == 0) [[unlikely]] {
-        const char* v = std::getenv("SMASH_FREE_CACHE_REPOP");
-        long n = v ? std::atol(v) : 0;
-        interval = (n >= 1 && n <= (1L << 20)) ? static_cast<uint32_t>(n)
-                                               : kFreeCacheRepopDefault;
-        cached.store(interval, std::memory_order_relaxed);
-    }
+    if (interval == 0) [[unlikely]] interval = freeCacheRepopIntervalInit(cached);
     return interval;
 }
 
@@ -188,17 +199,22 @@ inline ThreadCache*& currentThreadCache() { return g_thread_cache; }
 // that in smash needs per-CPU/per-core slab lanes, not a hash tweak. Kept as an
 // opt-in knob for hosts where CPU-locality routing helps (e.g. arena count ≈
 // CPU count). See the deferred-free work for the actual contention fix.
+[[gnu::cold, gnu::noinline]]
+inline int cpuArenaHashInit(std::atomic<int>& cached) {
+    const char* e = std::getenv("SMASH_CPU_ARENA");
+    int v = (e && e[0] == '1') ? 1 : 0;  // default OFF; opt in with SMASH_CPU_ARENA=1
+    cached.store(v, std::memory_order_relaxed);
+    return v;
+}
+
 [[gnu::always_inline]]
 inline bool cpuArenaHash() {
     // Hand-rolled lazy init (not a magic static) — this runs on every malloc,
-    // so the guard-variable acquire-load would sit on the hot path.
-    static std::atomic<int> cached{-1};
+    // so the guard-variable acquire-load would sit on the hot path. Init is
+    // outlined cold (see freeCacheRepopIntervalInit's comment).
+    static std::atomic<int> cached{-1};   // constant-init: no guard
     int v = cached.load(std::memory_order_relaxed);
-    if (v < 0) [[unlikely]] {
-        const char* e = std::getenv("SMASH_CPU_ARENA");
-        v = (e && e[0] == '1') ? 1 : 0;  // default OFF; opt in with SMASH_CPU_ARENA=1
-        cached.store(v, std::memory_order_relaxed);
-    }
+    if (v < 0) [[unlikely]] v = cpuArenaHashInit(cached);
     return v == 1;
 }
 
@@ -207,18 +223,23 @@ inline bool cpuArenaHash() {
 // active the inlined free() fast path is disabled so every free is routed
 // through freeSlow() — keeping the counters/traces complete. One-shot, so the
 // steady-state cost is a single predictable branch.
+[[gnu::cold, gnu::noinline]]
+inline int freeDiagnosticsActiveInit(std::atomic<int>& cached) {
+    const char* c = std::getenv("SMASH_COUNT_FREE");
+    const char* t = std::getenv("SMASH_TRACE_FOREIGN_FREE");
+    int v = ((c && c[0] == '1') || (t && t[0] == '1')) ? 1 : 0;
+    cached.store(v, std::memory_order_relaxed);
+    return v;
+}
+
 [[gnu::always_inline]]
 inline bool freeDiagnosticsActive() {
     // Hand-rolled lazy init (not a magic static) — this runs on every free,
-    // so the guard-variable acquire-load would sit on the hot path.
-    static std::atomic<int> cached{-1};
+    // so the guard-variable acquire-load would sit on the hot path. Init is
+    // outlined cold (see freeCacheRepopIntervalInit's comment).
+    static std::atomic<int> cached{-1};   // constant-init: no guard
     int v = cached.load(std::memory_order_relaxed);
-    if (v < 0) [[unlikely]] {
-        const char* c = std::getenv("SMASH_COUNT_FREE");
-        const char* t = std::getenv("SMASH_TRACE_FOREIGN_FREE");
-        v = ((c && c[0] == '1') || (t && t[0] == '1')) ? 1 : 0;
-        cached.store(v, std::memory_order_relaxed);
-    }
+    if (v < 0) [[unlikely]] v = freeDiagnosticsActiveInit(cached);
     return v == 1;
 }
 

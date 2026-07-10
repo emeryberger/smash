@@ -10,11 +10,20 @@
 #include "../util/bitops.h"
 #include "../vm/page_state.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 namespace smash {
+
+// Allocator-induced re-heat events: a slot was handed out on a page that had
+// already cooled past the closing threshold, resetting its cold streak (see
+// getCoolingCloseTicks()). With cooling-page closing active this only happens
+// when a span has no warmer free slot, so a high rate flags workloads where
+// span-level (not just slot-level) placement would pay off. Reported as
+// reheat= in the SIGUSR2 stats line.
+inline std::atomic<uint64_t> g_reheat_events{0};
 
 struct Span {
     void* base;                 // start of data pages
@@ -218,113 +227,179 @@ struct Span {
         cold_counts = nullptr;
     }
 
-    // Allocate one object. Returns nullptr if span is full.
-    //
-    // Scans over `full_capacity` words, not `object_count`: under a per-page
-    // cap the live bits are spread across every page (bit positions 0..cap-1
-    // on each page), so a truncated scan would miss every live slot beyond
-    // the first page and the span would appear "full" at ~1/page_count
-    // utilization.
-    // Check whether the page containing `slot_byte_offset` (offset from base)
-    // is currently COMPRESSED. If so, allocating from it would force a
-    // fault on the user's first access. The bitmap walk in allocate() uses
-    // this to prefer slots on ACTIVE pages.  Inline-friendly; reads one
-    // atomic byte from PageStateTable per check.
-    inline bool slotPageCompressed(size_t slot_byte_offset) const {
-        if (!page_states) return false;
-        // Until any page has ever been compressed (always, when compression is
-        // disabled), no slot can be on a COMPRESSED page — skip the per-slot
-        // atomic page-state load that would otherwise run on every bit the
-        // bitmap walk examines. Relaxed load: a stale false is impossible once
-        // the latch is set (monotonic 0→1, set-with-release before any page is
-        // actually PROT_NONE), and a stale-true only costs an extra get().
-        if (!g_any_page_compressed.load(std::memory_order_relaxed)) return false;
-        size_t page_off = slot_byte_offset / kPageSize;
-        size_t page_idx = static_cast<size_t>(first_page_vm_idx) + page_off;
-        return page_states->get(page_idx) == PageState::COMPRESSED;
-    }
-
     // Reset the cold-tick counter for the page containing the slot we just
     // handed out, so phase2 won't see this page as "idle" while it's still
     // receiving fresh allocations.  Plain (non-atomic) write — cold_count_
     // is a uint8_t snapshot read by phase1/phase2 with no ordering needs.
-    inline void resetColdCountForSlot(size_t slot_byte_offset) {
+    // telemetry_ticks classifies the overwrite: clobbering a streak that had
+    // already crossed coolingCloseDefaultTicks() is an allocator-induced
+    // re-heat, counted in g_reheat_events. The telemetry threshold is fixed
+    // at the default (not the env-overridable closing threshold) so runs
+    // with closing disabled still count the re-heats closing would prevent.
+    inline void resetColdCountForSlot(size_t slot_byte_offset,
+                                      int telemetry_ticks) {
         if (!cold_counts) return;
         size_t page_off = slot_byte_offset / kPageSize;
         size_t page_idx = static_cast<size_t>(first_page_vm_idx) + page_off;
+        if (telemetry_ticks > 0 && cold_counts[page_idx] >= telemetry_ticks)
+            g_reheat_events.fetch_add(1, std::memory_order_relaxed);
         cold_counts[page_idx] = 0;
     }
 
-    // Walk one bitmap word, picking the first free slot whose page is NOT
-    // COMPRESSED. Returns the chosen bit (0..63), or -1 if every free slot
-    // in this word is on a compressed page.  As a side effect, records the
-    // first compressed-page free slot in *fallback_bit (only if the caller
-    // hasn't already recorded one elsewhere).
-    inline int pickActiveBit(size_t word_idx, uint64_t word,
-                             int* fallback_word, int* fallback_bit) const {
+    // Allocation preference class of the page holding a free slot.
+    enum class SlotPageClass : uint8_t {
+        WARM = 0,       // recently touched, or EMPTY (nothing live to protect)
+        COOLING = 1,    // live data partway to compression — backfilling here
+                        // resets the cold streak and delays/void's the
+                        // compressor's investment in this page
+        COMPRESSED_PAGE = 2,  // slot write would fault + decompress
+    };
+
+    // Classify the page for the preference cascade. All reads here are racy
+    // snapshots of compressor-owned state (page-state byte, cold-tick byte);
+    // a stale value only shifts a placement preference, never correctness —
+    // the bitmap under the slab lock is the sole allocation truth.
+    inline SlotPageClass classifySlotPage(size_t slot_byte_offset,
+                                          int close_ticks) const {
+        if (!page_states) return SlotPageClass::WARM;
+        // Until any page has ever been compressed (always, when compression
+        // is disabled), no placement decision matters — skip the per-slot
+        // loads. Same latch rationale as the old slotPageCompressed().
+        if (!g_any_page_compressed.load(std::memory_order_relaxed))
+            return SlotPageClass::WARM;
+        size_t page_idx = static_cast<size_t>(first_page_vm_idx)
+                        + slot_byte_offset / kPageSize;
+        PageState st = page_states->get(page_idx);
+        if (st == PageState::COMPRESSED)
+            return SlotPageClass::COMPRESSED_PAGE;
+        // EMPTY = decommitted, nothing live: as good as warm — backfilling
+        // protects nothing and costs only a kernel zero-fill on first touch.
+        if (st == PageState::EMPTY)
+            return SlotPageClass::WARM;
+        // COMPRESSING is mid-snapshot and about to become COMPRESSED —
+        // treat as cooling (avoid if a warm slot exists, allowed as
+        // fallback, same as before this classification existed).
+        if (st == PageState::COMPRESSING)
+            return SlotPageClass::COOLING;
+        if (close_ticks > 0 && cold_counts &&
+            cold_counts[page_idx] >= close_ticks)
+            return SlotPageClass::COOLING;
+        return SlotPageClass::WARM;
+    }
+
+    // Walk one bitmap word, picking the first free slot on a WARM page.
+    // Returns the chosen bit (0..63), or -1 if this word has no warm free
+    // slot. As a side effect, records the first COOLING-page slot and the
+    // first COMPRESSED-page slot seen (only if the caller hasn't already
+    // recorded one elsewhere) — allocate() falls back to those, in that
+    // order, when the whole span has no warm slot.
+    inline int pickActiveBit(size_t word_idx, uint64_t word, int close_ticks,
+                             int* cool_word, int* cool_bit,
+                             int* comp_word, int* comp_bit) const {
         while (word) {
             int bit = ctz(word);
             size_t slot = word_idx * 64 + bit;
             size_t off  = slot * object_size;
-            if (!slotPageCompressed(off)) return bit;
-            if (*fallback_word < 0) {
-                *fallback_word = static_cast<int>(word_idx);
-                *fallback_bit  = bit;
+            switch (classifySlotPage(off, close_ticks)) {
+            case SlotPageClass::WARM:
+                return bit;
+            case SlotPageClass::COOLING:
+                if (*cool_word < 0) {
+                    *cool_word = static_cast<int>(word_idx);
+                    *cool_bit  = bit;
+                }
+                break;
+            case SlotPageClass::COMPRESSED_PAGE:
+                if (*comp_word < 0) {
+                    *comp_word = static_cast<int>(word_idx);
+                    *comp_bit  = bit;
+                }
+                break;
             }
             word &= word - 1;  // clear this bit, try next
         }
         return -1;
     }
 
-    void* allocate() {
-        size_t num_words = (full_capacity + 63) / 64;
-        int fallback_word = -1, fallback_bit = 0;
+    // Fallback slots recorded by a warm scan: the first free slot seen on a
+    // COOLING page and on a COMPRESSED page. Lets the caller (Slab) decide
+    // whether to consume a fallback or redirect the allocation to another
+    // span, without paying a second bitmap scan.
+    struct AllocFallback {
+        int cool_word = -1, cool_bit = 0;
+        int comp_word = -1, comp_bit = 0;
+        bool any() const { return cool_word >= 0 || comp_word >= 0; }
+    };
 
-        // Scan from hint position. Prefer slots on non-compressed pages so
-        // the user's first access doesn't force a decompress fault.
+    // Take the slot at (word, bit) out of the bitmap and return its address.
+    inline void* takeSlot(int word, int bit, bool reset_cold, int telem_ticks) {
+        size_t slot = static_cast<size_t>(word) * 64 + static_cast<size_t>(bit);
+        bitmap[word] &= ~(1ULL << bit);
+        ++allocated_count;
+        free_hint_word = static_cast<uint16_t>(word);
+        size_t off = slot * object_size;
+        if (reset_cold) resetColdCountForSlot(off, telem_ticks);
+        return static_cast<char*>(base) + off;
+    }
+
+    // Allocate one object from a WARM page, or return nullptr with *fb
+    // recording the best cooling/compressed fallback slots seen. One scan
+    // serves both outcomes.
+    //
+    // Scans over `full_capacity` words, not `object_count`: under a per-page
+    // cap the live bits are spread across every page (bit positions 0..cap-1
+    // on each page), so a truncated scan would miss every live slot beyond
+    // the first page and the span would appear "full" at ~1/page_count
+    // utilization.
+    void* allocateWarm(AllocFallback* fb) {
+        size_t num_words = (full_capacity + 63) / 64;
+        const int close_ticks = cold_counts ? getCoolingCloseTicks() : 0;
+        const int telem_ticks = cold_counts ? coolingCloseDefaultTicks() : 0;
+
         for (size_t i = free_hint_word; i < num_words; ++i) {
             uint64_t w = bitmap[i];
             if (!w) continue;
-            int bit = pickActiveBit(i, w, &fallback_word, &fallback_bit);
+            int bit = pickActiveBit(i, w, close_ticks,
+                                    &fb->cool_word, &fb->cool_bit,
+                                    &fb->comp_word, &fb->comp_bit);
             if (bit < 0) continue;
-            size_t slot = i * 64 + bit;
-            bitmap[i] &= ~(1ULL << bit);
-            ++allocated_count;
-            free_hint_word = static_cast<uint16_t>(i);
-            size_t off = slot * object_size;
-            resetColdCountForSlot(off);
-            return static_cast<char*>(base) + off;
+            return takeSlot(static_cast<int>(i), bit, true, telem_ticks);
         }
         for (size_t i = 0; i < free_hint_word; ++i) {
             uint64_t w = bitmap[i];
             if (!w) continue;
-            int bit = pickActiveBit(i, w, &fallback_word, &fallback_bit);
+            int bit = pickActiveBit(i, w, close_ticks,
+                                    &fb->cool_word, &fb->cool_bit,
+                                    &fb->comp_word, &fb->comp_bit);
             if (bit < 0) continue;
-            size_t slot = i * 64 + bit;
-            bitmap[i] &= ~(1ULL << bit);
-            ++allocated_count;
-            free_hint_word = static_cast<uint16_t>(i);
-            size_t off = slot * object_size;
-            resetColdCountForSlot(off);
-            return static_cast<char*>(base) + off;
+            return takeSlot(static_cast<int>(i), bit, true, telem_ticks);
         }
+        return nullptr;  // no warm slot; fb holds any fallbacks
+    }
 
-        // No active-page slot found. Fall back to the first compressed-page
-        // slot we saw — the user's first access will fault and decompress.
-        // Better than returning nullptr (which forces a new span).
-        if (fallback_word >= 0) {
-            size_t slot = static_cast<size_t>(fallback_word) * 64
-                        + static_cast<size_t>(fallback_bit);
-            bitmap[fallback_word] &= ~(1ULL << fallback_bit);
-            ++allocated_count;
-            free_hint_word = static_cast<uint16_t>(fallback_word);
-            size_t off = slot * object_size;
-            // Don't reset cold_counts here — the page is COMPRESSED.  The
-            // user's first access will fault and decompress, and the fault
-            // handler resets cold_count itself.
-            return static_cast<char*>(base) + off;
-        }
+    // Consume a fallback recorded by allocateWarm(): cooling first (streak
+    // reset counts as a re-heat, but no fault), then compressed (the user's
+    // first access will fault and decompress; cold_counts untouched — the
+    // fault handler resets it). Returns nullptr if fb is empty (span full).
+    void* consumeFallback(const AllocFallback& fb) {
+        const int telem_ticks = cold_counts ? coolingCloseDefaultTicks() : 0;
+        if (fb.cool_word >= 0)
+            return takeSlot(fb.cool_word, fb.cool_bit, true, telem_ticks);
+        if (fb.comp_word >= 0)
+            return takeSlot(fb.comp_word, fb.comp_bit, false, 0);
         return nullptr;  // full
+    }
+
+    // Allocate one object. Returns nullptr if span is full.
+    // Full preference cascade in one call: warm page > cooling page >
+    // COMPRESSED page. Warm avoids both a decompress fault and re-heating a
+    // page partway to compression; cooling costs a cold-streak reset but no
+    // fault; compressed costs a fault on the user's first access. Any
+    // fallback beats nullptr, which would force a whole new span.
+    void* allocate() {
+        AllocFallback fb;
+        if (void* p = allocateWarm(&fb)) return p;
+        return consumeFallback(fb);
     }
 
     // Free one object back to this span.

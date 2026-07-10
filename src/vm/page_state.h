@@ -25,7 +25,7 @@ enum class PageState : uint8_t {
 };
 
 // Set the first time any page is driven to COMPRESSED. The span bitmap walk
-// (Span::pickActiveBit / slotPageCompressed) reads a per-slot page-state byte
+// (Span::pickActiveBit / classifySlotPage) reads a per-slot page-state byte
 // to avoid handing out chunks on COMPRESSED pages — but until the compressor
 // has actually compressed something (and always, when compression is disabled
 // via SMASH_NO_COMPRESSOR) no page can be COMPRESSED, so that per-slot atomic

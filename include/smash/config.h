@@ -308,6 +308,44 @@ inline int getColdTicks() {
     return ticks;
 }
 
+// ── Cooling-page closing ─────────────────────────────────────────────────────
+// A free slot whose page has already been idle for this many compressor ticks
+// is demoted in Span::allocate()'s preference order: warm-page slots first,
+// then cooling-page slots, then COMPRESSED-page slots. Without this, steady
+// allocation churn backfills partial pages that hold long-lived cold survivors
+// and resets their cold counters, so such a page keeps getting re-heated and
+// never reaches compression (its freed slots would otherwise be zeroed and
+// compressed out). Preference-only: never forces a new span, so it cannot
+// grow the page count — it steers churn toward pages that are warm anyway and
+// lets cooling pages finish cooling.
+// SMASH_COOLING_CLOSE_TICKS=N overrides; 0 disables. Default: half the cold
+// threshold — a page halfway to compression eligibility stops receiving
+// backfill.
+//
+// coolingCloseDefaultTicks() is also the fixed threshold for the reheat=
+// telemetry (g_reheat_events): re-heats are counted against the default even
+// when closing is disabled, so an A/B of SMASH_COOLING_CLOSE_TICKS=0 vs
+// default shows how many re-heats the preference actually prevented.
+inline int coolingCloseDefaultTicks() {
+    static int ticks = []() {
+        int half = getColdTicks() / 2;
+        return half < 1 ? 1 : half;
+    }();
+    return ticks;
+}
+
+inline int getCoolingCloseTicks() {
+    static int ticks = []() {
+        const char* env = getenv("SMASH_COOLING_CLOSE_TICKS");
+        if (env) {
+            int v = atoi(env);
+            return v < 0 ? 0 : v;
+        }
+        return coolingCloseDefaultTicks();
+    }();
+    return ticks;
+}
+
 // ── Adaptive compression (Phase 5+) ─────────────────────────────────────────
 #ifndef SMASH_VERY_COLD_TICKS
 inline constexpr int kVeryColdTicks = 60;         // ~1 min → zstd deep

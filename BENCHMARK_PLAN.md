@@ -13,17 +13,23 @@ content homogeneity that improves compression ratios vs glibc/jemalloc/mimalloc.
 - bench_arena_segregation.cpp with 4 data types (JSON, floats, random, ints),
   hotness differentiation, anti-ICF and anti-tailcall measures
 
-### In Progress
-- Fix __builtin_return_address depth: with LTO, the inlined callsiteArena sees
-  the wrong return address. Fix: capture RA at the malloc entry point (before
-  inlining) and use it for arena routing on both fast and slow paths.
-- Compile-time tagging alternative: use __builtin_FILE()/__builtin_LINE() or
-  a source_location parameter to tag call sites at compile time (no runtime
-  stack walk needed). This would be passed via a defaulted parameter:
-  `void* malloc(size_t size, std::source_location loc = std::source_location::current())`
-  Limitation: only works for C++20 callers; C code and legacy binaries can't
-  use this. A hybrid approach: use source_location when available, fall back to
-  __builtin_return_address otherwise.
+### Completed (2026-07-10)
+- Return-address capture fixed for real: alloc8's app-facing wrapper entries
+  (malloc/calloc/realloc/memalign/operator new/...) now store
+  `__builtin_return_address(0)` into the initial-exec TLS hint
+  `alloc8_caller_ra` (alloc8 PR #12); smash reads it via `appCallerRA()`.
+  Capturing inside smash was unreliable — the frame count between the app and
+  `SmashHeap::malloc` depends on inlining/LTO/tail-call decisions (measured on
+  macOS Release: every RA reaching callsiteArena pointed into libsmash's own
+  wrapper code → all call sites collapsed into one arena, homogeneity 0%).
+  After the fix: homogeneity 100%, fully-mixed 0%, per-site page ratios
+  json 0.026 / floats 0.037 / random 1.0 (correctly skipped) / ints 0.63.
+  Verify RA arrival on any platform with `SMASH_ARENA_TRACE=1`.
+
+### Not pursued
+- Compile-time tagging alternative (source_location): unnecessary now that the
+  wrapper-entry capture works, and it can't cover C callers or change malloc's
+  ABI anyway. See "Compile-Time Tagging Design" below for the archived notes.
 
 ### Expected Results (once RA fix lands)
 | Config | Homogeneity | Avg Ratio | Pages Compressible | RSS Reduction |

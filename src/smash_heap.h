@@ -17,6 +17,7 @@
 #include "compress/compressor_thread.h"
 #include "util/bitops.h"
 #include "util/safe_printf.h"  // allocation-free snprintf for malloc-path diagnostics
+#include <alloc8/alloc8.h>     // alloc8_caller_ra: app allocation site captured at wrapper entry
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
@@ -369,6 +370,23 @@ struct SystemAllocFns {
 
 extern SystemAllocFns g_system_alloc;
 
+// The application's allocation call site, for arena routing. alloc8's
+// app-facing wrapper entries (malloc/calloc/realloc/memalign/operator new/...)
+// store __builtin_return_address(0) into alloc8_caller_ra before dispatching
+// to xxmalloc — the only frame where the RA is unambiguous. Reading
+// __builtin_return_address here instead is unreliable: how many frames sit
+// between the app and this code depends on inlining/LTO/tail-call decisions
+// (measured on macOS Release: every RA seen by callsiteArena pointed into
+// libsmash's own wrapper code, collapsing all call sites into one arena).
+// The RA(0) fallback covers entries that bypass the wrappers — direct
+// SmashHeap calls from tests and internal code — where no app site exists.
+[[gnu::always_inline]]
+inline uintptr_t appCallerRA() {
+    if (void* ra = alloc8_caller_ra) [[likely]]
+        return reinterpret_cast<uintptr_t>(ra);
+    return reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+}
+
 class SmashHeap {
     // Slab array sized to kTotalArenas (= kNumArenas when A3 off, 2*kNumArenas
     // when SMASH_COLD_ARENA_FEEDBACK is on).  Layout:
@@ -488,9 +506,10 @@ class SmashHeap {
         // LLAMA-style stack hash [Maas et al., ASPLOS 2020]:
         // hash(return_address, stack_depth, object_size).
         //
-        // The return address is captured at the malloc() entry point and
-        // passed here — this avoids __builtin_return_address depth issues
-        // when callsiteArena is inlined via LTO.
+        // The return address is captured at the alloc8 wrapper entry
+        // (alloc8_caller_ra, read via appCallerRA()) — the only frame where
+        // __builtin_return_address(0) unambiguously names the application's
+        // call site regardless of inlining/LTO/tail-call decisions.
         //
         // ASLR-resilient: stableCallsiteHash() resolves the return address
         // to an offset within its shared object via dladdr(), with caching.
@@ -573,6 +592,43 @@ class SmashHeap {
             .fetch_add(1, std::memory_order_relaxed);
 #endif
 #endif
+#ifndef SMASH_ABLATION_NO_CALLSITE_ARENA
+        // SMASH_ARENA_TRACE=1: print the first 32 distinct return addresses
+        // seen by arena routing, with their resolved image + offset and the
+        // arena chosen. Diagnostic for verifying that app call sites (not
+        // wrapper-internal addresses) reach the router on a given
+        // platform/compiler/LTO combination. Zero cost when unset beyond one
+        // predicted branch.
+        static int trace_arena = []{
+            const char* v = std::getenv("SMASH_ARENA_TRACE");
+            return (v && v[0] == '1') ? 1 : 0;
+        }();
+        if (trace_arena) [[unlikely]] {
+            static uintptr_t seen[32];
+            static std::atomic<int> nseen{0};
+            int n = nseen.load(std::memory_order_relaxed);
+            bool found = false;
+            for (int i = 0; i < n && i < 32; ++i)
+                if (seen[i] == ra) { found = true; break; }
+            if (!found && n < 32) {
+                seen[n] = ra;
+                nseen.store(n + 1, std::memory_order_relaxed);
+                Dl_info info{};
+                const char* fn = "?";
+                uintptr_t off = 0;
+                if (dladdr(reinterpret_cast<void*>(ra), &info) && info.dli_fbase) {
+                    fn = info.dli_fname ? info.dli_fname : "?";
+                    off = ra - reinterpret_cast<uintptr_t>(info.dli_fbase);
+                }
+                char buf[256];
+                int len = smash::safe_snprintf(buf, sizeof(buf),
+                    "[arena-trace] ra=%p off=0x%lx stable=%x sc=%d depth=%d arena=%d in=%s\n",
+                    (void*)ra, (unsigned long)off, stable_ra, (int)sc,
+                    (int)depth_bucket, (int)base, fn);
+                if (len > 0) (void)!::write(2, buf, (size_t)len);
+            }
+        }
+#endif  // !SMASH_ABLATION_NO_CALLSITE_ARENA
         if constexpr (kColdArenaFeedback) {
             // If compressor has flagged this (arena, sc) as cold-biased,
             // route to the cold sub-arena.
@@ -1081,8 +1137,7 @@ public:
         uint8_t sc = sizeToClass(size);
         if (sc < kNumClasses) {
             ThreadCache* tc = getOrCreateThreadCache();
-            uintptr_t ra_for_arena = caller_ra ? caller_ra :
-                reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+            uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
             uint8_t arena = callsiteArena(sc, ra_for_arena);
             void* ptr = tc->allocate(sc, arena);
             if (!ptr) ptr = tc->refill(sc, arena, &slab(arena, sc));
@@ -1098,8 +1153,7 @@ public:
             return ptr;
         }
         // For large allocations, use the caller's return address for arena routing
-        uintptr_t ra_for_arena = caller_ra ? caller_ra :
-            reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
         uint8_t arena = callsiteArenaForLarge(ra_for_arena);
         void* ptr = large_alloc_.allocate(size, kMinAlignment, arena);
         if (!ptr) {
@@ -1118,10 +1172,9 @@ public:
     // first `[[likely]]` returns directly without a function call.
     [[gnu::always_inline]]
     void* malloc(size_t size) {
-        // Capture caller RA early — used for arena routing on both paths.
-        // __builtin_return_address(0) here is the address that called malloc
-        // (the application code), since this function is the interposition entry.
-        uintptr_t caller_ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        // App call site for arena routing, captured by the alloc8 wrapper
+        // entry (see appCallerRA()).
+        uintptr_t caller_ra = appCallerRA();
         if (fullMallocPath() && size > 0 && size <= kMaxSmallSize) [[likely]] {
             uint8_t sc = sizeToClass(size);
             if (ThreadCache* tc = currentThreadCache()) [[likely]] {
@@ -1350,7 +1403,7 @@ public:
             // If system posix_memalign not available, fall through to smash's allocator
         }
         if (alignment <= kMinAlignment) return this->malloc(size);
-        uintptr_t caller_ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        uintptr_t caller_ra = appCallerRA();
         uint8_t arena = callsiteArenaForLarge(caller_ra);
         return large_alloc_.allocate(size, alignment, arena);
     }

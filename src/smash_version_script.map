@@ -67,6 +67,11 @@ GLIBC_2.2.5 {
     xxthread_cleanup;
     xxthread_created_flag;
 
+    # Diagnostic / test hooks (not interposers). smash_arena_for(ptr) returns
+    # the arena a smash-managed pointer routed to; test_arena_routing uses it
+    # to guard the call-site-arena invariant.
+    smash_arena_for;
+
     # Smash syscall wrappers for kernel buffer access
     read;
     write;

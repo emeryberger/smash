@@ -72,6 +72,11 @@
     xxthread_cleanup;
     xxthread_created_flag;
 
+    # Diagnostic / test hooks (not interposers). smash_arena_for(ptr) returns
+    # the arena a smash-managed pointer routed to; test_arena_routing uses it
+    # to guard the call-site-arena invariant.
+    smash_arena_for;
+
     # alloc8 getcwd hooks (function pointers set by Smash constructor)
     xx_getcwd_prepare_hook;
     xx_getcwd_finish_hook;

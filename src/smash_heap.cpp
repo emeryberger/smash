@@ -1362,6 +1362,18 @@ static void smash_atfork_child() {
 }
 }
 
+// Exported diagnostic / test hook. Returns the arena id a smash-managed
+// pointer was routed to, or -1 for a non-smash pointer. Default visibility
+// (the TU is built with -fvisibility=hidden) + a version-script entry on
+// Linux make it dlsym-resolvable from a program running under LD_PRELOAD /
+// DYLD_INSERT_LIBRARIES. Used by test_arena_routing to guard against a
+// regression of the call-site-arena collapse (return-address capture bug).
+extern "C" __attribute__((visibility("default")))
+int smash_arena_for(const void* ptr) {
+    auto* heap = SmashRedirect::getHeap();
+    return heap ? heap->arenaFor(ptr) : -1;
+}
+
 __attribute__((constructor(202)))  // After smash_start_main_thread (201)
 static void smash_register_atfork() {
     pthread_atfork(smash_atfork_prepare,

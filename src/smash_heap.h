@@ -995,6 +995,11 @@ public:
                             slabs_[a * kNumClasses + i].setCapFn(
                                 adaptiveCapQuery, this);
                         }
+                        // Nursery instrumentation arrays (null unless the gate
+                        // is on — see CompressorThread::init).
+                        slabs_[a * kNumClasses + i].setNurseryArrays(
+                            compressor_.nurseryBirthEpochs(),
+                            compressor_.nurseryColdSeen());
                     }
                 }
             }
@@ -1140,6 +1145,7 @@ public:
             uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
             uint8_t arena = callsiteArena(sc, ra_for_arena);
             void* ptr = tc->allocate(sc, arena);
+            if (ptr) nurseryMaybeSampleReuse(ptr);
             if (!ptr) ptr = tc->refill(sc, arena, &slab(arena, sc));
             if constexpr (kMeasureCohorts) {
                 if (ptr) {
@@ -1179,7 +1185,10 @@ public:
             uint8_t sc = sizeToClass(size);
             if (ThreadCache* tc = currentThreadCache()) [[likely]] {
                 uint8_t arena = callsiteArena(sc, caller_ra);
-                if (void* ptr = tc->allocate(sc, arena)) [[likely]] return ptr;
+                if (void* ptr = tc->allocate(sc, arena)) [[likely]] {
+                    nurseryMaybeSampleReuse(ptr);
+                    return ptr;
+                }
                 if (void* ptr = tc->refill(sc, arena, &slab(arena, sc)))
                     return ptr;
             }
@@ -1551,6 +1560,27 @@ public:
         }
         if (!span) return -1;
         return static_cast<int>(span->arena_id);
+    }
+
+    // Q2 (nursery instrumentation): sample thread-cache reuse hits and count
+    // how often the reused slot lands on a page the compressor considers
+    // cooling — the LIFO-reuse-onto-cold mixing a page nursery would prevent.
+    // noinline slow path; the gate keeps the malloc fast path at one branch.
+    [[gnu::noinline]] void nurserySampleReuseSlow(void* ptr) {
+        static thread_local uint32_t ctr = 0;
+        if ((++ctr & 63u) != 0) return;   // 1/64 sample
+        uint8_t* cc = compressor_.coldCounts();
+        if (!cc) return;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (!(vm_region_.inContigArena(addr) && vm_region_.hasSpanTable())) return;
+        size_t page_idx = vm_region_.contigPageIndex(addr);
+        bool onto_cold = cc[page_idx] >=
+            static_cast<uint8_t>(coolingCloseDefaultTicks());
+        nurseryOnReuseSample(onto_cold);
+    }
+    [[gnu::always_inline]] void nurseryMaybeSampleReuse(void* ptr) {
+        if (!nurseryStatsOn()) [[likely]] return;
+        nurserySampleReuseSlow(ptr);
     }
 
     // Whole-heap lock/unlock used by the pthread_atfork prepare/parent handlers

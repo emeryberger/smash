@@ -69,6 +69,13 @@ struct Span {
     // so phase2 doesn't compress pages that are still being filled.
     uint8_t*        cold_counts;
 
+    // Nursery instrumentation (SMASH_NURSERY_STATS): elapsed-allocation epoch
+    // and thread id stamped by the slab when this span (re)enters service, read
+    // at the fully-empty turnover event for same-thread attribution.
+    // Measurement-only; when the gate is off these are set but never read.
+    uint32_t        birth_epoch;
+    uint32_t        alloc_tid;
+
     // Initialize a slab span for the given size class.
     //
     // When max_slots_per_page > 0 and object_size < kPageSize, only the first

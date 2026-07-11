@@ -20,6 +20,7 @@
 #include "../vm/platform_mem.h"
 #include "../core/bootstrap_alloc.h"
 #include "../core/page_map.h"
+#include "../core/nursery_stats.h"  // SMASH_NURSERY_STATS: page age/turnover instrumentation
 #include "../util/spinlock.h"
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
@@ -331,6 +332,12 @@ class CompressorThread {
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
     uint8_t* cold_count_ = nullptr;
+
+    // Nursery instrumentation (SMASH_NURSERY_STATS): per-page span birth epoch
+    // (stamped by the slab) and a once-per-life "already counted as cold" flag.
+    // Allocated only when the gate is on. Used for the age-at-first-cold histogram.
+    uint32_t* nursery_birth_epoch_ = nullptr;
+    uint8_t*  nursery_cold_seen_ = nullptr;
 
     // Per-page tier marker for tiered recompression.  0 = no blob (page in
     // ACTIVE/COMPRESSING/etc.), 1 = fast-tier blob (LZ4 or zstd-1, eligible
@@ -1848,6 +1855,15 @@ private:
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             return false;
+        }
+
+        // Q3: this page has been decided cold (first compression this life).
+        // Record the elapsed-allocation age since its span's birth, once.
+        if (nursery_cold_seen_ && !nursery_cold_seen_[page_idx]) {
+            nursery_cold_seen_[page_idx] = 1;
+            uint64_t born = nursery_birth_epoch_[page_idx];
+            uint64_t now = nurseryEpoch();
+            nurseryOnPageCold(now >= born ? now - born : 0);
         }
 
         // Tier selection: either ROI cost/benefit model or UCB1-Tuned bandit.
@@ -4280,6 +4296,8 @@ public:
     // the cold counter for their containing page — pages still receiving
     // allocations should never be eligible for compression.
     uint8_t* coldCounts() const { return cold_count_; }
+    uint32_t* nurseryBirthEpochs() const { return nursery_birth_epoch_; }
+    uint8_t* nurseryColdSeen() const { return nursery_cold_seen_; }
 
     void init(VmRegion* vm, PageStateTable* states, PageLockTable* locks,
               CompressStore* store, CompressEngine* engine,
@@ -4298,6 +4316,10 @@ public:
         compressed_ = bootstrapArray<CompressedPageInfo>(max_pages);
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
+        if (nurseryStatsOn()) {
+            nursery_birth_epoch_ = bootstrapArray<uint32_t>(max_pages);
+            nursery_cold_seen_ = bootstrapArray<uint8_t>(max_pages);
+        }
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
         compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
         // Soft-dirty ROI per-page arrays: only allocate when the gate is on
@@ -4833,6 +4855,9 @@ public:
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
         if (n > 0) (void)!write(2, buf, (size_t)n);
+
+        // SMASH_NURSERY_STATS=1: dump page turnover / age-at-cold instrumentation.
+        nurseryDump();
 
         // SMASH_BUCKET_STATS=1: dump per-(arena, size_class) stats
         static const bool bucket_stats = []{

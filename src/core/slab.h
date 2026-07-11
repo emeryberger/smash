@@ -8,6 +8,7 @@
 #include "span.h"
 #include "page_map.h"
 #include "size_classes.h"
+#include "nursery_stats.h"
 #include "../util/spinlock.h"
 #include "../util/intrusive_list.h"
 #include "../vm/platform_mem.h"
@@ -44,6 +45,10 @@ class Slab {
     // it just handed out a chunk on — pages still receiving allocations
     // should not be eligible for compression yet.
     uint8_t* cold_counts_ = nullptr;
+    // Nursery instrumentation arrays (SMASH_NURSERY_STATS), owned by the
+    // compressor, plumbed via setNurseryArrays(). Null when the gate is off.
+    uint32_t* nursery_birth_epochs_ = nullptr;
+    uint8_t*  nursery_cold_seen_ = nullptr;
     void (*release_hook_)(size_t, size_t, void*) = nullptr;
     void* release_ctx_ = nullptr;
 
@@ -131,6 +136,11 @@ class Slab {
             full_.remove(span);
             partial_.pushFront(span);
         } else if (span->empty()) {
+            // Q1: whole-span turnover. same_tid is approximate — a free applied
+            // via the deferred (contended) path runs on a drain thread, not the
+            // original freer, so those are misattributed; the uncontended path
+            // (the common case) attributes correctly.
+            nurseryOnTurnover(nurseryTid() == span->alloc_tid);
             partial_.remove(span);
             decommitEmptySpan(span);
             empty_.pushFront(span);
@@ -169,6 +179,7 @@ class Slab {
             // so the fresh span's pages classify as warm, not cooling.
             resetColdCounts(span);
         }
+        nurseryStampBirth(span);
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
     }
@@ -213,6 +224,24 @@ class Slab {
         __builtin_memset(cold_counts_ + idx, 0, span->page_count);
     }
 
+    // Nursery instrumentation: stamp this span's birth (elapsed-allocation
+    // epoch + allocating thread) when it (re)enters service, and reset the
+    // per-page age/cold-seen arrays so the next cold transition dates from
+    // this life. No-op when the gate is off.
+    void nurseryStampBirth(Span* span) {
+        if (!nurseryStatsOn()) return;
+        span->birth_epoch = static_cast<uint32_t>(nurseryEpoch());
+        span->alloc_tid = nurseryTid();
+        nurseryOnSpanBirth();
+        if (nursery_birth_epochs_ && vm_region_) {
+            size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
+            for (uint32_t p = 0; p < span->page_count; ++p) {
+                nursery_birth_epochs_[idx + p] = span->birth_epoch;
+                if (nursery_cold_seen_) nursery_cold_seen_[idx + p] = 0;
+            }
+        }
+    }
+
     // Restore page state when reusing a decommitted empty span.
     // Physical pages are zero-filled by the kernel on first access
     // (MADV_DONTNEED on Linux, MADV_FREE on macOS).
@@ -225,9 +254,18 @@ class Slab {
         // streak that would classify them as cooling and defeat the redirect
         // that chose this span precisely because it has nothing to protect.
         resetColdCounts(span);
+        // Re-entering service counts as a fresh birth for age/turnover.
+        nurseryStampBirth(span);
     }
 
 public:
+    // Plumb the compressor-owned nursery instrumentation arrays. Null-safe;
+    // called once during init when SMASH_NURSERY_STATS is on.
+    void setNurseryArrays(uint32_t* birth_epochs, uint8_t* cold_seen) {
+        nursery_birth_epochs_ = birth_epochs;
+        nursery_cold_seen_ = cold_seen;
+    }
+
     void init(uint8_t sc, PageMap* pm,
               VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
               void (*hook)(size_t, size_t, void*) = nullptr,
@@ -355,6 +393,8 @@ public:
     size_t allocateBatch(void** out, size_t count) {
         LockGuard guard(lock_);
         drainPending();  // apply any deferred cross-thread frees first
+        // Advance the coarse elapsed-allocation clock once per refill batch.
+        nurseryBumpEpoch();
         size_t allocated = 0;
         // One empty-span redirect per refill: when the front partial span
         // has only cooling/compressed free slots, switch to a decommitted

@@ -241,6 +241,37 @@ endfunction()
 add_mode_compression_test(test_malloc_compression 0)      # full mode
 add_mode_compression_test(test_large_only_compression 1)  # large-only mode
 
+# Arena-routing regression guard: runs under interposition and asserts that
+# allocations from many distinct call sites do NOT all collapse into one arena
+# (the LTO/wrapper return-address bug). Full mode so 256 B allocations take the
+# slab path and receive an arena; CPU/thread hashing pinned off so the arena is
+# a pure function of the return address. Fast + deterministic (no compressor).
+add_executable(arena_routing_test arena_routing_test.cpp)
+set_target_properties(arena_routing_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(arena_routing_test PRIVATE ${CMAKE_DL_LIBS})
+if(APPLE)
+  add_test(
+    NAME test_arena_routing
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "DYLD_FORCE_FLAT_NAMESPACE=1"
+      "MallocNanoZone=0"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_CPU_ARENA=0"
+      $<TARGET_FILE:arena_routing_test>
+  )
+else()
+  add_test(
+    NAME test_arena_routing
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_CPU_ARENA=0"
+      $<TARGET_FILE:arena_routing_test>
+  )
+endif()
+set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
+
 # Syscall EFAULT-retry test: allocates a buffer, forces compression, then
 # issues real syscalls (read/writev/readv) directly on the compressed
 # buffer. Verifies that the EFAULT-driven retry path in syscall_compat.h

@@ -1532,6 +1532,27 @@ public:
         return classSize(span->size_class);
     }
 
+    // Diagnostic / test hook: the arena a smash-managed pointer was routed to,
+    // or -1 for a non-smash pointer (foreign, or large-only passthrough).
+    // Backs the exported smash_arena_for(); the arena-routing regression test
+    // uses it to assert distinct call sites don't collapse into one arena
+    // (the LTO/interposition return-address bug fixed in the RA-capture change).
+    // Same span resolution as free()/getSize().
+    int arenaFor(const void* ptr) {
+        if (!ptr) return -1;
+        if (BootstrapAlloc::instance().owns(ptr)) return -1;
+        if (isCompressOnlyMode() || isPassthroughMode()) return -1;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        Span* span;
+        if (vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()) {
+            span = vm_region_.getSpan(vm_region_.contigPageIndex(addr));
+        } else {
+            span = page_map_.get(addr);
+        }
+        if (!span) return -1;
+        return static_cast<int>(span->arena_id);
+    }
+
     // Whole-heap lock/unlock used by the pthread_atfork prepare/parent handlers
     // to quiesce every slab + the large-alloc lock across fork(). Clang Thread
     // Safety Analysis cannot reason about acquiring an *array* of mutexes in a

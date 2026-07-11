@@ -856,11 +856,29 @@ public:
     //   mid-tick leaves the child holding page-locks (etc.) acquired by a
     //   thread that no longer exists.
     // parent:  resume normal ticks.
-    // child:   reset thread bookkeeping and immediately respawn the
-    //   compressor. We're in a fresh single-thread context, so
-    //   pthread_create is fine here. Inherited PageState is left alone:
-    //   COMPRESSED pages stay decompressible-on-fault because the
-    //   compressed bytes live in BootstrapAlloc memory mapped CoW.
+    // child:   reset thread bookkeeping and mark compression not-started so it
+    //   respawns LAZILY on the child's next thread creation (threadInit) — NOT
+    //   synchronously here. Inherited PageState is left alone: COMPRESSED pages
+    //   stay decompressible-on-fault because the compressed bytes live in
+    //   BootstrapAlloc memory mapped CoW.
+    //
+    // Why not respawn the compressor here: startCompression() calls
+    // pthread_create(), which alloc8 interposes and routes through xxmalloc ->
+    // Slab::allocateBatch. If any slab/store lock was held at fork() time by a
+    // thread that no longer exists in the child, that allocation spins forever
+    // on the inherited-locked spinlock (the classic multithreaded-fork bug;
+    // see issue #61 — the atfork prepare does not yet quiesce the allocator
+    // locks). Forcing an allocation in the child handler makes EVERY forked
+    // child pay that risk, including children that never allocate on their own
+    // — e.g. Redis's startup checkLinuxMadvFreeForkBug(), whose fork child only
+    // madvise()s a raw page and writes a byte to a pipe. That child deadlocked
+    // here, hanging redis-server before it could serve (regression from
+    // 8c11ee79). Deferring respawn to the first real thread creation keeps
+    // non-allocating and fork+exec children deadlock-free while still restoring
+    // the compressor for children that go on to do threaded work (the
+    // multiprocessing/worker case 8c11ee79 targeted). A child that persists
+    // single-threaded and only allocates gets no compressor until issue #61's
+    // full prepare-side quiesce lands — strictly safer than deadlocking.
     void preparePauseForFork() {
         if (!compression_inited_) return;
         compressor_.pauseForFork();
@@ -871,11 +889,15 @@ public:
     }
     void resetForFork() {
         if (!compression_inited_) return;
-        // Reset decommit thread first (it doesn't exist in child after fork)
+        // Reset decommit thread first (it doesn't exist in child after fork).
+        // These reset internal bookkeeping only; they must not allocate or take
+        // a slab lock (the child stack that motivated this fix reached them
+        // safely and only deadlocked at the subsequent startCompression()).
         vm_region_.resetDecommitThreadForFork();
         compressor_.resetForFork();
+        // Mark not-started; threadInit() respawns on the child's next thread
+        // creation, on a clean stack rather than inside this atfork handler.
         compression_started_.store(false, std::memory_order_release);
-        startCompression();
     }
 
     // Stop compressor and drain compressed pages back to PROT_RW. Called

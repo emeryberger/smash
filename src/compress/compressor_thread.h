@@ -4819,14 +4819,16 @@ public:
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
-            "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu\n",
+            "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu"
+            "  reheat=%llu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
             (unsigned long long)tier_attempts,
             spilled,
             (unsigned long long)self->zero_pages_.load(std::memory_order_relaxed),
-            raw_bump);
+            raw_bump,
+            (unsigned long long)g_reheat_events.load(std::memory_order_relaxed));
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.

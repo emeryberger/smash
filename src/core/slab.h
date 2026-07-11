@@ -165,6 +165,9 @@ class Slab {
             span->first_page_vm_idx = static_cast<uint32_t>(
                 vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem)));
             span->cold_counts = cold_counts_;
+            // Page ranges recycle across spans: clear any stale cold streak
+            // so the fresh span's pages classify as warm, not cooling.
+            resetColdCounts(span);
         }
         page_map_->setRange(reinterpret_cast<uintptr_t>(mem), info.pages, span);
         return span;
@@ -200,6 +203,16 @@ class Slab {
         }
     }
 
+    // Clear the cold streak on every page of a span so it classifies as
+    // warm. Needed when a span's pages (re)enter service — the cold-count
+    // array is indexed by VM page and keeps whatever streak the previous
+    // occupant left behind.
+    void resetColdCounts(Span* span) {
+        if (!cold_counts_ || !vm_region_) return;
+        size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
+        __builtin_memset(cold_counts_ + idx, 0, span->page_count);
+    }
+
     // Restore page state when reusing a decommitted empty span.
     // Physical pages are zero-filled by the kernel on first access
     // (MADV_DONTNEED on Linux, MADV_FREE on macOS).
@@ -208,6 +221,10 @@ class Slab {
             size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
             page_states_->setRange(idx, span->page_count, PageState::ACTIVE);
         }
+        // The span sat idle in the empty list — its pages carry a stale cold
+        // streak that would classify them as cooling and defeat the redirect
+        // that chose this span precisely because it has nothing to protect.
+        resetColdCounts(span);
     }
 
 public:
@@ -257,7 +274,29 @@ public:
         Span* span = partial_.front();
         if (span) {
             maybeWiden(span);
-            void* ptr = span->allocate();
+            Span::AllocFallback fb;
+            void* ptr = span->allocateWarm(&fb);
+            if (!ptr && fb.any()) {
+                // The span's only free slots are on cooling/compressed pages.
+                // Prefer a decommitted empty span: committing one of its
+                // pages costs the same 4 KB the cooling page would keep
+                // resident, and lets the cooling page finish cooling and
+                // compress. Never allocate a NEW span for this — if the
+                // empty list is dry, consume the fallback (no page-count
+                // growth either way).
+                if (Span* es = empty_.popFront()) {
+                    // Rotate the warmless span to the back so the next
+                    // allocation doesn't rescan it while it cools.
+                    partial_.remove(span);
+                    partial_.pushBack(span);
+                    recommitEmptySpan(es);
+                    partial_.pushFront(es);
+                    span = es;
+                    ptr = span->allocate();
+                } else {
+                    ptr = span->consumeFallback(fb);
+                }
+            }
             if (span->full()) {
                 partial_.remove(span);
                 full_.pushFront(span);
@@ -317,6 +356,13 @@ public:
         LockGuard guard(lock_);
         drainPending();  // apply any deferred cross-thread frees first
         size_t allocated = 0;
+        // One empty-span redirect per refill: when the front partial span
+        // has only cooling/compressed free slots, switch to a decommitted
+        // empty span instead of backfilling (same physical cost, and the
+        // cooling pages get to compress). Bounded to one redirect so a
+        // refill can't churn the empty list; after that, fallbacks are
+        // consumed normally. Never allocates a NEW span for this.
+        bool redirected = false;
 
         while (allocated < count) {
             Span* span = partial_.front();
@@ -335,7 +381,23 @@ public:
             uintptr_t first_page = 0;
             bool first_in_batch = (allocated == 0);
             while (allocated < count) {
-                void* ptr = span->allocate();
+                Span::AllocFallback fb;
+                void* ptr = span->allocateWarm(&fb);
+                if (!ptr && fb.any()) {
+                    if (!redirected && empty_.front()) {
+                        // Rotate the warmless span to the back so it cools
+                        // undisturbed; the outer loop picks up the empty
+                        // span we just promoted.
+                        redirected = true;
+                        partial_.remove(span);
+                        partial_.pushBack(span);
+                        Span* es = empty_.popFront();
+                        recommitEmptySpan(es);
+                        partial_.pushFront(es);
+                        break;  // outer loop re-reads partial_.front()
+                    }
+                    ptr = span->consumeFallback(fb);
+                }
                 if (!ptr) break;
                 if (kPageLocalBatch) {
                     uintptr_t p = reinterpret_cast<uintptr_t>(ptr) & ~(kPageSize - 1);

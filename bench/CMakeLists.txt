@@ -181,6 +181,10 @@ target_link_libraries(bench_json PRIVATE cjson_static)
 # Key-value store simulation (unordered_map with Zipfian access)
 smash_add_standalone_bench(bench_kv_store bench_kv_store.cpp)
 
+# Churn re-heat: measures cooling-page closing (allocation churn re-heating
+# pages that hold cold survivors). A/B via SMASH_COOLING_CLOSE_TICKS=0.
+smash_add_standalone_bench(bench_churn_reheat bench_churn_reheat.cpp)
+
 # Configurable cold/hot mix microbenchmark (raw malloc/free)
 smash_add_standalone_bench(bench_coldhotmix bench_coldhotmix.cpp)
 

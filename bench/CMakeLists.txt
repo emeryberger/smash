@@ -28,12 +28,30 @@
 
 find_package(Threads REQUIRED)
 
-# ── Architectures for external static-library deps (macOS) ───────────────────
-# The root CMakeLists builds fat arm64+arm64e (needed so libsmash can interpose
-# into both arm64 and arm64e processes). Any external static lib we link INTO a
-# bench must therefore be fat too, or the link drops every object with
-# "found architecture arm64, required architecture arm64e".
+# ── Architectures for benches and their deps (macOS) ─────────────────────────
+# libsmash itself is built fat (arm64 + arm64e) so it can interpose into BOTH
+# kinds of process. The benches are the opposite case: they are the application
+# under test, and they must be arm64-ONLY.
 #
+# A fat executable runs its arm64e slice on Apple Silicon, and dyld refuses to
+# load an arm64-only dylib into an arm64e process ("incompatible architecture
+# (have 'arm64', need 'arm64e')" — the process aborts before main). Everything
+# we preload into a bench is arm64-only:
+#
+#   - the RELEASED libsmash-macos-arm64.dylib. release.yml builds it arm64-only
+#     on purpose: a user-built arm64e slice cannot be codesigned or loaded
+#     without Apple's ARMA entitlement, so arm64 is the drop-in slice for
+#     ordinary apps. A fat bench cannot load the artifact we actually ship.
+#   - the comparison allocators (mimalloc, jemalloc, tcmalloc) in allocators/.
+#
+# Real applications are arm64, so an arm64 bench is also the honest model of
+# one. Set it at directory scope: it covers every bench target here (present and
+# future) and flows into the ExternalProject deps below, so their static libs
+# match and the link doesn't drop objects for a mismatched slice.
+if(APPLE)
+  set(CMAKE_OSX_ARCHITECTURES "arm64")
+endif()
+
 # CMAKE_OSX_ARCHITECTURES is a ;-list, and ExternalProject_Add splits CMAKE_ARGS
 # on ';' — so re-encode with '|' and pair with LIST_SEPARATOR | at each use.
 # Empty on Linux, where -DCMAKE_OSX_ARCHITECTURES= is simply ignored.
@@ -538,12 +556,6 @@ if(NOT SMASH_BUILD_BENCH_DEPS)
     smash_add_standalone_bench(bench_rocksdb bench_rocksdb.cpp)
     target_link_libraries(bench_rocksdb PRIVATE ${ROCKSDB_LIB})
     target_include_directories(bench_rocksdb PRIVATE ${ROCKSDB_INCLUDE})
-    if(APPLE)
-      # Only reachable with SMASH_BUILD_BENCH_DEPS=OFF, where we link Homebrew's
-      # librocksdb — it ships arm64-only, so this bench cannot be fat. The
-      # deps-built path (bench_rocksdb_builtin) links our own fat RocksDB.
-      set_target_properties(bench_rocksdb PROPERTIES OSX_ARCHITECTURES "arm64")
-    endif()
     message(STATUS "RocksDB found (system): ${ROCKSDB_LIB}")
   else()
     message(STATUS "RocksDB not found (optional)")
@@ -568,10 +580,6 @@ if(NOT SMASH_BUILD_BENCH_DEPS AND ROCKSDB_LIB AND ROCKSDB_INCLUDE)
   target_link_libraries(bench_heap_compress_rocksdb PRIVATE
     ${ROCKSDB_LIB} lz4_static libzstd_static)
   target_include_directories(bench_heap_compress_rocksdb PRIVATE ${ROCKSDB_INCLUDE})
-  if(APPLE)
-    # See bench_rocksdb above: Homebrew's librocksdb is arm64-only.
-    set_target_properties(bench_heap_compress_rocksdb PROPERTIES OSX_ARCHITECTURES "arm64")
-  endif()
 endif()
 
 # Remote process heap page sampler (macOS only — uses mach_vm_read)

@@ -217,6 +217,41 @@ make -j$(nproc)
 
 This is what the CI regression-spotting workflow uses (see `.github/workflows/ci.yml`).
 
+### Build competing allocators as preloadable libraries
+
+`SMASH_BUILD_BENCH_ALLOCATORS` links other allocators *into* the `bench_alloc_*`
+binaries. To instead get standalone shared libraries you can drop in for
+`libsmash` on an unmodified application (`LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`),
+build the `allocators` target — the same arrangement Hoard uses:
+
+```bash
+cmake .. -DBUILD_ALL_ALLOCATORS=ON     # or -DBUILD_MIMALLOC=ON, etc.
+make allocators
+```
+
+The libraries are collected in `build/allocators/lib/`:
+
+| Option | Builds | Source |
+|--------|--------|--------|
+| `BUILD_MIMALLOC` | `libmimalloc` | microsoft/mimalloc, tag `MIMALLOC_TAG` (default `v2.1.7`) |
+| `BUILD_JEMALLOC` | `libjemalloc` | jemalloc/jemalloc, tag `JEMALLOC_TAG` (default `5.3.0`) |
+| `BUILD_TCMALLOC` | `libtcmalloc`, `libtcmalloc_minimal` | gperftools/gperftools, tag `GPERFTOOLS_TAG` (default `gperftools-2.16`) |
+| `BUILD_HOARD` | `libhoard` | emeryberger/Hoard, tag `HOARD_TAG`; set `-DHOARD_DIR=~/git/Hoard` to build a local checkout |
+
+`BUILD_ALL_ALLOCATORS=ON` turns on all four. All default to `OFF`, so a normal
+build (and the CI build) never fetches or configures any of them. Each allocator
+is built in its own ExternalProject tree, independent of the static mimalloc that
+`SMASH_BUILD_BENCH_ALLOCATORS` links into the bench binaries.
+
+On Linux, all four interpose under `LD_PRELOAD` (verified on Ubuntu 22.04 /
+glibc 2.35: a program's `malloc` resolves to the preloaded library in every
+case). **On macOS, only mimalloc and Hoard interpose** under
+`DYLD_INSERT_LIBRARIES` — mimalloc installs a malloc zone from a constructor and
+Hoard uses alloc8's `__interpose` section. jemalloc and gperftools export
+`malloc`/`free` but nothing binds to them under the two-level namespace, and both
+register their zone lazily from their own first `malloc`, which never runs; they
+still build, and the `bench_alloc_*` binaries link them directly.
+
 ### Build with benchmark dependencies (Redis, memcached, RocksDB)
 
 For full A/B benchmarking, build the external dependencies from source. This ensures they use system malloc (libc) instead of their default allocators (jemalloc), which is required for Smash to effectively compress their memory.

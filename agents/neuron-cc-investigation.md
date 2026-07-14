@@ -2,6 +2,30 @@
 
 This document captures the detailed investigation into running smash under neuron-cc (AWS Neuron compiler). The production-supported configuration for neuron-cc is `SMASH_LARGE_ONLY=1` (see CLAUDE.md).
 
+## Effectiveness study — where smash's RSS win actually comes from (2026-07-13)
+
+Goal this round: not correctness, but *why smash gives little benefit* on neuron-cc, and what would improve it. Ran on plain EC2 x86-64 (no Inferentia/Trainium — host-side compile only). Setup, harness, and full data in the `project_neuron_smash_effectiveness` memory; key conclusions:
+
+**Process-level memory breakdown of a compile (24-layer transformer, `neuronx-cc compile ... --target trn1`):** peak tree RSS ≈ 1819 MiB, dominated by **`hlo2penguin` (1668 MiB, ~92%)**, then the `neuronx-cc` python driver (640), `walrus_driver` (313), `hlo-neff-wrapper` (98). So the memory-critical process is **hlo2penguin (HLO→penguin-IR front-end), not walrus_driver.**
+
+**Reachability (nm -D audit of neuronx-cc 2.24 starfish binaries):**
+- **`hlo2penguin` uses glibc `malloc`/`free`/`calloc`/`realloc`/`posix_memalign` + `operator new` + libc `mmap`/`munmap`, ALL via PLT, and links ZERO tcmalloc.** → `LD_PRELOAD=libsmash.so` fully manages its heap. The dominant consumer is reachable.
+- **`libwalrus.so` (driving `walrus_driver`) statically links its own tcmalloc** (166 tcmalloc syms; exports `malloc/free/...`+`TCMalloc_SystemAlloc` as strong globals; **no undefined malloc/free imports**) and reaches the OS via **`__sbrk`** (imports `__sbrk`/`madvise`/`mprotect`/`posix_madvise`, **not `mmap`**). Both of smash's hooks (malloc, mmap) miss it entirely → the 313 MiB walrus part is truly bypassed. This is the same static-tcmalloc issue as the older section below — **still unfixed in 2.24.** TBB is present (825 syms) but as the **task scheduler**, not the allocator (`scalable_malloc` is a weak-undefined ref → falls through to tcmalloc).
+
+**Measured effect (large-only mode; full mode `LD_PRELOAD` CRASHES the compile with `free(): invalid pointer`, rc=70 — the libwalrus cross-allocator boundary, so full mode is not viable). Two model scales:**
+
+| model | baseline peak | large-only peak | Δ RSS | Δ wall |
+|---|---|---|---|---|
+| 24-layer (hlo2penguin 1.7 GB, ~5 s) | 1819 MiB | 1488 MiB | **−18%** | ~same |
+| 48-layer (hlo2penguin 9.5 GB, ~6 min) | 9694 MiB | 9820 MiB | **+1.3% (none)** | **+22% slower (469 s vs 385 s)** |
+
+- **The small-model −18% does NOT survive scale.** At a realistic 9.5 GB compile, large-only gives no RSS reduction and costs ~22% runtime.
+- **Compression contributes exactly 0 at both scales.** Isolation (24-layer): compression-ON 1487, OFF (`SMASH_COLD_TIMEOUT_SEC=99999`) 1488, AGGRESSIVE (`cold=0`) 1488 — identical. (48-layer): ON 9820, OFF 9816 — identical.
+- **Why:** (a) a compiler's peak memory is its **hot, live IR working set** — no cold pages at peak, so smash's cold-page compression has nothing to act on; (b) at scale glibc already `mmap`s/`munmap`s hlo2penguin's large buffers (its mmap threshold grows to 32 MB), so smash's allocator can't beat it and only adds overhead. The small-model −18% was smash's arena being tighter than glibc's for mid-sized allocations, a regime realistic compiles don't live in.
+
+**Implication for "improving smash's effectiveness on neuron":** none of smash's mechanisms help this workload at scale. Compression is structurally inapplicable (hot working set — do NOT pursue cold-timeout/codec tuning; verified 0 effect). The allocator edge doesn't generalize. Capturing the bypassed walrus part would need sbrk/brk interposition (new feature) but is low-ROI (minor + also hot). The genuinely useful RSS knob is non-smash: reduce `walrus_driver`'s TBB compile parallelism (`parallel_for_in_arenas`/ModuleForkPass fan-out inflates peak) — a Neuron flag, trading wall time for lower peak.
+
+
 ## Decompress-on-fault TOCTOU race (2026-06-05, FIXED)
 
 The dominant full-mode failure on neuron-cc (nondeterministic ~67% failure rate, surfacing as "overlapping memloc", BIR-verification, scheduler, or DenseMap assertions inside the multithreaded `walrus_driver mod_parallel_pass`) was a real smash bug, not a neuron-cc bug. `handleFault()` / `prefetchAdjacent()` restored a compressed page by doing `mprotect(PROT_RW)` **then** `memcpy(decompressed)`, leaving a window in which the page was readable but still held stale/zero bytes. A concurrent app thread doing a plain load on that page does not fault and does not take the per-page lock, so it read the wrong data and corrupted the compiler's state.

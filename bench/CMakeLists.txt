@@ -28,6 +28,17 @@
 
 find_package(Threads REQUIRED)
 
+# ── Architectures for external static-library deps (macOS) ───────────────────
+# The root CMakeLists builds fat arm64+arm64e (needed so libsmash can interpose
+# into both arm64 and arm64e processes). Any external static lib we link INTO a
+# bench must therefore be fat too, or the link drops every object with
+# "found architecture arm64, required architecture arm64e".
+#
+# CMAKE_OSX_ARCHITECTURES is a ;-list, and ExternalProject_Add splits CMAKE_ARGS
+# on ';' — so re-encode with '|' and pair with LIST_SEPARATOR | at each use.
+# Empty on Linux, where -DCMAKE_OSX_ARCHITECTURES= is simply ignored.
+string(REPLACE ";" "|" SMASH_BENCH_OSX_ARCHS "${CMAKE_OSX_ARCHITECTURES}")
+
 # ── Option to build external benchmark dependencies ──────────────────────────
 # ON by default when SMASH_BUILD_BENCH=ON.  Set -DSMASH_BUILD_BENCH_DEPS=OFF to skip.
 option(SMASH_BUILD_BENCH_DEPS "Build external benchmark dependencies (Redis, memcached, RocksDB)" ON)
@@ -137,25 +148,16 @@ smash_add_bench(bench_algo_compare bench_algo_compare.cpp)
 # the allocator into the benchmark.
 add_executable(bench_rss bench_rss.cpp)
 target_link_libraries(bench_rss PRIVATE ${CMAKE_DL_LIBS})
-if(APPLE)
-  set_target_properties(bench_rss PROPERTIES OSX_ARCHITECTURES "arm64")
-endif()
 
 # Allocation speed — standalone (threadtest, larson, linux-scalability)
 add_executable(bench_alloc_speed bench_alloc_speed.cpp)
 target_link_libraries(bench_alloc_speed PRIVATE Threads::Threads)
-if(APPLE)
-  set_target_properties(bench_alloc_speed PROPERTIES OSX_ARCHITECTURES "arm64")
-endif()
 
 # Compression ratio comparison: smash vs OS compressor (standalone, LD_PRELOAD)
 add_executable(bench_compression_vs_zswap bench_compression_vs_zswap.cpp)
 target_link_libraries(bench_compression_vs_zswap PRIVATE Threads::Threads lz4_static libzstd_static)
 target_include_directories(bench_compression_vs_zswap PRIVATE
   ${lz4_SOURCE_DIR}/lib ${zstd_SOURCE_DIR}/lib)
-if(APPLE)
-  set_target_properties(bench_compression_vs_zswap PROPERTIES OSX_ARCHITECTURES "arm64")
-endif()
 
 # Alloc/free latency percentiles
 add_executable(bench_latency
@@ -537,6 +539,9 @@ if(NOT SMASH_BUILD_BENCH_DEPS)
     target_link_libraries(bench_rocksdb PRIVATE ${ROCKSDB_LIB})
     target_include_directories(bench_rocksdb PRIVATE ${ROCKSDB_INCLUDE})
     if(APPLE)
+      # Only reachable with SMASH_BUILD_BENCH_DEPS=OFF, where we link Homebrew's
+      # librocksdb — it ships arm64-only, so this bench cannot be fat. The
+      # deps-built path (bench_rocksdb_builtin) links our own fat RocksDB.
       set_target_properties(bench_rocksdb PROPERTIES OSX_ARCHITECTURES "arm64")
     endif()
     message(STATUS "RocksDB found (system): ${ROCKSDB_LIB}")
@@ -564,6 +569,7 @@ if(NOT SMASH_BUILD_BENCH_DEPS AND ROCKSDB_LIB AND ROCKSDB_INCLUDE)
     ${ROCKSDB_LIB} lz4_static libzstd_static)
   target_include_directories(bench_heap_compress_rocksdb PRIVATE ${ROCKSDB_INCLUDE})
   if(APPLE)
+    # See bench_rocksdb above: Homebrew's librocksdb is arm64-only.
     set_target_properties(bench_heap_compress_rocksdb PROPERTIES OSX_ARCHITECTURES "arm64")
   endif()
 endif()
@@ -712,11 +718,16 @@ if(SMASH_BUILD_BENCH_DEPS)
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/lz4
     SOURCE_SUBDIR build/cmake
+    LIST_SEPARATOR |
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
       -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
       -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      "-DCMAKE_OSX_ARCHITECTURES=${SMASH_BENCH_OSX_ARCHS}"
+      # lz4 v1.9.4 declares cmake_minimum_required(2.8.12); CMake >= 4 dropped
+      # compatibility with < 3.5.
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       -DBUILD_STATIC_LIBS=ON
       -DBUILD_SHARED_LIBS=OFF
       -DLZ4_BUILD_CLI=OFF
@@ -738,11 +749,13 @@ if(SMASH_BUILD_BENCH_DEPS)
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/zstd
     SOURCE_SUBDIR build/cmake
+    LIST_SEPARATOR |
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
       -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
       -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      "-DCMAKE_OSX_ARCHITECTURES=${SMASH_BENCH_OSX_ARCHS}"
       -DZSTD_BUILD_STATIC=ON
       -DZSTD_BUILD_SHARED=OFF
       -DZSTD_BUILD_PROGRAMS=OFF
@@ -774,11 +787,13 @@ if(SMASH_BUILD_BENCH_DEPS)
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/rocksdb
     DEPENDS bench_lz4_build bench_zstd_build
+    LIST_SEPARATOR |
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
       -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
       -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      "-DCMAKE_OSX_ARCHITECTURES=${SMASH_BENCH_OSX_ARCHS}"
       ${_ROCKSDB_CXX_FLAGS_ARG}
       -DWITH_TESTS=OFF
       -DWITH_BENCHMARK_TOOLS=OFF
@@ -807,11 +822,13 @@ if(SMASH_BUILD_BENCH_DEPS)
     GIT_TAG 1.23
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/leveldb
+    LIST_SEPARATOR |
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
       -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
       -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      "-DCMAKE_OSX_ARCHITECTURES=${SMASH_BENCH_OSX_ARCHS}"
       -DLEVELDB_BUILD_TESTS=OFF
       -DLEVELDB_BUILD_BENCHMARKS=OFF
       -DBUILD_SHARED_LIBS=OFF
@@ -833,6 +850,16 @@ if(SMASH_BUILD_BENCH_DEPS)
   find_library(PCRE2_LIB pcre2-8 HINTS /usr/lib /usr/lib64 /usr/local/lib)
   find_path(PCRE2_INCLUDE pcre2.h HINTS /usr/include /usr/local/include)
   if(AUTORECONF AND PCRE2_LIB)
+    # Varnish 7.6.0 predates C23 and uses `bool` as a struct member name, so it
+    # needs a pre-C23 dialect on toolchains that now default to C23. Its
+    # configure also appends -Werror unconditionally, and clang (unlike gcc)
+    # diagnoses `char buf[lim + sizeof(x)]` with a const int lim as a folded
+    # VLA (cache_vpi.c). Disable that clang-only warning; a disabled warning is
+    # not promoted by the later -Werror.
+    set(VARNISH_CFLAGS "-std=gnu17")
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+      set(VARNISH_CFLAGS "${VARNISH_CFLAGS} -Wno-gnu-folding-constant")
+    endif()
     ExternalProject_Add(varnish_build
       GIT_REPOSITORY https://github.com/varnishcache/varnish-cache.git
       GIT_TAG varnish-7.6.0
@@ -840,6 +867,7 @@ if(SMASH_BUILD_BENCH_DEPS)
       PREFIX ${BENCH_DEPS_DIR}/varnish
       CONFIGURE_COMMAND
         cd <SOURCE_DIR> && ./autogen.sh &&
+        ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER} "CFLAGS=${VARNISH_CFLAGS}"
         <SOURCE_DIR>/configure
           --prefix=${BENCH_DEPS_DIR}
           --disable-dependency-tracking
@@ -877,20 +905,68 @@ if(SMASH_BUILD_BENCH_DEPS)
   else()
     set(MONGODB_PYTHON "")
   endif()
+  # MongoDB's buildscripts/scons.py needs poetry in the interpreter it runs
+  # under; without it the build step dies with "No module named 'poetry'".
+  # Provision it ourselves into a private venv rather than pip-installing into
+  # the user's interpreter — Homebrew/system Pythons are PEP-668
+  # "externally managed" and refuse `pip install` without
+  # --break-system-packages. The venv is created once and reused.
+  if(MONGODB_PYTHON)
+    execute_process(COMMAND ${MONGODB_PYTHON} -c "import poetry"
+                    RESULT_VARIABLE _POETRY_MISSING OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _POETRY_MISSING EQUAL 0)
+      set(MONGODB_VENV ${BENCH_DEPS_DIR}/mongodb-venv)
+      set(MONGODB_VENV_PYTHON ${MONGODB_VENV}/bin/python)
+      execute_process(COMMAND ${MONGODB_VENV_PYTHON} -c "import poetry"
+                      RESULT_VARIABLE _VENV_POETRY_MISSING OUTPUT_QUIET ERROR_QUIET)
+      if(NOT _VENV_POETRY_MISSING EQUAL 0)
+        message(STATUS "  MongoDB: installing poetry into ${MONGODB_VENV} ...")
+        execute_process(COMMAND ${MONGODB_PYTHON} -m venv ${MONGODB_VENV}
+                        RESULT_VARIABLE _VENV_RC OUTPUT_QUIET ERROR_QUIET)
+        if(_VENV_RC EQUAL 0)
+          execute_process(
+            COMMAND ${MONGODB_VENV_PYTHON} -m pip install --quiet
+                    "poetry==1.5.1" "packaging" "setuptools"
+            RESULT_VARIABLE _PIP_RC
+          )
+        else()
+          set(_PIP_RC 1)
+        endif()
+      else()
+        set(_PIP_RC 0)
+      endif()
+      if(_PIP_RC EQUAL 0)
+        set(MONGODB_PYTHON ${MONGODB_VENV_PYTHON})
+        message(STATUS "  MongoDB: using ${MONGODB_PYTHON} (poetry installed)")
+      else()
+        message(STATUS "  MongoDB: skipped (could not install poetry for ${MONGODB_PYTHON})")
+        set(MONGODB_PYTHON "")
+        set(MONGODB_SKIP_REPORTED TRUE)
+      endif()
+    endif()
+  endif()
   if(MONGODB_PYTHON)
     # MongoDB without tcmalloc (uses system malloc)
     # Patch SConstruct to use packaging.version instead of deprecated pkg_resources.
     # Uses --linker=bfd (system ld) since lld/gold may not be installed.
     ExternalProject_Add(mongodb_build
+      EXCLUDE_FROM_ALL TRUE
       GIT_REPOSITORY https://github.com/mongodb/mongo.git
       GIT_TAG r8.0.0
       GIT_SHALLOW TRUE
       PREFIX ${BENCH_DEPS_DIR}/mongodb
       CONFIGURE_COMMAND ""
       PATCH_COMMAND
-        sed -i "s/from pkg_resources import parse_version/from packaging.version import parse as parse_version/" <SOURCE_DIR>/SConstruct
+        sed -i.bak "s/from pkg_resources import parse_version/from packaging.version import parse as parse_version/" <SOURCE_DIR>/SConstruct
       BUILD_IN_SOURCE TRUE
+      # scons refuses to build until its poetry-managed build deps are in sync
+      # ("Detected one or more packages are out of date"). Run the sync it asks
+      # for; the null keyring backend keeps poetry from blocking on a keychain
+      # prompt in a non-interactive build.
       BUILD_COMMAND
+        ${CMAKE_COMMAND} -E env PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring
+          ${MONGODB_PYTHON} -m poetry install --no-root --sync
+      COMMAND
         ${MONGODB_PYTHON} buildscripts/scons.py
           DESTDIR=${BENCH_DEPS_DIR}/mongodb-system
           --allocator=system
@@ -907,15 +983,23 @@ if(SMASH_BUILD_BENCH_DEPS)
 
     # MongoDB with tcmalloc (baseline for comparison)
     ExternalProject_Add(mongodb_tcmalloc_build
+      EXCLUDE_FROM_ALL TRUE
       GIT_REPOSITORY https://github.com/mongodb/mongo.git
       GIT_TAG r8.0.0
       GIT_SHALLOW TRUE
       PREFIX ${BENCH_DEPS_DIR}/mongodb-tcmalloc
       CONFIGURE_COMMAND ""
       PATCH_COMMAND
-        sed -i "s/from pkg_resources import parse_version/from packaging.version import parse as parse_version/" <SOURCE_DIR>/SConstruct
+        sed -i.bak "s/from pkg_resources import parse_version/from packaging.version import parse as parse_version/" <SOURCE_DIR>/SConstruct
       BUILD_IN_SOURCE TRUE
+      # scons refuses to build until its poetry-managed build deps are in sync
+      # ("Detected one or more packages are out of date"). Run the sync it asks
+      # for; the null keyring backend keeps poetry from blocking on a keychain
+      # prompt in a non-interactive build.
       BUILD_COMMAND
+        ${CMAKE_COMMAND} -E env PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring
+          ${MONGODB_PYTHON} -m poetry install --no-root --sync
+      COMMAND
         ${MONGODB_PYTHON} buildscripts/scons.py
           DESTDIR=${BENCH_DEPS_DIR}/mongodb-tcmalloc
           --allocator=tcmalloc-google
@@ -931,7 +1015,7 @@ if(SMASH_BUILD_BENCH_DEPS)
     )
     message(STATUS "  MongoDB 8.0 (system malloc) using ${MONGODB_PYTHON}")
     message(STATUS "  MongoDB 8.0 (tcmalloc, baseline)")
-  else()
+  elseif(NOT MONGODB_SKIP_REPORTED)
     message(STATUS "  MongoDB: skipped (python3.9/3.10/3.11 not found)")
   endif()
 
@@ -995,9 +1079,6 @@ if(SMASH_BUILD_BENCH_DEPS)
   add_executable(bench_rocksdb_builtin bench_rocksdb.cpp)
   _get_filtered_dir_compile_options(rocksdb_builtin_opts)
   set_target_properties(bench_rocksdb_builtin PROPERTIES COMPILE_OPTIONS "${rocksdb_builtin_opts}")
-  if(APPLE)
-    set_target_properties(bench_rocksdb_builtin PROPERTIES OSX_ARCHITECTURES "arm64")
-  endif()
   target_include_directories(bench_rocksdb_builtin PRIVATE ${BENCH_DEPS_DIR}/include)
   target_link_libraries(bench_rocksdb_builtin PRIVATE
     ${BENCH_DEPS_DIR}/lib/librocksdb.a

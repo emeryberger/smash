@@ -35,6 +35,17 @@ brew install memcached redis rocksdb
 
 Paper experiments need both `=ON`. CI regression runs (`.github/workflows/ci.yml`) set both `=OFF` because the quick benches (`bench_rss`, `bench_sqlite`) don't need any of those allocators or external services, and skipping the heavy paths cuts CI build time from ~10 min to ~3 min.
 
+### Preloadable competing allocators (`allocators/`, `make allocators`)
+
+Separate from the flag above (which *links* allocators into `bench_alloc_*`), `allocators/CMakeLists.txt` builds mimalloc / jemalloc / gperftools-tcmalloc / Hoard from source as **shared libraries** collected in `build/allocators/lib/`, so they can be preloaded into an unmodified app exactly where `libsmash` would go. Same arrangement as `~/git/Hoard/allocators`. Gated by `BUILD_MIMALLOC` / `BUILD_JEMALLOC` / `BUILD_TCMALLOC` / `BUILD_HOARD` (or `BUILD_ALL_ALLOCATORS=ON`), all `OFF` by default — nothing is fetched or configured otherwise. Each is an independent ExternalProject, so it never fights with the static mimalloc that `SMASH_BUILD_BENCH_ALLOCATORS` FetchContents. `-DHOARD_DIR=~/git/Hoard` builds a local Hoard checkout (out of tree) instead of cloning.
+
+Interposition, measured both ways (a test program reporting which library its `malloc` resolves to via `dladdr`, plus the malloc zone name on macOS):
+
+- **Linux** (Ubuntu 22.04, glibc 2.35, the EC2 paper box): all four take over `malloc` under `LD_PRELOAD` — mimalloc, jemalloc, tcmalloc (both `libtcmalloc.so` and `libtcmalloc_minimal.so`), Hoard.
+- **macOS** (arm64): only mimalloc (installs a malloc zone from a constructor) and Hoard (alloc8 `__interpose`) interpose. jemalloc and gperftools export `malloc` but nothing binds to them under the two-level namespace, and their zone registration is lazy off their own first `malloc` — which therefore never runs. They still build; the `bench_alloc_*` binaries link them directly.
+
+So preload-based allocator comparisons must run on Linux, which is where the paper runs happen anyway.
+
 ## Unified Experiment Runner (ablation + compress-only)
 
 ```bash

@@ -358,6 +358,27 @@ if(SMASH_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+# ── External comparison allocators ───────────────────────────────────────────
+# Builds mimalloc / jemalloc / tcmalloc / Hoard as preloadable shared libraries
+# into ${CMAKE_BINARY_DIR}/allocators/lib.  All BUILD_* options default OFF, so
+# this is a no-op unless asked for (-DBUILD_ALL_ALLOCATORS=ON).  Added before
+# bench/ so its allocator sources are configured first.
+#
+# Guarded on the directory existing: add_subdirectory() on a missing directory
+# is a hard CMake error, which would break configure entirely for anyone whose
+# tree lacks it (a partial checkout, an exported tarball, a sparse clone). The
+# comparison allocators are a benchmarking convenience, never required to build
+# or test smash, so degrade to a warning rather than taking the build down.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/allocators/CMakeLists.txt)
+  add_subdirectory(allocators)
+elseif(BUILD_ALL_ALLOCATORS OR BUILD_MIMALLOC OR BUILD_JEMALLOC
+       OR BUILD_TCMALLOC OR BUILD_HOARD)
+  # Only worth mentioning if they actually asked for the allocators.
+  message(WARNING
+    "Comparison allocators requested, but allocators/ is missing from this "
+    "source tree — skipping. The BUILD_* allocator options will have no effect.")
+endif()
+
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 option(SMASH_BUILD_BENCH "Build smash benchmarks" OFF)
 if(SMASH_BUILD_BENCH)

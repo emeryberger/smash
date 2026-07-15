@@ -148,40 +148,83 @@ jobs:
           repository: emeryberger/alloc8
           path: alloc8
 
-      - name: Configure
+      - name: Configure (fat arm64 + arm64e)
         working-directory: smash
-        # arm64-only: smash defaults to arm64+arm64e for full
-        # DYLD_INSERT_LIBRARIES coverage of Apple system binaries, but a
-        # user-built arm64e slice cannot be codesigned/loaded without
-        # Apple's ARMA entitlement. arm64 is the drop-in slice for ordinary
-        # (non-PAC) applications.
+        # Build FAT. libsmash must carry an arm64e slice to interpose into
+        # arm64e processes — an arm64-only dylib fails to load into an arm64e
+        # app with "incompatible architecture (have 'arm64', need 'arm64e')".
+        # We ship two macOS assets from this one build (see the stage step):
+        # the arm64-only dylib as a direct download, and the fat dylib in a zip.
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DALLOC8_DIR="$GITHUB_WORKSPACE/alloc8" \
             -DSMASH_BUILD_TESTS=OFF \
             -DSMASH_BUILD_BENCH=OFF \
-            -DCMAKE_OSX_ARCHITECTURES=arm64
+            -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e"
 
       - name: Build libsmash
         working-directory: smash
         run: cmake --build build --target smash -j
 
-      - name: Stage artifact
+      - name: Stage artifacts (arm64-only dylib + fat zip)
         working-directory: smash
         run: |
           mkdir -p out
-          cp build/libsmash.dylib out/libsmash-macos-arm64.dylib
-          echo "=== architectures ==="
-          lipo -info out/libsmash-macos-arm64.dylib
-          echo "=== dependencies ==="
-          otool -L out/libsmash-macos-arm64.dylib
+          # Fat (arm64 + arm64e) — the arm64e-capable artifact. Re-sign ad-hoc:
+          # the linker already ad-hoc-signs, but arm64e MANDATES a valid
+          # signature to load, so make it explicit and deterministic.
+          cp build/libsmash.dylib out/libsmash-macos-fat.dylib
+          codesign --force --sign - out/libsmash-macos-fat.dylib
 
-      - name: Upload workflow artifact
+          # arm64-only drop-in: thinned from the SAME build, so its arm64 slice
+          # is byte-identical to the fat one's. lipo strips the signature, so
+          # re-sign the thinned copy.
+          lipo out/libsmash-macos-fat.dylib -thin arm64 \
+            -output out/libsmash-macos-arm64.dylib
+          codesign --force --sign - out/libsmash-macos-arm64.dylib
+
+          echo "=== fat ===";   lipo -archs out/libsmash-macos-fat.dylib
+          codesign -v --verbose=2 out/libsmash-macos-fat.dylib
+          echo "=== arm64 ==="; lipo -archs out/libsmash-macos-arm64.dylib
+          codesign -v --verbose=2 out/libsmash-macos-arm64.dylib
+          otool -L out/libsmash-macos-fat.dylib
+
+      - name: Verify the fat dylib interposes into an arm64e process
+        # The whole point of shipping fat. Build a real arm64e binary and
+        # preload the fat dylib into it: if dyld can't load the arm64e slice it
+        # aborts before main, so a clean "ok" is proof the slice loads.
+        run: |
+          cat > /tmp/probe.c <<'EOF'
+          #include <stdlib.h>
+          #include <stdio.h>
+          int main(void) {
+            void *p = malloc(1 << 20);
+            if (!p) return 1;
+            free(p);
+            puts("ok");
+            return 0;
+          }
+          EOF
+          clang -arch arm64e -O2 -o /tmp/probe_e /tmp/probe.c
+          echo "probe arch: $(lipo -archs /tmp/probe_e)"
+          out=$(DYLD_INSERT_LIBRARIES="$PWD/smash/out/libsmash-macos-fat.dylib" /tmp/probe_e)
+          echo "arm64e probe output: [$out]"
+          test "$out" = "ok"
+
+      - name: Package the fat dylib as a zip
+        working-directory: smash/out
+        # The zip is the delivery vehicle for the fat/arm64e slice; -X drops
+        # extra attributes so the archive is reproducible.
+        run: zip -X libsmash-macos-fat.zip libsmash-macos-fat.dylib
+
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: libsmash-macos-arm64
-          path: smash/out/libsmash-macos-arm64.dylib
+          name: libsmash-macos
+          path: |
+            smash/out/libsmash-macos-arm64.dylib
+            smash/out/libsmash-macos-fat.zip
           if-no-files-found: error
 
   # ── Attach all artifacts to the Release (release events only) ─────────────
@@ -199,7 +242,8 @@ jobs:
       - name: Flatten and checksum
         run: |
           mkdir -p release
-          find dist -type f \( -name '*.so' -o -name '*.dylib' \) -exec cp {} release/ \;
+          find dist -type f \( -name '*.so' -o -name '*.dylib' -o -name '*.zip' \) \
+            -exec cp {} release/ \;
           cd release
           sha256sum * > SHA256SUMS.txt
           echo "=== release assets ==="
@@ -223,21 +267,35 @@ jobs:
             LD_PRELOAD=./libsmash-linux-x86_64.so SMASH_LARGE_ONLY=1 ./your_program
             ```
 
-            **macOS** (`libsmash-macos-arm64.dylib`, Apple Silicon)
-            ```sh
-            # Required once after downloading: clear the quarantine flag the
-            # browser adds, or dyld refuses the ad-hoc-signed dylib with
-            # "library load disallowed by system policy".
-            xattr -d com.apple.quarantine libsmash-macos-arm64.dylib
+            **macOS** (Apple Silicon) — two artifacts:
 
+            - `libsmash-macos-arm64.dylib` — arm64 only. The drop-in for
+              ordinary arm64 apps.
+            - `libsmash-macos-fat.zip` — fat arm64 + arm64e. Needed to
+              interpose into **arm64e** apps (an arm64-only dylib fails to load
+              into an arm64e process). Shipped as a zip so the arm64e slice's
+              code signature is delivered intact.
+
+            ```sh
+            # arm64 app — direct download:
+            xattr -d com.apple.quarantine libsmash-macos-arm64.dylib
             DYLD_INSERT_LIBRARIES=./libsmash-macos-arm64.dylib ./your_program
+
+            # arm64e app — use the fat build from the zip:
+            unzip libsmash-macos-fat.zip
+            xattr -d com.apple.quarantine libsmash-macos-fat.dylib
+            DYLD_INSERT_LIBRARIES=./libsmash-macos-fat.dylib ./your_program
             ```
-            Note: macOS strips `DYLD_*` for SIP-protected system binaries
-            (e.g. `/bin/*`), so interposition applies to your own binaries.
+            The `xattr -d` is required once after downloading: the browser tags
+            the file with `com.apple.quarantine`, and dyld otherwise refuses the
+            ad-hoc-signed dylib with "library load disallowed by system policy".
+            macOS strips `DYLD_*` for SIP-protected system binaries (e.g.
+            `/bin/*`), so interposition applies to your own binaries.
 
             Verify integrity against `SHA256SUMS.txt`.
           files: |
             release/libsmash-linux-x86_64.so
             release/libsmash-linux-aarch64.so
             release/libsmash-macos-arm64.dylib
+            release/libsmash-macos-fat.zip
             release/SHA256SUMS.txt

@@ -121,6 +121,10 @@ On macOS, `dlsym(RTLD_NEXT, "malloc")` returns the interposed wrapper — DYLD i
 
 The compressor flow calls `decommitPages()` (MADV_FREE_REUSABLE) **before** `mprotect(PROT_NONE)`, after the page data has been copied to the scratch buffer. On Linux, `MADV_DONTNEED` works regardless of protection.
 
+## macOS arm64 / arm64e
+
+libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinary and PAC (arm64e) processes; the benchmark binaries are built **arm64-only** because they are the app under test and must load arm64-only preloads. See [agents/macos-arm64e.md](agents/macos-arm64e.md) for the full mechanism, the exec-vs-load trap (macOS ≤ 15 SIGKILLs third-party arm64e; macOS 26 runs it), and the debugging pitfalls.
+
 ## Key Conventions
 
 - Never allocate from the managed heap inside smash internals — use BootstrapAlloc
@@ -149,6 +153,15 @@ ctest --output-on-failure                                   # unit + integration
 python3 ../bench/run_quick_ci.py                            # CI regression (bench_rss + bench_sqlite)
 python3 bench/verify_paper_claims.py                        # verify paper figures
 python3 ../bench/run_paper_experiments.py --runs 3          # full paper experiments
+```
+
+## Releases
+
+Drop-in `libsmash` binaries are published to GitHub Releases by `.github/workflows/release.yml`. Publishing a Release (not a bare tag, not `workflow_dispatch`) is what triggers the build and attaches the five assets (Linux x86-64/aarch64 `.so`, macOS arm64 `.dylib`, macOS fat `.zip`, `SHA256SUMS.txt`). See [agents/releases.md](agents/releases.md) for the full procedure, the glibc-floor rationale, and the macOS arm64/arm64e split.
+
+```bash
+gh release create vX.Y.Z-alpha --target master --prerelease \
+  --title "libsmash vX.Y.Z-alpha" --notes "…"     # publishing triggers the build
 ```
 
 ## Config Tuning

@@ -540,6 +540,15 @@ class SmashHeap {
         // from a fixed base. We use the distance from a sentinel (first
         // allocation's frame) as an approximation of stack depth.
         // (g_arena_stack_base: file-scope initial-exec TLS, see declaration.)
+        //
+        // SMASH_ABLATION_NO_DEPTH (off by default): drop the LLAMA stack-depth
+        // component so the arena becomes hash(RA, size_class) only. This is a
+        // measurement gate for quantifying how much depth segregation buys on
+        // sub-page objects; production always builds with depth ON. Do NOT make
+        // this the default — see feedback_llama_segregation.
+#ifdef SMASH_ABLATION_NO_DEPTH
+        uint8_t depth_bucket = 0;
+#else
         uintptr_t frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
         if (g_arena_stack_base == 0 || frame > g_arena_stack_base) {
             g_arena_stack_base = frame;  // reset on new thread or deeper call
@@ -547,6 +556,7 @@ class SmashHeap {
         // Depth bucket: (base - frame) / 16KB, truncated to 8 bits
         uint8_t depth_bucket = static_cast<uint8_t>(
             ((g_arena_stack_base - frame) >> 14) & 0xFF);
+#endif
 
         // Mix with murmur3 finalizer to spread closely-spaced addresses
         // across arenas. Without this, adjacent noinline functions (differing

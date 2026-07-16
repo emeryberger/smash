@@ -190,27 +190,19 @@ jobs:
           codesign -v --verbose=2 out/libsmash-macos-arm64.dylib
           otool -L out/libsmash-macos-fat.dylib
 
-      - name: Verify the fat dylib interposes into an arm64e process
-        # The whole point of shipping fat. Build a real arm64e binary and
-        # preload the fat dylib into it: if dyld can't load the arm64e slice it
-        # aborts before main, so a clean "ok" is proof the slice loads.
+      - name: Verify the fat dylib carries a signed arm64e slice
+        working-directory: smash
+        # Static hard gate — runs on any macOS. The fat dylib MUST contain a
+        # validly-signed arm64e slice; that's the whole reason for the fat
+        # build. The DYNAMIC "does it actually load into an arm64e process"
+        # check lives in the separate verify-macos-arm64e job: executing a
+        # third-party arm64e binary needs a runner OS that allows it (macOS 26),
+        # and this build job runs on macos-14, which SIGKILLs such a process
+        # (no -arm64e_preview_abi boot-arg on hosted runners).
         run: |
-          cat > /tmp/probe.c <<'EOF'
-          #include <stdlib.h>
-          #include <stdio.h>
-          int main(void) {
-            void *p = malloc(1 << 20);
-            if (!p) return 1;
-            free(p);
-            puts("ok");
-            return 0;
-          }
-          EOF
-          clang -arch arm64e -O2 -o /tmp/probe_e /tmp/probe.c
-          echo "probe arch: $(lipo -archs /tmp/probe_e)"
-          out=$(DYLD_INSERT_LIBRARIES="$PWD/smash/out/libsmash-macos-fat.dylib" /tmp/probe_e)
-          echo "arm64e probe output: [$out]"
-          test "$out" = "ok"
+          lipo -archs out/libsmash-macos-fat.dylib | tr ' ' '\n' | grep -qx arm64e \
+            || { echo "FAIL: fat dylib has no arm64e slice"; exit 1; }
+          codesign -v --verbose=2 out/libsmash-macos-fat.dylib
 
       - name: Package the fat dylib as a zip
         working-directory: smash/out
@@ -227,10 +219,61 @@ jobs:
             smash/out/libsmash-macos-fat.zip
           if-no-files-found: error
 
+  # ── Dynamically verify the shipped fat dylib loads into an arm64e process ──
+  #    Runs on macos-26: executing a third-party arm64e binary needs a runner
+  #    OS that permits it, and macOS 26 does (older hosted images SIGKILL it,
+  #    lacking the -arm64e_preview_abi boot-arg). Tests the ACTUAL shipped
+  #    artifact — downloads the zip, unzips, and preloads the dylib through the
+  #    same round-trip a user gets — so the arm64e code signature is verified
+  #    end-to-end, not just at build time.
+  verify-macos-arm64e:
+    name: verify-macos-arm64e
+    needs: build-macos
+    runs-on: macos-26
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libsmash-macos
+          path: dist
+
+      - name: Preload the fat dylib into a real arm64e process
+        working-directory: dist
+        run: |
+          unzip -o libsmash-macos-fat.zip
+          echo "fat slices: $(lipo -archs libsmash-macos-fat.dylib)"
+          codesign -v --verbose=2 libsmash-macos-fat.dylib
+          cat > /tmp/probe.c <<'EOF'
+          #include <stdlib.h>
+          #include <stdio.h>
+          int main(void) {
+            void *p = malloc(1 << 20);
+            if (!p) return 1;
+            free(p);
+            puts("ok");
+            return 0;
+          }
+          EOF
+          clang -arch arm64e -O2 -o /tmp/probe_e /tmp/probe.c
+          echo "probe arch: $(lipo -archs /tmp/probe_e)"
+          # Capability probe: can this runner exec a third-party arm64e binary
+          # at all? Run the bare probe (no dylib). A runner that can't (older
+          # macOS) SIGKILLs it, so the substitution fails; the `if` condition
+          # keeps that non-zero exit from tripping `set -e` and we skip rather
+          # than block the release. macOS 26 runs it, so this normally asserts.
+          if bare=$(/tmp/probe_e 2>/dev/null) && [ "$bare" = ok ]; then
+            echo "runner can exec arm64e — running DYLD_INSERT load check"
+            out=$(DYLD_INSERT_LIBRARIES="$PWD/libsmash-macos-fat.dylib" /tmp/probe_e)
+            echo "arm64e probe output: [$out]"
+            test "$out" = ok
+          else
+            echo "::warning::runner cannot exec third-party arm64e; skipped dynamic load check (static arm64e slice + signature checks ran in build-macos)."
+          fi
+
   # ── Attach all artifacts to the Release (release events only) ─────────────
   publish:
     name: publish-to-release
-    needs: [build-linux, build-macos]
+    needs: [build-linux, build-macos, verify-macos-arm64e]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:

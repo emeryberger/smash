@@ -150,6 +150,17 @@ if(APPLE)
   target_compile_options(bench_throughput PRIVATE -ftls-model=initial-exec)
 endif()
 
+add_executable(bench_fastpath
+  bench_fastpath.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src/smash_heap.cpp
+  ${printf_SOURCE_DIR}/printf.cpp
+)
+target_include_directories(bench_fastpath PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
+target_link_libraries(bench_fastpath PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
+if(APPLE)
+  target_compile_options(bench_fastpath PRIVATE -ftls-model=initial-exec)
+endif()
+
 # Compression ratio comparison: LZ4 vs zstd vs zstd+dict
 smash_add_bench(bench_compression bench_compression.cpp)
 

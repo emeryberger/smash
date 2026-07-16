@@ -244,6 +244,27 @@ inline bool freeDiagnosticsActive() {
     return v == 1;
 }
 
+// SMASH_ARENA_TRACE=1: log the first 32 distinct return addresses reaching
+// callsiteArena(). This runs on every full-mode malloc, so it uses the same
+// hand-rolled relaxed cache as the helpers above — a function-local magic
+// static would put a guard-variable acquire-load (ldar on aarch64) on the
+// hottest path instead of a plain relaxed load.
+[[gnu::cold, gnu::noinline]]
+inline int arenaTraceEnabledInit(std::atomic<int>& cached) {
+    const char* v = std::getenv("SMASH_ARENA_TRACE");
+    int r = (v && v[0] == '1') ? 1 : 0;
+    cached.store(r, std::memory_order_relaxed);
+    return r;
+}
+
+[[gnu::always_inline]]
+inline bool arenaTraceEnabled() {
+    static std::atomic<int> cached{-1};   // constant-init: no guard
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] v = arenaTraceEnabledInit(cached);
+    return v == 1;
+}
+
 // SMASH_PASSTHROUGH=1: smash passes all malloc/free to system allocator.
 // Used to isolate whether issues are caused by smash's allocation logic
 // or just by having the library loaded at all.
@@ -599,11 +620,7 @@ class SmashHeap {
         // wrapper-internal addresses) reach the router on a given
         // platform/compiler/LTO combination. Zero cost when unset beyond one
         // predicted branch.
-        static int trace_arena = []{
-            const char* v = std::getenv("SMASH_ARENA_TRACE");
-            return (v && v[0] == '1') ? 1 : 0;
-        }();
-        if (trace_arena) [[unlikely]] {
+        if (arenaTraceEnabled()) [[unlikely]] {
             static uintptr_t seen[32];
             static std::atomic<int> nseen{0};
             int n = nseen.load(std::memory_order_relaxed);

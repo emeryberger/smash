@@ -3856,6 +3856,43 @@ private:
             // fault handlers reclaiming pages) we resume.
             defer_phases = true;
         }
+
+        // Adaptive CPU-pressure compression pause (SMASH_CPU_PRESSURE_PAUSE,
+        // default ON). On a machine whose cores are already saturated by the
+        // host application's own threads (e.g. walrus's ~200-thread TBB
+        // fan-out on a 192-core box), running Phase 2 (compress) and Phase 3
+        // (PROT_READ monitor) steals cores from the app AND churns: pages
+        // compress, then the app immediately faults them back in, so RSS is
+        // not retained but wall time balloons (measured +26% on neuron-cc
+        // test7_full for ~0 net RSS gain — the large-alloc management +
+        // madvise already deliver the RSS win without compression). When the
+        // worker cap has collapsed to its floor (cap==1 ⇒ nproc − app_threads
+        // ≤ 1, i.e. no spare cores) for kCpuPausePauseTicks consecutive
+        // samples, pause the compress/monitor phases; Phase 1 access tracking
+        // still runs (cheap) so we resume within one tick once the app's
+        // thread count drops (e.g. between passes / at teardown). The check
+        // reuses cpuPressureWorkerCap()'s already-sampled cap — no extra
+        // syscalls on the pause path.
+        static const bool cpu_pause_enabled = []{
+            const char* v = std::getenv("SMASH_CPU_PRESSURE_PAUSE");
+            return !(v && v[0] == '0');
+        }();
+        bool cpu_pressure_paused = false;
+        if (cpu_pause_enabled && !defer_phases) {
+            int cap = cpuPressureWorkerCap();  // 0 = disabled/uncapped
+            if (cap == 1) {
+                if (cpu_pause_streak_ < kCpuPausePauseTicks) ++cpu_pause_streak_;
+            } else {
+                cpu_pause_streak_ = 0;
+            }
+            if (cpu_pause_streak_ >= kCpuPausePauseTicks) {
+                defer_phases = true;
+                cpu_pressure_paused = true;
+            }
+        } else if (!cpu_pause_enabled) {
+            cpu_pause_streak_ = 0;
+        }
+
         // Re-claim SIGUSR2 each tick so Firefox / other runtimes that
         // also install a SIGUSR2 handler can't permanently displace ours.
         // Cheap: one sigaction-read + one branch.
@@ -3913,6 +3950,19 @@ private:
         if (external_pages_hot_from_profile_) {
             size_t contig = vm_->contigPages();
             if (contig < committed) committed = contig;
+        }
+
+        // CPU-pressure pause: skip the entire per-tick scan. With Phase 2/3
+        // paused there is nothing to compress or monitor, and Phase 1 access
+        // tracking only exists to feed the compression decision — so the
+        // O(committed) rebuildChunkBitmap + dispatch(1) walk over the (here
+        // ~2M-page) committed range is pure overhead while paused. Skipping it
+        // is the bulk of the pause's wall-time win on core-saturated hosts.
+        // The streak logic above re-samples the worker cap each tick, so the
+        // moment the app's thread count drops (between passes / at teardown)
+        // cap!=1 clears the streak and normal ticking resumes next tick.
+        if (cpu_pressure_paused) {
+            return;
         }
 
         // Rebuild chunk bitmap
@@ -4129,6 +4179,14 @@ private:
 
     int cpu_pressure_cached_cap_ = 0;
     int cpu_pressure_sample_age_ = 1000;  // force resample on first call
+
+    // Adaptive CPU-pressure compression pause (see tick()). Number of
+    // consecutive samples at the worker-cap floor (cap==1, i.e. no spare
+    // cores) before Phase 2/3 are paused. Small so we react within a few
+    // seconds of a pass saturating the machine, but >1 to ignore a single
+    // transient loadavg spike. cpu_pause_streak_ counts them.
+    static constexpr int kCpuPausePauseTicks = 3;
+    int cpu_pause_streak_ = 0;
 
     // Measures λ (cold arrival rate) and μ (per-worker service rate) each
     // tick, smooths with EMA (α = 1/4), and sets N = ⌈λ_ema / μ_ema⌉.

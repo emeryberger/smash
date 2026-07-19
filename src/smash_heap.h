@@ -1338,7 +1338,7 @@ public:
         const uint8_t arena = span->arena_id;
         ThreadCache* tc = currentThreadCache();
         if (!tc) [[unlikely]] return freeSlow(ptr);
-        if (!tc->deallocate(sc, arena, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, arena, ptr); }
+        if (!tc->deallocate(sc, arena, ptr)) { tc->drain(sc, arena, slabs_, &page_map_); tc->deallocate(sc, arena, ptr); }
     }
 
     // Cold path: full free() semantics for every mode. Never inlined.
@@ -1379,7 +1379,7 @@ public:
                 if (sp->is_large) { large_alloc_.deallocate(sp); return; }
                 ThreadCache* tc = getOrCreateThreadCache();
                 if (!tc->deallocate(sp->size_class, sp->arena_id, ptr)) {
-                    tc->drain(sp->size_class, slabs_, &page_map_);
+                    tc->drain(sp->size_class, sp->arena_id, slabs_, &page_map_);
                     tc->deallocate(sp->size_class, sp->arena_id, ptr);
                 }
                 return;
@@ -1450,7 +1450,7 @@ public:
         uint8_t sc = span->size_class;
         uint8_t arena = span->arena_id;
         ThreadCache* tc = getOrCreateThreadCache();
-        if (!tc->deallocate(sc, arena, ptr)) { tc->drain(sc, slabs_, &page_map_); tc->deallocate(sc, arena, ptr); }
+        if (!tc->deallocate(sc, arena, ptr)) { tc->drain(sc, arena, slabs_, &page_map_); tc->deallocate(sc, arena, ptr); }
     }
 
     void* memalign(size_t alignment, size_t size) {

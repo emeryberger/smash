@@ -131,13 +131,62 @@ extern __attribute__((tls_model("initial-exec")))
 extern __attribute__((tls_model("initial-exec")))
     thread_local uint32_t g_free_cache_skip;
 
-// Stack-depth sentinel for callsiteArena()'s LLAMA-style hash (first
-// allocation's frame, reset when a deeper frame is seen). Runs on every
-// malloc; file-scope initial-exec TLS keeps it a direct tpidr_el0 + offset
-// load instead of the __tls_get_addr call a function-local thread_local
-// in an inline function would emit.
+// Stack-base anchor for callsiteArena()'s LLAMA-style depth bucket. Caches the
+// thread's TRUE stack base (highest address), computed once. depth_bucket is the
+// OFFSET of the current frame below this base, so it is ASLR-invariant and
+// history-free. Runs on every malloc; file-scope initial-exec TLS keeps it a
+// direct tpidr_el0 + offset load, not the __tls_get_addr call a function-local
+// thread_local in an inline function would emit. 0 = not yet computed.
+//
+// This replaced a drifting reference (the shallowest frame seen so far, reset
+// whenever a shallower allocation occurred): that made depth depend on
+// allocation history and vary run-to-run — measured as bimodal arena
+// assignments / RSS on rocksdb. Anchoring to the real stack base removes the
+// drift while preserving the depth signal.
 extern __attribute__((tls_model("initial-exec")))
     thread_local uintptr_t g_arena_stack_base;
+
+// Resolve the thread's true stack base once and cache it in g_arena_stack_base.
+// Cold: only the first allocation per thread (plus any reentrant allocations the
+// query itself makes) reaches here.
+[[gnu::cold, gnu::noinline]]
+inline uintptr_t computeThreadStackBase(uintptr_t frame) {
+    // Reentrancy guard: on glibc, pthread_getattr_np() reads /proc/self/maps for
+    // the main thread and calls malloc — which re-enters this via callsiteArena.
+    // A reentrant call returns its own frame (depth 0 for that allocation) and
+    // does NOT cache; the outer call resolves and caches the real base.
+    static __attribute__((tls_model("initial-exec")))
+        thread_local bool computing = false;
+    if (computing) return frame;
+    computing = true;
+    uintptr_t base = frame;
+#if defined(__APPLE__)
+    // Returns the base (highest address); allocation-free.
+    if (void* b = pthread_get_stackaddr_np(pthread_self()))
+        base = reinterpret_cast<uintptr_t>(b);
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        void* addr = nullptr; size_t size = 0;
+        if (pthread_attr_getstack(&attr, &addr, &size) == 0 && addr && size)
+            base = reinterpret_cast<uintptr_t>(addr) + size;  // low addr + size = top
+        pthread_attr_destroy(&attr);
+    }
+#endif
+    if (base < frame) base = frame;   // sanity: base is the highest (shallowest) addr
+    g_arena_stack_base = base;
+    computing = false;
+    return base;
+}
+
+[[gnu::always_inline]]
+inline uintptr_t threadStackBase() {
+    uintptr_t base = g_arena_stack_base;
+    if (base == 0) [[unlikely]]
+        base = computeThreadStackBase(
+            reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
+    return base;
+}
 
 // Repopulate interval for the free() last-span cache (see above). Read once
 // from SMASH_FREE_CACHE_REPOP (default kFreeCacheRepopDefault); 1 = always
@@ -549,13 +598,15 @@ class SmashHeap {
 #ifdef SMASH_ABLATION_NO_DEPTH
         uint8_t depth_bucket = 0;
 #else
+        // Depth bucket: current frame's offset below the thread's true stack
+        // base, in 16 KB units, truncated to 8 bits. Anchored to a fixed,
+        // ASLR-invariant base (threadStackBase()) so the same call path always
+        // yields the same bucket — no history drift.
         uintptr_t frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-        if (g_arena_stack_base == 0 || frame > g_arena_stack_base) {
-            g_arena_stack_base = frame;  // reset on new thread or deeper call
-        }
-        // Depth bucket: (base - frame) / 16KB, truncated to 8 bits
-        uint8_t depth_bucket = static_cast<uint8_t>(
-            ((g_arena_stack_base - frame) >> 14) & 0xFF);
+        uintptr_t stack_base = threadStackBase();
+        uint8_t depth_bucket = (stack_base > frame)
+            ? static_cast<uint8_t>(((stack_base - frame) >> 14) & 0xFF)
+            : 0;
 #endif
 
         // Mix with murmur3 finalizer to spread closely-spaced addresses

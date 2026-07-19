@@ -585,10 +585,12 @@ class SmashHeap {
         // to an offset within its shared object via dladdr(), with caching.
         uint32_t stable_ra = stableCallsiteHash(ra);
 
-        // Compute stable stack depth bucket. Thread stacks grow downward
-        // from a fixed base. We use the distance from a sentinel (first
-        // allocation's frame) as an approximation of stack depth.
-        // (g_arena_stack_base: file-scope initial-exec TLS, see declaration.)
+        // Compute the stack-depth bucket: the current frame's offset below the
+        // thread's TRUE stack base (threadStackBase(), cached in the initial-exec
+        // TLS g_arena_stack_base). Anchoring to a fixed base makes depth an
+        // ASLR-invariant, history-free function of the call path — see the
+        // g_arena_stack_base declaration for why the old drifting reference was
+        // replaced.
         //
         // SMASH_ABLATION_NO_DEPTH (off by default): drop the LLAMA stack-depth
         // component so the arena becomes hash(RA, size_class) only. This is a

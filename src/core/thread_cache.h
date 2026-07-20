@@ -31,9 +31,18 @@ class ThreadCache {
     // Total = kCacheLanes * kNumClasses * depth * 8 = 64 * 36 * 4 * 8 = 72 KB
     // (same as the old flat kNumClasses * 256 * 8 = 72 KB).
     // Shallow depth (4) trades refill frequency for segregation quality.
+    // Overridable: fewer lanes → deeper per-lane cache → far fewer slab-lock
+    // acquisitions per allocation (glibc's tcache is ~64 deep and refills rarely;
+    // smash's default depth-4 hits the slab lock every 4 allocs — 16× more lock
+    // traffic, the structural reason smash scales ~2.7× where glibc scales ~12×).
+#ifdef SMASH_CACHE_LANES
+    static constexpr int kCacheLanes = SMASH_CACHE_LANES;
+#else
     static constexpr int kCacheLanes = 64;
+#endif
     static constexpr int kPerLaneDepth = kThreadCacheMaxPerClass / kCacheLanes;
     static_assert(kPerLaneDepth >= 4, "per-lane cache too shallow");
+    static_assert((kCacheLanes & (kCacheLanes - 1)) == 0, "kCacheLanes must be power of 2");
 
     struct ClassCache {
         void* ptrs[kPerLaneDepth];

@@ -89,6 +89,16 @@ void* ThreadCache::refill(uint8_t sc, uint8_t arena, Slab* slab) {
     size_t batch = kThreadCacheBatchSize;
     if (batch > static_cast<size_t>(kPerLaneDepth)) batch = kPerLaneDepth;
 
+    // Magazine fast path: try to satisfy the refill from the lock-free depot
+    // (a batch a peer thread freed). No slab lock_, no bitmap scan.
+    if (Slab::magazineEnabled()) {
+        size_t got = slab->allocateBatchMag(c.ptrs);
+        if (got > 0) {
+            c.count = static_cast<uint32_t>(got - 1);
+            return c.ptrs[got - 1];
+        }
+    }
+
     size_t got = slab->allocateBatch(c.ptrs, batch);
     if (got == 0) return nullptr;
 
@@ -155,9 +165,16 @@ void drainRangeToSlabs(void** ptrs, size_t start, size_t n,
         defer_free = (!v || v[0] != '0') ? 1 : 0;
         defer_free_cached.store(defer_free, std::memory_order_relaxed);
     }
+    const bool mag = Slab::magazineEnabled();
     for (int a = 0; a < total_arenas; ++a) {
         if (counts[a] == 0) continue;
         Slab& slab = all_slabs[a * kNumClasses + sc];
+        // Magazine fast path: stash the freed batch in the lock-free depot for a
+        // peer thread's next refill. Falls through to the real free path only if
+        // the depot is full (bounds memory).
+        if (mag &&
+            slab.deallocateBatchMag(out_ptrs + offsets[a], out_spans + offsets[a], counts[a]))
+            continue;
         if (defer_free)
             slab.deallocateBatchDeferred(out_ptrs + offsets[a], out_spans + offsets[a], counts[a]);
         else

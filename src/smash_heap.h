@@ -552,6 +552,39 @@ class SmashHeap {
         (void)ra;
         uint8_t base = 0;
 #else
+#if !defined(SMASH_NO_ARENA_MEMO)
+        // Per-op fast path: the arena `base` for a given (ra, sc) is a pure
+        // deterministic function of (stable_ra, depth_bucket, sc) — but the
+        // murmur3 finalizer that computes it is a chain of dependent 64-bit
+        // multiplies that stalls the pipeline on EVERY malloc (measured: 1-thread
+        // IPC 1.26 vs glibc 1.66, the whole contention-free deficit — see PLAN).
+        // Memoize `base` in a tiny direct-mapped TLS cache keyed on (ra, sc) so the
+        // hash runs once per call-site/class per thread. Routing is unchanged: the
+        // hash is deterministic in (ra, sc) within a thread (depth_bucket only
+        // varies with recursion depth at the same call site, a rare corner we
+        // accept — the arena is a compression-homogeneity hint, not correctness).
+        // The cold-bias check below is intentionally NOT memoized (must stay live).
+        struct ArenaMemo { uintptr_t key; uint8_t base; bool valid; };
+        static constexpr size_t kArenaMemoSlots = 256;  // power of 2
+        // initial-exec: libsmash is LD_PRELOAD'd, so its TLS is in the startup
+        // reservation. Without this, a function-static thread_local uses the
+        // local-dynamic model → a __tls_get_addr call on every malloc (callgrind:
+        // 1.23 M calls = 9% of instructions came from exactly this).
+        static __attribute__((tls_model("initial-exec")))
+            thread_local ArenaMemo s_arena_memo[kArenaMemoSlots];
+        const uintptr_t memo_key = ra ^ (static_cast<uintptr_t>(sc) << 56);
+        const size_t memo_slot =
+            (memo_key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
+        ArenaMemo& memo = s_arena_memo[memo_slot];
+        if (memo.valid && memo.key == memo_key) [[likely]] {
+            uint8_t base = memo.base;
+            if constexpr (kColdArenaFeedback) {
+                if (cold_bias_[base * kNumClasses + sc].load(std::memory_order_relaxed))
+                    return static_cast<uint8_t>(base + getNumArenas());
+            }
+            return base;
+        }
+#endif
         // LLAMA-style stack hash [Maas et al., ASPLOS 2020]:
         // hash(return_address, stack_depth, object_size).
         //
@@ -653,6 +686,13 @@ class SmashHeap {
         base = (load1 <= load2) ? arena1 : arena2;
         arena_alloc_count_[base * kNumClasses + sc]
             .fetch_add(1, std::memory_order_relaxed);
+#endif
+#if !defined(SMASH_NO_ARENA_MEMO) && !defined(SMASH_POWER_OF_TWO_CHOICES)
+        // Cache the computed base for this (ra, sc). Not done under
+        // power-of-two-choices, where base depends on live per-arena load.
+        memo.base = base;
+        memo.key = memo_key;
+        memo.valid = true;
 #endif
 #endif
 #ifndef SMASH_ABLATION_NO_CALLSITE_ARENA

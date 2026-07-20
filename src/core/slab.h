@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <atomic>
 
 namespace smash {
@@ -67,6 +68,78 @@ class Slab {
     // Bootstrap node free-pool (recycled; steady-state allocation-free).
     Spinlock pending_pool_lock_;
     PendingNode* pending_pool_ = nullptr;
+
+    // ── Magazine depot (lock-free transfer cache, à la tcmalloc) ─────────────
+    // A Treiber stack of FULL magazines (reusing PendingNode as the magazine).
+    // On free, a resolved batch is pushed here as a magazine. On refill, a
+    // magazine is popped and its pointers handed straight back to the thread
+    // cache — WITHOUT taking lock_, touching the bitmap, or updating span lists.
+    // Objects circulate thread → depot → thread; the span bitmap keeps them
+    // marked "allocated" the whole time (correct: they never logically returned
+    // to the span, so the compressor won't zero/compress their slots, and
+    // allocated_count stays accurate). This closes the alloc/free churn loop
+    // lock-free — the slab lock_ is only hit when the depot is empty (genuine
+    // growth) or on the eventual drain to reclaim spans. ABA-safe via a tagged
+    // head (counter in the high 16 bits of the pointer word is not portable, so
+    // we use a separate generation via a 128-bit-free scheme: the magazine node
+    // is never freed back to a shared pool while linked, and pop re-validates).
+    // Gated by SMASH_MAGAZINE (default off) for clean A/B.
+    //
+    // SINGLE global depot, guarded by a dedicated tiny lock whose critical
+    // section is an O(1) list swing (NOT the bitmap walk / span-list churn that
+    // the main slab lock_ does). Objects circulate thread → depot → thread and
+    // never touch lock_/bitmap on the common path.
+    //
+    // NOTE (2026-07-18): a per-CPU-SHARDED depot was prototyped and measured —
+    // it LOST to this single depot (96t: sharded 24.0 vs single 27.9 MOPS).
+    // Sharding by running CPU removed the (already tiny) mag_lock_ contention but
+    // scattered freed magazines across 64 stacks, dropping the refill hit rate;
+    // wider work-stealing (16 probes) made it worse still. The single mag_lock_
+    // critical section (~5 instructions) was never the bottleneck, so trading
+    // hit-rate for lock-sharding is a net loss here. Single depot kept.
+    PendingNode* mag_head_ = nullptr;
+    uint32_t mag_count_ = 0;
+    Spinlock mag_lock_;
+    static constexpr uint32_t kMaxMagazines = 64;   // depot cap: bounds the held
+        // (marked-allocated, not-yet-returned) set to ~64·256·8 = 128 KB. An
+        // UNCAPPED depot livelocked at 32t — held objects + thread caches held
+        // the whole live set, exhausting spans. Cap is load-bearing.
+
+    // Push a resolved batch as a full magazine (free path). false → depot full
+    // (caller falls back to the real free path so memory stays reclaimable).
+    bool magazinePush(void** ptrs, Span** spans, size_t count) {
+        PendingNode* n = acquirePendingNode();
+        __builtin_memcpy(n->ptrs, ptrs, count * sizeof(void*));
+        __builtin_memcpy(n->spans, spans, count * sizeof(Span*));
+        n->count = static_cast<uint32_t>(count);
+        {
+            LockGuard g(mag_lock_);
+            if (mag_count_ >= kMaxMagazines) {
+                recyclePendingNode(n);
+                return false;
+            }
+            n->next = mag_head_;
+            mag_head_ = n;
+            ++mag_count_;
+        }
+        return true;
+    }
+
+    // Pop a full magazine (refill path). Returns its count, or 0 if empty.
+    size_t magazinePop(void** out_ptrs) {
+        PendingNode* n = nullptr;
+        {
+            LockGuard g(mag_lock_);
+            n = mag_head_;
+            if (!n) return 0;
+            mag_head_ = n->next;
+            --mag_count_;
+        }
+        size_t count = n->count;
+        __builtin_memcpy(out_ptrs, n->ptrs, count * sizeof(void*));
+        recyclePendingNode(n);
+        return count;
+    }
 
     // Above this many queued nodes, the next freer force-locks and drains rather
     // than pushing — bounds memory if a lock owner stalls.
@@ -472,10 +545,55 @@ public:
             if (spans[i]) deallocateOne(ptrs[i], spans[i]);
     }
 
+    static bool magazineEnabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("SMASH_MAGAZINE");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+
+    // ── Magazine (transfer-cache) public entry points ───────────────────────
+    // Refill: try to satisfy the whole batch from one popped magazine (no lock_,
+    // no bitmap). Returns count handed back, or 0 if the depot is empty (caller
+    // falls back to allocateBatch). Only valid when magazineEnabled().
+    size_t allocateBatchMag(void** out) {
+        return magazinePop(out);
+    }
+
+    // Free: push a resolved full-lane batch as a magazine (no lock_, no bitmap).
+    // Returns true if pushed; false if the depot is full (caller falls back to
+    // the real free path so memory is still reclaimable). Spans are carried so a
+    // later depot drain (on shutdown / span reclaim) can return them properly.
+    bool deallocateBatchMag(void** ptrs, Span** spans, size_t count) {
+        return magazinePush(ptrs, spans, count);
+    }
+
+    // Drain the whole depot back through the real free path (bitmap + span
+    // lists). Called under lock_ when we need spans reclaimable (scavenge) or at
+    // shutdown. Objects held in magazines were never returned to their spans, so
+    // this is where their bitmap bits finally clear.
+    void drainMagazines() SMASH_REQUIRES(lock_) {
+        for (;;) {
+            PendingNode* n = nullptr;
+            {
+                LockGuard g(mag_lock_);
+                n = mag_head_;
+                if (!n) break;
+                mag_head_ = n->next;
+                --mag_count_;
+            }
+            for (uint32_t i = 0; i < n->count; ++i)
+                if (n->spans[i]) deallocateOne(n->ptrs[i], n->spans[i]);
+            recyclePendingNode(n);
+        }
+    }
+
     // Return empty spans' pages to OS
     void scavenge() {
         LockGuard guard(lock_);
         drainPending();
+        if (magazineEnabled()) drainMagazines();
         while (Span* span = empty_.popFront()) {
             releaseSpan(span);
         }

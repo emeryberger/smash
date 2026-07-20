@@ -5,6 +5,18 @@ project(smash
   DESCRIPTION "Compression-aware memory allocator"
 )
 
+# ── Default build type ──────────────────────────────────────────────────────
+# Default to RelWithDebInfo (optimized + debug info) when the user hasn't picked
+# a build type. Skipped for multi-config generators (Xcode, VS), which select
+# the config at build time rather than configure time.
+get_property(_smash_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT _smash_multi_config AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
+      "Choose the build type." FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+      Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 # Generate build/compile_commands.json so clangd (see .clangd) and other
 # language servers can resolve include paths, defines, and per-file flags
 # without needing the user to remember a CMake option.

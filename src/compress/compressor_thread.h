@@ -3877,8 +3877,24 @@ private:
             const char* v = std::getenv("SMASH_CPU_PRESSURE_PAUSE");
             return !(v && v[0] == '0');
         }();
+        // Minimum core count for the pause to engage. cap==1 means "no spare
+        // cores", but on a SMALL machine (few cores) that is the normal resting
+        // state, not saturation — a 2-core CI runner whose test process has a
+        // few threads always reports cap==1, which would permanently pause the
+        // compressor and make compression tests see compressed=0 (the CI
+        // failure this guards against). The feature targets many-core hosts
+        // saturated by a large app thread fan-out (e.g. 192-core walrus), so
+        // only arm it when there are enough cores that cap==1 genuinely means
+        // the app has taken them all. Overridable via SMASH_CPU_PRESSURE_MIN_CORES.
+        static const long cpu_pause_min_cores = []{
+            const char* v = std::getenv("SMASH_CPU_PRESSURE_MIN_CORES");
+            long n = (v && *v) ? atol(v) : 16;
+            return n > 0 ? n : 16;
+        }();
+        static const bool cpu_pause_big_enough =
+            sysconf(_SC_NPROCESSORS_ONLN) >= cpu_pause_min_cores;
         bool cpu_pressure_paused = false;
-        if (cpu_pause_enabled && !defer_phases) {
+        if (cpu_pause_enabled && cpu_pause_big_enough && !defer_phases) {
             int cap = cpuPressureWorkerCap();  // 0 = disabled/uncapped
             if (cap == 1) {
                 if (cpu_pause_streak_ < kCpuPausePauseTicks) ++cpu_pause_streak_;
@@ -3889,7 +3905,7 @@ private:
                 defer_phases = true;
                 cpu_pressure_paused = true;
             }
-        } else if (!cpu_pause_enabled) {
+        } else if (!cpu_pause_enabled || !cpu_pause_big_enough) {
             cpu_pause_streak_ = 0;
         }
 

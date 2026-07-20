@@ -167,9 +167,9 @@ void drainRangeToSlabs(void** ptrs, size_t start, size_t n,
 
 } // namespace
 
-void ThreadCache::drain(uint8_t sc, Slab* all_slabs, PageMap* page_map) {
-    auto& c = caches_[sc];
-    // Drain half the cache
+void ThreadCache::drain(uint8_t sc, uint8_t arena, Slab* all_slabs, PageMap* page_map) {
+    auto& c = caches_[idx(arena, sc)];
+    // Drain half the lane
     size_t to_drain = c.count / 2;
     if (to_drain == 0) to_drain = c.count;
     const size_t start = c.count - to_drain;
@@ -178,11 +178,18 @@ void ThreadCache::drain(uint8_t sc, Slab* all_slabs, PageMap* page_map) {
 }
 
 void ThreadCache::drainAll(Slab* all_slabs, PageMap* page_map) {
-    for (int i = 0; i < kNumClasses; ++i) {
-        auto& c = caches_[i];
-        if (c.count > 0) {
-            drainRangeToSlabs(c.ptrs, 0, c.count, static_cast<uint8_t>(i), all_slabs, page_map);
-            c.count = 0;
+    // Sweep every (lane, size class) — pointers live in caches_[lane*kNumClasses+sc]
+    // for lane = arena & (kCacheLanes-1). The old loop covered only lane 0's
+    // classes (i < kNumClasses), leaking every non-zero-lane pointer on thread
+    // teardown. drainRangeToSlabs re-resolves each span's true arena, so passing
+    // sc alone is sufficient for correct routing back to the slabs.
+    for (int lane = 0; lane < kCacheLanes; ++lane) {
+        for (int sc = 0; sc < kNumClasses; ++sc) {
+            auto& c = caches_[lane * kNumClasses + sc];
+            if (c.count > 0) {
+                drainRangeToSlabs(c.ptrs, 0, c.count, static_cast<uint8_t>(sc), all_slabs, page_map);
+                c.count = 0;
+            }
         }
     }
 }

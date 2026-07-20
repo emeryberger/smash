@@ -396,6 +396,13 @@ class CompressorThread {
 
     uint32_t tick_counter_ = 0;
     int phase3_idle_ticks_ = 0;  // P2.1 selective Phase 3 skip
+
+    // Page index of the C `environ` array within smash's contiguous arena, or
+    // kNoEnvironPage if environ is not smash-managed. Refreshed each tick by
+    // refreshEnvironExclusion(); phase2Range/phase3Range skip this page so a
+    // fork+exec child's getenv() never hits a compressed (PROT_NONE) environ.
+    static constexpr size_t kNoEnvironPage = ~size_t{0};
+    size_t environ_page_idx_ = kNoEnvironPage;
     long vma_count_cached_ = 0;   // VMA-cap guard: refreshed every N ticks
 
     // ── Time-budget machinery (SMASH_TIME_BUDGET_PCT) ────────────────────
@@ -1335,6 +1342,18 @@ private:
         // independently by the per-page rc backoff below.
         forEachLivePage(start, end, [&](size_t i) {
             if (cold_count_[i] < floor) return;
+            // Never compress the page(s) backing the C `environ` array. A
+            // fork+exec child (Python subprocess.Popen / hlo2penguin) runs
+            // getenv() in the child, which walks `environ` — but a raw fork()
+            // bypasses pthread_atfork (so smash's child handler never runs) and
+            // the child has no fault handler, so if the compressor had put the
+            // environ page in COMPRESSED (PROT_NONE) state the child SIGSEGVs
+            // in getenv (diagnosed 2026-07-18 from a full-mode core: environ
+            // read as a zero/absent page). Excluding this single hot page is
+            // negligible for compression and keeps every fork child's getenv
+            // valid. environ moves when setenv/putenv reallocs it, so the index
+            // is refreshed each tick in refreshEnvironExclusion().
+            if (i == environ_page_idx_) return;
             PageState st = states_->get(i);
 
             // Tiered recompression: COMPRESSED pages at the LZ4 tier
@@ -1756,6 +1775,18 @@ private:
             // monitoring them (PROT_READ) interferes with application use.
             // External pages have indices >= contig_pages.
             if (i >= contig_pages) return;
+
+            // Never PROT_READ-arm the environ page (see refreshEnvironExclusion
+            // / phase2Range): a fork child's getenv() must always find it
+            // readable. Break the run so the flush before/after stays correct.
+            if (i == environ_page_idx_) {
+                if (run_end > run_start && run_start != ~size_t{0}) {
+                    flushPhase3Run(run_start, run_end);
+                }
+                run_start = ~size_t{0};
+                run_end = 0;
+                return;
+            }
 
             if (!states_->transition(i, PageState::ACTIVE,
                                         PageState::ACTIVE_MONITORING)) {
@@ -2737,6 +2768,37 @@ private:
             smash::vm::warmPages(f->_bf._base, f->_bf._size, vm_);
             smash::vm::warmPages(f, sizeof(FILE), vm_);
         }
+#endif
+    }
+
+    // Keep the page(s) backing the C `environ` array out of COMPRESSED state.
+    // A fork+exec child (Python subprocess.Popen, hlo2penguin) calls getenv()
+    // in the child after a raw fork() that bypassed pthread_atfork; if the
+    // environ page is PROT_NONE (compressed) the child SIGSEGVs with no fault
+    // handler to restore it. We (a) record environ's current page index so
+    // phase2Range/phase3Range skip it, and (b) warm it now so if it is already
+    // COMPRESSED it gets faulted back to ACTIVE before the next fork. `environ`
+    // moves when setenv/putenv reallocs the array, so this is refreshed every
+    // tick (one pointer read + one page-index compute — negligible).
+    // environ + its NULL-terminated pointer array are page-sized at most for
+    // any realistic environment; warmPages covers the array's span.
+    void refreshEnvironExclusion() {
+#if defined(__linux__)
+        // Cheap per-tick bookkeeping ONLY: record which arena page currently
+        // holds the `environ` array so phase2Range/phase3Range skip it (never
+        // transition it to COMPRESSED/ACTIVE_MONITORING). No page is touched
+        // here — exclusion alone keeps environ readable, which is all a fork
+        // child's getenv() needs. `environ` moves when setenv/putenv reallocs
+        // the array, hence the re-read each tick (one load + one compare).
+        char** e = ::environ;  // <unistd.h> declares environ at global scope
+        uintptr_t addr = reinterpret_cast<uintptr_t>(e);
+        if (!e || !vm_ || !vm_->contains(addr)) {
+            // environ not smash-managed (e.g. still on the initial stack /
+            // glibc .bss) — smash never compresses it, nothing to exclude.
+            environ_page_idx_ = kNoEnvironPage;
+            return;
+        }
+        environ_page_idx_ = vm_->contigPageIndex(addr);
 #endif
     }
 
@@ -3823,6 +3885,13 @@ private:
         // hit a protected stdin/stdout/stderr buffer and EFAULT inside libc
         // before our wrapper sees the call.
         warmStdioBuffers();
+
+        // Record which arena page holds `environ` so phase2/phase3 never
+        // compress it — a fork+exec child's getenv() must always find it
+        // readable. Runs before dispatch(2)/(3) below, and environ is
+        // populated + read heavily at startup (long before kColdTicks could
+        // make it eligible), so it is excluded before it can ever compress.
+        refreshEnvironExclusion();
 
         // SMASH_DEBUG=1: print a stats line every 5 ticks (~5s at the
         // 1000ms compressor cadence — kCompressIntervalMs). Mirrors the

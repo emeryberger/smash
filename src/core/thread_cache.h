@@ -117,8 +117,12 @@ public:
         return refill(sc, 0, slab);
     }
 
-    // Drain cache for size class `sc`, routing pointers to their arena's slab.
-    void drain(uint8_t sc, Slab* all_slabs, PageMap* page_map);
+    // Drain the (arena, sc) lane, routing pointers to their arena's slab.
+    // The arena is required: pointers live in caches_[idx(arena, sc)], so
+    // draining without it (the old caches_[sc] form) emptied lane 0 while the
+    // caller's full lane was untouched — the retry deallocate then failed and
+    // the pointer was silently dropped (leak).
+    void drain(uint8_t sc, uint8_t arena, Slab* all_slabs, PageMap* page_map);
 
     // Drain all classes, routing pointers to their arena's slab.
     void drainAll(Slab* all_slabs, PageMap* page_map);

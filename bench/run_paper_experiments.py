@@ -120,7 +120,7 @@ ABLATION_CONFIGS = OrderedDict([
              "cmake_flags": {"SMASH_COLD_ARENA_FEEDBACK": "ON"}, "use_smash": True}),
 ])
 
-APPS = ["sqlite", "rocksdb", "memcached", "redis", "redis_ext", "pandas"]
+APPS = ["sqlite", "rocksdb", "memcached", "redis", "redis_ext", "valkey", "pandas"]
 
 IS_DARWIN = platform.system() == "Darwin"
 PRELOAD_VAR = "DYLD_INSERT_LIBRARIES" if IS_DARWIN else "LD_PRELOAD"
@@ -214,6 +214,7 @@ def collect_system_info():
         if v:
             info[f"{tool}_version"] = v.splitlines()[0]
     info["redis_server_version"] = run(["redis-server", "--version"]) or None
+    info["valkey_server_version"] = run(["valkey-server", "--version"]) or None
     info["memcached_version"] = run(["memcached", "--version"]) or None
 
     _SYSTEM_INFO_CACHE = info
@@ -325,6 +326,17 @@ BENCH_PARAMS = {
                                    "--save", "", "--appendonly", "no"]},
     },
     "redis_ext": {"full": {"port": 16400, "note": "extended: SET + DELETE 50% + GET"}},
+    "valkey": {
+        "quick": {"port": 16401, "num_ops": 50000, "num_clients": 1000,
+                  "value_size": 1000, "keyspace": 100000, "cool_sec": 5,
+                  "note": "Redis fork; same workload as redis via valkey-benchmark"},
+        "full":  {"port": 16401, "num_ops": 200000,
+                  "num_clients_linux": 50, "num_clients_darwin": 5000,
+                  "value_size": 2000, "keyspace": 200000, "cool_sec": 20,
+                  "server_flags": ["--hz", "1", "--dynamic-hz", "no",
+                                   "--save", "", "--appendonly", "no"],
+                  "note": "Redis fork; same workload as redis via valkey-benchmark"},
+    },
     "memcached": {
         "full": {"num_items": 200000, "value_size": 1024, "cool_sec": 20},
     },
@@ -437,11 +449,11 @@ def wait_for_timewait_drain(port, timeout=60):
     return False
 
 
-def kill_redis(port, build_dir=None):
-    """Forcefully kill any Redis on the given port and wait for it to die."""
-    cli = "redis-cli"
+def kill_redis(port, build_dir=None, cli_name="redis-cli"):
+    """Forcefully kill any Redis/Valkey on the given port and wait for it to die."""
+    cli = cli_name
     if build_dir:
-        cli_path = get_binary("redis-cli", build_dir)
+        cli_path = get_binary(cli_name, build_dir)
         if cli_path:
             cli = cli_path
     subprocess.run([cli, "-p", str(port), "SHUTDOWN", "NOSAVE"],
@@ -599,21 +611,39 @@ def run_rocksdb(build_dir, smash_lib, quick):
 
 def run_redis_bench(build_dir, smash_lib, quick):
     """Run Redis benchmark using redis-benchmark (LLAMA-style config)."""
-    redis_server = get_binary("redis-server", build_dir)
-    redis_cli = get_binary("redis-cli", build_dir)
-    redis_benchmark = get_binary("redis-benchmark", build_dir)
-    for cmd in ("redis-server", "redis-cli", "redis-benchmark"):
+    return _run_redis_family_bench(build_dir, smash_lib, quick,
+                                   prefix="redis", port=16399)
+
+
+def run_valkey_bench(build_dir, smash_lib, quick):
+    """Run Valkey benchmark. Valkey is a Redis fork with valkey-* binaries and
+    the same RESP protocol / benchmark tool, so it reuses the redis code path
+    verbatim — only the binary prefix and port differ."""
+    return _run_redis_family_bench(build_dir, smash_lib, quick,
+                                   prefix="valkey", port=16401)
+
+
+def _run_redis_family_bench(build_dir, smash_lib, quick, prefix, port):
+    """Shared driver for Redis and its forks (Valkey). `prefix` selects the
+    binary family (redis / valkey); everything else is identical so the two
+    apps cannot drift apart in methodology."""
+    server_cmd = f"{prefix}-server"
+    cli_cmd = f"{prefix}-cli"
+    benchmark_cmd = f"{prefix}-benchmark"
+    redis_server = get_binary(server_cmd, build_dir)
+    redis_cli = get_binary(cli_cmd, build_dir)
+    redis_benchmark = get_binary(benchmark_cmd, build_dir)
+    for cmd in (server_cmd, cli_cmd, benchmark_cmd):
         if not check_binary(cmd, build_dir):
             return None
 
-    port = 16399
     num_ops = 50000 if quick else 200000
     num_clients = 1000 if quick else (50 if not IS_DARWIN else 5000)
     value_size = 1000 if quick else 2000
     keyspace = 100000 if quick else 200000
     cool_sec = 5 if quick else 20
 
-    kill_redis(port, build_dir)
+    kill_redis(port, build_dir, cli_name=cli_cmd)
 
     env = os.environ.copy()
     if smash_lib:
@@ -630,7 +660,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
 
     try:
         if not wait_for_port(port, timeout=10):
-            print("    redis: failed to start")
+            print(f"    {prefix}: failed to start")
             return None
 
         # SET phase via redis-benchmark
@@ -643,10 +673,10 @@ def run_redis_bench(build_dir, smash_lib, quick):
             )
             set_rps = _parse_redis_benchmark_rps(set_result.stdout, "SET")
         except subprocess.TimeoutExpired:
-            print("    redis SET timed out, returning partial results")
+            print(f"    {prefix} SET timed out, returning partial results")
             set_rps = 0
 
-        # Verify Redis is actually filled
+        # Verify the server is actually filled
         try:
             dbsize = subprocess.check_output(
                 [redis_cli, "-p", str(port), "DBSIZE"],
@@ -657,7 +687,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
 
         fill_rss = get_rss_mb(proc.pid)
         if fill_rss < 10:
-            print(f"    redis: fill_rss={fill_rss:.1f}MB (too low, DBSIZE={dbsize})")
+            print(f"    {prefix}: fill_rss={fill_rss:.1f}MB (too low, DBSIZE={dbsize})")
             return None
 
         # Cool-down: let compression run, sample RSS timeline
@@ -686,12 +716,12 @@ def run_redis_bench(build_dir, smash_lib, quick):
                 )
                 get_rps = _parse_redis_benchmark_rps(get_result.stdout, "GET")
             except subprocess.TimeoutExpired:
-                print("    redis GET timed out, returning partial results")
+                print(f"    {prefix} GET timed out, returning partial results")
                 get_rps = 0
 
         # Validate measurements - min_rss=0 means measurement failed (process died)
         if min_rss <= 0 or fill_rss <= 0:
-            print(f"    redis: invalid RSS measurement (fill={fill_rss}, min={min_rss})")
+            print(f"    {prefix}: invalid RSS measurement (fill={fill_rss}, min={min_rss})")
             return None
         reduction = (1 - min_rss / fill_rss) * 100
         # AUC = area under curve (MB-seconds) - integral of RSS over cool phase
@@ -714,7 +744,7 @@ def run_redis_bench(build_dir, smash_lib, quick):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
-        kill_redis(port, build_dir)
+        kill_redis(port, build_dir, cli_name=cli_cmd)
 
 
 def _parse_redis_benchmark_rps(output, cmd_name):
@@ -1149,6 +1179,9 @@ def get_binary(name, build_dir):
         "redis-server": "redis-server-libc",
         "redis-cli": "redis-cli",
         "redis-benchmark": "redis-benchmark",
+        "valkey-server": "valkey-server-libc",
+        "valkey-cli": "valkey-cli",
+        "valkey-benchmark": "valkey-benchmark",
     }
 
     built_name = binary_map.get(name, name)
@@ -1169,6 +1202,9 @@ def check_binary(name, build_dir):
         "redis-server": "redis-server-libc",
         "redis-cli": "redis-cli",
         "redis-benchmark": "redis-benchmark",
+        "valkey-server": "valkey-server-libc",
+        "valkey-cli": "valkey-cli",
+        "valkey-benchmark": "valkey-benchmark",
     }
     built_name = binary_map.get(name, name)
     built_path = deps_bin / built_name
@@ -1290,6 +1326,8 @@ def run_app(app, build_dir, smash_lib, quick):
         return run_memcached_bench(build_dir, smash_lib, quick)
     elif app == "redis":
         return run_redis_bench(build_dir, smash_lib, quick)
+    elif app == "valkey":
+        return run_valkey_bench(build_dir, smash_lib, quick)
     elif app == "redis_ext":
         return run_redis_extended_bench(build_dir, smash_lib, quick)
     elif app == "pandas":
@@ -1669,6 +1707,8 @@ def main():
             elif app == "redis" and check_binary("redis-server", build_dir):
                 apps.append(app)
             elif app == "redis_ext" and check_binary("redis-server", build_dir):
+                apps.append(app)
+            elif app == "valkey" and check_binary("valkey-server", build_dir):
                 apps.append(app)
 
     print(f"Apps: {', '.join(apps)}")

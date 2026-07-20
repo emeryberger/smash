@@ -662,6 +662,29 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/bin/redis-benchmark
   )
 
+  # ── Valkey 9.1.0 (MALLOC=libc — no jemalloc) ──────────────────────────────
+  # Redis fork (Linux Foundation). Same plain Makefile build as redis: build
+  # with MALLOC=libc so libsmash can interpose malloc. Binaries are named
+  # valkey-* but stay RESP-compatible. Installed alongside redis so the harness
+  # can drive it as a separate opt-in app.
+  ExternalProject_Add(valkey_build
+    GIT_REPOSITORY https://github.com/valkey-io/valkey.git
+    GIT_TAG 9.1.0
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/valkey
+    CONFIGURE_COMMAND ""
+    BUILD_IN_SOURCE TRUE
+    BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make MALLOC=libc -j${NCPU}
+    INSTALL_COMMAND
+      ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/valkey-server ${BENCH_DEPS_DIR}/bin/valkey-server-libc
+      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/valkey-cli ${BENCH_DEPS_DIR}/bin/valkey-cli
+      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/valkey-benchmark ${BENCH_DEPS_DIR}/bin/valkey-benchmark
+    BUILD_BYPRODUCTS
+      ${BENCH_DEPS_DIR}/bin/valkey-server-libc
+      ${BENCH_DEPS_DIR}/bin/valkey-cli
+      ${BENCH_DEPS_DIR}/bin/valkey-benchmark
+  )
+
   # ── libevent (required by memcached) ───────────────────────────────────────
   # Prefer system/brew install; build from source only if missing.
   find_path(LIBEVENT_INCLUDE_DIR event.h

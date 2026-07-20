@@ -57,6 +57,30 @@ endif()
 # Empty on Linux, where -DCMAKE_OSX_ARCHITECTURES= is simply ignored.
 string(REPLACE ";" "|" SMASH_BENCH_OSX_ARCHS "${CMAKE_OSX_ARCHITECTURES}")
 
+# ── SDK env prefix for autoconf/Makefile sub-builds ─────────────────────────
+# The CMake-based ExternalProjects below inherit SDK detection automatically.
+# The autoconf/Makefile ones (varnish, memcached, tcmalloc, redis) shell out to
+# a bare compiler that does NOT: on macOS, if the invoking shell has no SDKROOT,
+# their configure/link fails with `ld: library 'System' not found`. Prefix those
+# sub-build commands with this to inject SDKROOT. On Linux it stays empty and
+# expands to nothing (the compiler needs no sysroot hint), so the prefix is a
+# no-op there — the same command line works on both platforms.
+set(SMASH_BENCH_SDK_ENV "")
+if(APPLE)
+  if(NOT CMAKE_OSX_SYSROOT STREQUAL "")
+    set(_SMASH_SDKROOT "${CMAKE_OSX_SYSROOT}")
+  else()
+    execute_process(COMMAND xcrun --show-sdk-path
+                    OUTPUT_VARIABLE _SMASH_SDKROOT
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+  endif()
+  if(NOT _SMASH_SDKROOT STREQUAL "")
+    set(SMASH_BENCH_SDK_ENV ${CMAKE_COMMAND} -E env "SDKROOT=${_SMASH_SDKROOT}")
+    message(STATUS "Bench autoconf sub-builds will use SDKROOT=${_SMASH_SDKROOT}")
+  endif()
+endif()
+
 # ── Option to build external benchmark dependencies ──────────────────────────
 # ON by default when SMASH_BUILD_BENCH=ON.  Set -DSMASH_BUILD_BENCH_DEPS=OFF to skip.
 option(SMASH_BUILD_BENCH_DEPS "Build external benchmark dependencies (Redis, memcached, RocksDB)" ON)
@@ -380,11 +404,11 @@ else()
     URL_HASH SHA256=f12624af5c5987f2cc830ee534f754c3c5961eec08004c26a8b80de015cf056f
     PREFIX ${GPERFTOOLS_PREFIX}
     CONFIGURE_COMMAND
-      <SOURCE_DIR>/configure
+      ${SMASH_BENCH_SDK_ENV} <SOURCE_DIR>/configure
         --prefix=${GPERFTOOLS_PREFIX}/install
         --enable-minimal
         --disable-debugalloc
-    BUILD_COMMAND make -j${_TCMALLOC_NCPU}
+    BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make -j${_TCMALLOC_NCPU}
     INSTALL_COMMAND make install
     BUILD_BYPRODUCTS
       ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal${_TCMALLOC_SHLIB_SUFFIX}
@@ -627,7 +651,7 @@ if(SMASH_BUILD_BENCH_DEPS)
     PREFIX ${BENCH_DEPS_DIR}/redis
     CONFIGURE_COMMAND ""
     BUILD_IN_SOURCE TRUE
-    BUILD_COMMAND make MALLOC=libc -j${NCPU}
+    BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make MALLOC=libc -j${NCPU}
     INSTALL_COMMAND
       ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-server ${BENCH_DEPS_DIR}/bin/redis-server-libc
       COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-cli ${BENCH_DEPS_DIR}/bin/redis-cli
@@ -687,13 +711,13 @@ if(SMASH_BUILD_BENCH_DEPS)
       PREFIX ${BENCH_DEPS_DIR}/memcached
       CONFIGURE_COMMAND
         cd <SOURCE_DIR> && ./autogen.sh &&
-        <SOURCE_DIR>/configure
+        ${SMASH_BENCH_SDK_ENV} <SOURCE_DIR>/configure
           --prefix=${BENCH_DEPS_DIR}
           --with-libevent=${LIBEVENT_PREFIX}
           --disable-extstore
           --disable-tls
       BUILD_IN_SOURCE TRUE
-      BUILD_COMMAND make -j${NCPU}
+      BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make -j${NCPU}
       INSTALL_COMMAND
         ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/memcached ${BENCH_DEPS_DIR}/bin/memcached
       BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/memcached
@@ -875,13 +899,13 @@ if(SMASH_BUILD_BENCH_DEPS)
       PREFIX ${BENCH_DEPS_DIR}/varnish
       CONFIGURE_COMMAND
         cd <SOURCE_DIR> && ./autogen.sh &&
-        ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER} "CFLAGS=${VARNISH_CFLAGS}"
+        ${SMASH_BENCH_SDK_ENV} ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER} "CFLAGS=${VARNISH_CFLAGS}"
         <SOURCE_DIR>/configure
           --prefix=${BENCH_DEPS_DIR}
           --disable-dependency-tracking
           --without-jemalloc
       BUILD_IN_SOURCE TRUE
-      BUILD_COMMAND make -j${NCPU}
+      BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make -j${NCPU}
       INSTALL_COMMAND make install
       BUILD_BYPRODUCTS
         ${BENCH_DEPS_DIR}/sbin/varnishd

@@ -1330,8 +1330,23 @@ extern "C" bool xxowns(const void* ptr) {
     if (!ptr) return false;
     if (smash::BootstrapAlloc::instance().owns(ptr)) return true;
     auto* vm = smash::g_smash_vm_region;
-    if (vm && vm->contains(reinterpret_cast<uintptr_t>(ptr))) return true;
-    return false;
+    if (!vm) return false;
+    auto addr = reinterpret_cast<uintptr_t>(ptr);
+    // Ownership means "smash's malloc allocated this pointer, so smash must
+    // free/realloc/size it" — i.e. the contiguous arena (full mode) or the
+    // tracking hash when it IS the allocator (compress-only mode).
+    //
+    // Under SMASH_TRACK_EXTERNAL=1, VmRegion::contains() ALSO returns true for
+    // application-direct mmap pages that smash merely *tracks* for the
+    // compressor to scan — smash did NOT allocate them. Claiming ownership of
+    // those routes the app's own free()/realloc() (e.g. libcrypto freeing a
+    // pointer into an mmap'd OpenSSL config arena) into smash's slab path,
+    // which has no valid span for the pointer → state corruption → SIGSEGV
+    // (or a decommitPages OOB trap on the tracked page). Tracking is NOT
+    // ownership: exclude externally-tracked pages from xxowns.
+    if (vm->isTrackingMode())
+        return vm->contains(addr);   // compress-only: hash IS the allocator
+    return vm->inContigArena(addr);  // full mode: only smash's own arena
 }
 
 // ── Start compressor from constructor ─────────────────────────────────────────

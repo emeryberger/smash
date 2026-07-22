@@ -870,13 +870,50 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/include/rocksdb/db.h
   )
 
+  # ── Snappy 1.2.1 (static, vendored) ──────────────────────────────────────────
+  # LevelDB compresses SST blocks with Snappy when it detects the library at
+  # configure time (check_library_exists(snappy ...)). We vendor it so LevelDB
+  # is built WITH compression enabled (matching a realistic deployment) and the
+  # build is self-contained (no reliance on a system libsnappy). Static + PIC so
+  # it links cleanly into bench_leveldb.
+  ExternalProject_Add(bench_snappy_build
+    GIT_REPOSITORY https://github.com/google/snappy.git
+    GIT_TAG 1.2.1
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/snappy
+    LIST_SEPARATOR |
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      "-DCMAKE_OSX_ARCHITECTURES=${SMASH_BENCH_OSX_ARCHS}"
+      -DBUILD_SHARED_LIBS=OFF
+      -DSNAPPY_BUILD_TESTS=OFF
+      -DSNAPPY_BUILD_BENCHMARKS=OFF
+      -DSNAPPY_INSTALL=ON
+      -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+      -DCMAKE_INSTALL_LIBDIR=lib
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j${NCPU}
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    BUILD_BYPRODUCTS
+      ${BENCH_DEPS_DIR}/lib/libsnappy.a
+      ${BENCH_DEPS_DIR}/include/snappy.h
+  )
+  message(STATUS "  Snappy 1.2.1 (static, vendored for LevelDB)")
+
   # ── LevelDB 1.23 (static library) ──────────────────────────────────────────
   # LevelDB uses an arena allocator over malloc — Smash should work.
+  # Built WITH vendored Snappy: CMAKE_PREFIX_PATH points its
+  # check_library_exists(snappy ...) probe at BENCH_DEPS_DIR so HAVE_SNAPPY is
+  # set and SST blocks are Snappy-compressed.
   ExternalProject_Add(leveldb_build
     GIT_REPOSITORY https://github.com/google/leveldb.git
     GIT_TAG 1.23
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/leveldb
+    DEPENDS bench_snappy_build
     LIST_SEPARATOR |
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
@@ -887,6 +924,13 @@ if(SMASH_BUILD_BENCH_DEPS)
       -DLEVELDB_BUILD_TESTS=OFF
       -DLEVELDB_BUILD_BENCHMARKS=OFF
       -DBUILD_SHARED_LIBS=OFF
+      -DCMAKE_PREFIX_PATH=${BENCH_DEPS_DIR}
+      -DCMAKE_LIBRARY_PATH=${BENCH_DEPS_DIR}/lib
+      -DCMAKE_INCLUDE_PATH=${BENCH_DEPS_DIR}/include
+      # check_library_exists(snappy ...) links a probe via try_compile, which
+      # honors CMAKE_EXE_LINKER_FLAGS (not CMAKE_LIBRARY_PATH) — point it at our
+      # vendored libsnappy.a so HAVE_SNAPPY is detected without a system libsnappy.
+      "-DCMAKE_EXE_LINKER_FLAGS=-L${BENCH_DEPS_DIR}/lib"
       -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
       -DCMAKE_INSTALL_LIBDIR=lib
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON
@@ -896,7 +940,7 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/lib/libleveldb.a
       ${BENCH_DEPS_DIR}/include/leveldb/db.h
   )
-  message(STATUS "  LevelDB 1.23 (static)")
+  message(STATUS "  LevelDB 1.23 (static, Snappy-enabled)")
 
   # ── Varnish 7.6.0 (HTTP cache, supports -s malloc backend) ────────────────
   # Varnish with -s malloc uses system malloc for cache storage.
@@ -1079,12 +1123,15 @@ if(SMASH_BUILD_BENCH_DEPS)
   _get_filtered_dir_compile_options(leveldb_opts)
   set_target_properties(bench_leveldb PROPERTIES COMPILE_OPTIONS "${leveldb_opts}")
   target_include_directories(bench_leveldb PRIVATE ${BENCH_DEPS_DIR}/include)
+  # LevelDB was built with Snappy, so libleveldb.a has unresolved snappy_*
+  # symbols; link the vendored static libsnappy.a after it.
   target_link_libraries(bench_leveldb PRIVATE
     ${BENCH_DEPS_DIR}/lib/libleveldb.a
+    ${BENCH_DEPS_DIR}/lib/libsnappy.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
   )
-  add_dependencies(bench_leveldb leveldb_build)
+  add_dependencies(bench_leveldb leveldb_build bench_snappy_build)
 
   # ── Export paths ───────────────────────────────────────────────────────────
   set(BENCH_REDIS_SERVER   ${BENCH_DEPS_DIR}/bin/redis-server-libc CACHE PATH "")

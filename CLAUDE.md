@@ -141,6 +141,12 @@ libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinar
 - **LZ4 v1.9.4**: Fast compression (fetched via CMake FetchContent)
 - **Zstandard v1.5.6**: Dictionary compression (fetched via CMake FetchContent)
 
+Benchmark-only deps (built by `-DSMASH_BUILD_BENCH_DEPS=ON`, all vendored via
+ExternalProject into `build/bench/deps/`): Redis 8.0.2, Valkey 9.1.0,
+memcached 1.6.34, RocksDB v9.8.4, LevelDB 1.23, and **Snappy 1.2.1** — vendored
+so LevelDB builds with SST compression enabled and `bench_leveldb` links a
+static libsnappy.a (no reliance on a system libsnappy).
+
 ## Benchmarks
 
 See [agents/benchmarks.md](agents/benchmarks.md) for the full benchmark procedure, paper experiments, application-specific configuration, and result provenance.

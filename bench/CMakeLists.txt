@@ -498,6 +498,59 @@ else()
   message(STATUS "DieHarder not found (optional)")
 endif()
 
+# ── Preloadable shared allocators (jemalloc, mimalloc) for whole-application
+# LD_PRELOAD comparisons ──────────────────────────────────────────────────────
+# The bench_alloc_* microbenchmarks above STATIC-link mimalloc and use a
+# system jemalloc, which is fine for direct-linked micro comparisons. But the
+# application-level RSS study (redis/valkey/memcached/mongo/... under
+# LD_PRELOAD) needs preloadable *.so builds at pinned, reproducible versions.
+# Build them here from source (same pins as elsewhere) and export their paths,
+# mirroring the tcmalloc-preload pattern above.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  ProcessorCount(_ALLOC_NCPU)
+  if(_ALLOC_NCPU EQUAL 0)
+    set(_ALLOC_NCPU 4)
+  endif()
+  set(ALLOC_PRELOAD_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/alloc_preload)
+  set(JEMALLOC_PRELOAD_SO  ${ALLOC_PRELOAD_PREFIX}/lib/libjemalloc.so)
+  set(MIMALLOC_PRELOAD_SO  ${ALLOC_PRELOAD_PREFIX}/lib/libmimalloc.so)
+
+  ExternalProject_Add(jemalloc_preload_build
+    GIT_REPOSITORY https://github.com/jemalloc/jemalloc.git
+    GIT_TAG 5.3.0
+    GIT_SHALLOW TRUE
+    PREFIX ${ALLOC_PRELOAD_PREFIX}/jemalloc
+    CONFIGURE_COMMAND cd <SOURCE_DIR> && ./autogen.sh &&
+      <SOURCE_DIR>/configure --prefix=${ALLOC_PRELOAD_PREFIX} --enable-shared --disable-static
+    BUILD_COMMAND cd <SOURCE_DIR> && make -j${_ALLOC_NCPU}
+    INSTALL_COMMAND cd <SOURCE_DIR> && make install
+    BUILD_IN_SOURCE TRUE
+    BUILD_BYPRODUCTS ${JEMALLOC_PRELOAD_SO}
+  )
+  message(STATUS "  jemalloc 5.3.0 (preloadable .so)")
+
+  ExternalProject_Add(mimalloc_preload_build
+    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG v2.1.2
+    GIT_SHALLOW TRUE
+    PREFIX ${ALLOC_PRELOAD_PREFIX}/mimalloc
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+      -DMI_BUILD_TESTS=OFF
+      -DCMAKE_INSTALL_PREFIX=${ALLOC_PRELOAD_PREFIX}
+      -DCMAKE_INSTALL_LIBDIR=lib
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j${_ALLOC_NCPU}
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    BUILD_BYPRODUCTS ${MIMALLOC_PRELOAD_SO}
+  )
+  message(STATUS "  mimalloc v2.1.2 (preloadable .so)")
+
+  set(BENCH_JEMALLOC_PRELOAD ${JEMALLOC_PRELOAD_SO} CACHE PATH "")
+  set(BENCH_MIMALLOC_PRELOAD ${MIMALLOC_PRELOAD_SO} CACHE PATH "")
+endif()
+
 endif() # SMASH_BUILD_BENCH_ALLOCATORS
 
 # Python runner (configure paths)

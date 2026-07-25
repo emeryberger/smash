@@ -11,10 +11,15 @@
 #include <rocksdb/table.h>
 #include <rocksdb/cache.h>
 #include <rocksdb/filter_policy.h>
+// ROCKSDB_MAJOR — included explicitly rather than relying on db.h pulling it
+// in, so the version test below can never silently evaluate 0 >= 10 and pick
+// the wrong DB::Open overload.
+#include <rocksdb/version.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <chrono>
 #include <random>
@@ -157,8 +162,18 @@ int main(int argc, char* argv[]) {
 
     options.compression = compression_type;
 
-    rocksdb::DB* db;
+    // RocksDB 10.0.1 replaced the `DB**` overload of DB::Open with
+    // `std::unique_ptr<DB>*` (9.x has only the raw form, 10+ only the
+    // unique_ptr form).  Normalize on the owning unique_ptr so every `db->`
+    // use below — and the close at the end of main — is version-independent.
+    std::unique_ptr<rocksdb::DB> db;
+#if ROCKSDB_MAJOR >= 10
     rocksdb::Status s = rocksdb::DB::Open(options, db_path, &db);
+#else
+    rocksdb::DB* db_raw = nullptr;
+    rocksdb::Status s = rocksdb::DB::Open(options, db_path, &db_raw);
+    db.reset(db_raw);
+#endif
     if (!s.ok()) {
         fprintf(stderr, "Failed to open DB: %s\n", s.ToString().c_str());
         return 1;
@@ -337,6 +352,6 @@ int main(int argc, char* argv[]) {
     }
 
     fflush(stdout);
-    delete db;
+    db.reset();  // close the DB (was `delete db` before the unique_ptr port)
     return 0;
 }

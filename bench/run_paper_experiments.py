@@ -28,6 +28,13 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+# Shared per-pid footprint helper (repo tools/footprint.py).  On macOS it
+# samples phys_footprint (matching the C++ ri_phys_footprint monitors); on
+# Linux it preserves the existing VmRSS/ps semantics.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "tools"))
+import footprint  # noqa: E402
+
 # ── CMake ablation variables ─────────────────────────────────────────────────
 ALL_ABLATION_VARS = [
     "SMASH_NUM_ARENAS", "SMASH_COLD_TICKS", "SMASH_VERY_COLD_TICKS",
@@ -180,6 +187,9 @@ def collect_system_info():
         "machine": platform.machine(),
         "python": platform.python_version(),
         "page_size_bytes": os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else None,
+        # How the RSS/footprint timeline was sampled, so macOS(phys_footprint)
+        # data is distinguishable from Linux(VmRSS) data at a glance.
+        "metric_source": footprint.METRIC_SOURCE,
     }
 
     if IS_DARWIN:
@@ -389,7 +399,15 @@ def rebuild(build_dir, cmake_flags, source_dir):
 # ── RSS measurement ──────────────────────────────────────────────────────────
 
 def get_rss_mb(pid):
-    """Get RSS of a process in MiB."""
+    """Get heap footprint of a process in MiB.
+
+    macOS: phys_footprint via footprint.pid_footprint_kb (KB->MiB), matching
+    the C++ ri_phys_footprint monitors.  `ps -o rss=` is NOT used on macOS
+    because it reports resident_size (clean file-backed pages included), which
+    is inconsistent with phys_footprint.  Linux: existing `ps -o rss=` path is
+    preserved unchanged (VmRSS-equivalent)."""
+    if IS_DARWIN:
+        return footprint.pid_footprint_kb(pid) / 1024
     try:
         out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)], text=True)
         return float(out.strip()) / 1024
@@ -531,6 +549,7 @@ def run_sqlite(build_dir, smash_lib, quick):
         metrics = parse_metrics(stdout)
 
         if metrics and rss_timeline:
+            metrics["metric_source"] = footprint.METRIC_SOURCE
             metrics["rss_timeline"] = rss_timeline
             metrics["total_auc_mb_sec"] = sum(rss_timeline)
             metrics["peak_rss_mb"] = max(rss_timeline) if rss_timeline else metrics.get("peak_rss_mb", 0)
@@ -578,6 +597,7 @@ def run_rocksdb(build_dir, smash_lib, quick):
             metrics = parse_metrics(stdout)
 
             if metrics:
+                metrics["metric_source"] = footprint.METRIC_SOURCE
                 if rss_timeline:
                     metrics["rss_timeline"] = rss_timeline
                     metrics["total_auc_mb_sec"] = sum(rss_timeline)
@@ -728,6 +748,7 @@ def _run_redis_family_bench(build_dir, smash_lib, quick, prefix, port):
         auc_mb_sec = sum(rss_timeline)  # Each sample is 1 second apart
 
         return {
+            "metric_source": footprint.METRIC_SOURCE,
             "peak_rss_mb": fill_rss,
             "steady_rss_mb": cool_rss,
             "min_rss_mb": min_rss,
@@ -900,6 +921,7 @@ def run_redis_extended_bench(build_dir, smash_lib, quick):
         auc_mb_sec = sum(rss_timeline)
 
         return {
+            "metric_source": footprint.METRIC_SOURCE,
             "peak_rss_mb": peak_rss,
             "post_del_rss_mb": post_del_rss,
             "steady_rss_mb": cool_rss,
@@ -1006,6 +1028,7 @@ def run_memcached_bench(build_dir, smash_lib, quick):
         auc_mb_sec = sum(rss_timeline)
 
         return {
+            "metric_source": footprint.METRIC_SOURCE,
             "peak_rss_mb": fill_rss,
             "cool_rss_mb": cool_rss,
             "steady_rss_mb": serve_rss,

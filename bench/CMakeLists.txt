@@ -319,7 +319,9 @@ endif()
 # gperftools 2.16 (the stable autotools-based fork).
 include(ExternalProject)
 
-# Detect glibc version for google/tcmalloc compatibility
+# Detect glibc version for google/tcmalloc compatibility.  "0" means "not
+# glibc" (macOS, musl) or unparseable `ldd --version` output — either way there
+# is no RSEQ TLS, so google/tcmalloc is off the table.
 set(_GLIBC_VERSION "0")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   execute_process(
@@ -370,7 +372,11 @@ if(BAZEL_PROG AND _GLIBC_VERSION VERSION_GREATER_EQUAL "2.35")
   message(STATUS "google/tcmalloc (latest) will be built from source using Bazel 8.2.1")
 else()
   # ── gperftools/tcmalloc 2.16 (works on all glibc versions) ──────────────
-  if(BAZEL_PROG AND _GLIBC_VERSION VERSION_LESS "2.35")
+  if(BAZEL_PROG AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(STATUS "${CMAKE_SYSTEM_NAME}: google/tcmalloc requires glibc >= 2.35 (RSEQ TLS); using gperftools instead")
+  elseif(BAZEL_PROG AND _GLIBC_VERSION STREQUAL "0")
+    message(STATUS "glibc version undetected: google/tcmalloc requires glibc >= 2.35 (RSEQ TLS); using gperftools instead")
+  elseif(BAZEL_PROG)
     message(STATUS "glibc ${_GLIBC_VERSION} < 2.35: google/tcmalloc requires RSEQ TLS; using gperftools instead")
   endif()
 
@@ -560,14 +566,82 @@ configure_file(
 
 # ── RocksDB benchmark (system install fallback) ──────────────────────────────
 # Only use brew/system RocksDB if we are NOT building deps from source.
+#
+# SMASH_ROCKSDB_VERSION is the single source of truth for which RocksDB the
+# benches target: it drives the from-source GIT_TAG below *and* the acceptance
+# check on a system install, so a stray system RocksDB cannot silently change
+# the workload under measurement.
+#
+# Pinned to 11.1.2 (current release).  The previous pin was 9.8.4 — the version
+# the original paper figures were measured against — and an A/B of the two on
+# the EC2 Linux box showed the version does not move the result (82.6% vs 82.4%
+# cool-phase RSS reduction, a gap smaller than the run-to-run spread), which is
+# what makes moving the pin forward safe.  Building against 10+ at all requires
+# the ROCKSDB_MAJOR conditional in bench_rocksdb.cpp / bench_heap_compress.cpp
+# for the DB::Open signature change in 10.0.1 (`DB**` → `std::unique_ptr<DB>*`).
+#
+# A system install newer than the pin is usable but reported loudly (the paper's
+# numbers describe the pinned version); older than the pin is refused.
+set(SMASH_ROCKSDB_VERSION "11.1.2" CACHE STRING
+    "RocksDB version the benches target")
+
+set(SMASH_SYSTEM_ROCKSDB_OK FALSE)
 if(NOT SMASH_BUILD_BENCH_DEPS)
-  find_library(ROCKSDB_LIB rocksdb HINTS /opt/homebrew/lib)
-  find_path(ROCKSDB_INCLUDE rocksdb/db.h HINTS /opt/homebrew/include)
-  if(ROCKSDB_LIB AND ROCKSDB_INCLUDE)
+  # SMASH_ROCKSDB_ROOT lets a matching out-of-tree build be used without a full
+  # deps build (e.g. -DSMASH_ROCKSDB_ROOT=/path/to/build/bench/deps).  Empty by
+  # default: we never silently prefer a scratch tree we happen to find.
+  set(SMASH_ROCKSDB_ROOT "" CACHE PATH
+      "Prefix holding a RocksDB ${SMASH_ROCKSDB_VERSION} lib/ + include/ (empty = search the system)")
+
+  find_library(ROCKSDB_LIB rocksdb
+    HINTS ${SMASH_ROCKSDB_ROOT}/lib /opt/homebrew/lib)
+  find_path(ROCKSDB_INCLUDE rocksdb/db.h
+    HINTS ${SMASH_ROCKSDB_ROOT}/include /opt/homebrew/include)
+
+  # Reconstruct major.minor.patch from the found headers so the check compares
+  # against the pin above rather than a hardcoded API cutoff.
+  set(_ROCKSDB_FOUND_VERSION "0")
+  if(ROCKSDB_INCLUDE AND EXISTS ${ROCKSDB_INCLUDE}/rocksdb/version.h)
+    set(_rocksdb_ver_parts "")
+    foreach(_part MAJOR MINOR PATCH)
+      file(STRINGS ${ROCKSDB_INCLUDE}/rocksdb/version.h _line
+           REGEX "^#define[ \t]+ROCKSDB_${_part}[ \t]+[0-9]+")
+      string(REGEX MATCH "[0-9]+" _num "${_line}")
+      list(APPEND _rocksdb_ver_parts "${_num}")
+    endforeach()
+    string(JOIN "." _ROCKSDB_FOUND_VERSION ${_rocksdb_ver_parts})
+  endif()
+
+  if(ROCKSDB_LIB AND ROCKSDB_INCLUDE
+     AND _ROCKSDB_FOUND_VERSION VERSION_GREATER_EQUAL SMASH_ROCKSDB_VERSION)
+    set(SMASH_SYSTEM_ROCKSDB_OK TRUE)
     smash_add_standalone_bench(bench_rocksdb bench_rocksdb.cpp)
     target_link_libraries(bench_rocksdb PRIVATE ${ROCKSDB_LIB})
     target_include_directories(bench_rocksdb PRIVATE ${ROCKSDB_INCLUDE})
-    message(STATUS "RocksDB found (system): ${ROCKSDB_LIB}")
+    # Homebrew's shared librocksdb carries its own LZ4/ZSTD, but a static
+    # librocksdb.a (what the pinned from-source build produces, and what
+    # SMASH_ROCKSDB_ROOT usually points at) leaves LZ4_*/ZSTD_*/ZDICT_*
+    # undefined — RocksDB is configured WITH_LZ4=ON WITH_ZSTD=ON.  Supply them
+    # from the versions the bench tree already builds.
+    if(ROCKSDB_LIB MATCHES "\\.a$")
+      target_link_libraries(bench_rocksdb PRIVATE lz4_static libzstd_static)
+    endif()
+    if(_ROCKSDB_FOUND_VERSION VERSION_EQUAL SMASH_ROCKSDB_VERSION)
+      message(STATUS "RocksDB ${_ROCKSDB_FOUND_VERSION} found (matches pin): ${ROCKSDB_LIB}")
+    else()
+      message(WARNING "RocksDB ${_ROCKSDB_FOUND_VERSION} found (${ROCKSDB_LIB}), newer than "
+                      "the ${SMASH_ROCKSDB_VERSION} pin the paper's RocksDB figures were "
+                      "measured against. The benches compile against it, but numbers from "
+                      "this build are NOT comparable to the published ones — use "
+                      "-DSMASH_BUILD_BENCH_DEPS=ON (or -DSMASH_ROCKSDB_ROOT=<prefix>) for "
+                      "a ${SMASH_ROCKSDB_VERSION} build when reproducing paper results.")
+    endif()
+  elseif(ROCKSDB_LIB AND ROCKSDB_INCLUDE)
+    message(STATUS "RocksDB ${_ROCKSDB_FOUND_VERSION} found (${ROCKSDB_LIB}) but is older "
+                   "than the ${SMASH_ROCKSDB_VERSION} pin the benches target; skipping "
+                   "RocksDB benches. Use -DSMASH_BUILD_BENCH_DEPS=ON to build the pin from "
+                   "source, or -DSMASH_ROCKSDB_ROOT=<prefix> to point at an existing "
+                   "${SMASH_ROCKSDB_VERSION}+ tree.")
   else()
     message(STATUS "RocksDB not found (optional)")
   endif()
@@ -585,7 +659,7 @@ smash_add_standalone_bench(bench_heap_compress bench_heap_compress.cpp)
 target_link_libraries(bench_heap_compress PRIVATE lz4_static libzstd_static)
 
 # RocksDB variant (only when using system RocksDB — deps build has its own)
-if(NOT SMASH_BUILD_BENCH_DEPS AND ROCKSDB_LIB AND ROCKSDB_INCLUDE)
+if(SMASH_SYSTEM_ROCKSDB_OK)
   smash_add_standalone_bench(bench_heap_compress_rocksdb bench_heap_compress.cpp)
   target_compile_definitions(bench_heap_compress_rocksdb PRIVATE HAS_ROCKSDB)
   target_link_libraries(bench_heap_compress_rocksdb PRIVATE
@@ -802,7 +876,7 @@ if(SMASH_BUILD_BENCH_DEPS)
 
   ExternalProject_Add(rocksdb_build
     GIT_REPOSITORY https://github.com/facebook/rocksdb.git
-    GIT_TAG v9.8.4
+    GIT_TAG v${SMASH_ROCKSDB_VERSION}   # see SMASH_ROCKSDB_VERSION (paper pin)
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/rocksdb
     DEPENDS bench_lz4_build bench_zstd_build

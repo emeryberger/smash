@@ -2,6 +2,8 @@
 
 **smash** — a compression-aware memory allocator that transparently compresses cold pages to reduce resident set size (RSS).
 
+by [Emery Berger](http://www.emeryberger.org), University of Massachusetts Amherst and Amazon Web Services
+
 ## Overview
 
 Smash is a drop-in malloc replacement that monitors page access patterns and compresses pages that haven't been touched recently. When compressed pages are accessed again, a signal handler transparently decompresses them before the application sees the data. Smash reduces physical memory usage for applications with large working sets where significant portions of allocated memory are idle at any given time.

@@ -5,9 +5,14 @@ Usage:
     rss_sampler.py --interval 0.5 --label foo --out foo.rss.csv -- prog [args...]
 
 Tracks the launched process AND any descendants it forks (ProcessPoolExecutor
-children, hlo2penguin subprocesses, etc.) by walking /proc each tick. Writes
-a CSV (timestamp_s, total_rss_kb, num_procs) and prints peak/avg/wall on
-stdout when the child exits.
+children, hlo2penguin subprocesses, etc.) each tick. Writes a CSV
+(timestamp_s, total_rss_kb, num_procs) and prints peak/avg/wall on stdout when
+the child exits.
+
+Works on macOS AND Linux via the shared tools/footprint helper: macOS samples
+phys_footprint (matching the C++ ri_phys_footprint monitors), Linux samples
+/proc VmRSS. The CSV carries a `# metric_source:` header so its provenance is
+self-describing.
 """
 import argparse
 import os
@@ -17,43 +22,19 @@ import sys
 import time
 from pathlib import Path
 
+# Shared per-pid footprint helper (tools/footprint.py, same directory).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from footprint import METRIC_SOURCE, descendant_pids, pid_footprint_kb
+
 
 def descendants(root_pid: int) -> list[int]:
     """Return root_pid + every PID currently in its descendant tree."""
-    pids = {root_pid}
-    # Build a parent->children map by reading /proc/*/stat once.
-    children: dict[int, list[int]] = {}
-    for entry in os.listdir('/proc'):
-        if not entry.isdigit():
-            continue
-        pid = int(entry)
-        try:
-            with open(f'/proc/{pid}/stat') as f:
-                fields = f.read().rsplit(')', 1)[1].split()
-            ppid = int(fields[1])
-            children.setdefault(ppid, []).append(pid)
-        except (FileNotFoundError, ProcessLookupError, IndexError):
-            continue
-    queue = [root_pid]
-    while queue:
-        p = queue.pop()
-        for c in children.get(p, ()):
-            if c not in pids:
-                pids.add(c)
-                queue.append(c)
-    return list(pids)
+    return descendant_pids(root_pid)
 
 
 def rss_of(pid: int) -> int:
-    """RSS in kilobytes for a single PID, or 0 if dead."""
-    try:
-        with open(f'/proc/{pid}/status') as f:
-            for line in f:
-                if line.startswith('VmRSS:'):
-                    return int(line.split()[1])
-    except (FileNotFoundError, ProcessLookupError):
-        pass
-    return 0
+    """Footprint in kilobytes for a single PID, or 0 if dead."""
+    return pid_footprint_kb(pid)
 
 
 def main() -> int:
@@ -72,6 +53,7 @@ def main() -> int:
 
     out_f = Path(args.out).open('w') if args.out else None
     if out_f:
+        out_f.write(f'# metric_source: {METRIC_SOURCE}\n')
         out_f.write('label,timestamp_s,total_rss_kb,num_procs\n')
 
     start = time.monotonic()

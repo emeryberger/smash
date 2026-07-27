@@ -537,6 +537,28 @@ public:
     void releasePages(void* addr, size_t num_pages) {
         if (tracking_mode_) return;
 
+        // Refuse non-arena addresses. The free list stores ARENA page indices;
+        // pageIndex() on a tracked-external address returns an external index
+        // (>= contig_pages_) which allocatePages would re-mint as
+        // base_ + idx*kPageSize — an address past the arena end (#84). No
+        // caller should pass one after the LargeAlloc routing fix; if one
+        // does, unmap it (the only legitimate producer was a direct-mmap
+        // fallback page) and warn once rather than corrupt the free list.
+        if (!inContigArena(reinterpret_cast<uintptr_t>(addr))) {
+            static std::atomic<bool> warned{false};
+            bool expected = false;
+            if (warned.compare_exchange_strong(expected, true,
+                                               std::memory_order_relaxed)) {
+                char buf[128];
+                int n = smash::safe_snprintf(buf, sizeof(buf),
+                    "[smash WARN] releasePages: non-arena addr=%p npages=%zu"
+                    " — unmapping instead of freelisting\n", addr, num_pages);
+                if (n > 0) (void)!::write(2, buf, (size_t)n);
+            }
+            vm::unmapPages(addr, num_pages * kPageSize);
+            return;
+        }
+
         // SMASH_LANDMINES=1: synchronously mprotect(PROT_NONE) the freed range
         // and log it. Pages are never returned to the free list, so any
         // dangling pointer in the application surfaces as SIGSEGV at the

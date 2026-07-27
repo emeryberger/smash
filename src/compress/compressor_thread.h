@@ -3740,12 +3740,34 @@ private:
             // handleFault only ever holds a single page lock (blocking), so
             // there is no cross-page deadlock. Pages that fail any check break
             // the run (so the mprotect range stays contiguous AND uniform).
+            //
+            // ADDRESS contiguity — not just index contiguity — is required: the
+            // flush below issues ONE mprotect/madvise over [pageAddress(run[0]),
+            // +n*kPageSize). For contiguous-arena pages, index i maps to
+            // base_+i*kPageSize, so consecutive indices are consecutive
+            // addresses. But SMASH_TRACK_EXTERNAL pages get indices by
+            // registration order (contig_pages_+local) and pageAddress() returns
+            // their arbitrary registered mmap address, so consecutive external
+            // indices are NOT adjacent in memory. Coalescing them would make the
+            // single range walk off the first page's mapping into foreign memory
+            // (issue #84's secondary bug). Require each page's address to equal
+            // the previous page's address + kPageSize; a break here degrades
+            // external pages to correct single-page runs while leaving the arena
+            // fast path untouched. (protectPages only bounds-checks size<=4096,
+            // so a multi-page external run would silently escape its guard.)
             size_t n = 0;
             size_t j = i;
+            uintptr_t expect_addr = 0;
             while (j < total && n < kSweepCoalesceMax) {
                 if (!deferred_pending_[j].load(std::memory_order_acquire) ||
                     (now - deferred_queue_tick_[j] < ttl))
                     break;                         // not eligible → end run
+                // Address-contiguity gate (checked before locking so a
+                // non-adjacent page simply ends the run without churn).
+                void* aj = vm_->pageAddress(j);
+                auto uaj = reinterpret_cast<uintptr_t>(aj);
+                if (!aj) break;                    // no mapping → end run
+                if (n > 0 && uaj != expect_addr) break;  // address gap → end run
                 if (!locks_->tryLock(j)) break;    // contended → end run
                 // Re-check under lock; on mismatch drop this page and end run.
                 if (!deferred_pending_[j].load(std::memory_order_acquire) ||
@@ -3756,6 +3778,7 @@ private:
                     break;
                 }
                 run[n++] = j;
+                expect_addr = uaj + kPageSize;
                 ++j;
             }
 

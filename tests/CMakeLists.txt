@@ -192,9 +192,10 @@ else()
   )
 endif()
 set_tests_properties(test_external_mapping PROPERTIES
-  TIMEOUT 60
-  LABELS "known_issue"
-  DISABLED TRUE)  # OOB protectPages on external pages — tracked separately
+  TIMEOUT 60)
+# Re-enabled: the OOB-on-external-pages crash class was root-caused and fixed
+# in issue #84 (self-interposition registered smash's own direct-mmap fallback
+# pages as external; free-path routing then poisoned the arena free list).
 
 # Mode compression test: ONE executable (mode_compression_test.cpp), run twice
 # with SMASH_LARGE_ONLY={0,1}, so FULL mode (test_malloc_compression) and

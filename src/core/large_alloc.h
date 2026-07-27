@@ -100,7 +100,14 @@ public:
         // Must clear BEFORE releasing pages to prevent race with reallocation.
         page_map_->set(reinterpret_cast<uintptr_t>(base), nullptr);
 
-        if (vm_region_ && vm_region_->contains(reinterpret_cast<uintptr_t>(base))) {
+        // Placement test, NOT contains(): under SMASH_TRACK_EXTERNAL,
+        // contains() also matches externally-TRACKED pages (including this
+        // allocator's own direct-mmap fallback pages if they ever get
+        // registered). Feeding a non-arena address to releasePages() poisons
+        // the arena free list with an external page index that allocatePages
+        // later re-mints as base_+idx*kPageSize — past the arena end (#84).
+        // Only pages actually placed in the contiguous arena go back to it.
+        if (vm_region_ && vm_region_->inContigArena(reinterpret_cast<uintptr_t>(base))) {
             if (release_hook_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(base));
                 release_hook_(idx, num_pages, release_ctx_);

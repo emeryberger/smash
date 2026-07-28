@@ -63,13 +63,45 @@ inline bool vmAddrAllowed(uintptr_t a, size_t size) {
     return false;
 }
 
+// Raw mmap/munmap that BYPASS libsmash's own exported mmap/munmap wrappers.
+//
+// libsmash exports mmap/munmap (SMASH_TRACK_EXTERNAL interposition), and a
+// preloaded library's internal PLT calls to those symbols resolve to its OWN
+// wrappers. So every internal mapPages() was re-entering the interposer and —
+// under SMASH_TRACK_EXTERNAL=1 — registering smash's own PROT_RW mappings
+// (e.g. LargeAlloc's direct-mmap fallback) as "external app pages". That
+// poisoned VmRegion::contains(), which LargeAlloc::deallocate used to route
+// frees: tracked fallback pages went to releasePages() with an EXTERNAL page
+// index, the arena free list recycled that index as an ARENA OFFSET, and
+// allocatePages minted pointers past the arena end → app-memory corruption
+// (issue #84, FFmpeg av_expr_free SIGSEGV / decommitPages OOB trap).
+// Direct syscalls also make these safe from PLT lazy-resolution in fault paths
+// (same rationale as SYS_mprotect in protectPages below).
+#if defined(__linux__)
+inline void* rawMmap(void* addr, size_t size, int prot, int flags) {
+    long r = syscall(SYS_mmap, addr, size, prot, flags, -1, 0);
+    return (r == -1) ? MAP_FAILED : reinterpret_cast<void*>(r);
+}
+inline int rawMunmap(void* addr, size_t size) {
+    return static_cast<int>(syscall(SYS_munmap, addr, size));
+}
+#elif !defined(_WIN32)
+// macOS: DYLD __interpose rewrites callers OUTSIDE the interposing image only;
+// libsmash's own calls to mmap/munmap are not self-interposed, so the libc
+// symbols are already "raw" here.
+inline void* rawMmap(void* addr, size_t size, int prot, int flags) {
+    return mmap(addr, size, prot, flags, -1, 0);
+}
+inline int rawMunmap(void* addr, size_t size) { return munmap(addr, size); }
+#endif
+
 // Map anonymous private pages. Returns nullptr on failure.
 inline void* mapPages(size_t size) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
-    void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    void* p = rawMmap(nullptr, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON);
     return (p == MAP_FAILED) ? nullptr : p;
 #endif
 }
@@ -79,13 +111,13 @@ inline void* reservePages(size_t size) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
 #elif defined(__linux__)
-    void* p = mmap(nullptr, size, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    void* p = rawMmap(nullptr, size, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
     return (p == MAP_FAILED) ? nullptr : p;
 #else
     // macOS: pages are lazily backed, plain mmap suffices
-    void* p = mmap(nullptr, size, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    void* p = rawMmap(nullptr, size, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANON);
     return (p == MAP_FAILED) ? nullptr : p;
 #endif
 }
@@ -182,7 +214,10 @@ inline void unmapPages(void* addr, size_t size) {
     // Note: small unmaps outside VmRegion are legitimate — LargeAlloc
     // falls back to direct mmap for oversized allocations, and deallocate
     // unmaps them here. Do NOT trap on these.
-    munmap(addr, size);
+    // rawMunmap: never re-enter libsmash's own munmap interposer (its
+    // deregistration loop takes per-page locks — unsafe from fault paths,
+    // and pointless for smash-internal pages).
+    rawMunmap(addr, size);
 #endif
 }
 
@@ -277,8 +312,10 @@ inline bool remapPages(void* addr, size_t size, bool read, bool write) {
     int prot = PROT_NONE;
     if (read) prot |= PROT_READ;
     if (write) prot |= PROT_WRITE;
-    void* p = mmap(addr, size, prot,
-                   MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    // rawMmap: remapPages runs in fault-handler paths; the PLT-bound mmap
+    // would both risk lazy-resolution and re-enter smash's own interposer.
+    void* p = rawMmap(addr, size, prot,
+                      MAP_PRIVATE | MAP_ANON | MAP_FIXED);
     return p == addr;
 #endif
 }

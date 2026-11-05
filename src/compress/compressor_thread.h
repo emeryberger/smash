@@ -20,6 +20,7 @@
 #include "../vm/platform_mem.h"
 #include "../core/bootstrap_alloc.h"
 #include "../core/page_map.h"
+#include "../util/waker.h"
 #include "../util/spinlock.h"
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
@@ -967,6 +968,7 @@ public:
         helpers_created_ = 0;
         active_workers_ = kCompressorWorkers;
         work_gen_.store(0, std::memory_order_release);
+        work_waker_.reinitAfterFork();
         current_phase_ = 0;
         // /proc/self/{clear_refs,pagemap} fds inherited from the parent
         // refer to the parent's pid-namespace entries — the kernel
@@ -1032,6 +1034,7 @@ private:
     // Work dispatch: coordinator increments work_gen_ to signal helpers.
     // Helpers compare against their last-seen gen to detect new work.
     std::atomic<uint64_t> work_gen_{0};
+    Waker work_waker_;       // helpers park here between dispatches
     int current_phase_ = 0;  // 1=access, 2=compress, 3=monitor
     std::atomic<uint64_t> helper_done_gen_[kMaxHelpers]{};
 
@@ -2812,6 +2815,7 @@ private:
         if (helpers_active) {
             current_phase_ = phase;
             work_gen_.fetch_add(1, std::memory_order_release);
+            work_waker_.notifyAll();
 
             // Coordinator does worker 0's range
             executePhase(phase, 0);
@@ -3740,12 +3744,34 @@ private:
             // handleFault only ever holds a single page lock (blocking), so
             // there is no cross-page deadlock. Pages that fail any check break
             // the run (so the mprotect range stays contiguous AND uniform).
+            //
+            // ADDRESS contiguity — not just index contiguity — is required: the
+            // flush below issues ONE mprotect/madvise over [pageAddress(run[0]),
+            // +n*kPageSize). For contiguous-arena pages, index i maps to
+            // base_+i*kPageSize, so consecutive indices are consecutive
+            // addresses. But SMASH_TRACK_EXTERNAL pages get indices by
+            // registration order (contig_pages_+local) and pageAddress() returns
+            // their arbitrary registered mmap address, so consecutive external
+            // indices are NOT adjacent in memory. Coalescing them would make the
+            // single range walk off the first page's mapping into foreign memory
+            // (issue #84's secondary bug). Require each page's address to equal
+            // the previous page's address + kPageSize; a break here degrades
+            // external pages to correct single-page runs while leaving the arena
+            // fast path untouched. (protectPages only bounds-checks size<=4096,
+            // so a multi-page external run would silently escape its guard.)
             size_t n = 0;
             size_t j = i;
+            uintptr_t expect_addr = 0;
             while (j < total && n < kSweepCoalesceMax) {
                 if (!deferred_pending_[j].load(std::memory_order_acquire) ||
                     (now - deferred_queue_tick_[j] < ttl))
                     break;                         // not eligible → end run
+                // Address-contiguity gate (checked before locking so a
+                // non-adjacent page simply ends the run without churn).
+                void* aj = vm_->pageAddress(j);
+                auto uaj = reinterpret_cast<uintptr_t>(aj);
+                if (!aj) break;                    // no mapping → end run
+                if (n > 0 && uaj != expect_addr) break;  // address gap → end run
                 if (!locks_->tryLock(j)) break;    // contended → end run
                 // Re-check under lock; on mismatch drop this page and end run.
                 if (!deferred_pending_[j].load(std::memory_order_acquire) ||
@@ -3756,6 +3782,7 @@ private:
                     break;
                 }
                 run[n++] = j;
+                expect_addr = uaj + kPageSize;
                 ++j;
             }
 
@@ -4405,7 +4432,12 @@ private:
         while (self->running_.load(std::memory_order_relaxed)) {
             uint64_t gen = self->work_gen_.load(std::memory_order_acquire);
             if (gen == last_gen) {
-                usleep(100);  // brief sleep while waiting for work
+                // Park until dispatch() bumps work_gen_ or stop() clears
+                // running_ (was: usleep(100) polling; see util/waker.h).
+                self->work_waker_.waitUntil([&] {
+                    return self->work_gen_.load(std::memory_order_acquire) != last_gen ||
+                           !self->running_.load(std::memory_order_relaxed);
+                }, 100);
                 continue;
             }
             last_gen = gen;
@@ -4913,6 +4945,7 @@ public:
         // crashing at shutdown.
         if (pthread_create(&coord_thread_, &helper_attr, coordEntry, this) != 0) {
             running_.store(false, std::memory_order_release);
+            work_waker_.notifyAll();
             char buf[128];
             int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash WARN] pthread_create(coordinator) failed; "
@@ -5155,6 +5188,7 @@ public:
         }
         trace_msg("setting running=false");
         running_.store(false, std::memory_order_release);
+        work_waker_.notifyAll();
         trace_msg("joining coord_thread...");
         pthread_join(coord_thread_, nullptr);
         trace_msg("coord_thread joined");

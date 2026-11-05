@@ -27,6 +27,50 @@ if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)
 endif()
 
+# Timestamp URL-downloaded archives at extraction time rather than preserving
+# the timestamps stored in the tarball.  Without this, bumping a dependency URL
+# can leave the extracted sources looking older than their build outputs, so
+# nothing rebuilds.  Applies to every FetchContent/ExternalProject URL download
+# in the tree (LZ4, zstd, gperftools, the bench deps, ...).
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
+endif()
+
+# ── Default build type ────────────────────────────────────────────────────────
+# smash is a performance-critical allocator, so a plain `cmake ..` must never
+# produce an unoptimized library.  RelWithDebInfo keeps the symbols/line tables
+# the allocator needs for profiling and for readable crash reports out of the
+# fault handler; the -O3 promotion just below makes it as fast as Release, which
+# would otherwise be the only way to get -O3 (at the cost of -g).
+# We set the default here rather than letting alloc8 do it (it FORCEs Release
+# into the cache when unset, which is where the "Setting build type to
+# 'Release'" message came from): our optimization level should not depend on a
+# fetched dependency's defaults, and anything between here and
+# add_subdirectory(alloc8) should see the final value.  Multi-config generators
+# (Xcode, Visual Studio) choose the config at build time, so they are left alone.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+               "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+endif()
+
+# ── -O3 for every optimized config ────────────────────────────────────────────
+# CMake hardcodes -O2 for RelWithDebInfo (and for Release on some toolchains).
+# Peak optimization matters more here than compile time, so promote -O2 to -O3
+# in the optimized configs.  These are set as *normal* variables, which shadow
+# the cache in this directory and every subdirectory — so alloc8, LZ4, zstd,
+# mimalloc and the rest of the FetchContent/add_subdirectory tree get -O3 too,
+# not just smash's own targets.  Substitution (rather than assignment) preserves
+# whatever else the toolchain put in the flags, notably -g and -DNDEBUG.
+if(NOT MSVC)
+  foreach(_cfg RELWITHDEBINFO RELEASE)
+    foreach(_lang C CXX)
+      string(REPLACE "-O2" "-O3"
+             CMAKE_${_lang}_FLAGS_${_cfg} "${CMAKE_${_lang}_FLAGS_${_cfg}}")
+    endforeach()
+  endforeach()
+endif()
+
 # ── C++ Standard ──────────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -193,6 +237,24 @@ add_library(smash SHARED
 )
 target_include_directories(smash PRIVATE ${printf_SOURCE_DIR})
 
+# macOS arm64: keep hot per-thread state in a reserved pthread TSD slot (one
+# `mrs` + load) instead of thread_locals (a _tlv_get_addr call each on Mach-O).
+# See src/util/tsd_slot.h. The header is force-included so alloc8's wrappers
+# store the caller hint there too (ALLOC8_CALLER_RA_HOOK); requires an alloc8
+# with that hook (#error otherwise). Slot 89 is the one mimalloc uses; pick
+# another reserved-but-unused slot if something else claims it.
+if(APPLE)
+  option(SMASH_TSD_SLOT "Per-thread state in a reserved pthread TSD slot (macOS)" ON)
+  set(SMASH_TSD_SLOT_INDEX 89 CACHE STRING "pthread TSD slot used when SMASH_TSD_SLOT=ON")
+  if(SMASH_TSD_SLOT)
+    target_compile_definitions(smash PRIVATE
+      SMASH_TSD_SLOT=${SMASH_TSD_SLOT_INDEX}
+      SMASH_TSD_SLOT_STR="${SMASH_TSD_SLOT_INDEX}")
+    target_compile_options(smash PRIVATE
+      -include ${CMAKE_CURRENT_SOURCE_DIR}/src/util/tsd_slot.h)
+  endif()
+endif()
+
 # Linux syscall wrappers need default visibility for LD_PRELOAD interposition.
 # The global -fvisibility=hidden flag hides them otherwise.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -229,7 +291,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash PRIVATE alloc8::headers pthread dl)
   target_link_options(smash PRIVATE
     "LINKER:--version-script=${SMASH_VERSION_SCRIPT}"
-    "-Bsymbolic"
+    "LINKER:-Bsymbolic"
   )
 else()
   target_link_libraries(smash PRIVATE alloc8::interpose)
@@ -303,7 +365,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash_noopt PRIVATE alloc8::headers pthread dl)
   target_link_options(smash_noopt PRIVATE
     "LINKER:--version-script=${SMASH_VERSION_SCRIPT}"
-    "-Bsymbolic"
+    "LINKER:-Bsymbolic"
   )
 else()
   target_link_libraries(smash_noopt PRIVATE alloc8::interpose)

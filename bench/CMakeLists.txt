@@ -57,6 +57,30 @@ endif()
 # Empty on Linux, where -DCMAKE_OSX_ARCHITECTURES= is simply ignored.
 string(REPLACE ";" "|" SMASH_BENCH_OSX_ARCHS "${CMAKE_OSX_ARCHITECTURES}")
 
+# ── SDK env prefix for autoconf/Makefile sub-builds ─────────────────────────
+# The CMake-based ExternalProjects below inherit SDK detection automatically.
+# The autoconf/Makefile ones (varnish, memcached, tcmalloc, redis) shell out to
+# a bare compiler that does NOT: on macOS, if the invoking shell has no SDKROOT,
+# their configure/link fails with `ld: library 'System' not found`. Prefix those
+# sub-build commands with this to inject SDKROOT. On Linux it stays empty and
+# expands to nothing (the compiler needs no sysroot hint), so the prefix is a
+# no-op there — the same command line works on both platforms.
+set(SMASH_BENCH_SDK_ENV "")
+if(APPLE)
+  if(NOT CMAKE_OSX_SYSROOT STREQUAL "")
+    set(_SMASH_SDKROOT "${CMAKE_OSX_SYSROOT}")
+  else()
+    execute_process(COMMAND xcrun --show-sdk-path
+                    OUTPUT_VARIABLE _SMASH_SDKROOT
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+  endif()
+  if(NOT _SMASH_SDKROOT STREQUAL "")
+    set(SMASH_BENCH_SDK_ENV ${CMAKE_COMMAND} -E env "SDKROOT=${_SMASH_SDKROOT}")
+    message(STATUS "Bench autoconf sub-builds will use SDKROOT=${_SMASH_SDKROOT}")
+  endif()
+endif()
+
 # ── Option to build external benchmark dependencies ──────────────────────────
 # ON by default when SMASH_BUILD_BENCH=ON.  Set -DSMASH_BUILD_BENCH_DEPS=OFF to skip.
 option(SMASH_BUILD_BENCH_DEPS "Build external benchmark dependencies (Redis, memcached, RocksDB)" ON)
@@ -308,7 +332,9 @@ endif()
 # gperftools 2.16 (the stable autotools-based fork).
 include(ExternalProject)
 
-# Detect glibc version for google/tcmalloc compatibility
+# Detect glibc version for google/tcmalloc compatibility.  "0" means "not
+# glibc" (macOS, musl) or unparseable `ldd --version` output — either way there
+# is no RSEQ TLS, so google/tcmalloc is off the table.
 set(_GLIBC_VERSION "0")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   execute_process(
@@ -359,7 +385,11 @@ if(BAZEL_PROG AND _GLIBC_VERSION VERSION_GREATER_EQUAL "2.35")
   message(STATUS "google/tcmalloc (latest) will be built from source using Bazel 8.2.1")
 else()
   # ── gperftools/tcmalloc 2.16 (works on all glibc versions) ──────────────
-  if(BAZEL_PROG AND _GLIBC_VERSION VERSION_LESS "2.35")
+  if(BAZEL_PROG AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(STATUS "${CMAKE_SYSTEM_NAME}: google/tcmalloc requires glibc >= 2.35 (RSEQ TLS); using gperftools instead")
+  elseif(BAZEL_PROG AND _GLIBC_VERSION STREQUAL "0")
+    message(STATUS "glibc version undetected: google/tcmalloc requires glibc >= 2.35 (RSEQ TLS); using gperftools instead")
+  elseif(BAZEL_PROG)
     message(STATUS "glibc ${_GLIBC_VERSION} < 2.35: google/tcmalloc requires RSEQ TLS; using gperftools instead")
   endif()
 
@@ -380,11 +410,11 @@ else()
     URL_HASH SHA256=f12624af5c5987f2cc830ee534f754c3c5961eec08004c26a8b80de015cf056f
     PREFIX ${GPERFTOOLS_PREFIX}
     CONFIGURE_COMMAND
-      <SOURCE_DIR>/configure
+      ${SMASH_BENCH_SDK_ENV} <SOURCE_DIR>/configure
         --prefix=${GPERFTOOLS_PREFIX}/install
         --enable-minimal
         --disable-debugalloc
-    BUILD_COMMAND make -j${_TCMALLOC_NCPU}
+    BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make -j${_TCMALLOC_NCPU}
     INSTALL_COMMAND make install
     BUILD_BYPRODUCTS
       ${GPERFTOOLS_PREFIX}/install/lib/libtcmalloc_minimal${_TCMALLOC_SHLIB_SUFFIX}
@@ -474,6 +504,59 @@ else()
   message(STATUS "DieHarder not found (optional)")
 endif()
 
+# ── Preloadable shared allocators (jemalloc, mimalloc) for whole-application
+# LD_PRELOAD comparisons ──────────────────────────────────────────────────────
+# The bench_alloc_* microbenchmarks above STATIC-link mimalloc and use a
+# system jemalloc, which is fine for direct-linked micro comparisons. But the
+# application-level RSS study (redis/valkey/memcached/mongo/... under
+# LD_PRELOAD) needs preloadable *.so builds at pinned, reproducible versions.
+# Build them here from source (same pins as elsewhere) and export their paths,
+# mirroring the tcmalloc-preload pattern above.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  ProcessorCount(_ALLOC_NCPU)
+  if(_ALLOC_NCPU EQUAL 0)
+    set(_ALLOC_NCPU 4)
+  endif()
+  set(ALLOC_PRELOAD_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/alloc_preload)
+  set(JEMALLOC_PRELOAD_SO  ${ALLOC_PRELOAD_PREFIX}/lib/libjemalloc.so)
+  set(MIMALLOC_PRELOAD_SO  ${ALLOC_PRELOAD_PREFIX}/lib/libmimalloc.so)
+
+  ExternalProject_Add(jemalloc_preload_build
+    GIT_REPOSITORY https://github.com/jemalloc/jemalloc.git
+    GIT_TAG 5.3.0
+    GIT_SHALLOW TRUE
+    PREFIX ${ALLOC_PRELOAD_PREFIX}/jemalloc
+    CONFIGURE_COMMAND cd <SOURCE_DIR> && ./autogen.sh &&
+      <SOURCE_DIR>/configure --prefix=${ALLOC_PRELOAD_PREFIX} --enable-shared --disable-static
+    BUILD_COMMAND cd <SOURCE_DIR> && make -j${_ALLOC_NCPU}
+    INSTALL_COMMAND cd <SOURCE_DIR> && make install
+    BUILD_IN_SOURCE TRUE
+    BUILD_BYPRODUCTS ${JEMALLOC_PRELOAD_SO}
+  )
+  message(STATUS "  jemalloc 5.3.0 (preloadable .so)")
+
+  ExternalProject_Add(mimalloc_preload_build
+    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG v2.1.2
+    GIT_SHALLOW TRUE
+    PREFIX ${ALLOC_PRELOAD_PREFIX}/mimalloc
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+      -DMI_BUILD_TESTS=OFF
+      -DCMAKE_INSTALL_PREFIX=${ALLOC_PRELOAD_PREFIX}
+      -DCMAKE_INSTALL_LIBDIR=lib
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j${_ALLOC_NCPU}
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    BUILD_BYPRODUCTS ${MIMALLOC_PRELOAD_SO}
+  )
+  message(STATUS "  mimalloc v2.1.2 (preloadable .so)")
+
+  set(BENCH_JEMALLOC_PRELOAD ${JEMALLOC_PRELOAD_SO} CACHE PATH "")
+  set(BENCH_MIMALLOC_PRELOAD ${MIMALLOC_PRELOAD_SO} CACHE PATH "")
+endif()
+
 endif() # SMASH_BUILD_BENCH_ALLOCATORS
 
 # Python runner (configure paths)
@@ -549,14 +632,82 @@ configure_file(
 
 # ── RocksDB benchmark (system install fallback) ──────────────────────────────
 # Only use brew/system RocksDB if we are NOT building deps from source.
+#
+# SMASH_ROCKSDB_VERSION is the single source of truth for which RocksDB the
+# benches target: it drives the from-source GIT_TAG below *and* the acceptance
+# check on a system install, so a stray system RocksDB cannot silently change
+# the workload under measurement.
+#
+# Pinned to 11.1.2 (current release).  The previous pin was 9.8.4 — the version
+# the original paper figures were measured against — and an A/B of the two on
+# the EC2 Linux box showed the version does not move the result (82.6% vs 82.4%
+# cool-phase RSS reduction, a gap smaller than the run-to-run spread), which is
+# what makes moving the pin forward safe.  Building against 10+ at all requires
+# the ROCKSDB_MAJOR conditional in bench_rocksdb.cpp / bench_heap_compress.cpp
+# for the DB::Open signature change in 10.0.1 (`DB**` → `std::unique_ptr<DB>*`).
+#
+# A system install newer than the pin is usable but reported loudly (the paper's
+# numbers describe the pinned version); older than the pin is refused.
+set(SMASH_ROCKSDB_VERSION "11.1.2" CACHE STRING
+    "RocksDB version the benches target")
+
+set(SMASH_SYSTEM_ROCKSDB_OK FALSE)
 if(NOT SMASH_BUILD_BENCH_DEPS)
-  find_library(ROCKSDB_LIB rocksdb HINTS /opt/homebrew/lib)
-  find_path(ROCKSDB_INCLUDE rocksdb/db.h HINTS /opt/homebrew/include)
-  if(ROCKSDB_LIB AND ROCKSDB_INCLUDE)
+  # SMASH_ROCKSDB_ROOT lets a matching out-of-tree build be used without a full
+  # deps build (e.g. -DSMASH_ROCKSDB_ROOT=/path/to/build/bench/deps).  Empty by
+  # default: we never silently prefer a scratch tree we happen to find.
+  set(SMASH_ROCKSDB_ROOT "" CACHE PATH
+      "Prefix holding a RocksDB ${SMASH_ROCKSDB_VERSION} lib/ + include/ (empty = search the system)")
+
+  find_library(ROCKSDB_LIB rocksdb
+    HINTS ${SMASH_ROCKSDB_ROOT}/lib /opt/homebrew/lib)
+  find_path(ROCKSDB_INCLUDE rocksdb/db.h
+    HINTS ${SMASH_ROCKSDB_ROOT}/include /opt/homebrew/include)
+
+  # Reconstruct major.minor.patch from the found headers so the check compares
+  # against the pin above rather than a hardcoded API cutoff.
+  set(_ROCKSDB_FOUND_VERSION "0")
+  if(ROCKSDB_INCLUDE AND EXISTS ${ROCKSDB_INCLUDE}/rocksdb/version.h)
+    set(_rocksdb_ver_parts "")
+    foreach(_part MAJOR MINOR PATCH)
+      file(STRINGS ${ROCKSDB_INCLUDE}/rocksdb/version.h _line
+           REGEX "^#define[ \t]+ROCKSDB_${_part}[ \t]+[0-9]+")
+      string(REGEX MATCH "[0-9]+" _num "${_line}")
+      list(APPEND _rocksdb_ver_parts "${_num}")
+    endforeach()
+    string(JOIN "." _ROCKSDB_FOUND_VERSION ${_rocksdb_ver_parts})
+  endif()
+
+  if(ROCKSDB_LIB AND ROCKSDB_INCLUDE
+     AND _ROCKSDB_FOUND_VERSION VERSION_GREATER_EQUAL SMASH_ROCKSDB_VERSION)
+    set(SMASH_SYSTEM_ROCKSDB_OK TRUE)
     smash_add_standalone_bench(bench_rocksdb bench_rocksdb.cpp)
     target_link_libraries(bench_rocksdb PRIVATE ${ROCKSDB_LIB})
     target_include_directories(bench_rocksdb PRIVATE ${ROCKSDB_INCLUDE})
-    message(STATUS "RocksDB found (system): ${ROCKSDB_LIB}")
+    # Homebrew's shared librocksdb carries its own LZ4/ZSTD, but a static
+    # librocksdb.a (what the pinned from-source build produces, and what
+    # SMASH_ROCKSDB_ROOT usually points at) leaves LZ4_*/ZSTD_*/ZDICT_*
+    # undefined — RocksDB is configured WITH_LZ4=ON WITH_ZSTD=ON.  Supply them
+    # from the versions the bench tree already builds.
+    if(ROCKSDB_LIB MATCHES "\\.a$")
+      target_link_libraries(bench_rocksdb PRIVATE lz4_static libzstd_static)
+    endif()
+    if(_ROCKSDB_FOUND_VERSION VERSION_EQUAL SMASH_ROCKSDB_VERSION)
+      message(STATUS "RocksDB ${_ROCKSDB_FOUND_VERSION} found (matches pin): ${ROCKSDB_LIB}")
+    else()
+      message(WARNING "RocksDB ${_ROCKSDB_FOUND_VERSION} found (${ROCKSDB_LIB}), newer than "
+                      "the ${SMASH_ROCKSDB_VERSION} pin the paper's RocksDB figures were "
+                      "measured against. The benches compile against it, but numbers from "
+                      "this build are NOT comparable to the published ones — use "
+                      "-DSMASH_BUILD_BENCH_DEPS=ON (or -DSMASH_ROCKSDB_ROOT=<prefix>) for "
+                      "a ${SMASH_ROCKSDB_VERSION} build when reproducing paper results.")
+    endif()
+  elseif(ROCKSDB_LIB AND ROCKSDB_INCLUDE)
+    message(STATUS "RocksDB ${_ROCKSDB_FOUND_VERSION} found (${ROCKSDB_LIB}) but is older "
+                   "than the ${SMASH_ROCKSDB_VERSION} pin the benches target; skipping "
+                   "RocksDB benches. Use -DSMASH_BUILD_BENCH_DEPS=ON to build the pin from "
+                   "source, or -DSMASH_ROCKSDB_ROOT=<prefix> to point at an existing "
+                   "${SMASH_ROCKSDB_VERSION}+ tree.")
   else()
     message(STATUS "RocksDB not found (optional)")
   endif()
@@ -574,7 +725,7 @@ smash_add_standalone_bench(bench_heap_compress bench_heap_compress.cpp)
 target_link_libraries(bench_heap_compress PRIVATE lz4_static libzstd_static)
 
 # RocksDB variant (only when using system RocksDB — deps build has its own)
-if(NOT SMASH_BUILD_BENCH_DEPS AND ROCKSDB_LIB AND ROCKSDB_INCLUDE)
+if(SMASH_SYSTEM_ROCKSDB_OK)
   smash_add_standalone_bench(bench_heap_compress_rocksdb bench_heap_compress.cpp)
   target_compile_definitions(bench_heap_compress_rocksdb PRIVATE HAS_ROCKSDB)
   target_link_libraries(bench_heap_compress_rocksdb PRIVATE
@@ -627,7 +778,7 @@ if(SMASH_BUILD_BENCH_DEPS)
     PREFIX ${BENCH_DEPS_DIR}/redis
     CONFIGURE_COMMAND ""
     BUILD_IN_SOURCE TRUE
-    BUILD_COMMAND make MALLOC=libc -j${NCPU}
+    BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make MALLOC=libc -j${NCPU}
     INSTALL_COMMAND
       ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-server ${BENCH_DEPS_DIR}/bin/redis-server-libc
       COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/redis-cli ${BENCH_DEPS_DIR}/bin/redis-cli
@@ -636,6 +787,29 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/bin/redis-server-libc
       ${BENCH_DEPS_DIR}/bin/redis-cli
       ${BENCH_DEPS_DIR}/bin/redis-benchmark
+  )
+
+  # ── Valkey 9.1.0 (MALLOC=libc — no jemalloc) ──────────────────────────────
+  # Redis fork (Linux Foundation). Same plain Makefile build as redis: build
+  # with MALLOC=libc so libsmash can interpose malloc. Binaries are named
+  # valkey-* but stay RESP-compatible. Installed alongside redis so the harness
+  # can drive it as a separate opt-in app.
+  ExternalProject_Add(valkey_build
+    GIT_REPOSITORY https://github.com/valkey-io/valkey.git
+    GIT_TAG 9.1.0
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/valkey
+    CONFIGURE_COMMAND ""
+    BUILD_IN_SOURCE TRUE
+    BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make MALLOC=libc -j${NCPU}
+    INSTALL_COMMAND
+      ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/valkey-server ${BENCH_DEPS_DIR}/bin/valkey-server-libc
+      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/valkey-cli ${BENCH_DEPS_DIR}/bin/valkey-cli
+      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/valkey-benchmark ${BENCH_DEPS_DIR}/bin/valkey-benchmark
+    BUILD_BYPRODUCTS
+      ${BENCH_DEPS_DIR}/bin/valkey-server-libc
+      ${BENCH_DEPS_DIR}/bin/valkey-cli
+      ${BENCH_DEPS_DIR}/bin/valkey-benchmark
   )
 
   # ── libevent (required by memcached) ───────────────────────────────────────
@@ -687,13 +861,13 @@ if(SMASH_BUILD_BENCH_DEPS)
       PREFIX ${BENCH_DEPS_DIR}/memcached
       CONFIGURE_COMMAND
         cd <SOURCE_DIR> && ./autogen.sh &&
-        <SOURCE_DIR>/configure
+        ${SMASH_BENCH_SDK_ENV} <SOURCE_DIR>/configure
           --prefix=${BENCH_DEPS_DIR}
           --with-libevent=${LIBEVENT_PREFIX}
           --disable-extstore
           --disable-tls
       BUILD_IN_SOURCE TRUE
-      BUILD_COMMAND make -j${NCPU}
+      BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make -j${NCPU}
       INSTALL_COMMAND
         ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/memcached ${BENCH_DEPS_DIR}/bin/memcached
       BUILD_BYPRODUCTS ${BENCH_DEPS_DIR}/bin/memcached
@@ -791,7 +965,7 @@ if(SMASH_BUILD_BENCH_DEPS)
 
   ExternalProject_Add(rocksdb_build
     GIT_REPOSITORY https://github.com/facebook/rocksdb.git
-    GIT_TAG v9.8.4
+    GIT_TAG v${SMASH_ROCKSDB_VERSION}   # see SMASH_ROCKSDB_VERSION (paper pin)
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/rocksdb
     DEPENDS bench_lz4_build bench_zstd_build
@@ -823,13 +997,50 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/include/rocksdb/db.h
   )
 
+  # ── Snappy 1.2.1 (static, vendored) ──────────────────────────────────────────
+  # LevelDB compresses SST blocks with Snappy when it detects the library at
+  # configure time (check_library_exists(snappy ...)). We vendor it so LevelDB
+  # is built WITH compression enabled (matching a realistic deployment) and the
+  # build is self-contained (no reliance on a system libsnappy). Static + PIC so
+  # it links cleanly into bench_leveldb.
+  ExternalProject_Add(bench_snappy_build
+    GIT_REPOSITORY https://github.com/google/snappy.git
+    GIT_TAG 1.2.1
+    GIT_SHALLOW TRUE
+    PREFIX ${BENCH_DEPS_DIR}/snappy
+    LIST_SEPARATOR |
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
+      "-DCMAKE_OSX_ARCHITECTURES=${SMASH_BENCH_OSX_ARCHS}"
+      -DBUILD_SHARED_LIBS=OFF
+      -DSNAPPY_BUILD_TESTS=OFF
+      -DSNAPPY_BUILD_BENCHMARKS=OFF
+      -DSNAPPY_INSTALL=ON
+      -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
+      -DCMAKE_INSTALL_LIBDIR=lib
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . -- -j${NCPU}
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    BUILD_BYPRODUCTS
+      ${BENCH_DEPS_DIR}/lib/libsnappy.a
+      ${BENCH_DEPS_DIR}/include/snappy.h
+  )
+  message(STATUS "  Snappy 1.2.1 (static, vendored for LevelDB)")
+
   # ── LevelDB 1.23 (static library) ──────────────────────────────────────────
   # LevelDB uses an arena allocator over malloc — Smash should work.
+  # Built WITH vendored Snappy: CMAKE_PREFIX_PATH points its
+  # check_library_exists(snappy ...) probe at BENCH_DEPS_DIR so HAVE_SNAPPY is
+  # set and SST blocks are Snappy-compressed.
   ExternalProject_Add(leveldb_build
     GIT_REPOSITORY https://github.com/google/leveldb.git
     GIT_TAG 1.23
     GIT_SHALLOW TRUE
     PREFIX ${BENCH_DEPS_DIR}/leveldb
+    DEPENDS bench_snappy_build
     LIST_SEPARATOR |
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
@@ -840,6 +1051,13 @@ if(SMASH_BUILD_BENCH_DEPS)
       -DLEVELDB_BUILD_TESTS=OFF
       -DLEVELDB_BUILD_BENCHMARKS=OFF
       -DBUILD_SHARED_LIBS=OFF
+      -DCMAKE_PREFIX_PATH=${BENCH_DEPS_DIR}
+      -DCMAKE_LIBRARY_PATH=${BENCH_DEPS_DIR}/lib
+      -DCMAKE_INCLUDE_PATH=${BENCH_DEPS_DIR}/include
+      # check_library_exists(snappy ...) links a probe via try_compile, which
+      # honors CMAKE_EXE_LINKER_FLAGS (not CMAKE_LIBRARY_PATH) — point it at our
+      # vendored libsnappy.a so HAVE_SNAPPY is detected without a system libsnappy.
+      "-DCMAKE_EXE_LINKER_FLAGS=-L${BENCH_DEPS_DIR}/lib"
       -DCMAKE_INSTALL_PREFIX=${BENCH_DEPS_DIR}
       -DCMAKE_INSTALL_LIBDIR=lib
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON
@@ -849,7 +1067,7 @@ if(SMASH_BUILD_BENCH_DEPS)
       ${BENCH_DEPS_DIR}/lib/libleveldb.a
       ${BENCH_DEPS_DIR}/include/leveldb/db.h
   )
-  message(STATUS "  LevelDB 1.23 (static)")
+  message(STATUS "  LevelDB 1.23 (static, Snappy-enabled)")
 
   # ── Varnish 7.6.0 (HTTP cache, supports -s malloc backend) ────────────────
   # Varnish with -s malloc uses system malloc for cache storage.
@@ -875,13 +1093,13 @@ if(SMASH_BUILD_BENCH_DEPS)
       PREFIX ${BENCH_DEPS_DIR}/varnish
       CONFIGURE_COMMAND
         cd <SOURCE_DIR> && ./autogen.sh &&
-        ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER} "CFLAGS=${VARNISH_CFLAGS}"
+        ${SMASH_BENCH_SDK_ENV} ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER} "CFLAGS=${VARNISH_CFLAGS}"
         <SOURCE_DIR>/configure
           --prefix=${BENCH_DEPS_DIR}
           --disable-dependency-tracking
           --without-jemalloc
       BUILD_IN_SOURCE TRUE
-      BUILD_COMMAND make -j${NCPU}
+      BUILD_COMMAND ${SMASH_BENCH_SDK_ENV} make -j${NCPU}
       INSTALL_COMMAND make install
       BUILD_BYPRODUCTS
         ${BENCH_DEPS_DIR}/sbin/varnishd
@@ -1032,12 +1250,15 @@ if(SMASH_BUILD_BENCH_DEPS)
   _get_filtered_dir_compile_options(leveldb_opts)
   set_target_properties(bench_leveldb PROPERTIES COMPILE_OPTIONS "${leveldb_opts}")
   target_include_directories(bench_leveldb PRIVATE ${BENCH_DEPS_DIR}/include)
+  # LevelDB was built with Snappy, so libleveldb.a has unresolved snappy_*
+  # symbols; link the vendored static libsnappy.a after it.
   target_link_libraries(bench_leveldb PRIVATE
     ${BENCH_DEPS_DIR}/lib/libleveldb.a
+    ${BENCH_DEPS_DIR}/lib/libsnappy.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
   )
-  add_dependencies(bench_leveldb leveldb_build)
+  add_dependencies(bench_leveldb leveldb_build bench_snappy_build)
 
   # ── Export paths ───────────────────────────────────────────────────────────
   set(BENCH_REDIS_SERVER   ${BENCH_DEPS_DIR}/bin/redis-server-libc CACHE PATH "")

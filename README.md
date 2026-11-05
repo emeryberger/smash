@@ -2,6 +2,8 @@
 
 **smash** — a compression-aware memory allocator that transparently compresses cold pages to reduce resident set size (RSS).
 
+by [Emery Berger](http://www.emeryberger.org), University of Massachusetts Amherst and Amazon Web Services
+
 ## Overview
 
 Smash is a drop-in malloc replacement that monitors page access patterns and compresses pages that haven't been touched recently. When compressed pages are accessed again, a signal handler transparently decompresses them before the application sees the data. Smash reduces physical memory usage for applications with large working sets where significant portions of allocated memory are idle at any given time.
@@ -272,7 +274,7 @@ The `bench_deps` target builds:
 ### macOS
 
 ```bash
-DYLD_INSERT_LIBRARIES=./build/libsmash.dylib DYLD_FORCE_FLAT_NAMESPACE=1 ./your_application
+DYLD_INSERT_LIBRARIES=./build/libsmash.dylib ./your_application
 ```
 
 If you downloaded `libsmash-macos-arm64.dylib` from a [release](https://github.com/emeryberger/smash/releases) (rather than building locally), clear the quarantine flag your browser adds first — otherwise dyld rejects the ad-hoc-signed dylib with *"library load disallowed by system policy"*:

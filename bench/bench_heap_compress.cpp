@@ -230,6 +230,11 @@ static void workloadSQLite(int rows) {
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
 #include <rocksdb/table.h>
+// ROCKSDB_MAJOR — included explicitly rather than relying on db.h pulling it
+// in, so the version test below can never silently evaluate 0 >= 10 and pick
+// the wrong DB::Open overload.
+#include <rocksdb/version.h>
+#include <memory>
 
 static void workloadRocksDB(int keys, int value_size) {
     rocksdb::Options options;
@@ -241,8 +246,19 @@ static void workloadRocksDB(int keys, int value_size) {
     table_opts.block_cache = rocksdb::NewLRUCache(256 * 1024 * 1024);
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
 
+    // RocksDB 10.0.1 replaced the `DB**` overload of DB::Open with
+    // `std::unique_ptr<DB>*`.  Either way the DB is deliberately *not* closed
+    // (see the end of this function — its pages must stay resident for the
+    // sampling that follows), so on 10+ the unique_ptr is released rather than
+    // left to close the DB at scope exit.
     rocksdb::DB* db = nullptr;
+#if ROCKSDB_MAJOR >= 10
+    std::unique_ptr<rocksdb::DB> db_owner;
+    rocksdb::DB::Open(options, "/tmp/bench_heap_rocksdb", &db_owner);
+    db = db_owner.release();
+#else
     rocksdb::DB::Open(options, "/tmp/bench_heap_rocksdb", &db);
+#endif
 
     // Fill
     for (int i = 0; i < keys; i++) {

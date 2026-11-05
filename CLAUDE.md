@@ -22,7 +22,7 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All 18 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Five of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All tests must pass (`ctest` lists them; some are macOS-only). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Five of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -76,6 +76,20 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 - **Per-origin sliding-window stats**: `SizeClassStats` keyed by `(arena, size_class, worker)` — `sc_stats[kNumArenas * kNumClasses]` per worker, indexed via `statsIndex(arena, sc)`. Each bucket holds a 64-entry ratio window (0–255) plus per-tier compression-time EMAs. Aggregating across arenas would wash out the homogeneity arena routing produces.
 - **Signal handler path**: No malloc allowed. Decompression uses pre-allocated per-slot contexts only.
 
+## Allocation Fast Path
+
+Small `malloc`/`free`/`calloc`/`realloc` are served by lean entry points (`SmashFastRedirect` in `smash_heap.cpp`) that alloc8's `xx*` functions call directly; everything else tail-calls the full `SmashHeap` path, which handles every mode.
+
+- **One gate:** the per-thread `g_fast_tc` is non-null only when the lean path is valid (full mode, no free diagnostics, heap constructed). No per-call heap-state, mode or diagnostics checks.
+- **free() without touching the Span:** the VmRegion keeps a 2-byte page tag (small flag, arena, size class) beside the flat page→Span table, so free picks the thread-cache lane with one load.
+- **Thread cache:** 16 lanes × depth 16 (`SMASH_CACHE_LANES` to change); counts in a compact array separate from the pointers.
+- **Linking:** `LINKER:-Bsymbolic` binds the wrappers' calls to `xxmalloc`/`xxfree` locally (direct jump, no PLT). The old `"-Bsymbolic"` form went to the compiler driver as `-B symbolic` and never reached ld.
+- **Large blocks (16 KiB–8 MiB)** are cached on free with their Span descriptors (`LargeAlloc`'s `LargeBlockCache`) instead of being munmap'd or decommitted. Sizes round to 8 steps per power of two; idle buckets are purged after 2 compressor ticks.
+- **Empty slab spans** stay resident for 2 compressor ticks before `madvise` (they leave compressor tracking immediately), under a process-wide cap.
+- **Background threads** (compressor helpers, VmRegion decommit drainer) block on a `Waker` (condition variable) instead of polling with `usleep(100)`; `Spinlock` yields after a bounded spin.
+
+Measured on x86-64 (Xeon 8175M) and Graviton3, glibc 2.35: faster than glibc on every microbenchmark (e.g. malloc+free pairs 0.78×/0.86×, 16 KiB–1 MiB churn 0.22×/0.09×), g++ -O2 compile at parity, Python churn 0.67×/0.64×; `bench_rss`/`bench_sqlite` RSS reductions unchanged.
+
 ## Syscall & Buffered I/O Compatibility
 
 See [agents/syscall-compat.md](agents/syscall-compat.md) for details on EFAULT-driven decompress-and-retry, DYLD interposition limitations, buffered-I/O carve-outs, and the full list of interposed functions per platform.
@@ -125,6 +139,19 @@ The compressor flow calls `decommitPages()` (MADV_FREE_REUSABLE) **before** `mpr
 
 libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinary and PAC (arm64e) processes; the benchmark binaries are built **arm64-only** because they are the app under test and must load arm64-only preloads. See [agents/macos-arm64e.md](agents/macos-arm64e.md) for the full mechanism, the exec-vs-load trap (macOS ≤ 15 SIGKILLs third-party arm64e; macOS 26 runs it), and the debugging pitfalls.
 
+## macOS Per-Thread State (TSD slot, `SMASH_TSD_SLOT`)
+
+On Mach-O every `thread_local` access from a dylib calls `_tlv_get_addr` — `tls_model("initial-exec")` has no effect (there is no static TLS model) — and each distinct variable a function touches is its own call. Smash's malloc/free fast path touched eight of them plus alloc8's caller-RA hint, which made `_tlv_get_addr` the hottest non-waiting frame in allocation-heavy programs.
+
+On Apple silicon (arm64/arm64e) the hot per-thread fields therefore live in one `ThreadState` (`smash_heap.h`) whose pointer sits in pthread TSD slot `SMASH_TSD_SLOT_INDEX` (default **89**, `__PTK_FRAMEWORK_OLDGC_KEY9`, the slot mimalloc uses: reserved by libpthread for the long-gone Objective-C GC, never handed out by `pthread_key_create`). A read is `mrs tpidrro_el0` + load; see `src/util/tsd_slot.h`. x86-64 macOS keeps the `thread_local`s: the `%gs` equivalent could not be validated (smash is unstable on x86-64 under Rosetta with or without it, and no Intel Mac was available).
+
+- The old names (`g_thread_cache`, `g_free_cache_*`, `g_arena_stack_base`, `g_full_mode_cached`) are macros for `threadState()->field`, so call sites are unchanged. Linux and x86-64 macOS keep the `thread_local`s.
+- **Lifecycle:** a null slot means "not set up": `threadStateSlow()` pops a recycled `ThreadState` or carves one from `BootstrapAlloc` (never malloc), installs it, and arms a pthread-key destructor. At thread exit the destructor drains a still-live thread cache (GCD workers never pass through alloc8's `pthread_create` trampoline, so they get no `xxthread_cleanup`), clears the slot, and pushes the state on a free list. A later destructor that allocates simply gets a fresh state (pthread re-runs destructors). The free-list lock is handled in the atfork handlers.
+- **Caller hint:** `tsd_slot.h` is force-included into every libsmash TU, including alloc8's wrappers, and defines `ALLOC8_CALLER_RA_HOOK`, so the wrappers store the return address in `ThreadState::caller_ra` (first field) instead of alloc8's `thread_local`. Requires an alloc8 with `ALLOC8_HAS_CALLER_RA_HOOK` — the build `#error`s otherwise, because the hint would silently never be written and call-site arenas would collapse.
+- **Conflicts:** the slot is unofficial. If the main thread's slot already holds something that is not a `ThreadState` (magic check) when smash's constructor runs — e.g. a second malloc replacement using the same slot — smash aborts with a message rather than corrupt both. There is deliberately no runtime fallback switch: the fast path reads the slot unconditionally. Pick another slot with `-DSMASH_TSD_SLOT_INDEX=N` or disable with `-DSMASH_TSD_SLOT=OFF`. A `thread_local` fallback state exists only for `BootstrapAlloc` exhaustion.
+- **Test:** `test_tsd_thread` (1024 short-lived pthreads, GCD workers, an app destructor that allocates during exit, fork with live threads) checks reuse via the exported `smash_tsd_stats()`.
+- Measured (M1 Max): malloc+free microbench 41.4 → 24.7 ns/op; jaq 24.3 → 18.0 s; minijinja, stylua, rhai 10–13% faster.
+
 ## Key Conventions
 
 - Never allocate from the managed heap inside smash internals — use BootstrapAlloc
@@ -140,6 +167,12 @@ libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinar
 - **alloc8**: Interposition framework (cloned via FetchContent; override with `-DALLOC8_DIR=`)
 - **LZ4 v1.9.4**: Fast compression (fetched via CMake FetchContent)
 - **Zstandard v1.5.6**: Dictionary compression (fetched via CMake FetchContent)
+
+Benchmark-only deps (built by `-DSMASH_BUILD_BENCH_DEPS=ON`, all vendored via
+ExternalProject into `build/bench/deps/`): Redis 8.0.2, Valkey 9.1.0,
+memcached 1.6.34, RocksDB v9.8.4, LevelDB 1.23, and **Snappy 1.2.1** — vendored
+so LevelDB builds with SST compression enabled and `bench_leveldb` links a
+static libsnappy.a (no reliance on a system libsnappy).
 
 ## Benchmarks
 
@@ -188,6 +221,8 @@ Runtime environment variables:
 - `SMASH_DEFER_PHASES_MS=N`: Skip Phase 2 (compress) + Phase 3 (monitor) for the first N ms after start. Useful for workloads that establish IPC channels at startup with buffers in smash-managed pages (Firefox sweet spot is 30000)
 - `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
 - `SMASH_CPU_PRESSURE_PAUSE=1`: Default ON. Adaptive compression pause for CPU-saturated hosts. When the app's own threads leave no spare cores (the worker cap collapses to 1) for a few consecutive ticks, the compressor pauses Phase 2 (compress) + Phase 3 (monitor) **and skips the per-tick page scan** — resuming automatically within a tick once cores free up (e.g. between passes / at teardown). On such workloads compression is net-useless churn (pages compress then immediately fault back in) while the RSS win comes from large-alloc management + madvise, not compression. Measured on neuron-cc `test7_full` (192-core box, ~200-thread walrus): large-only wall regression **+50.7% → +19.6%** vs glibc (61% of the regression recovered) with the peak-RSS win preserved (−13.4% → −12.2%) and AUC-RSS improved from +36% to +7%. Set `=0` to disable (ablation / latency-critical workloads that want compression regardless of CPU pressure). Gated by `SMASH_CPU_PRESSURE_CAP` (which computes the underlying cap); if that is disabled this is a no-op. Only arms on hosts with at least `SMASH_CPU_PRESSURE_MIN_CORES` online cores (default 16), since cap==1 is the normal resting state on small machines.
+- `SMASH_EMPTY_RESIDENT_MB=N`: Cap on empty slab spans kept resident (decommit deferred up to 2 compressor ticks). Default 1/32 of physical memory, clamped to [64 MiB, 1 GiB]; `0` decommits at once
+- `SMASH_LARGE_CACHE_MB=N`: Byte cap of the freed large-block cache (16 KiB–8 MiB blocks). Default 32; `0` disables it
 - `SMASH_COLD_TIMEOUT_SEC=N`: Override cold timeout at runtime
 - `SMASH_COOLING_CLOSE_TICKS=N`: Cooling-page closing threshold (default `getColdTicks()/2`; `0` disables). Slab allocation prefers warm/EMPTY pages over pages whose cold streak ≥ N, and redirects to a decommitted empty span (never a new one) when the front span has only cooling/compressed free slots. Allocator-induced re-heats are counted in the `reheat=` field of the SIGUSR2 stats line (`SMASH_STATS_SIGNAL=1`); the telemetry threshold stays at the default even when closing is disabled, so A/B runs can measure prevented re-heats. Note: objects recycled through the thread cache bypass slab placement entirely — the app's writes into recycled objects re-heat their pages regardless of this policy
 - `SMASH_VERY_COLD_TICKS=N`: Override deep-tier cold-tick threshold (ROI model). `9999` disables the deep tier entirely (fast tier only).

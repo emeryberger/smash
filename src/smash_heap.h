@@ -1,4 +1,5 @@
 #pragma once
+#include <cerrno>
 #include <cmath>
 #include <chrono>
 #include "smash/config.h"
@@ -24,6 +25,7 @@
 #include <dlfcn.h>
 #if defined(__linux__)
 #include <sched.h>   // sched_getcpu (vDSO) for CPU-indexed arena routing
+#include <link.h>    // dl_iterate_phdr: image table for the call-site hash
 #endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -91,45 +93,72 @@ extern PageLockTable* g_smash_page_locks_for_external;
 // Without this, the compiler emits __tls_get_addr indirections for
 // every static-local thread_local in an inline function, costing one
 // dependent indirect call per TLS access on the hot path.
+// Per-thread memo of callsiteArena()'s result, keyed on (ra, size class); see
+// callsiteArena(). Shared by the inlined hit path and the out-of-line miss
+// path: a thread_local below, or a ThreadState field on macOS arm64.
+struct ArenaMemo { uintptr_t key; uint8_t base; bool valid; };
+inline constexpr size_t kArenaMemoSlots = 256;  // power of 2
+
+#include "util/tsd_slot.h"
+#if defined(SMASH_USE_TSD)
+#if !defined(ALLOC8_HAS_CALLER_RA_HOOK)
+#error "SMASH_TSD_SLOT needs an alloc8 with ALLOC8_CALLER_RA_HOOK (alloc8 main >= feat/caller-ra-hook); \
+otherwise the caller hint is never written and call-site arenas collapse. Update alloc8 or configure -DSMASH_TSD_SLOT=OFF."
+#endif
+// macOS: the hot per-thread fields live in one ThreadState reached through a
+// reserved TSD slot (see util/tsd_slot.h) instead of thread_locals, each of
+// which costs a _tlv_get_addr call per access on Mach-O. The names below
+// expand to fields of the current thread's ThreadState, so the code that
+// uses them is unchanged.
+inline constexpr uint64_t kThreadStateMagic = 0x4453545f48534d53ULL;  // "SMSH_TSD"
+struct ThreadState {
+    void* caller_ra = nullptr;          // MUST stay first: ALLOC8_CALLER_RA_HOOK writes slot[0]
+    ThreadCache* thread_cache = nullptr;
+    ThreadCache* fast_tc = nullptr;     // see g_fast_tc
+    uintptr_t arena_stack_base = 0;
+    int full_mode_cached = -1;
+    uint64_t magic = kThreadStateMagic; // identifies our object in the slot
+    ThreadState* next_free = nullptr;   // free-list link after thread exit
+    // callsiteArena() memo, read on every small malloc. Last, so the hot
+    // scalars above share cache lines; zeroed (all invalid) on (re)use.
+    ArenaMemo arena_memo[kArenaMemoSlots] = {};
+};
+static_assert(offsetof(ThreadState, caller_ra) == 0, "caller_ra must be first");
+
+// Cold path (smash_heap.cpp): set up (or reuse) this thread's state; returns a
+// thread_local fallback only if BootstrapAlloc is exhausted.
+ThreadState* threadStateSlow();
+void threadStateAtforkPrepare();
+void threadStateAtforkParent();
+void threadStateAtforkChild();
+
+[[gnu::always_inline]] inline ThreadState* threadState() {
+    auto* ts = static_cast<ThreadState*>(tsdGet());
+    if (__builtin_expect(ts == nullptr, 0)) ts = threadStateSlow();
+    return ts;
+}
+#define g_thread_cache     (::smash::threadState()->thread_cache)
+#define g_fast_tc          (::smash::threadState()->fast_tc)
+#define g_full_mode_cached (::smash::threadState()->full_mode_cached)
+#define g_arena_stack_base (::smash::threadState()->arena_stack_base)
+#define g_arena_memo       (::smash::threadState()->arena_memo)
+#else
 extern __attribute__((tls_model("initial-exec")))
     thread_local ThreadCache* g_thread_cache;
 
 extern __attribute__((tls_model("initial-exec")))
     thread_local int g_full_mode_cached;  // -1 = unknown, 0 = bypass, 1 = full
 
+// This thread's cache, published ONLY when the lean entry points
+// (SmashFastRedirect in smash_heap.cpp) may use it: full mode, no free()
+// diagnostics, heap constructed. One TLS load then gates the whole fast
+// path -- no heap-state, mode or diagnostics checks per call. Null means
+// "take the full path", which handles every mode and every first call.
+extern __attribute__((tls_model("initial-exec")))
+    thread_local ThreadCache* g_fast_tc;
+
 // Compressor thread bypass flag — defined as inline thread_local in
 // compressor_thread.h (included above). Used here on the malloc fast path.
-
-// free()-path last-span cache. The dominant cost of free() at scale is the
-// single load from the 128 MB flat page→Span table (a near-random access that
-// misses cache once the live set is large). Consecutive frees overwhelmingly
-// hit the same span (objects from one slab page are freed together), so a
-// one-entry per-thread cache of the most recently resolved span elides that
-// load. Validated against g_pagemap_generation (see page_map.h): a span whose
-// stamped generation still matches the global one provably still owns its
-// range. initial-exec TLS keeps the access to a direct tpidr_el0 + offset load.
-//
-// The span's [base, end) range is cached INLINE (not read through the Span*)
-// so the hit test is a pure TLS integer comparison. This matters on the miss
-// path: a workload with no free-locality must not pay a dereference of the
-// stale cached span (its own cache miss) before falling through to the table
-// load. On a miss we touch only TLS scalars, then resolve via the table once.
-extern __attribute__((tls_model("initial-exec")))
-    thread_local Span* g_free_cache_span;
-extern __attribute__((tls_model("initial-exec")))
-    thread_local uintptr_t g_free_cache_base;
-extern __attribute__((tls_model("initial-exec")))
-    thread_local uintptr_t g_free_cache_end;
-extern __attribute__((tls_model("initial-exec")))
-    thread_local uint64_t g_free_cache_gen;
-// Populate-throttle countdown. On a miss the cache is repopulated only when
-// this hits 0, then reset to (interval-1); otherwise it counts down and the
-// stale entry is left in place. Hits reset it to 0 so the next miss repopulates
-// immediately (fast phase-change adoption). With interval==1 every miss
-// repopulates (max locality benefit); larger intervals amortize the populate
-// stores away on locality-free workloads where they are pure overhead.
-extern __attribute__((tls_model("initial-exec")))
-    thread_local uint32_t g_free_cache_skip;
 
 // Stack-base anchor for callsiteArena()'s LLAMA-style depth bucket. Caches the
 // thread's TRUE stack base (highest address), computed once. depth_bucket is the
@@ -145,6 +174,12 @@ extern __attribute__((tls_model("initial-exec")))
 // drift while preserving the depth signal.
 extern __attribute__((tls_model("initial-exec")))
     thread_local uintptr_t g_arena_stack_base;
+#endif  // SMASH_USE_TSD
+
+#if !defined(SMASH_USE_TSD)
+extern __attribute__((tls_model("initial-exec")))
+    thread_local ArenaMemo g_arena_memo[kArenaMemoSlots];
+#endif
 
 // Resolve the thread's true stack base once and cache it in g_arena_stack_base.
 // Cold: only the first allocation per thread (plus any reentrant allocations the
@@ -188,51 +223,21 @@ inline uintptr_t threadStackBase() {
     return base;
 }
 
-// Repopulate interval for the free() last-span cache (see above). Read once
-// from SMASH_FREE_CACHE_REPOP (default kFreeCacheRepopDefault); 1 = always
-// repopulate. Exposed as a runtime knob so the policy can be swept without
-// rebuilding; the resolved value is cached in a static.
-//
-// Default 8 chosen by a parameter sweep across the real suite (bench_sqlite,
-// bench_rss) plus the locality and no-locality extremes of the churn microbench
-// (bench_throughput). The real suite is flat for all intervals (the cache is
-// invisible to locality-bearing workloads), the locality case holds 3.2 ns/op
-// at every interval, and 8 recovers most of the no-locality populate overhead
-// (random-replacement churn 18.9→18.3 ns/op vs 1) while still adopting a new
-// hot span within 8 misses on a phase change. Higher intervals buy a sliver
-// more on the synthetic no-locality case with no real-suite gain and slower
-// phase adoption, so 8 is the Pareto knee.
-inline constexpr uint32_t kFreeCacheRepopDefault = 8;
-// Hand-rolled lazy init (not a magic static): the guard-variable acquire-load
-// measured at 7-10 % of free()'s CPU elsewhere (see config.h getSmashMode()).
-// 0 = uninitialised sentinel; valid intervals are >= 1.
-// The getenv/parse init bodies below are OUTLINED into cold, noinline
-// helpers. The hot readers are always_inline'd into malloc()/free(); with
-// the init code written inline in the [[unlikely]] branch, GCC keeps it in
-// the hot function body (bigger frame, extra spills across every call
-// site) — measured +1.7 ns/op (9.7 → 11.4) on the direct-linked x86-64
-// bench_throughput single-alloc/free loop. Outlining restores a minimal
-// hot body: one relaxed load, one predicted branch, cold call on first use.
-[[gnu::cold, gnu::noinline]]
-inline uint32_t freeCacheRepopIntervalInit(std::atomic<uint32_t>& cached) {
-    const char* v = std::getenv("SMASH_FREE_CACHE_REPOP");
-    long n = v ? std::atol(v) : 0;
-    uint32_t interval = (n >= 1 && n <= (1L << 20)) ? static_cast<uint32_t>(n)
-                                                    : kFreeCacheRepopDefault;
-    cached.store(interval, std::memory_order_relaxed);
-    return interval;
-}
-
-[[gnu::always_inline]]
-inline uint32_t freeCacheRepopInterval() {
-    static std::atomic<uint32_t> cached{0};   // constant-init: no guard
-    uint32_t interval = cached.load(std::memory_order_relaxed);
-    if (interval == 0) [[unlikely]] interval = freeCacheRepopIntervalInit(cached);
-    return interval;
-}
-
 [[gnu::always_inline]]
 inline ThreadCache*& currentThreadCache() { return g_thread_cache; }
+
+// Immutable after SmashHeap construction: the contiguous arena's range and
+// its flat page -> Span* table, so the lean free() entry can resolve a span
+// with one subtraction, one compare and one load, without touching the heap
+// object. size == 0 (no arena / no table) sends every free down the full path.
+struct FastSpanTable {
+    uintptr_t base = 0;
+    uintptr_t size = 0;
+    std::atomic<Span*>* table = nullptr;
+    std::atomic<uint16_t>* tags = nullptr;   // VmRegion page tags (see page_tag_)
+};
+inline FastSpanTable g_fast_span_table;
+
 
 // CPU-indexed arena routing (SMASH_CPU_ARENA, default OFF). When set,
 // callsiteArena() mixes the running CPU id (sched_getcpu on Linux,
@@ -260,8 +265,11 @@ inline int cpuArenaHashInit(std::atomic<int>& cached) {
 [[gnu::always_inline]]
 inline bool cpuArenaHash() {
     // Hand-rolled lazy init (not a magic static) — this runs on every malloc,
-    // so the guard-variable acquire-load would sit on the hot path. Init is
-    // outlined cold (see freeCacheRepopIntervalInit's comment).
+    // so the guard-variable acquire-load would sit on the hot path. The
+    // getenv/parse init body is outlined into a cold, noinline helper: written
+    // inline in the [[unlikely]] branch, GCC keeps it in the hot function
+    // body (bigger frame, extra spills at every call site) — measured
+    // +1.7 ns/op on an x86-64 malloc/free loop.
     static std::atomic<int> cached{-1};   // constant-init: no guard
     int v = cached.load(std::memory_order_relaxed);
     if (v < 0) [[unlikely]] v = cpuArenaHashInit(cached);
@@ -286,7 +294,7 @@ inline int freeDiagnosticsActiveInit(std::atomic<int>& cached) {
 inline bool freeDiagnosticsActive() {
     // Hand-rolled lazy init (not a magic static) — this runs on every free,
     // so the guard-variable acquire-load would sit on the hot path. Init is
-    // outlined cold (see freeCacheRepopIntervalInit's comment).
+    // outlined cold (see cpuArenaHash()).
     static std::atomic<int> cached{-1};   // constant-init: no guard
     int v = cached.load(std::memory_order_relaxed);
     if (v < 0) [[unlikely]] v = freeDiagnosticsActiveInit(cached);
@@ -320,6 +328,17 @@ inline bool fullMallocPath() {
         g_full_mode_cached = s;
     }
     return s == 1;
+}
+
+// Whether the lean entry points may run at all in this build/process.
+// Compile-time features that change the small-object path disable them.
+inline bool leanEntriesAllowed() {
+#if defined(SMASH_ABLATION_NO_CALLSITE_ARENA) || defined(SMASH_NO_ARENA_MEMO)
+    return false;
+#else
+    if constexpr (kColdArenaFeedback || kMeasureCohorts) return false;
+    return fullMallocPath() && !freeDiagnosticsActive();
+#endif
 }
 
 // ── System malloc/free pointers for compress-only mode ──────────────────────
@@ -431,7 +450,11 @@ extern SystemAllocFns g_system_alloc;
 // SmashHeap calls from tests and internal code — where no app site exists.
 [[gnu::always_inline]]
 inline uintptr_t appCallerRA() {
+#if defined(SMASH_USE_TSD)
+    if (void* ra = threadState()->caller_ra) [[likely]]
+#else
     if (void* ra = alloc8_caller_ra) [[likely]]
+#endif
         return reinterpret_cast<uintptr_t>(ra);
     return reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 }
@@ -485,7 +508,7 @@ class SmashHeap {
 
     // ── ASLR-resilient call-site hash cache ─────────────────────────────────
     // Maps (return_address >> 12) -> stable offset within shared object.
-    // dladdr() is expensive (~12ns), so we cache results. The cache is
+    // Resolving the image base is not free (see imageBaseFor), so we cache. The cache is
     // direct-mapped for minimal overhead on the hot path (~2ns vs 0.5ns for
     // the original hash).
     //
@@ -519,12 +542,120 @@ class SmashHeap {
         return stableCallsiteHashSlow(ra, slot);
     }
 
+    // ── Image table: return address -> image base, without dladdr ─────────
+    // dladdr() searches the image's symbol table for the closest symbol. We
+    // only need the image base (dli_fbase), and for a large image (rustc's
+    // librustc_driver) that search costs microseconds; with tens of thousands
+    // of allocation sites it dominated rustc's run time (5-6x slowdown).
+    // Instead keep a sorted table of loaded images' executable ranges and
+    // binary-search it. Rebuilt (from BootstrapAlloc, never malloc) only when
+    // an address falls outside every known image, e.g. after dlopen; old
+    // tables are leaked so concurrent readers never see freed memory.
+    struct ImageRange { uintptr_t lo, hi, base; };
+    struct ImageTable { size_t n; ImageRange r[1]; };
+    std::atomic<ImageTable*> image_table_{nullptr};
+    Spinlock image_table_lock_;
+
+    static void sortRanges(ImageRange* r, size_t n) {
+        for (size_t i = 1; i < n; ++i) {           // insertion sort; n ~ 1e3, rare
+            ImageRange x = r[i];
+            size_t j = i;
+            while (j > 0 && r[j - 1].lo > x.lo) { r[j] = r[j - 1]; --j; }
+            r[j] = x;
+        }
+    }
+
+#if defined(__linux__)
+    struct PhdrCollect { ImageRange* out; size_t cap; size_t n; };
+    static int collectPhdr(struct dl_phdr_info* info, size_t, void* arg) {
+        auto* c = static_cast<PhdrCollect*>(arg);
+        uintptr_t first = UINTPTR_MAX;
+        for (int i = 0; i < info->dlpi_phnum; ++i)
+            if (info->dlpi_phdr[i].p_type == PT_LOAD && info->dlpi_phdr[i].p_vaddr < first)
+                first = info->dlpi_phdr[i].p_vaddr;
+        if (first == UINTPTR_MAX) return 0;
+        // dladdr's dli_fbase is the map start: load bias + lowest PT_LOAD vaddr.
+        uintptr_t base = info->dlpi_addr + (first & ~uintptr_t(4095));
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+            const auto& ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_X)) continue;
+            if (c->n < c->cap)
+                c->out[c->n++] = {info->dlpi_addr + ph.p_vaddr,
+                                  info->dlpi_addr + ph.p_vaddr + ph.p_memsz, base};
+        }
+        return 0;
+    }
+#endif
+
+    [[gnu::noinline]]
+    ImageTable* rebuildImageTable() {
+        LockGuard guard(image_table_lock_);
+#if defined(__APPLE__)
+        size_t cap = _dyld_image_count() + 64;
+#else
+        size_t cap = 0;
+        dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* arg) {
+            for (int i = 0; i < info->dlpi_phnum; ++i)
+                if (info->dlpi_phdr[i].p_type == PT_LOAD) ++*static_cast<size_t*>(arg);
+            return 0;
+        }, &cap);
+        cap += 64;
+#endif
+        auto* t = static_cast<ImageTable*>(BootstrapAlloc::instance().allocate(
+            sizeof(ImageTable) + cap * sizeof(ImageRange), alignof(ImageTable)));
+        if (!t) return image_table_.load(std::memory_order_acquire);
+        size_t n = 0;
+#if defined(__APPLE__)
+        uint32_t count = _dyld_image_count();
+        for (uint32_t i = 0; i < count && n < cap; ++i) {
+            auto* hdr = reinterpret_cast<const struct mach_header_64*>(_dyld_get_image_header(i));
+            if (!hdr) continue;
+            unsigned long size = 0;
+            uint8_t* text = getsegmentdata(hdr, "__TEXT", &size);
+            if (!text || !size) continue;
+            uintptr_t lo = reinterpret_cast<uintptr_t>(text);
+            t->r[n++] = {lo, lo + size, reinterpret_cast<uintptr_t>(hdr)};
+        }
+#else
+        PhdrCollect c{t->r, cap, 0};
+        dl_iterate_phdr(collectPhdr, &c);
+        n = c.n;
+#endif
+        sortRanges(t->r, n);
+        t->n = n;
+        image_table_.store(t, std::memory_order_release);
+        return t;
+    }
+
+    static uintptr_t findImageBase(const ImageTable* t, uintptr_t ra) {
+        if (!t) return 0;
+        size_t lo = 0, hi = t->n;
+        while (lo < hi) {                          // last range with r.lo <= ra
+            size_t mid = (lo + hi) / 2;
+            if (t->r[mid].lo <= ra) lo = mid + 1; else hi = mid;
+        }
+        if (lo == 0) return 0;
+        const ImageRange& r = t->r[lo - 1];
+        return ra < r.hi ? r.base : 0;
+    }
+
+    uintptr_t imageBaseFor(uintptr_t ra) {
+        ImageTable* t = image_table_.load(std::memory_order_acquire);
+        if (uintptr_t b = findImageBase(t, ra)) return b;
+        return findImageBase(rebuildImageTable(), ra);   // new image (dlopen)?
+    }
+
     [[gnu::noinline]]
     uint32_t stableCallsiteHashSlow(uintptr_t ra, size_t slot) {
-        Dl_info info{};
         uint32_t hash = 0;
-        if (dladdr(reinterpret_cast<void*>(ra), &info) && info.dli_fbase) {
-            uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+        uintptr_t base = imageBaseFor(ra);
+        if (!base) {
+            // Not in any image's code we enumerated: fall back to dladdr.
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<void*>(ra), &info) && info.dli_fbase)
+                base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+        }
+        if (base) {
             uintptr_t offset = ra - base;
             // Full-avalanche integer hash: even offsets differing by 0x20
             // produce completely different outputs. The old offset^(offset>>16)
@@ -547,7 +678,32 @@ class SmashHeap {
 
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
+    // Hot path: the memo hit, inlined into malloc. Everything else (hashing,
+    // stable call-site resolution, tracing) is in callsiteArenaSlow(), so the
+    // malloc fast path no longer pays that function's frame setup, callee-saved
+    // register spills and stack-protector canary on every call (x86-64 perf:
+    // callsiteArena was 13% of malloc+free cycles, almost all prologue/epilogue).
+    [[gnu::always_inline]]
     uint8_t callsiteArena(uint8_t sc, uintptr_t ra) {
+#if !defined(SMASH_ABLATION_NO_CALLSITE_ARENA) && !defined(SMASH_NO_ARENA_MEMO)
+        const uintptr_t memo_key = ra ^ (static_cast<uintptr_t>(sc) << 56);
+        const size_t memo_slot =
+            (memo_key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
+        const ArenaMemo& memo = g_arena_memo[memo_slot];
+        if (memo.valid && memo.key == memo_key) [[likely]] {
+            uint8_t base = memo.base;
+            if constexpr (kColdArenaFeedback) {
+                if (cold_bias_[base * kNumClasses + sc].load(std::memory_order_relaxed))
+                    return static_cast<uint8_t>(base + getNumArenas());
+            }
+            return base;
+        }
+#endif
+        return callsiteArenaSlow(sc, ra);
+    }
+
+    [[gnu::noinline, gnu::cold]]
+    uint8_t callsiteArenaSlow(uint8_t sc, uintptr_t ra) {
 #ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
         (void)ra;
         uint8_t base = 0;
@@ -564,18 +720,12 @@ class SmashHeap {
         // varies with recursion depth at the same call site, a rare corner we
         // accept — the arena is a compression-homogeneity hint, not correctness).
         // The cold-bias check below is intentionally NOT memoized (must stay live).
-        struct ArenaMemo { uintptr_t key; uint8_t base; bool valid; };
-        static constexpr size_t kArenaMemoSlots = 256;  // power of 2
-        // initial-exec: libsmash is LD_PRELOAD'd, so its TLS is in the startup
-        // reservation. Without this, a function-static thread_local uses the
-        // local-dynamic model → a __tls_get_addr call on every malloc (callgrind:
-        // 1.23 M calls = 9% of instructions came from exactly this).
-        static __attribute__((tls_model("initial-exec")))
-            thread_local ArenaMemo s_arena_memo[kArenaMemoSlots];
+        // (Memo hit is handled inline in callsiteArena(); this re-check is
+        // the miss path's own lookup so it can fill the same slot below.)
         const uintptr_t memo_key = ra ^ (static_cast<uintptr_t>(sc) << 56);
         const size_t memo_slot =
             (memo_key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
-        ArenaMemo& memo = s_arena_memo[memo_slot];
+        ArenaMemo& memo = g_arena_memo[memo_slot];
         if (memo.valid && memo.key == memo_key) [[likely]] {
             uint8_t base = memo.base;
             if constexpr (kColdArenaFeedback) {
@@ -792,6 +942,8 @@ public:
             recomputeAdaptiveCap(idx);
         }
     }
+
+    static inline SmashHeap* tick_self_ = nullptr;
 
     static void compressedEventHook(size_t /*page_idx*/, uint8_t arena_id,
                                     uint8_t sc, void* ctx) {
@@ -1070,6 +1222,12 @@ public:
             // initialization so the first allocation's setRange() mirrors.
             if (!compress_only) {
                 page_map_.attachVmRegion(&vm_region_);
+                if (vm_region_.hasSpanTable() && vm_region_.pageTagTable()) {
+                    g_fast_span_table.table = vm_region_.spanTable();
+                    g_fast_span_table.tags = vm_region_.pageTagTable();
+                    g_fast_span_table.base = reinterpret_cast<uintptr_t>(vm_region_.base());
+                    g_fast_span_table.size = vm_region_.contigPages() * kPageSize;
+                }
             }
             log_time("attach_vm");
             page_states_.init(vm_region_.totalPages());
@@ -1091,6 +1249,19 @@ public:
             }
             if (!compress_only && kAdaptiveCap) {
                 compressor_.setDecompressedCallback(decompressedEventHook, this);
+            }
+            // Once per tick: return idle cached large blocks and long-empty
+            // resident slab spans to the OS.
+            if (!compress_only) {
+                tick_self_ = this;
+                compressor_.setPreTickCallback(+[] {
+                    SmashHeap* h = tick_self_;
+                    if (!h) return;
+                    h->large_alloc_.onTick();
+                    Slab::advanceTick();
+                    const int total = getTotalArenas() * kNumClasses;
+                    for (int i = 0; i < total; ++i) h->slabs_[i].purgeResidentEmpty();
+                });
             }
 
             if (!compress_only) {
@@ -1189,7 +1360,10 @@ public:
 
     ThreadCache* getOrCreateThreadCache() {
         ThreadCache*& tc = currentThreadCache();
-        if (!tc) tc = newThreadCache();
+        if (!tc) {
+            tc = newThreadCache();
+            if (tc && leanEntriesAllowed()) g_fast_tc = tc;
+        }
         return tc;
     }
 
@@ -1312,9 +1486,9 @@ public:
         return mallocSlow(size, caller_ra);
     }
 
-    // Hot path. A non-null, full-mode, smash-owned pointer is resolved to its
-    // span via the TLS last-span cache (or the flat table on a miss) and
-    // pushed to the thread cache — all inlined into the caller. Everything
+    // A non-null, full-mode, smash-owned pointer is resolved to its span via
+    // the flat table (or the radix tree outside the arena) and pushed to the
+    // thread cache. Everything
     // uncommon (null, bootstrap pointer, passthrough/compress-only modes,
     // foreign pointers, drains, diagnostics) falls through to freeSlow().
     [[gnu::always_inline]]
@@ -1329,50 +1503,17 @@ public:
 
         const auto addr = reinterpret_cast<uintptr_t>(ptr);
 
-        // TLS last-span cache. Read the generation BEFORE resolving the span
-        // (the load-before-read ordering that makes the stamp safe — see
-        // page_map.h). The hit test is a pure TLS scalar comparison: the
-        // pointer falls in the cached span's [base, end) range AND the stamped
-        // generation still matches (so that mapping has not been torn down).
-        // No span dereference until a hit is confirmed — a locality-free
-        // workload pays only TLS compares before falling through to the table.
-        const auto gen = g_pagemap_generation.load(std::memory_order_acquire);
+        // Resolve the span: flat page table inside the contiguous arena,
+        // radix tree outside it. (Small objects normally never get here: the
+        // lean xxfree entry handles them; this path serves large blocks,
+        // first calls, full thread-cache lanes and direct callers.)
         Span* span;
-        // No static branch hint: real workloads hit (free-locality), the
-        // adversarial random-replacement churn always misses; the hardware
-        // predictor adapts to either far better than a fixed [[likely]] that
-        // would mispredict every iteration of the no-locality case.
-        if (addr >= g_free_cache_base && addr < g_free_cache_end &&
-            g_free_cache_gen == gen) {
-            span = g_free_cache_span;
-            g_free_cache_skip = 0;  // hit → next miss repopulates immediately
+        if (vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()) [[likely]] {
+            span = vm_region_.getSpan(vm_region_.contigPageIndex(addr));
         } else {
-            if (vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()) [[likely]] {
-                span = vm_region_.getSpan(vm_region_.contigPageIndex(addr));
-            } else {
-                span = page_map_.get(addr);
-            }
-            if (!span) [[unlikely]] return freeSlow(ptr);
-            // Repopulate-throttle: under sustained misses (a locality-free
-            // workload) the populate stores are pure overhead, so only
-            // repopulate every freeCacheRepopInterval()-th miss. A hit above
-            // resets the countdown to 0, so a workload with real locality
-            // repopulates on the very next miss (immediate phase adoption).
-            if (g_free_cache_skip == 0) {
-                // Cache the span and its immutable [base, end) range with the
-                // generation read above (never newer than the span we resolved
-                // → a future stamp match is sound). A Span* describes the same
-                // range for life, so base/end stay valid while the stamp holds.
-                g_free_cache_span = span;
-                g_free_cache_base = reinterpret_cast<uintptr_t>(span->base);
-                g_free_cache_end = g_free_cache_base +
-                    static_cast<uintptr_t>(span->page_count) * kPageSize;
-                g_free_cache_gen = gen;
-                g_free_cache_skip = freeCacheRepopInterval() - 1;
-            } else {
-                --g_free_cache_skip;
-            }
+            span = page_map_.get(addr);
         }
+        if (!span) [[unlikely]] return freeSlow(ptr);
         if (span->is_large) [[unlikely]] { large_alloc_.deallocate(span); return; }
         const auto sc = span->size_class;
         const uint8_t arena = span->arena_id;
@@ -1546,10 +1687,23 @@ public:
             trackAllocation(ptr, count * size);
             return ptr;
         }
-        size_t total = count * size;
+        size_t total;
+        if (__builtin_mul_overflow(count, size, &total)) [[unlikely]] {
+            errno = ENOMEM;
+            return nullptr;
+        }
         // Large-only: small callocs go to system allocator
         if (isLargeOnlyMode() && total <= largeOnlyThreshold() && g_system_alloc.calloc) {
             return g_system_alloc.calloc(count, size);
+        }
+        // Large blocks: a fresh anonymous mapping is already zero, so skip
+        // the memset (which would also fault in every page of the block).
+        if (total > kMaxSmallSize && fullMallocPath() && !isEagerZeroMode()) {
+            uint8_t arena = callsiteArenaForLarge(appCallerRA());
+            bool zeroed = false;
+            void* ptr = large_alloc_.allocate(total, kMinAlignment, arena, &zeroed);
+            if (ptr && !zeroed) __builtin_memset(ptr, 0, total);
+            return ptr;
         }
         void* ptr = this->malloc(total);
         if (ptr) __builtin_memset(ptr, 0, total);
@@ -1608,6 +1762,19 @@ public:
         }
         size_t old_size = sp->is_large ? sp->large_size
                                        : classSize(sp->size_class);
+        // In place when the block still fits the request and the request
+        // uses at least half of it (so a big shrink still gives memory back).
+        // Small: the size class is the capacity. Large: the mapped pages;
+        // only the recorded size changes (getSize / later realloc read it).
+        if (sp->is_large) {
+            const size_t cap = static_cast<size_t>(sp->page_count) * kPageSize;
+            if (size <= cap && size > kMaxSmallSize && size >= cap / 2) {
+                sp->large_size = size;
+                return old_ptr;
+            }
+        } else if (size <= old_size && size >= old_size / 2) {
+            return old_ptr;
+        }
         void* new_ptr = this->malloc(size);
         if (new_ptr) {
             __builtin_memcpy(new_ptr, old_ptr, old_size < size ? old_size : size);
@@ -1657,6 +1824,11 @@ public:
         return classSize(span->size_class);
     }
 
+    // Large blocks placed with direct mmap (below kLargeAllocVmThreshold, or
+    // in large-only mode) live outside the contiguous arena and are only
+    // registered in page_map_; xxowns() must recognise them.
+    bool hasPageMapSpan(uintptr_t addr) const { return page_map_.get(addr) != nullptr; }
+
     // Diagnostic / test hook: the arena a smash-managed pointer was routed to,
     // or -1 for a non-smash pointer (foreign, or large-only passthrough).
     // Backs the exported smash_arena_for(); the arena-routing regression test
@@ -1686,16 +1858,53 @@ public:
     // are exempted. They are exact mirrors (lock all ascending; unlock large
     // then all descending) and both short-circuit identically in compress-only
     // mode, so the pairing is balanced by construction.
+    // fork() locking (xxmalloc_lock/xxmalloc_unlock). alloc8 calls these at
+    // the allocator's point in the fork sequence: on macOS from libSystem's
+    // own fork handling (interposed _malloc_fork_prepare/_parent/_child),
+    // which in the child runs BEFORE any pthread_atfork child handler and
+    // before other libSystem child handlers that allocate (libnotify calls
+    // calloc); on Linux from alloc8's pthread_atfork handlers. Every lock an
+    // allocation may need must be taken here and released in unlock() --
+    // a lock released only in smash's own pthread_atfork child handler is
+    // still held when the child's first allocations run, and they spin.
+    //
+    // Order = the nesting order the allocation paths use, outermost first,
+    // so prepare cannot deadlock against a thread still allocating:
+    //   slab locks -> large-alloc -> slab leaf locks (magazine, pending pool)
+    //   -> VmRegion free shards, commit, decommit pool -> PageMap L2
+    //   -> call-site image table -> TSD free list -> thread-cache pool
+    //   -> BootstrapAlloc (innermost: the others allocate from it).
+    // The compressor is already paused by smash's own pthread_atfork prepare
+    // handler, which runs before this.
     void lock() SMASH_NO_TS_ANALYSIS {
-        if (isCompressOnlyMode()) return;
         const int total = getTotalArenas() * kNumClasses;
-        for (int i = 0; i < total; ++i) slabs_[i].lockSlab();
-        large_alloc_.lockAlloc();
+        if (!isCompressOnlyMode()) {
+            for (int i = 0; i < total; ++i) slabs_[i].lockSlab();
+            large_alloc_.lockAlloc();
+            for (int i = 0; i < total; ++i) slabs_[i].lockLeafForFork();
+        }
+        vm_region_.lockForFork();
+        page_map_.lockForFork();
+        image_table_lock_.lock();
+#if defined(SMASH_USE_TSD)
+        threadStateAtforkPrepare();
+#endif
+        ThreadCachePool::instance().lockForFork();
+        BootstrapAlloc::instance().atforkPrepare();
     }
     void unlock() SMASH_NO_TS_ANALYSIS {
+        BootstrapAlloc::instance().atforkParent();   // same as child: release
+        ThreadCachePool::instance().unlockForFork();
+#if defined(SMASH_USE_TSD)
+        threadStateAtforkParent();
+#endif
+        image_table_lock_.unlock();
+        page_map_.unlockForFork();
+        vm_region_.unlockForFork();
         if (isCompressOnlyMode()) return;
-        large_alloc_.unlockAlloc();
         const int total = getTotalArenas() * kNumClasses;
+        for (int i = total - 1; i >= 0; --i) slabs_[i].unlockLeafForFork();
+        large_alloc_.unlockAlloc();
         for (int i = total - 1; i >= 0; --i) slabs_[i].unlockSlab();
     }
     // SMASH_NO_THREAD_HOOKS=1: disable all thread lifecycle hooks.
@@ -1732,6 +1941,7 @@ public:
         if (noThreadHooks()) return;
         if (isCompressOnlyMode()) return;
         ThreadCache*& tc = currentThreadCache();
+        g_fast_tc = nullptr;
         if (tc) { tc->drainAll(slabs_, &page_map_); returnThreadCache(tc); tc = nullptr; }
     }
 

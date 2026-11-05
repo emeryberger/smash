@@ -154,7 +154,6 @@ add_test(
   NAME test_interpose
   COMMAND ${CMAKE_COMMAND} -E env
     "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-    "DYLD_FORCE_FLAT_NAMESPACE=1"
     $<TARGET_FILE:interpose_test>
 )
 
@@ -171,7 +170,6 @@ if(APPLE)
     NAME test_external_mapping
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
@@ -192,9 +190,10 @@ else()
   )
 endif()
 set_tests_properties(test_external_mapping PROPERTIES
-  TIMEOUT 60
-  LABELS "known_issue"
-  DISABLED TRUE)  # OOB protectPages on external pages — tracked separately
+  TIMEOUT 60)
+# Re-enabled: the OOB-on-external-pages crash class was root-caused and fixed
+# in issue #84 (self-interposition registered smash's own direct-mmap fallback
+# pages as external; free-path routing then poisoned the arena free list).
 
 # Mode compression test: ONE executable (mode_compression_test.cpp), run twice
 # with SMASH_LARGE_ONLY={0,1}, so FULL mode (test_malloc_compression) and
@@ -215,7 +214,6 @@ function(add_mode_compression_test test_name large_only)
       NAME ${test_name}
       COMMAND ${CMAKE_COMMAND} -E env
         "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-        "DYLD_FORCE_FLAT_NAMESPACE=1"
         "MallocNanoZone=0"
         "SMASH_LARGE_ONLY=${large_only}"
         "SMASH_DEFER_PHASES_MS=0"
@@ -254,7 +252,6 @@ if(APPLE)
     NAME test_arena_routing
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_CPU_ARENA=0"
@@ -272,6 +269,58 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# Per-thread state in a TSD slot (macOS SMASH_TSD_SLOT): ThreadStates are
+# reclaimed and reused across thousands of short-lived threads, GCD workers and
+# allocating app destructors work, fork() keeps the free list usable. Skips
+# itself when smash_tsd_stats is not exported (TSD slot not compiled in).
+if(APPLE)
+  add_executable(tsd_thread_test tsd_thread_test.cpp)
+  set_target_properties(tsd_thread_test PROPERTIES CXX_STANDARD 20)
+  add_test(
+    NAME test_tsd_thread
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "MallocNanoZone=0"
+      $<TARGET_FILE:tsd_thread_test>
+  )
+  set_tests_properties(test_tsd_thread PROPERTIES TIMEOUT 120)
+endif()
+
+# Large-block ownership regression: blocks smash mmaps directly (16 KiB < size
+# < kLargeAllocVmThreshold, and every large block in large-only mode) sit
+# outside the contiguous arena; xxowns() must still claim them or alloc8
+# forwards realloc/malloc_size/free to the system allocator (malloc_size 0,
+# realloc reads past the block -> SIGSEGV; crashed every Rust program).
+# Interposed, both modes, no compressor needed.
+add_executable(large_realloc_test large_realloc_test.cpp)
+set_target_properties(large_realloc_test PROPERTIES CXX_STANDARD 20)
+foreach(lo 0 1)
+  if(lo)
+    set(_name test_large_realloc_large_only)
+  else()
+    set(_name test_large_realloc)
+  endif()
+  if(APPLE)
+    add_test(
+      NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+        "MallocNanoZone=0"
+        "SMASH_LARGE_ONLY=${lo}"
+        $<TARGET_FILE:large_realloc_test>
+    )
+  else()
+    add_test(
+      NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "LD_PRELOAD=$<TARGET_FILE:smash>"
+        "SMASH_LARGE_ONLY=${lo}"
+        $<TARGET_FILE:large_realloc_test>
+    )
+  endif()
+  set_tests_properties(${_name} PROPERTIES TIMEOUT 30)
+endforeach()
+
 # Syscall EFAULT-retry test: allocates a buffer, forces compression, then
 # issues real syscalls (read/writev/readv) directly on the compressed
 # buffer. Verifies that the EFAULT-driven retry path in syscall_compat.h
@@ -287,7 +336,6 @@ if(APPLE)
     NAME test_syscall_efault
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"

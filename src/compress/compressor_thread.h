@@ -3868,11 +3868,14 @@ private:
         // madvise already deliver the RSS win without compression). When the
         // worker cap has collapsed to its floor (cap==1 ⇒ nproc − app_threads
         // ≤ 1, i.e. no spare cores) for kCpuPausePauseTicks consecutive
-        // samples, pause the compress/monitor phases; Phase 1 access tracking
-        // still runs (cheap) so we resume within one tick once the app's
-        // thread count drops (e.g. between passes / at teardown). The check
-        // reuses cpuPressureWorkerCap()'s already-sampled cap — no extra
-        // syscalls on the pause path.
+        // samples, pause the whole per-tick scan: Phase 1 access tracking is
+        // skipped too (see the early return below), since it only feeds the
+        // compression decision. Resumption does not depend on Phase 1 — the
+        // cap is re-sampled every tick, so once the app's thread count drops
+        // (e.g. between passes / at teardown) the streak clears and normal
+        // ticking resumes on the next tick. The check reuses
+        // cpuPressureWorkerCap()'s already-sampled cap — no extra syscalls on
+        // the pause path.
         static const bool cpu_pause_enabled = []{
             const char* v = std::getenv("SMASH_CPU_PRESSURE_PAUSE");
             return !(v && v[0] == '0');

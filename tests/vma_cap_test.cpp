@@ -38,6 +38,7 @@ int main() {
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace {
@@ -52,6 +53,13 @@ constexpr long kMaxCapToTest = 1L << 20;       // larger caps take too long to f
 constexpr int kAlarmSec = 120;
 
 unsigned char* g_bufs[kNumBufs];
+uintptr_t g_buf_lo = UINTPTR_MAX, g_buf_hi = 0;  // span of all buffers
+
+double secsSince(const timespec& t0) {
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9;
+}
 
 long readLong(const char* path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -94,10 +102,12 @@ size_t protNoneBufBytes() {
             }
             line[ll] = 0;
             ll = 0;
-            unsigned long lo, hi;
-            char perms[8];
-            if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3) continue;
-            if (strncmp(perms, "---", 3) != 0) continue;
+            char* e;
+            unsigned long lo = strtoul(line, &e, 16);
+            if (*e != '-') continue;
+            unsigned long hi = strtoul(e + 1, &e, 16);
+            if (*e != ' ' || strncmp(e + 1, "---", 3) != 0) continue;
+            if (hi <= g_buf_lo || lo >= g_buf_hi) continue;  // most lines: the filler
             for (size_t i = 0; i < kNumBufs; ++i) {
                 uintptr_t blo = reinterpret_cast<uintptr_t>(g_bufs[i]);
                 uintptr_t bhi = blo + kBufBytes;
@@ -159,12 +169,17 @@ int main() {
     setvbuf(stdout, nullptr, _IOLBF, 0);  // progress survives the alarm's _exit
     signal(SIGALRM, onAlarm);
     alarm(kAlarmSec);
+    timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
     // 1. Large, compressible, page-tagged blocks.
     for (size_t i = 0; i < kNumBufs; ++i) {
         g_bufs[i] = static_cast<unsigned char*>(malloc(kBufBytes));
         if (!g_bufs[i]) { fprintf(stderr, "FAIL: malloc\n"); return 1; }
         for (size_t p = 0; p < kPagesPerBuf; ++p) fillPage(g_bufs[i] + p * kPage, i, p);
+        uintptr_t a = reinterpret_cast<uintptr_t>(g_bufs[i]);
+        if (a < g_buf_lo) g_buf_lo = a;
+        if (a + kBufBytes > g_buf_hi) g_buf_hi = a + kBufBytes;
     }
 
     // Use up VMAs until kHeadroom remain. Each isolated PROT_READ page in a
@@ -187,7 +202,8 @@ int main() {
             }
         }
     }
-    printf("vma_cap_test: cap=%ld start=%ld filled=%ld\n", cap, start, vmaCount());
+    printf("vma_cap_test: cap=%ld start=%ld filled=%ld (%.1f s)\n", cap, start, vmaCount(),
+           secsSince(t0));
 
     // 2. Wait until most of the blocks are compressed and reclaimed.
     const size_t want = kNumBufs * kBufBytes * 3 / 4;
@@ -199,22 +215,29 @@ int main() {
                 none, kNumBufs * kBufBytes, vmaCount());
         return 1;
     }
-    printf("vma_cap_test: %zu MiB PROT_NONE, VMAs=%ld\n", none >> 20, vmaCount());
+    printf("vma_cap_test: %zu MiB PROT_NONE, VMAs=%ld (%.1f s)\n", none >> 20, vmaCount(),
+           secsSince(t0));
 
-    // 3. Teardown-like walk: every kStride-th page, low to high.
+    // 3. Teardown-like walk: every kStride-th page, low to high. The peak is
+    // sampled every kPeakEvery buffers: at a 1M cap each read of
+    // /proc/self/maps is ~70 MB.
+    constexpr size_t kPeakEvery = 16;
     long peak = 0;
     for (size_t i = 0; i < kNumBufs; ++i) {
         for (size_t p = 0; p < kPagesPerBuf; p += kStride)
             if (!checkPage(g_bufs[i] + p * kPage, i, p)) return 1;
-        long c = vmaCount();
-        if (c > peak) peak = c;
+        if ((i + 1) % kPeakEvery == 0) {
+            long c = vmaCount();
+            if (c > peak) peak = c;
+        }
     }
     for (size_t i = 0; i < kNumBufs; ++i)
         for (size_t p = 0; p < kPagesPerBuf; ++p)
             if (!checkPage(g_bufs[i] + p * kPage, i, p)) return 1;
     for (size_t i = 0; i < kNumBufs; ++i) free(g_bufs[i]);
 
-    printf("vma_cap_test: OK, peak VMAs during walk %ld of cap %ld\n", peak, cap);
+    printf("vma_cap_test: OK, peak VMAs during walk %ld of cap %ld (%.1f s)\n", peak, cap,
+           secsSince(t0));
     return 0;
 }
 

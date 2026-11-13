@@ -73,6 +73,19 @@ jobs:
             redis_build memcached_build bench_rocksdb_builtin
           ls -l build/bench/deps/bin
 
+      # Never build for the host CPU: CI caches builds and GitHub runners
+      # vary (Intel Xeon 6975P / AMD EPYC 7763), so -march=native output can
+      # SIGILL on the next runner. Scan every generated CMake compile/link
+      # flag file, including the ExternalProjects under build/bench/deps.
+      - name: Check no native-CPU flags
+        working-directory: smash
+        run: |
+          if grep -rlE --include=flags.make --include=link.txt \
+               --include=build.ninja -e '-m(arch|cpu|tune)=native' build; then
+            echo "::error::build uses -march/-mcpu/-mtune=native (files above)"
+            exit 1
+          fi
+
       - name: Run paper workloads (full smash)
         working-directory: smash/build
         run: |

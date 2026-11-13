@@ -29,12 +29,14 @@ import os
 import statistics
 import sys
 
-# app -> (paper %, CI floor %)
+# app -> (paper %, CI floor %).  Floors calibrated 2026-11-13 on master
+# d54ceca; ubuntu-latest measured (3 runs each) SQLite 73.2, RocksDB 84.9-85.0,
+# memcached 88.0, Redis 56.6, Redis-ext 65.2, with spread <= 0.1 point.
 EXPECT = {
     "sqlite":    (73.3, 71.0),
-    "rocksdb":   (84.0, 81.0),
-    "memcached": (87.8, 85.0),
-    "redis":     (58.0, 54.0),
+    "rocksdb":   (84.0, 83.0),
+    "memcached": (87.8, 86.0),
+    "redis":     (58.0, 54.5),
     "redis_ext": (68.7, 63.0),
 }
 

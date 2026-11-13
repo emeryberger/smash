@@ -458,3 +458,12 @@ option(SMASH_BUILD_BENCH "Build smash benchmarks" OFF)
 if(SMASH_BUILD_BENCH)
   add_subdirectory(bench)
 endif()
+
+# smash-idled: root helper giving unprivileged smash processes per-page read
+# tracking through the kernel idle-page bitmap (include/smash/idled_protocol.h).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(smash-idled tools/smash_idled.cpp)
+  target_include_directories(smash-idled PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  find_package(Threads REQUIRED)
+  target_link_libraries(smash-idled PRIVATE Threads::Threads)
+endif()

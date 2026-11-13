@@ -187,6 +187,7 @@ class VmRegion {
 
         // Decommit the pages (release physical backing).
         vm::decommitPages(e->addr, e->num_pages * kPageSize);
+        vm::uffdZeroFill(e->addr, e->num_pages * kPageSize);
 
         // NOW add to free list (safe - pages are decommitted and PROT_RW).
         // CRITICAL: newFreeRun() POPS shard.free_pool (the FreeRun recycle
@@ -569,6 +570,7 @@ public:
         void* addr = base_ + already * kPageSize;
         size_t commit_bytes = (target - already) * kPageSize;
         vm::commitPages(addr, commit_bytes);
+        vm::uffdZeroFill(addr, commit_bytes);
         committed_pages_.store(target, std::memory_order_release);
     }
 
@@ -862,6 +864,23 @@ public:
     }
 
     static constexpr uint16_t kPageTagSmall = 0x8000;
+    // SMASH_AGE_ORDER=3 (TAP): page is cooling/compressed, so the lean free
+    // must route frees on it to the slow path (no thread-cache reuse). Bit 14
+    // is free: the arena field (bits 6..13) needs at most 8 bits, and the lean
+    // free's uint8_t(tag >> 6) drops it. Maintained by the compressor each tick
+    // (markPageCold); setSpan/setSpanRange overwrite it with a fresh tag.
+    static constexpr uint16_t kPageTagCold = 0x4000;
+
+    // CAS so a concurrent setSpan (span re-tag) always wins.
+    void markPageCold(size_t page_idx, bool cold) {
+        if (!page_tag_ || page_idx >= total_pages_) return;
+        uint16_t t = page_tag_[page_idx].load(std::memory_order_relaxed);
+        if (!(t & kPageTagSmall)) return;
+        const uint16_t want = cold ? (t | kPageTagCold) : (t & ~kPageTagCold);
+        if (want != t)
+            page_tag_[page_idx].compare_exchange_strong(t, want, std::memory_order_release,
+                                                        std::memory_order_relaxed);
+    }
 
     // `tag` is the page tag for `span` (see page_tag_); PageMap computes it.
     [[gnu::always_inline]]

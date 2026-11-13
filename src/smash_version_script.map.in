@@ -76,6 +76,9 @@
     # the arena a smash-managed pointer routed to; test_arena_routing uses it
     # to guard the call-site-arena invariant.
     smash_arena_for;
+    # Hint for smash-friendly applications (on-access hot-object migration).
+    smash_migrate_hint;
+    smash_migrate_map;
 
     # alloc8 getcwd hooks (function pointers set by Smash constructor)
     xx_getcwd_prepare_hook;

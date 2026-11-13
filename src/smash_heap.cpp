@@ -276,6 +276,9 @@ thread_local smash::ThreadCache* smash::g_fast_tc = nullptr;
 
 __attribute__((tls_model("initial-exec")))
 thread_local uintptr_t smash::g_arena_stack_base = 0;
+
+__attribute__((tls_model("initial-exec")))
+thread_local uintptr_t smash::g_arena_entry_frame = 0;
 #endif  // !SMASH_USE_TSD
 
 #if !defined(SMASH_USE_TSD)
@@ -1354,12 +1357,16 @@ struct SmashFastRedirect : SmashRedirect {
             const auto ra = reinterpret_cast<uintptr_t>(alloc8_caller_ra);
 #endif
             const uint8_t sc = sizeToClass(sz);
-            const uintptr_t key = ra ^ (static_cast<uintptr_t>(sc) << 56);
+            const uintptr_t frame = currentStackPointer();
+            const uintptr_t key = arenaMemoKey(ra, sc, arenaKeyDepth(frame));
             const size_t slot = (key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
             const ArenaMemo& m = g_arena_memo[slot];
             if (ra && m.valid && m.key == key) [[likely]] {
                 if (void* p = tc->allocate(sc, m.base)) [[likely]] return p;
             }
+            // Measure depth from this frame on the full path too (see
+            // takeArenaEntryFrame), so it fills the memo under this key.
+            g_arena_entry_frame = frame;
         }
         return mallocFull(sz);
     }
@@ -1414,6 +1421,10 @@ struct SmashFastRedirect : SmashRedirect {
             if (tag & VmRegion::kPageTagSmall) [[likely]] {
                 const uint8_t sc = tag & 63;
                 const uint8_t arena = static_cast<uint8_t>(tag >> 6);
+                // TAP: cold page → slow path (the bit is only ever set when
+                // SMASH_AGE_ORDER=3; compiled in only for experiments).
+                if (Slab::kPlacementExperiments && (tag & VmRegion::kPageTagCold)) [[unlikely]]
+                    return freeFull(p);
                 if (tc->deallocate(sc, arena, p)) [[likely]] return;
             }
         }
@@ -1635,6 +1646,29 @@ static void smash_atfork_child() {
     auto* heap = SmashRedirect::getHeap();
     if (heap) heap->resetForFork();
 }
+}
+
+// Exported hint for smash-friendly applications: 1 if the object at `ptr`
+// sits on a page that is mostly cold (compressed, or restored from
+// compressed within the last few compressor ticks), so an application that
+// is touching it now (i.e. it is hot) should move it to a fresh allocation.
+// Cheap (two loads). Self-limiting: once hot objects share fresh pages,
+// those pages are not compressed and the hint stays 0 for them.
+extern "C" __attribute__((visibility("default")))
+int smash_migrate_hint(const void* ptr) {
+    auto* heap = SmashRedirect::getHeap();
+    return heap ? heap->migrateHint(ptr) : 0;
+}
+
+// Pre-filter for smash_migrate_hint: on success (1) *bits is a bitset with
+// one bit per page of [*base, *base + *npages * 4096); a clear bit means the
+// hint would return 0, so the caller may skip the call. A set bit is only a
+// maybe (call the hint). The pointers stay valid for the process lifetime;
+// bits are read racily (relaxed) by design. Returns 0 when unavailable.
+extern "C" __attribute__((visibility("default")))
+int smash_migrate_map(const uint64_t** bits, uintptr_t* base, size_t* npages) {
+    auto* heap = SmashRedirect::getHeap();
+    return heap && bits && base && npages ? heap->migrateMap(bits, base, npages) : 0;
 }
 
 // Exported diagnostic / test hook. Returns the arena id a smash-managed

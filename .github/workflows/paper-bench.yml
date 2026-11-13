@@ -1,0 +1,96 @@
+name: Paper benchmarks
+
+# Regression gate for the paper workloads (README "Results" table): SQLite,
+# RocksDB, memcached, Redis and Redis-ext, each run under full smash with the
+# real application and the paper runner's default (full) parameters.  The gate
+# is the median RSS reduction (peak -> min during cooling) against per-app
+# floors in bench/check_paper_regression.py.  Throughput is reported in the
+# uploaded results but not gated: shared runners are too noisy for it.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Runs per app (gate uses the median)"
+        default: "3"
+
+concurrency:
+  group: paper-bench-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  paper-bench:
+    name: paper workloads (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout smash
+        uses: actions/checkout@v4
+        with:
+          path: smash
+
+      - name: Checkout alloc8 (sibling dir)
+        uses: actions/checkout@v4
+        with:
+          repository: emeryberger/alloc8
+          path: alloc8
+
+      # memcached builds from a git checkout (autoreconf); libevent-dev lets
+      # bench/CMakeLists.txt use the system libevent instead of building it.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq autoconf automake libtool pkg-config \
+            libssl-dev libevent-dev zlib1g-dev libbz2-dev libsnappy-dev
+
+      # Redis / memcached / RocksDB are pinned ExternalProjects installed
+      # (with their stamp files) under build/bench/deps; cache them keyed on
+      # the file that pins their versions.
+      - name: Cache benchmark dependencies
+        uses: actions/cache@v4
+        with:
+          path: smash/build/bench/deps
+          key: paper-deps-${{ runner.os }}-${{ hashFiles('smash/bench/CMakeLists.txt') }}
+
+      - name: Configure
+        working-directory: smash
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSMASH_BUILD_BENCH=ON \
+            -DSMASH_BUILD_BENCH_DEPS=ON \
+            -DSMASH_BUILD_BENCH_ALLOCATORS=OFF
+
+      - name: Build smash, benchmarks and services
+        working-directory: smash
+        run: |
+          cmake --build build -j"$(nproc)" --target \
+            smash smash_noopt smash_compress_only bench_sqlite \
+            redis_build memcached_build bench_rocksdb_builtin
+          ls -l build/bench/deps/bin
+
+      - name: Run paper workloads (full smash)
+        working-directory: smash/build
+        run: |
+          python3 ../bench/run_paper_experiments.py --compress-only-only \
+            --configs full_smash \
+            --apps sqlite,rocksdb,memcached,redis,redis_ext \
+            --runs "${{ github.event.inputs.runs || '3' }}" \
+            --output-dir "$GITHUB_WORKSPACE/paper-results" \
+            2>&1 | tee "$GITHUB_WORKSPACE/paper-results.log"
+
+      - name: Check against regression floors
+        run: python3 smash/bench/check_paper_regression.py paper-results/compress_only_results.json
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-results
+          path: |
+            paper-results/
+            paper-results.log

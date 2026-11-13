@@ -978,6 +978,12 @@ if(SMASH_BUILD_BENCH_DEPS)
       "-DCMAKE_OSX_ARCHITECTURES=${SMASH_BENCH_OSX_ARCHS}"
       ${_ROCKSDB_CXX_FLAGS_ARG}
       -DWITH_TESTS=OFF
+      # RocksDB 9.8.4 builds with -Werror by default; GCC 13 (ubuntu-24.04)
+      # flags a maybe-uninitialized in compaction_picker_level.cc.
+      -DFAIL_ON_WARNINGS=OFF
+      # No -march=native: CI caches this build and GitHub runners vary
+      # (Intel Xeon 6975P vs AMD EPYC 7763), so a native build SIGILLs.
+      -DPORTABLE=ON
       -DWITH_BENCHMARK_TOOLS=OFF
       -DWITH_TOOLS=OFF
       -DWITH_GFLAGS=OFF

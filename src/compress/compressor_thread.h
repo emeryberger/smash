@@ -684,7 +684,14 @@ class CompressorThread {
     // is exactly the write-locked mprotect this mode removes, and a wrong
     // guess now costs one in-thread UFFDIO_COPY (refault backoff bounds it).
     bool readCheckOff() const { return uffd_mode_ && idle_read_ok_ != 1; }
-    void armReadCheck(size_t i) {
+    // Per-worker end (exclusive) of the run of pages this worker armed
+    // PROT_NONE (arm_run_end_) or compressed (compress_run_end_) in the
+    // current Phase 2 range; SIZE_MAX = no run. Phase 2 walks a range in
+    // ascending order, so page i == run end means page i-1 just got the same
+    // protection and the kernel merges page i into its VMA: no new VMAs.
+    size_t arm_run_end_[kMaxCompressorWorkers]{};
+    size_t compress_run_end_[kMaxCompressorWorkers]{};
+    void armReadCheck(size_t i, int worker_id) {
 #ifdef __linux__
         if (idle_read_ok_ == 1 && idled_) {
             if (i < idled_npages_) { read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; idledArm(i); return; }
@@ -693,12 +700,23 @@ class CompressorThread {
             if (pfn) { markPageIdle(pfn); read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; return; }
         }
 #endif
-        if (!chargeVmaBudget(2)) return;
+        // Charge 2 VMAs per contiguous run, not per page: page i-1 armed
+        // PROT_NONE earlier in this range means the kernel merges page i into
+        // its VMA. Charging every page made a large cold wave (SQLite's 110K
+        // pages after fill) spend the whole budget on accounting, so most
+        // pages waited extra ticks for an arm and reclaim lagged (73% -> 59%
+        // on the paper's SQLite metric). A concurrent restore of page i-1
+        // can split the run after all; kVmaSafetyMargin covers that.
+        size_t& run_end = arm_run_end_[worker_id];
+        if (run_end != i && !chargeVmaBudget(2)) return;
         locks_->lock(i);
         if (states_->transition(i, PageState::ACTIVE, PageState::ACTIVE_MONITORING)) {
             vm::protectPages(vm_->pageAddress(i), kPageSize, false, false);  // PROT_NONE
             read_armed_[i] = 1;
             arm_cc_[i] = cold_count_[i];
+            run_end = i + 1;
+        } else {
+            run_end = SIZE_MAX;
         }
         locks_->unlock(i);
     }
@@ -1896,6 +1914,8 @@ private:
     // survives one full tick at PROT_NONE without any access, it is truly
     // cold and Phase 2 compresses it on the next tick.
     __attribute__((cold)) void phase2Range(int worker_id, size_t start, size_t end) {
+        arm_run_end_[worker_id] = SIZE_MAX;
+        compress_run_end_[worker_id] = SIZE_MAX;
         const ROIConfig& cfg = ROIConfig::instance();
         uint32_t floor = effectiveColdFloor(cfg.cold_ticks_floor);
         bool backoff_enabled = cfg.recompress_backoff;
@@ -2135,7 +2155,7 @@ private:
                 // Soft-dirty saw no WRITE for profile_floor ticks; check for
                 // reads before compressing (see read_check_). >= not ==: an
                 // arm skipped for VMA budget retries on the next tick.
-                armReadCheck(i);
+                armReadCheck(i, worker_id);
             } else if (cold_count_[i] == profile_floor && st == PageState::ACTIVE_MONITORING) {
                 // Always escalate to deep monitoring at the BASE floor —
                 // this just changes protection, not compression. It gives
@@ -2150,11 +2170,17 @@ private:
                 // compressPage changes this page's protection: PROT_READ for
                 // the snapshot in standard mode; PROT_RW in deferred mode,
                 // which splits a VMA only if the page is not already RW
-                // (monitored). A deferred-mode ACTIVE page costs nothing.
+                // (monitored). A deferred-mode ACTIVE page costs nothing, and
+                // neither does one that extends this worker's run (the read
+                // check arms whole cold runs PROT_NONE; charging each page as
+                // it flips back made SQLite's cold wave wait on the budget).
+                size_t& crun = compress_run_end_[worker_id];
                 if ((st == PageState::ACTIVE_MONITORING || !isDeferredReclaimMode()) &&
-                    !chargeVmaBudget(2))
+                    crun != i && !chargeVmaBudget(2))
                     return;  // VMA budget spent this tick
-                if (compressPage(i, workers_[worker_id])) {
+                const bool compressed_ok = compressPage(i, workers_[worker_id]);
+                crun = compressed_ok ? i + 1 : SIZE_MAX;
+                if (compressed_ok) {
                     worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
                     // Periodic mid-range flush so the pending list
                     // doesn't get too long and so the cap is never hit

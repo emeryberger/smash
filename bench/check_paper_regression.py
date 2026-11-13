@@ -36,9 +36,11 @@ import sys
 #
 # app -> (paper %, CI floor %).  Floors calibrated 2026-11-13 on master
 # d54ceca; ubuntu-latest measured (3 runs each) SQLite 73.2, RocksDB 84.9-85.0,
-# memcached 88.0, Redis 56.6, Redis-ext 65.2, with spread <= 0.1 point.
+# memcached 88.0, Redis 56.6, Redis-ext 65.2-69.7.
 EXPECT = {
-    "sqlite":    (73.3, 71.0),
+    # SQLite depends on the runner: 73.2 x3 on Intel Xeon 6975P, 67.7-73.2
+    # on AMD EPYC 7763 (between runs and between jobs).
+    "sqlite":    (73.3, 64.0),
     "rocksdb":   (84.0, 83.0),
     "memcached": (87.8, 86.0),
     "redis":     (58.0, 54.5),

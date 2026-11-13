@@ -545,8 +545,11 @@ def run_sqlite(build_dir, smash_lib, quick):
                 rss_timeline.append(rss)
             time.sleep(1)
 
-        stdout, _ = proc.communicate(timeout=10)
+        stdout, stderr = proc.communicate(timeout=10)
         metrics = parse_metrics(stdout)
+        if not metrics:
+            print(f" sqlite exit={proc.returncode} stderr: "
+                  f"{(stderr or '').strip()[-300:]!r}", end="")
 
         if metrics and rss_timeline:
             metrics["metric_source"] = footprint.METRIC_SOURCE
@@ -593,8 +596,11 @@ def run_rocksdb(build_dir, smash_lib, quick):
                     rss_timeline.append(rss)
                 time.sleep(1)
 
-            stdout, _ = proc.communicate(timeout=10)
+            stdout, stderr = proc.communicate(timeout=10)
             metrics = parse_metrics(stdout)
+            if not metrics:
+                print(f" rocksdb exit={proc.returncode} stderr: "
+                      f"{(stderr or '').strip()[-300:]!r}", end="")
 
             if metrics:
                 metrics["metric_source"] = footprint.METRIC_SOURCE

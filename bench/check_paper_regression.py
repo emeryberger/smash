@@ -29,6 +29,11 @@ import os
 import statistics
 import sys
 
+# Redis and Redis-ext measure below the paper on c7a.2xlarge (Ubuntu) and
+# ubuntu-latest, and that is the machine, not a regression: on the same
+# c7a box, the paper's own commit (41f3bab) gives Redis 56.4% and Redis-ext
+# 66.4%, vs main's 56.6% and 66.7%.  Expect WARNs for those two.
+#
 # app -> (paper %, CI floor %).  Floors calibrated 2026-11-13 on master
 # d54ceca; ubuntu-latest measured (3 runs each) SQLite 73.2, RocksDB 84.9-85.0,
 # memcached 88.0, Redis 56.6, Redis-ext 65.2, with spread <= 0.1 point.

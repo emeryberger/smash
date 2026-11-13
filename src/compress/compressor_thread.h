@@ -3009,8 +3009,16 @@ private:
                     compressed_[i].compressedSize(), kPageSize,
                     algo, sc);
 
+                // The blob was compressed with free slots zeroed
+                // (zeroFreeSlots in compressPage), so compare against the
+                // live page with the same masking. A raw memcmp fails for
+                // every page whose freed slots still hold old bytes, which
+                // discards and recompresses those pages forever.
+                alignas(64) unsigned char live[kPageSize];
+                __builtin_memcpy(live, page_addr, kPageSize);
+                zeroFreeSlots(live, i);
                 bool content_matches =
-                    __builtin_memcmp(page_addr, fault_slots_[slot].buf, kPageSize) == 0;
+                    __builtin_memcmp(live, fault_slots_[slot].buf, kPageSize) == 0;
                 releaseFaultSlot(slot);
 
                 if (!content_matches) {

@@ -239,6 +239,36 @@ endfunction()
 add_mode_compression_test(test_malloc_compression 0)      # full mode
 add_mode_compression_test(test_large_only_compression 1)  # large-only mode
 
+# Shadow-reclaim regression guard: slab pages that hold freed slots must
+# finish shadow reclaim. compressPage() zeroes free slots in the image it
+# compresses, so the shadow content check has to mask the live page the same
+# way; comparing the raw page discarded every such page forever.
+add_executable(shadow_free_slots_test shadow_free_slots_test.cpp)
+set_target_properties(shadow_free_slots_test PROPERTIES CXX_STANDARD 20)
+if(APPLE)
+  add_test(
+    NAME test_shadow_free_slots
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "MallocNanoZone=0"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_STATS_SIGNAL=1"
+      $<TARGET_FILE:shadow_free_slots_test>
+  )
+else()
+  add_test(
+    NAME test_shadow_free_slots
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_STATS_SIGNAL=1"
+      $<TARGET_FILE:shadow_free_slots_test>
+  )
+endif()
+set_tests_properties(test_shadow_free_slots PROPERTIES TIMEOUT 60)
+
 # Arena-routing regression guard: runs under interposition and asserts that
 # allocations from many distinct call sites do NOT all collapse into one arena
 # (the LTO/wrapper return-address bug). Full mode so 256 B allocations take the

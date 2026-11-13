@@ -1465,8 +1465,13 @@ def run_ablation(build_dir, source_dir, apps, quick, output_dir, runs=1):
 
 # ── Compress-only experiment ─────────────────────────────────────────────────
 
-def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1):
-    """Run compress-only experiment for all apps."""
+def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1,
+                      only_configs=None):
+    """Run compress-only experiment for all apps.
+
+    only_configs: optional set of config names (baseline, jemalloc, mimalloc,
+    compress_only, full_smash) to run; the rest are skipped.  CI's paper
+    regression job runs only full_smash."""
     results_path = output_dir / "compress_only_results.json"
 
     smash_lib = build_dir / f"libsmash{LIB_SUFFIX}"
@@ -1519,6 +1524,8 @@ def run_compress_only(build_dir, source_dir, apps, quick, output_dir, runs=1):
         ("compress_only", co_lib),
         ("full_smash", smash_lib),
     ]
+    if only_configs:
+        configs = [c for c in configs if c[0] in only_configs]
 
     t0 = time.time()
     for app in apps:
@@ -1702,6 +1709,10 @@ def main():
     parser.add_argument("--runs", type=int, default=1, help="Runs per config (default: 1)")
     parser.add_argument("--apps", default=None,
                         help="Comma-separated app list (default: all available)")
+    parser.add_argument("--configs", default=None,
+                        help="Compress-only configs to run, comma-separated "
+                             "(baseline,jemalloc,mimalloc,compress_only,full_smash; "
+                             "default: all)")
     args = parser.parse_args()
 
     build_dir = Path(args.build_dir).resolve()
@@ -1754,8 +1765,9 @@ def main():
         print("\n" + "=" * 70)
         print("  COMPRESS-ONLY EXPERIMENT")
         print("=" * 70)
+        only = set(c.strip() for c in args.configs.split(",")) if args.configs else None
         co_results = run_compress_only(build_dir, source_dir, apps, args.quick,
-                                       output_dir, runs=args.runs)
+                                       output_dir, runs=args.runs, only_configs=only)
 
     # Generate tables
     tables_path = output_dir / "paper_tables.txt"

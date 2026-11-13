@@ -334,6 +334,7 @@ public:
             if (cacheable && !VmRegion::releaseDebugModes() && cache_.canAccept(num_pages)) {
                 if (g_any_page_compressed.load(std::memory_order_relaxed))
                     vm::commitPages(base, num_pages * kPageSize);
+                vm::uffdZeroFill(base, num_pages * kPageSize);
                 if (cache_.push(span, num_pages, now)) return;
             }
             vm_region_->releasePages(base, num_pages);

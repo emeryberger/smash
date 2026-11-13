@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <execinfo.h>
+#include "platform_mem.h"  // g_uffd_fd (SIGBUS ownership in uffd mode)
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -78,6 +79,17 @@ inline int& faultWasWrite() {
     static thread_local int v = -1;
     return v;
 }
+#endif
+
+// Signal of the fault being handled (Linux): in userfaultfd mode SIGBUS is a
+// MISSING page (smash dropped it, or never populated), SIGSEGV a protection
+// fault (a PROT_NONE/PROT_READ page from the classic path). handleFault
+// dispatches on it. 0 = unknown (macOS / not in a fault).
+#if defined(__linux__)
+inline __thread __attribute__((tls_model("initial-exec"))) int g_fault_sig = 0;
+inline int faultSignal() { return g_fault_sig; }
+#else
+inline int faultSignal() { return 0; }
 #endif
 
 // Per-thread recursion depth for the SIGSEGV/SIGBUS handler (bounded re-entry
@@ -198,6 +210,11 @@ class FaultHandler {
             } depth_guard{depth};
 #endif
             uintptr_t addr = reinterpret_cast<uintptr_t>(info->si_addr);
+#if defined(__linux__)
+            const int prev_sig = g_fault_sig;
+            g_fault_sig = sig;
+            struct SigRestore { int v; ~SigRestore() { g_fault_sig = v; } } sig_restore{prev_sig};
+#endif
             // Classify read vs write for the soft-dirty ROI re-dirty signal.
             // x86-64: bit 1 of the page-fault error code (gregs[REG_ERR]) is the
             // write bit. ucontext_t/REG_ERR come from <csignal> (already
@@ -540,23 +557,27 @@ public:
         bool need_reinstall = (current.sa_sigaction != signalHandler);
 
 #ifdef __APPLE__
-        if (!need_reinstall && isDeferredReclaimMode()) {
-            sigaction(SIGBUS, nullptr, &current);
-            need_reinstall = (current.sa_sigaction != signalHandler);
-        }
+        const bool want_bus = isDeferredReclaimMode();
+#else
+        // userfaultfd mode delivers smash's faults as SIGBUS; an app that
+        // installs its own SIGBUS handler after us (Redis does, at startup)
+        // must not keep it.
+        const bool want_bus = g_uffd_fd >= 0;
 #endif
+        bool bus_reinstall = false;
+        if (want_bus) {
+            sigaction(SIGBUS, nullptr, &current);
+            bus_reinstall = (current.sa_sigaction != signalHandler);
+        }
 
-        if (!need_reinstall) return;
+        if (!need_reinstall && !bus_reinstall) return;
 
         struct sigaction sa{};
         sa.sa_sigaction = signalHandler;
         sa.sa_flags = SA_SIGINFO | SA_NODEFER;
         sigemptyset(&sa.sa_mask);
-        sigaction(SIGSEGV, &sa, &old_sigsegv_);
-#ifdef __APPLE__
-        if (isDeferredReclaimMode())
-            sigaction(SIGBUS, &sa, &old_sigbus_);
-#endif
+        if (need_reinstall) sigaction(SIGSEGV, &sa, &old_sigsegv_);
+        if (bus_reinstall) sigaction(SIGBUS, &sa, &old_sigbus_);
     }
 
     ~FaultHandler() { stop(); }

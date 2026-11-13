@@ -38,6 +38,11 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 #include <csignal>
 #include <cstdio>
 #include "../vm/fault_handler.h"
+#ifdef __linux__
+#include <sys/socket.h>
+#include <sys/un.h>
+#include "smash/idled_protocol.h"
+#endif
 #include "../vm/syscall_compat.h"
 
 #include <algorithm>
@@ -60,6 +65,32 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 #include <sys/vfs.h>          // statfs — reject tmpfs/ramfs spill dirs
 #include <sys/syscall.h>      // SYS_membarrier
 #include <linux/membarrier.h> // MEMBARRIER_CMD_*
+#include <linux/userfaultfd.h> // SMASH_UFFD
+#include <sys/ioctl.h>
+#ifndef UFFD_USER_MODE_ONLY
+#define UFFD_USER_MODE_ONLY 1
+#endif
+#ifndef UFFD_FEATURE_WP_ASYNC
+#define UFFD_FEATURE_WP_UNPOPULATED (1ULL << 13)
+#define UFFD_FEATURE_WP_ASYNC (1ULL << 15)
+#endif
+#ifndef PAGEMAP_SCAN  // Linux 6.7 uAPI (linux/fs.h)
+struct page_region { __u64 start; __u64 end; __u64 categories; };
+struct pm_scan_arg {
+    __u64 size, flags, start, end, walk_end, vec, vec_len, max_pages;
+    __u64 category_inverted, category_mask, category_anyof_mask, return_mask;
+};
+#define PAGEMAP_SCAN _IOWR('f', 16, struct pm_scan_arg)
+#define PM_SCAN_WP_MATCHING (1ULL << 0)
+#define PM_SCAN_CHECK_WPASYNC (1ULL << 1)
+#define PAGE_IS_WRITTEN (1ULL << 1)
+#endif
+#ifndef UFFDIO_MOVE  // Linux 6.8 uAPI; older headers lack it
+#define UFFD_FEATURE_MOVE (1ULL << 16)
+#define _UFFDIO_MOVE (0x05)
+struct uffdio_move { __u64 dst; __u64 src; __u64 len; __u64 mode; __s64 move; };
+#define UFFDIO_MOVE _IOWR(UFFDIO, _UFFDIO_MOVE, struct uffdio_move)
+#endif
 #ifndef TMPFS_MAGIC
 #define TMPFS_MAGIC 0x01021994
 #endif
@@ -81,6 +112,20 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 #endif
 
 namespace smash {
+
+// SMASH_AGE_ORDER=3 (TAP) refault probation, set by SmashHeap at init. A page
+// a fault just restored from compressed is not proof of a hot page: the access
+// may be the application reading an object header on its way to free() (Redis's
+// sdsfree reads the sds header), or a prefetch/near-cap neighbour nobody
+// touched. With probation the page restarts its cold streak at the cooling
+// threshold instead of 0, so placement treats it as cooling (its holes are not
+// refilled) until Phase 3 monitoring or a write proves it hot again; if nothing
+// does, it recompresses.
+inline bool g_refault_probation = false;
+// SMASH_AGE_ORDER=4: publish "dense page of an aged span" in the page tag
+// (VmRegion::kPageTagCold, read by the lean free as "do not cache").
+inline bool g_tag_density = false;
+
 
 // Compressor thread bypass flag. inline thread_local (C++17) gives a single
 // definition across all TUs — both libsmash.so and test executables that
@@ -333,6 +378,373 @@ class CompressorThread {
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
     uint8_t* cold_count_ = nullptr;
+    // Ticks left in which a page counts as "just restored from compressed"
+    // (set on fault/prefetch/near-cap restore, decremented by Phase 1). Feeds
+    // smash_migrate_hint(): a hot object on such a page is a hot passenger
+    // on a mostly cold page, worth moving.
+    uint8_t* restore_mark_ = nullptr;
+    // Ticks a restored page stays open for migration (SMASH_RESTORE_MARK_TICKS,
+    // default 3). Read once in init(): this runs on the fault path, where a
+    // lazy getenv can fault on a compressed environment string and deadlock
+    // on its own static-init guard.
+    uint8_t restore_mark_ticks_ = 3;
+    uint8_t restoreMarkTicks() const { return restore_mark_ticks_; }
+    // Hints granted for page i since its last restore.  migrateHint() stops
+    // granting once a page has given up `cap` objects (a fraction of its
+    // slots): a page whose objects are *all* being read (a keyspace scan) is
+    // hot, not a cold page with hot passengers, and moving everything off it
+    // would only duplicate it.
+    uint8_t* migrate_count_ = nullptr;
+    // Migration pre-filter: one bit per page, set when a page is (or may be)
+    // cold for migration purposes (compressing/compressed/shadow or restore
+    // mark open). Set eagerly at those transitions, rebuilt each phase 1.
+    // False positives fall through to migrateHint's full check; the point is
+    // that the per-lookup hint touches 1 bit in a small array (100K pages =
+    // 12.5 KB, cache resident) instead of two random byte-array loads.
+    std::atomic<uint64_t>* mig_bits_ = nullptr;
+    void migBitSet(size_t i) {
+        if (mig_bits_) mig_bits_[i >> 6].fetch_or(1ULL << (i & 63), std::memory_order_relaxed);
+    }
+
+    // Adaptive idle wait (SMASH_ADAPTIVE_COLD=1). The cold threshold shrinks
+    // as the uncompressed resident heap grows: the memory a fixed wait
+    // costs scales with the heap, so a big heap compresses sooner, while a
+    // small one keeps the configured floor.  floor = clamp(base * ref /
+    // resident, kAdaptiveMinTicks, base), ref = SMASH_ADAPTIVE_COLD_REF_MB
+    // (default 64).  `resident` is ACTIVE/ACTIVE_MONITORING pages counted by
+    // phase 1 the tick before, so as compression shrinks the resident set
+    // the wait lengthens again and the hot working set is left alone.
+    std::atomic<size_t> p1_resident_acc_{0};
+    size_t resident_pages_last_ = 0;
+    static constexpr uint32_t kAdaptiveMinTicks = 2;
+    // Migration probing (SMASH_MIGRATE_PROBE_PCT, default 0 = off). A page
+    // holding a few hot objects among many cold ones never goes cold, so it
+    // is never compressed and smash_migrate_hint() never fires for it. Each
+    // tick, probeMigration() opens the migration window (restore_mark_) on a
+    // rotating pct% of resident pages without compressing them: hot objects
+    // the app reads in the window move off; cold ones stay. A page that gives
+    // up its whole cap is hot-dense (e.g. a migration destination); it backs
+    // off exponentially (probe_level_/probe_skip_) so it is not churned.
+    // Read check before compression (SMASH_READ_CHECK, default 1). With
+    // soft-dirty write tracking, Phase 3 never moves pages to
+    // ACTIVE_MONITORING, so the base-floor escalation (the only pre-compress
+    // READ detection) never ran: a page that is read constantly but never
+    // written looked cold, was compressed, and refaulted within a tick,
+    // dragging its prefetch neighbors with it. Now an ACTIVE page reaching
+    // the base floor is armed first (idle bit if privileged, else PROT_NONE
+    // via ACTIVE_MONITORING) and compressed only if it stays unread.
+    // ── userfaultfd mode (SMASH_UFFD=1, Linux, deferred reclaim) ─────────
+    // The PROT_NONE design changes protections on every reclaim (PROT_READ,
+    // then PROT_NONE) and every restore (PROT_RW): each mprotect takes the
+    // mmap_lock for WRITE and splits VMAs, so a busy compressor stalls the
+    // app's page faults (perf: 57% of Redis main-thread blocking was in
+    // rwsem_down_write_slowpath under mprotect) and VMAs run into
+    // vm.max_map_count. In uffd mode the contiguous arena is registered once
+    // for MISSING + WP faults with UFFD_FEATURE_SIGBUS, so faults stay
+    // in-thread (SIGBUS into the existing handler):
+    //   reclaim  = UFFDIO_MOVE the frame to a scratch page (the arena page
+    //              is now MISSING: any access faults and waits on the page
+    //              lock), verify the scratch copy, then drop it, or move it
+    //              back on a mismatch                             (read lock)
+    //   restore  = UFFDIO_COPY of the decompressed page         (read lock)
+    //   1st touch/decommitted page = UFFDIO_ZEROPAGE
+    // No protection changes, no VMA splits. Pages protected PROT_NONE before
+    // a fork (prot_none_) keep the classic path; the child never uses uffd.
+    int uffd_ = -1;
+    bool uffd_mode_ = false;
+    bool uffd_init_done_ = false;
+    uint8_t* prot_none_ = nullptr;
+    char* uffd_scratch_ = nullptr;  // one page per fault slot, uffd-registered
+    // Batched shadow reclaim: each uffd reclaim used to cost three TLB
+    // flushes (WP clear, MOVE, scratch madvise), each an IPI to every CPU
+    // running the app. After an idle period Phase B reclaims a whole-heap
+    // shadow batch at once; perf on Redis: 19.5% of the main thread in
+    // asm_sysvec_call_function_single for ~1 s, p50 doubled. reclaimBatch()
+    // clears WP once per contiguous run and drops the scratch frames with one
+    // madvise per batch, leaving one flush (the MOVE) per page.
+    static constexpr int kReclaimBatch = 64;
+    char* uffd_rbatch_ = nullptr;   // kReclaimBatch uffd-registered scratch pages
+    std::atomic<bool> rbatch_busy_{false};
+    // Write tracking without clear_refs (x86: uffd-wp): the arena is also
+    // registered for async write-protect, and one PAGEMAP_SCAN per tick
+    // returns the pages written since the last scan and re-protects them,
+    // under mmap_lock READ. clear_refs (soft-dirty) holds mmap_lock WRITE for
+    // its whole page-table walk: ~2.3 ms per tick on a 400 MB Redis, stalling
+    // every app page fault behind it (the residual p99.9 tail).
+    bool wp_scan_ = false;
+    std::atomic<uint64_t> uffd_move_fail_{0}, uffd_move_ok_{0}, uffd_copy_fail_{0};
+    bool uffdPage(size_t i) const { return uffd_mode_ && i < vm_->contigPages(); }
+    // In handleFault: this fault is a uffd MISSING fault (SIGBUS); a SIGSEGV
+    // is a protection fault and takes the classic path.
+    bool uffdFault(size_t i) const { return uffdPage(i) && vm::faultSignal() == SIGBUS; }
+    void* scratchPage(int slot) const { return uffd_scratch_ + static_cast<size_t>(slot) * kPageSize; }
+    static void uffdLog(const char* msg) { (void)!write(2, msg, std::strlen(msg)); }
+#ifdef __linux__
+    bool uffdCopy(void* dst, const void* src) {
+        struct uffdio_copy c{};
+        c.dst = reinterpret_cast<uintptr_t>(dst);
+        c.src = reinterpret_cast<uintptr_t>(src);
+        c.len = kPageSize;
+        c.mode = 0;
+        for (int tries = 0; tries < 64; ++tries) {
+            if (syscall(SYS_ioctl, uffd_, UFFDIO_COPY, &c) == 0) return true;
+            if (errno != EAGAIN) break;
+            c.copy = 0;
+        }
+        const int err = errno;
+        uffd_copy_fail_.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1, std::memory_order_relaxed) == 0) {
+            char b[160];
+            const uintptr_t d = reinterpret_cast<uintptr_t>(dst);
+            const bool arena = vm_ && vm_->contains(d);
+            const size_t pi = arena ? vm_->pageIndex(d) : 0;
+            int n = smash::safe_snprintf(b, sizeof(b),
+                                         "[smash] UFFDIO_COPY failed (errno %d, copy %lld, page %lld, state %d)\n",
+                                         err, static_cast<long long>(c.copy), arena ? static_cast<long long>(pi) : -1LL,
+                                         arena && states_ ? static_cast<int>(states_->get(pi)) : -1);
+            if (n > 0) (void)!write(2, b, (size_t)n);
+        }
+        errno = err;
+        return false;
+    }
+    // Missing page → zero page. Already present (a racing fault resolved
+    // it, or a reclaim moved the frame back) → nothing to do.
+    bool uffdResolve(void* page) {
+        struct uffdio_zeropage z{};
+        z.range.start = reinterpret_cast<uintptr_t>(page);
+        z.range.len = kPageSize;
+        if (syscall(SYS_ioctl, uffd_, UFFDIO_ZEROPAGE, &z) == 0) return true;
+        if (errno == EEXIST && wp_scan_) {
+            // Present page, or a uffd-wp marker left by a zap: clearing wp
+            // removes the marker; then zero-fill if it is really empty.
+            uffdWp(page, false);
+            z.zeropage = 0;
+            if (syscall(SYS_ioctl, uffd_, UFFDIO_ZEROPAGE, &z) == 0) return true;
+        }
+        return errno == EEXIST || errno == EAGAIN;
+    }
+    bool uffdWp(void* page, bool on, size_t len = kPageSize) {
+        struct uffdio_writeprotect w{};
+        w.range.start = reinterpret_cast<uintptr_t>(page);
+        w.range.len = len;
+        w.mode = on ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
+        return syscall(SYS_ioctl, uffd_, UFFDIO_WRITEPROTECT, &w) == 0;
+    }
+    // Atomically move one frame src → dst (dst must be MISSING).
+    bool uffdMove(void* dst, void* src) {
+        struct uffdio_move m{};
+        m.dst = reinterpret_cast<uintptr_t>(dst);
+        m.src = reinterpret_cast<uintptr_t>(src);
+        m.len = kPageSize;
+        m.mode = 0;
+        for (int tries = 0; tries < 16; ++tries) {
+            m.move = 0;
+            if (syscall(SYS_ioctl, uffd_, UFFDIO_MOVE, &m) == 0) return true;
+            if (errno != EAGAIN) return false;
+        }
+        return false;
+    }
+    static void uffdDrop(void* page) {
+        syscall(SYS_madvise, page, kPageSize, MADV_DONTNEED);  // never MADV_FREE here
+    }
+    void uffdInit() {
+        if (uffd_init_done_) return;
+        uffd_init_done_ = true;
+        const char* e = std::getenv("SMASH_UFFD");
+        if (!e || e[0] != '1') return;
+        const char* mf = std::getenv("SMASH_MADV_FREE");
+        if (!isDeferredReclaimMode() || (mf && mf[0] == '1') || vm_->contigPages() == 0) {
+            uffdLog("[smash] SMASH_UFFD needs deferred reclaim and MADV_DONTNEED; off\n");
+            return;
+        }
+        int fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+        if (fd < 0) fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK));
+        if (fd < 0) { uffdLog("[smash] SMASH_UFFD: userfaultfd() failed; off\n"); return; }
+        struct uffdio_api api{};
+        api.api = UFFD_API;
+        // WP_ASYNC only, NOT WP_UNPOPULATED: that feature lets the scan put
+        // uffd-wp markers on empty PTEs, after which a dropped (compressed)
+        // page no longer takes a clean MISSING fault (seen: fault loops).
+        api.features = UFFD_FEATURE_SIGBUS | UFFD_FEATURE_MOVE | UFFD_FEATURE_WP_ASYNC;
+        bool wp = true;
+        {
+            const char* w = std::getenv("SMASH_UFFD_WP_SCAN");
+            if (w && w[0] == '0') wp = false;
+        }
+        if (!wp || ioctl(fd, UFFDIO_API, &api) != 0) {
+            // No async WP (e.g. arm64 6.8): UFFDIO_API is once per fd.
+            close(fd);
+            fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+            if (fd < 0) fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK));
+            if (fd < 0) { uffdLog("[smash] SMASH_UFFD: userfaultfd() failed; off\n"); return; }
+            api = {};
+            api.api = UFFD_API;
+            api.features = UFFD_FEATURE_SIGBUS | UFFD_FEATURE_MOVE;
+            wp = false;
+            if (ioctl(fd, UFFDIO_API, &api) != 0) {
+                uffdLog("[smash] SMASH_UFFD: UFFDIO_API failed (needs Linux 6.8 for MOVE); off\n");
+                close(fd);
+                return;
+            }
+        }
+        auto fail = [&](const char* what) {
+            char b[160];
+            int n = smash::safe_snprintf(b, sizeof(b), "[smash] SMASH_UFFD: %s failed (errno %d); off\n", what, errno);
+            if (n > 0) (void)!write(2, b, (size_t)n);
+            close(fd);
+        };
+        // Scratch: one page per fault slot plus one for the self-test.
+        const size_t scratch_len = static_cast<size_t>(kFaultSlotCount + 1 + kReclaimBatch) * kPageSize;
+        void* sc = mmap(nullptr, scratch_len, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (sc == MAP_FAILED) return fail("scratch mmap");
+        struct uffdio_register sreg{};
+        sreg.range.start = reinterpret_cast<uintptr_t>(sc);
+        sreg.range.len = scratch_len;
+        sreg.mode = UFFDIO_REGISTER_MODE_MISSING;
+        if (ioctl(fd, UFFDIO_REGISTER, &sreg) != 0) { munmap(sc, scratch_len); return fail("scratch REGISTER"); }
+        struct uffdio_register reg{};
+        reg.range.start = reinterpret_cast<uintptr_t>(vm_->base());
+        reg.range.len = vm_->contigPages() * kPageSize;
+        reg.mode = UFFDIO_REGISTER_MODE_MISSING | (wp ? UFFDIO_REGISTER_MODE_WP : 0);
+        if (ioctl(fd, UFFDIO_REGISTER, &reg) != 0) { munmap(sc, scratch_len); return fail("arena REGISTER"); }
+        wp_scan_ = wp;
+        vm::g_uffd_wp = wp;
+        uffd_ = fd;
+        uffd_scratch_ = static_cast<char*>(sc);
+        uffd_rbatch_ = uffd_scratch_ + static_cast<size_t>(kFaultSlotCount + 1) * kPageSize;
+        // Self-test MOVE within the scratch area: fill page A (a MISSING
+        // fault here would be fatal, so populate it with UFFDIO_COPY), move
+        // it to page B, check B, drop B.
+        {
+            alignas(64) static unsigned char pat[kPageSize];
+            for (size_t k = 0; k < kPageSize; ++k) pat[k] = static_cast<unsigned char>(k * 7 + 3);
+            char* A = uffd_scratch_ + static_cast<size_t>(kFaultSlotCount - 1) * kPageSize;
+            char* B = uffd_scratch_ + static_cast<size_t>(kFaultSlotCount) * kPageSize;
+            const bool ok = uffdCopy(A, pat) && uffdMove(B, A) && std::memcmp(B, pat, kPageSize) == 0;
+            uffdDrop(B);
+            if (!ok) {
+                uffd_ = -1; uffd_scratch_ = nullptr; uffd_rbatch_ = nullptr;
+                munmap(sc, scratch_len);
+                return fail("UFFDIO_MOVE self-test");
+            }
+        }
+        prot_none_ = bootstrapArray<uint8_t>(vm_->totalPages());
+        vm::g_uffd_lo = reinterpret_cast<uintptr_t>(vm_->base());
+        vm::g_uffd_hi = vm::g_uffd_lo + vm_->contigPages() * kPageSize;
+        vm::g_uffd_fd = fd;
+        // Everything committed so far that was never touched is MISSING:
+        // map it to the zero page (present pages are skipped).
+        vm::uffdZeroFill(vm_->base(), vm_->committedPages() * kPageSize);
+        uffd_mode_ = true;
+        vm::FaultHandler::ensureInstalledIfRunning();  // own SIGBUS now
+        uffdLog(wp_scan_ ? "[smash] userfaultfd mode on (MOVE reclaim, UFFDIO_COPY restore, PAGEMAP_SCAN writes)\n"
+                         : "[smash] userfaultfd mode on (MOVE reclaim, UFFDIO_COPY restore)\n");
+    }
+    // Parent, compressor paused: protect every dropped (COMPRESSED) arena page
+    // PROT_NONE so a fork child (which inherits no uffd registration and would
+    // read them as zero) faults into the classic SIGSEGV path instead.
+    void uffdPrepareFork() {
+        if (!uffd_mode_) return;
+        const size_t n = vm_->contigPages() < vm_->committedPages() ? vm_->contigPages()
+                                                                    : vm_->committedPages();
+        for (size_t i = 0; i < n; ++i) {
+            if (states_->get(i) != PageState::COMPRESSED || prot_none_[i]) continue;
+            locks_->lock(i);
+            if (states_->get(i) == PageState::COMPRESSED && !prot_none_[i]) {
+                vm::protectPages(vm_->pageAddress(i), kPageSize, false, false);
+                prot_none_[i] = 1;
+            }
+            locks_->unlock(i);
+        }
+    }
+#else
+    bool uffdCopy(void*, const void*) { return false; }
+    bool uffdResolve(void*) { return false; }
+    bool uffdMove(void*, void*) { return false; }
+    bool uffdWp(void*, bool) { return false; }
+    static void uffdDrop(void*) {}
+    void uffdInit() {}
+    void uffdPrepareFork() {}
+#endif
+    long vmaCountNow() const { return uffd_mode_ ? 1 : readVmaCount(); }
+
+    bool read_check_ = true;
+    uint32_t read_check_ticks_ = 1;  // SMASH_READ_CHECK_TICKS: unread ticks after arming
+    bool softdirty_now_ = false;   // soft-dirty tracking active this tick
+    uint8_t* read_armed_ = nullptr;
+    uint8_t* arm_cc_ = nullptr;  // cold_count_ when armed
+    bool readCheckPassed(size_t i) const {
+        return read_armed_[i] &&
+               (cold_count_[i] == 255 ||
+                static_cast<uint32_t>(cold_count_[i]) >= static_cast<uint32_t>(arm_cc_[i]) + read_check_ticks_);
+    }
+    // Without the idle bitmap, uffd mode skips the read check: a PROT_NONE arm
+    // is exactly the write-locked mprotect this mode removes, and a wrong
+    // guess now costs one in-thread UFFDIO_COPY (refault backoff bounds it).
+    bool readCheckOff() const { return uffd_mode_ && idle_read_ok_ != 1; }
+    void armReadCheck(size_t i) {
+#ifdef __linux__
+        if (idle_read_ok_ == 1 && idled_) {
+            if (i < idled_npages_) { read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; idledArm(i); return; }
+        } else if (idle_read_ok_ == 1) {
+            uint64_t pfn = pfnForPage(i);
+            if (pfn) { markPageIdle(pfn); read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; return; }
+        }
+#endif
+        if (!chargeVmaBudget(2)) return;
+        locks_->lock(i);
+        if (states_->transition(i, PageState::ACTIVE, PageState::ACTIVE_MONITORING)) {
+            vm::protectPages(vm_->pageAddress(i), kPageSize, false, false);  // PROT_NONE
+            read_armed_[i] = 1;
+            arm_cc_[i] = cold_count_[i];
+        }
+        locks_->unlock(i);
+    }
+    unsigned probe_pct_ = 0;
+    size_t probe_cursor_ = 0;
+    uint8_t* probe_level_ = nullptr;
+    uint8_t* probe_skip_ = nullptr;
+    uint8_t* probed_ = nullptr;
+    void probeMigration() {
+        if (probe_pct_ == 0 || !restore_mark_) return;
+        const size_t committed = vm_->committedPages();
+        if (committed == 0) return;
+        size_t budget = committed * probe_pct_ / 100;
+        if (budget < 64) budget = 64;
+        size_t scanned = 0, opened = 0;
+        while (scanned < committed && opened < budget) {
+            if (probe_cursor_ >= committed) probe_cursor_ = 0;
+            const size_t i = probe_cursor_++;
+            ++scanned;
+            const PageState st = states_->get(i);
+            if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) continue;
+            if (restore_mark_[i]) continue;
+            if (probe_skip_[i]) { --probe_skip_[i]; continue; }
+            restore_mark_[i] = restoreMarkTicks();
+            migBitSet(i);
+            migrate_count_[i] = 0;
+            probed_[i] = 1;
+            ++opened;
+        }
+    }
+    // Called when page i's migration cap is reached.
+    void probeCapHit(size_t i) {
+        if (!probed_ || !probed_[i]) return;
+        probed_[i] = 0;
+        if (probe_level_[i] < 6) ++probe_level_[i];
+        probe_skip_[i] = static_cast<uint8_t>((1u << probe_level_[i]) - 1);
+    }
+    size_t adaptive_ref_pages_ = 0;  // 0 = off; set in init()
+    uint32_t effectiveColdFloor(uint32_t base) const {
+        const size_t ref_pages = adaptive_ref_pages_;
+        if (ref_pages == 0 || base <= kAdaptiveMinTicks) return base;
+        const size_t res = resident_pages_last_;
+        if (res <= ref_pages) return base;
+        const uint64_t f = static_cast<uint64_t>(base) * ref_pages / res;
+        return f < kAdaptiveMinTicks ? kAdaptiveMinTicks : static_cast<uint32_t>(f);
+    }
 
     // Per-page tier marker for tiered recompression.  0 = no blob (page in
     // ACTIVE/COMPRESSING/etc.), 1 = fast-tier blob (LZ4 or zstd-1, eligible
@@ -466,6 +878,25 @@ class CompressorThread {
     // false and we fall back to the existing PROT_NONE read-arm, byte-identical.
     [[maybe_unused]] int page_idle_fd_ = -1;     // /sys/kernel/mm/page_idle/bitmap
     [[maybe_unused]] int idle_read_ok_ = -1;     // -1 unprobed, 0 unavailable, 1 active
+    // smash-idled client (see include/smash/idled_protocol.h). Unprivileged
+    // processes get the idle-bitmap read signal from a root daemon: arms are
+    // queued and sent in batches as Phase 2 makes them; the read check is one
+    // batched QUERY before Phase 1, results in idle_hit_.
+    bool idled_ = false, idled_tried_ = false;
+    int idled_fd_ = -1;
+    pid_t idled_pid_ = 0;
+    size_t idled_npages_ = 0;
+    uint8_t* idle_hit_ = nullptr;     // 1 = accessed since armed (or unknown)
+    uint32_t* idled_buf_ = nullptr;
+    uint8_t* idled_out_ = nullptr;
+    uint64_t idled_armed_ = 0, idled_queried_ = 0;
+    // Arms are sent as Phase 2 makes them (every kArmQ), not at tick end:
+    // Phase 2 can run >1 s, and a late arm shortens the read-check window
+    // (measured: 3x the refaults of the in-process root path).
+    static constexpr uint32_t kArmQ = 512;
+    pthread_mutex_t idled_mu_ = PTHREAD_MUTEX_INITIALIZER;
+    uint32_t idled_armq_[kArmQ];
+    uint32_t idled_armn_ = 0;
 
     // /proc/self/mem fd (Linux). Used to populate a page's physical backing
     // *while it is still PROT_NONE*, before flipping it readable — closing the
@@ -983,6 +1414,7 @@ public:
         // those (~50 ms total) to drain in_tick_ before we let fork proceed.
         for (int i = 0; i < 50 && in_tick_.load(std::memory_order_seq_cst); ++i)
             usleep(1000);
+        uffdPrepareFork();
     }
 
     // Resume after fork() in the parent.
@@ -997,6 +1429,12 @@ public:
     // Without this, the singleton's startCompression() CAS fails (because
     // compression_started_ is true) and the child runs with no compressor.
     void resetForFork() {
+        // Child: the inherited uffd refers to the PARENT's mm; never use it.
+        if (uffd_ >= 0) { close(uffd_); uffd_ = -1; }
+        vm::g_uffd_fd = -1;
+        uffd_mode_ = false;
+        wp_scan_ = false;  // child: no uffd-wp registration (soft-dirty again)
+        vm::g_uffd_wp = false;
         running_.store(false, std::memory_order_release);
         paused_.store(false, std::memory_order_release);
         in_tick_.store(false, std::memory_order_release);
@@ -1028,6 +1466,13 @@ public:
         // in the child since PFNs and privilege may differ; reset the cache.
         if (page_idle_fd_ >= 0)  { close(page_idle_fd_);  page_idle_fd_ = -1; }
         idle_read_ok_ = -1;
+        // The smash-idled socket is the parent's connection (registered for
+        // the parent's pid): drop our copy and let the child connect afresh.
+        if (idled_fd_ >= 0) { close(idled_fd_); idled_fd_ = -1; }
+        idled_ = false;
+        idled_tried_ = false;
+        idled_armn_ = 0;
+        pthread_mutex_init(&idled_mu_, nullptr);
         // Spill file: the child inherited the parent's MAP_SHARED mapping of the
         // (unlinked) parent spill file plus the in-memory SpillStore offsets/
         // free-list, which are process-local. Continuing to use them would
@@ -1247,6 +1692,30 @@ private:
         }
     }
 
+    // Cold streak a page restarts with after a fault restores it (see
+    // g_refault_probation): 0 normally, the cooling threshold under TAP.
+    static uint8_t refaultColdStart() {
+        if (!g_refault_probation) return 0;
+        const int t = getCoolingCloseTicks();
+        return static_cast<uint8_t>(t > 0 && t < 255 ? t : 0);
+    }
+
+    // Shadow verification: the blob was compressed from a copy of the page
+    // with its free slots zeroed (zeroFreeSlots), but the live page keeps
+    // whatever stale bytes those slots held. Comparing the raw page against
+    // the decompressed blob therefore failed on every page with a non-zero
+    // free slot, so such pages were discarded and recompressed every tick and
+    // never reclaimed (measured: a heap with holes from overwrites stayed
+    // fully resident; SMASH_AGE_ORDER made it the common case). Compare with
+    // the free slots zeroed the same way. A slot allocated or freed since
+    // compression still shows up as a mismatch (conservative discard).
+    bool shadowMatches(const void* page_addr, const void* decompressed, size_t page_idx) {
+        alignas(64) unsigned char live[kPageSize];
+        __builtin_memcpy(live, page_addr, kPageSize);
+        zeroFreeSlots(live, page_idx);
+        return __builtin_memcmp(live, decompressed, kPageSize) == 0;
+    }
+
     // ── Chunk bitmap management ───────────────────────────────────────────
 
     void rebuildChunkBitmap(size_t committed) {
@@ -1296,9 +1765,28 @@ private:
     // Phase 1: Process access bits and update cold counts
     __attribute__((cold)) void phase1Range(size_t start, size_t end) {
         const bool sd_roi = write_clean_streak_ != nullptr;  // gate on
+        size_t resident = 0;
+        struct Flush {
+            std::atomic<size_t>& acc; size_t& n;
+            ~Flush() { acc.fetch_add(n, std::memory_order_relaxed); }
+        } flush{p1_resident_acc_, resident};
+        // Rebuild the migration pre-filter for [start, end): clear, then
+        // re-set from the live pages below (EMPTY pages stay clear).
+        if (mig_bits_) {
+            for (size_t w = (start + 63) / 64; w < end / 64; ++w)
+                mig_bits_[w].store(0, std::memory_order_relaxed);
+        }
         forEachLivePage(start, end, [&](size_t i) {
+            if (restore_mark_ && restore_mark_[i]) --restore_mark_[i];
+            if (mig_bits_) {
+                const PageState ms = states_->get(i);
+                if ((restore_mark_ && restore_mark_[i]) || ms == PageState::COMPRESSED ||
+                    ms == PageState::COMPRESSING || ms == PageState::COMPRESSED_SHADOW)
+                    migBitSet(i);
+            }
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+                ++resident;
                 // Raw WRITE signal (soft-dirty) BEFORE the idle-read augmentation
                 // below folds reads in. The soft-dirty ROI machinery needs the
                 // write-only bit to track data stability independent of reads.
@@ -1319,25 +1807,61 @@ private:
                 // read since — count that as an access, fault-free. soft-dirty
                 // (accessed_) only covers writes; this adds the read signal.
                 if (!accessed && idle_read_ok_ == 1 &&
-                    st == PageState::ACTIVE_MONITORING) {
-                    uint64_t pfn = pfnForPage(i);
-                    if (pfn && !isPageIdle(pfn)) accessed = true;  // read since armed
+                    (st == PageState::ACTIVE_MONITORING || (read_armed_ && read_armed_[i]))) {
+                    if (idled_) {
+                        if (i < idled_npages_ && idle_hit_[i]) accessed = true;
+                    } else {
+                        uint64_t pfn = pfnForPage(i);
+                        if (pfn && !isPageIdle(pfn)) accessed = true;  // read since armed
+                    }
                 }
 #endif
                 if (accessed) {
-                    cold_count_[i] = 0;
+                    // Refault probation lasts the restore window: a write
+                    // here is usually the burst that faulted the page in,
+                    // and resetting to 0 would let its own frees refill
+                    // the page's holes with hot objects (see v58 note).
+                    cold_count_[i] = (restore_mark_ && restore_mark_[i]) ? refaultColdStart() : 0;
+                    if (read_armed_) read_armed_[i] = 0;
                     // Access can change contents — the incompressibility
                     // verdict behind the ratio-gate backoff is stale.
                     compress_fail_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
                 } else {
                     if (cold_count_[i] < 255) cold_count_[i]++;
-                    decayRecompressCount(i);
+                    // Under soft-dirty an unarmed ACTIVE page's quiet ticks say
+                    // nothing about reads: don't let them erase its refault
+                    // history (that made read-hot pages recompress on a cycle).
+                    if (!(read_armed_ && softdirty_now_ && st == PageState::ACTIVE && !read_armed_[i]))
+                        decayRecompressCount(i);
                 }
             } else if (st == PageState::COMPRESSED) {
+                if (read_armed_) read_armed_[i] = 0;  // a restore re-arms from scratch
                 // Keep counting for compressed pages so zstd upgrade can trigger
                 if (cold_count_[i] < 255) cold_count_[i]++;
                 decayRecompressCount(i);
+            }
+            if (g_tag_density && page_map_) {
+                // Density mode: frees on a dense page of an aged span must not
+                // be cached. Approximate (bitmap read without the slab lock;
+                // a stale bit costs one cached or one slow free).
+                bool keep = false;
+                if (void* pa = vm_->pageAddress(i)) {
+                    Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(pa));
+                    if (sp && !sp->is_large && sp->object_size && sp->bitmap && sp->aged) {
+                        const size_t po = reinterpret_cast<uintptr_t>(pa) -
+                                          reinterpret_cast<uintptr_t>(sp->base);
+                        keep = sp->pageLiveBytes(po) >= Span::dense_bytes_;
+                    }
+                }
+                vm_->markPageCold(i, keep);
+            } else if (g_refault_probation) {
+                // TAP: publish page temperature in its tag for the lean free.
+                const PageState s2 = states_->get(i);
+                const bool cold = s2 == PageState::COMPRESSED || s2 == PageState::COMPRESSING ||
+                                  s2 == PageState::COMPRESSED_SHADOW ||
+                                  cold_count_[i] >= static_cast<uint8_t>(getCoolingCloseTicks());
+                vm_->markPageCold(i, cold);
             }
         });
     }
@@ -1373,7 +1897,7 @@ private:
     // cold and Phase 2 compresses it on the next tick.
     __attribute__((cold)) void phase2Range(int worker_id, size_t start, size_t end) {
         const ROIConfig& cfg = ROIConfig::instance();
-        uint32_t floor = cfg.cold_ticks_floor;
+        uint32_t floor = effectiveColdFloor(cfg.cold_ticks_floor);
         bool backoff_enabled = cfg.recompress_backoff;
 
         // No CPU-pressure multiplier and no per-tick compression budget.
@@ -1519,7 +2043,13 @@ private:
             // stable_cold and high-thrash are mutually exclusive by
             // construction (stable_cold requires thrash < 26/255 ≈ 10%).
             uint32_t profile_floor = floor;
-            if (page_map_) {
+            // Productive refault: page i gave up hot objects to migration
+            // (smash_migrate_hint) since it was restored, so what stays is
+            // colder than before. Its fault was not thrash: skip the
+            // profile, recompression and bucket backoffs below and let it
+            // compress again at the base floor.
+            const bool migrated_off = migrate_count_ && migrate_count_[i] != 0;
+            if (page_map_ && !migrated_off) {
                 void* page_addr_pf = vm_->pageAddress(i);
                 Span* sp_pf = page_map_->get(reinterpret_cast<uintptr_t>(page_addr_pf));
                 if (sp_pf) {
@@ -1560,7 +2090,7 @@ private:
             // from the per-bucket EMA — fresh pages from a known-thrashy
             // call site inherit the wait without needing their own history.
             uint32_t eff_floor = profile_floor;
-            if (backoff_enabled) {
+            if (backoff_enabled && !migrated_off) {
                 uint8_t rc = recompress_count_[i];
                 uint8_t bucket_bias = 0;
                 if (page_map_) {
@@ -1600,13 +2130,21 @@ private:
                 eff_floor = static_cast<uint32_t>(wide_floor);
             }
 
-            if (cold_count_[i] == profile_floor && st == PageState::ACTIVE_MONITORING) {
+            if (cold_count_[i] >= profile_floor && st == PageState::ACTIVE &&
+                read_armed_ && softdirty_now_ && !read_armed_[i] && !readCheckOff()) {
+                // Soft-dirty saw no WRITE for profile_floor ticks; check for
+                // reads before compressing (see read_check_). >= not ==: an
+                // arm skipped for VMA budget retries on the next tick.
+                armReadCheck(i);
+            } else if (cold_count_[i] == profile_floor && st == PageState::ACTIVE_MONITORING) {
                 // Always escalate to deep monitoring at the BASE floor —
                 // this just changes protection, not compression. It gives
                 // the compressor more accurate access info for thrashy
                 // pages (which we won't compress anyway until eff_floor).
                 escalateToDeepMonitoring(i);  // charges the VMA budget itself
-            } else if (cold_count_[i] > profile_floor && cold_count_[i] >= eff_floor) {
+            } else if (cold_count_[i] > profile_floor && cold_count_[i] >= eff_floor &&
+                       (!read_armed_ || !softdirty_now_ || readCheckOff() || readCheckPassed(i) ||
+                        (st == PageState::ACTIVE_MONITORING && !read_armed_[i]))) {
                 // Page is eligible for compression — count it
                 worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
                 // compressPage changes this page's protection: PROT_READ for
@@ -1702,7 +2240,9 @@ private:
         // avoids both the mprotect arm here and the per-read SIGSEGV. Only taken
         // when the privileged probe passed — otherwise falls through to the
         // legacy PROT_NONE path below, byte-identical to before.
-        if (idle_read_ok_ == 1) {
+        if (idle_read_ok_ == 1 && idled_) {
+            if (page_idx < idled_npages_) { idledArm(page_idx); return; }
+        } else if (idle_read_ok_ == 1) {
             uint64_t pfn = pfnForPage(page_idx);
             if (pfn) { markPageIdle(pfn); return; }
             // PFN vanished (page swapped/migrated) → fall through to PROT_NONE.
@@ -1901,6 +2441,7 @@ private:
 
         // Mark as compressing
         states_->set(page_idx, PageState::COMPRESSING);
+        migBitSet(page_idx);
 
         // ROI-based compression decision (replaces fixed shouldSkip + selectAlgorithm).
         // Stats are per (arena_id, size_class) so the ROI model sees the
@@ -2074,7 +2615,15 @@ private:
             // the per-page lock; LOOSENING protection to PROT_RW cannot fault
             // an app thread, so there is no TLB-shootdown-vs-page-lock deadlock
             // (that hazard only applies to TIGHTENING protection).
-            vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
+            // uffd + soft-dirty: nothing makes an ACTIVE page non-RW except
+            // a classic-path drop, which prot_none_ flags (conservatively, it
+            // survives frees). Skip the mprotect otherwise: even a no-op one
+            // takes mmap_lock for WRITE, ~300/s under Redis, each able to
+            // stall an app page fault for milliseconds.
+            if (!(uffdPage(page_idx) && softdirty_now_ && !prot_none_[page_idx])) {
+                vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
+                if (uffdPage(page_idx)) prot_none_[page_idx] = 0;
+            }
             __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
             // Snapshot verification for deferred mode. Without PROT_READ
             // protection during the snapshot, a concurrent write can land
@@ -2403,6 +2952,10 @@ private:
 
         if (deferred) {
             shadow_tick_[page_idx] = tick_counter_;
+            // Writes after the snapshot reach accessed_ via the next write
+            // scan; Phase 1 leaves shadow pages' bits alone, so at reclaim
+            // accessed_ means "written since the snapshot".
+            accessed_[page_idx].store(false, std::memory_order_relaxed);
             states_->set(page_idx, PageState::COMPRESSED_SHADOW);
         } else {
             // P2 chunking: batch the mprotect(PROT_NONE) of just-compressed
@@ -2813,7 +3366,8 @@ private:
                 // Restore to active
                 pstats::onExit(adj, pstats::kPrefetch);
                 states_->set(adj, PageState::ACTIVE);
-                cold_count_[adj] = 0;
+                cold_count_[adj] = refaultColdStart();
+                if (restore_mark_) { restore_mark_[adj] = restoreMarkTicks(); migBitSet(adj); migrate_count_[adj] = 0; if (probed_) probed_[adj] = 0; }
             }
 
             locks_->unlock(adj);
@@ -2921,6 +3475,126 @@ private:
     // For pages in COMPRESSED_SHADOW, verify content hasn't changed since
     // Phase A, then reclaim physical memory (decommit + PROT_NONE).
 
+    // uffd reclaim of a verified-idle COMPRESSED_SHADOW page; called with
+    // the page lock held, releases it. Returns false (lock still held, page
+    // untouched) if the MOVE is refused, so the caller can fall back.
+    bool uffdReclaim(size_t i, void* page_addr) {
+        int slot = acquireFaultSlot();
+        if (slot < 0) { locks_->unlock(i); return true; }  // busy: retry next tick
+        void* scratch = scratchPage(slot);
+        // MOVE refuses a uffd-wp'd PTE (EBUSY); the page is cold, clear it.
+        if (wp_scan_) uffdWp(page_addr, false);
+        if (!uffdMove(scratch, page_addr)) {
+            if (uffd_move_fail_.fetch_add(1, std::memory_order_relaxed) == 0) {
+                char b[96];
+                int n = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); classic reclaim\n", errno);
+                if (n > 0) (void)!write(2, b, (size_t)n);
+            }
+            releaseFaultSlot(slot);
+            return false;
+        }
+        uffd_move_ok_.fetch_add(1, std::memory_order_relaxed);
+        // The arena page is MISSING now: a concurrent access faults into
+        // handleFault and waits for this page's lock.
+        CompressAlgo algo = compressed_[i].algorithm();
+        uint8_t sc = lookupSizeClass(i);
+        engine_->decompressWithDCtx(fault_slots_[slot].dctx, compressed_[i].data,
+                                    fault_slots_[slot].buf, compressed_[i].compressedSize(),
+                                    kPageSize, algo, sc);
+        if (shadowMatches(scratch, fault_slots_[slot].buf, i)) {
+            uffdDrop(scratch);
+            shadow_tick_[i] = 0;
+            states_->set(i, PageState::COMPRESSED);
+        } else {
+            // Written since the snapshot: put the frame back, keep it live.
+            if (!uffdMove(page_addr, scratch)) {
+                // Cannot fail for a MISSING dst in practice; never lose data.
+                uffdCopy(page_addr, scratch);
+                uffdDrop(scratch);
+            }
+            releaseBlob(i);
+            compressed_[i] = {};
+            shadow_tick_[i] = 0;
+            if (page_tier_) page_tier_[i] = kTierNone;
+            cold_count_[i] = 0;
+            compress_fail_count_[i] = 0;
+            pstats::onExit(i, pstats::kShadowDiscard);
+            states_->set(i, PageState::ACTIVE);
+        }
+        releaseFaultSlot(slot);
+        locks_->unlock(i);
+        return true;
+    }
+
+    // Batched uffd reclaim of verified-idle shadow pages (all locked by the
+    // caller; every lock is released here). Per page: MOVE out, verify,
+    // keep COMPRESSED (frame left in the batch scratch) or MOVE back.
+    void reclaimBatch(const size_t* rb, int n) {
+#ifdef __linux__
+        bool expect = false;
+        if (!uffd_rbatch_ || !rbatch_busy_.compare_exchange_strong(expect, true, std::memory_order_acquire)) {
+            for (int k = 0; k < n; ++k)
+                if (!uffdReclaim(rb[k], vm_->pageAddress(rb[k]))) locks_->unlock(rb[k]);
+            return;
+        }
+        const int slot = acquireFaultSlot();
+        if (slot < 0) {  // busy: retry next tick
+            for (int k = 0; k < n; ++k) locks_->unlock(rb[k]);
+            rbatch_busy_.store(false, std::memory_order_release);
+            return;
+        }
+        if (wp_scan_) {  // MOVE refuses a uffd-wp'd PTE; the pages are cold
+            for (int k = 0; k < n;) {
+                int e = k + 1;
+                while (e < n && rb[e] == rb[e - 1] + 1) ++e;
+                uffdWp(vm_->pageAddress(rb[k]), false, static_cast<size_t>(e - k) * kPageSize);
+                k = e;
+            }
+        }
+        int used = 0;
+        for (int k = 0; k < n; ++k) {
+            const size_t i = rb[k];
+            void* page_addr = vm_->pageAddress(i);
+            void* scratch = uffd_rbatch_ + static_cast<size_t>(k) * kPageSize;
+            if (!uffdMove(scratch, page_addr)) {
+                if (uffd_move_fail_.fetch_add(1, std::memory_order_relaxed) == 0) {
+                    char b[96];
+                    int m = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); retry\n", errno);
+                    if (m > 0) (void)!write(2, b, (size_t)m);
+                }
+                if (wp_scan_) uffdWp(page_addr, true);  // stays SHADOW, keep tracking writes
+                locks_->unlock(i);
+                continue;
+            }
+            used = k + 1;
+            uffd_move_ok_.fetch_add(1, std::memory_order_relaxed);
+            engine_->decompressWithDCtx(fault_slots_[slot].dctx, compressed_[i].data,
+                                        fault_slots_[slot].buf, compressed_[i].compressedSize(),
+                                        kPageSize, compressed_[i].algorithm(), lookupSizeClass(i));
+            if (shadowMatches(scratch, fault_slots_[slot].buf, i)) {
+                shadow_tick_[i] = 0;
+                states_->set(i, PageState::COMPRESSED);
+            } else {
+                if (!uffdMove(page_addr, scratch)) uffdCopy(page_addr, scratch);
+                releaseBlob(i);
+                compressed_[i] = {};
+                shadow_tick_[i] = 0;
+                if (page_tier_) page_tier_[i] = kTierNone;
+                cold_count_[i] = 0;
+                compress_fail_count_[i] = 0;
+                pstats::onExit(i, pstats::kShadowDiscard);
+                states_->set(i, PageState::ACTIVE);
+            }
+            locks_->unlock(i);
+        }
+        releaseFaultSlot(slot);
+        if (used) syscall(SYS_madvise, uffd_rbatch_, static_cast<size_t>(used) * kPageSize, MADV_DONTNEED);
+        rbatch_busy_.store(false, std::memory_order_release);
+#else
+        for (int k = 0; k < n; ++k) locks_->unlock(rb[k]);
+#endif
+    }
+
     void reclaimShadowRange(size_t start, size_t end) {
         if (!shadow_tick_) return;
         const int delay = getDeferredReclaimDelay();
@@ -2942,10 +3616,16 @@ private:
         // within cfg_vma_margin_ of the cap. Un-reclaimed pages stay
         // COMPRESSED_SHADOW (still accessible, no fault) and are reclaimed a
         // later tick once fault-driven decompression has merged VMAs back.
-        long vma_now = readVmaCount();
+        long vma_now = vmaCountNow();
         const long vma_cap = vmaMaxMapCount() - cfg_vma_margin_;
         long reclaimed_since_resync = 0;
         constexpr long kVmaResyncReclaims = 256;
+        size_t rb[kReclaimBatch];
+        int rbn = 0;
+        struct FlushBatch {
+            CompressorThread* t; size_t* rb; int& n;
+            ~FlushBatch() { if (n) t->reclaimBatch(rb, n); n = 0; }
+        } flush_batch{this, rb, rbn};
 
         for (size_t c = 0; c < num_chunks_range; ++c) {
             if (vma_cap > 0 && vma_now >= vma_cap) break;  // VMA budget exhausted
@@ -2983,6 +3663,31 @@ private:
                     locks_->unlock(i);
                     continue;
                 }
+                if (uffdPage(i) && !prot_none_[i]) {
+                    if (wp_scan_ && accessed_[i].load(std::memory_order_relaxed)) {
+                        // Written since the snapshot (Redis: every GET writes
+                        // the object's LRU field): the verify would fail, so
+                        // discard without the MOVE out and back. Two MOVEs
+                        // (each a TLB flush, the page MISSING in between) per
+                        // page over a whole-heap shadow batch doubled Redis
+                        // p50 for ~1.3 s after an idle period.
+                        releaseBlob(i);
+                        compressed_[i] = {};
+                        shadow_tick_[i] = 0;
+                        if (page_tier_) page_tier_[i] = kTierNone;
+                        cold_count_[i] = 0;
+                        compress_fail_count_[i] = 0;
+                        pstats::onExit(i, pstats::kShadowDiscard);
+                        states_->set(i, PageState::ACTIVE);
+                        locks_->unlock(i);
+                        continue;
+                    }
+                    // Lock held; reclaimBatch() releases it.
+                    rb[rbn++] = i;
+                    if (rbn == kReclaimBatch) { reclaimBatch(rb, rbn); rbn = 0; }
+                    continue;
+                }
+                const bool uf = false;
                 vm::protectPages(page_addr, kPageSize, true, false);  // PROT_READ
 
                 // If the state was changed by a concurrent fault handler
@@ -3010,7 +3715,7 @@ private:
                     algo, sc);
 
                 bool content_matches =
-                    __builtin_memcmp(page_addr, fault_slots_[slot].buf, kPageSize) == 0;
+                    shadowMatches(page_addr, fault_slots_[slot].buf, i);
                 releaseFaultSlot(slot);
 
                 if (!content_matches) {
@@ -3031,6 +3736,8 @@ private:
                 // Content verified under PROT_READ — any write between
                 // the memcmp and now would have faulted (handler discards
                 // blob and sets ACTIVE). Safe to reclaim.
+                (void)uf;
+                if (uffd_mode_ && i < vm_->contigPages()) prot_none_[i] = 1;  // classic drop
                 if (fixavEnabled()) {
                     // FixAv: PROT_NONE → membarrier → madvise so a remote
                     // reader can never observe a DROPPED+RO page (the
@@ -3053,7 +3760,7 @@ private:
                 // to absorb merges from concurrent fault-driven decompression.
                 ++vma_now;
                 if (++reclaimed_since_resync >= kVmaResyncReclaims) {
-                    vma_now = readVmaCount();
+                    vma_now = vmaCountNow();
                     reclaimed_since_resync = 0;
                 }
             }
@@ -3125,6 +3832,145 @@ private:
     // — redacted to 0 without CAP_SYS_ADMIN. Cached: idle_read_ok_ in {0,1}.
     // SMASH_IDLE_READ_TRACK: unset/AUTO ⇒ use iff probe passes; 0 ⇒ force off;
     // 1 ⇒ force on (still requires probe; warns to stderr if it can't).
+#ifdef __linux__
+    bool idledSend(uint32_t op, uint32_t n, uint32_t* buf) {
+        using namespace smash::idled;
+        Req q{kMagic, op, n, 0};
+        struct iovec iov[2] = {{&q, sizeof(q)}, {buf, n * sizeof(uint32_t)}};
+        struct msghdr mh{};
+        mh.msg_iov = iov;
+        mh.msg_iovlen = n ? 2 : 1;
+        size_t want = sizeof(q) + n * sizeof(uint32_t);
+        while (want) {  // sendmsg may be partial on a stream socket
+            ssize_t r = sendmsg(idled_fd_, &mh, MSG_NOSIGNAL);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) return false;
+            want -= static_cast<size_t>(r);
+            size_t adv = static_cast<size_t>(r);
+            while (adv && mh.msg_iovlen) {
+                if (adv >= mh.msg_iov[0].iov_len) { adv -= mh.msg_iov[0].iov_len; ++mh.msg_iov; --mh.msg_iovlen; }
+                else { mh.msg_iov[0].iov_base = static_cast<char*>(mh.msg_iov[0].iov_base) + adv; mh.msg_iov[0].iov_len -= adv; adv = 0; }
+            }
+        }
+        return true;
+    }
+    bool idledRecv(void* p, size_t n) {
+        auto* c = static_cast<char*>(p);
+        while (n) {
+            ssize_t r = recv(idled_fd_, c, n, 0);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) return false;
+            c += r; n -= static_cast<size_t>(r);
+        }
+        return true;
+    }
+    // Daemon gone or misbehaving: read tracking off for this process (the
+    // unprivileged behaviour); never retried.
+    void idledDrop() {
+        if (idled_fd_ >= 0) close(idled_fd_);
+        idled_fd_ = -1;
+        idled_ = false;
+        idle_read_ok_ = 0;
+        uffdLog("[smash] smash-idled connection lost; read tracking off\n");
+    }
+    bool idledLive() {
+        if (!idled_) return false;
+        if (getpid() != idled_pid_) {  // fork child: the socket is the parent's
+            idled_fd_ = -1; idled_ = false; idle_read_ok_ = 0;
+            return false;
+        }
+        return true;
+    }
+    void idledConnect() {
+        using namespace smash::idled;
+        idled_tried_ = true;
+        const char* t = std::getenv("SMASH_IDLE_READ_TRACK");
+        if (t && t[0] == '0') return;
+        const char* path = std::getenv("SMASH_IDLED_SOCK");
+        if (!path || !*path) path = kDefaultSock;
+        const size_t np = vm_->contigPages();
+        if (np == 0 || np > kMaxPages) return;
+        struct sockaddr_un sa{};
+        sa.sun_family = AF_UNIX;
+        if (std::strlen(path) >= sizeof(sa.sun_path)) return;
+        std::strcpy(sa.sun_path, path);
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return;
+        struct timeval tv{2, 0};  // a stuck daemon must not stall the tick for long
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) { close(fd); return; }
+        Req q{kMagic, kOpRegister, 0, 0};
+        uint64_t a[2] = {reinterpret_cast<uintptr_t>(vm_->base()), np};
+        Resp r{};
+        if (send(fd, &q, sizeof(q), MSG_NOSIGNAL) != sizeof(q) || send(fd, a, sizeof(a), MSG_NOSIGNAL) != sizeof(a)) { close(fd); return; }
+        idled_fd_ = fd;
+        if (!idledRecv(&r, sizeof(r)) || r.status != 0) {
+            close(fd);
+            idled_fd_ = -1;
+            if (r.status == -EPERM)
+                uffdLog("[smash] smash-idled refused this process (not its launcher's descendant); no read tracking\n");
+            return;
+        }
+        if (np > idled_npages_ || !idle_hit_) idle_hit_ = bootstrapArray<uint8_t>(np);
+        if (!idled_buf_) idled_buf_ = bootstrapArray<uint32_t>(kMaxBatch);
+        if (!idled_out_) idled_out_ = bootstrapArray<uint8_t>(kMaxBatch);
+        if (!idle_hit_ || !idled_buf_ || !idled_out_) { close(fd); idled_fd_ = -1; return; }
+        idled_npages_ = np;
+        idled_pid_ = getpid();
+        idled_ = true;
+        idle_read_ok_ = 1;
+        uffdLog("[smash] read tracking via smash-idled\n");
+    }
+    // Caller holds idled_mu_.
+    void idledArmSendLocked() {
+        const uint32_t n = idled_armn_;
+        idled_armn_ = 0;
+        if (!n || !idled_ || idled_fd_ < 0) return;
+        smash::idled::Resp r{};
+        if (!idledSend(smash::idled::kOpArm, n, idled_armq_) || !idledRecv(&r, sizeof(r))) { idledDrop(); return; }
+        idled_armed_ += r.n;
+    }
+    void idledArm(size_t i) {
+        pthread_mutex_lock(&idled_mu_);
+        idled_armq_[idled_armn_++] = static_cast<uint32_t>(i);
+        if (idled_armn_ == kArmQ) idledArmSendLocked();
+        pthread_mutex_unlock(&idled_mu_);
+    }
+    bool idledQueryBatch(uint32_t n) {
+        smash::idled::Resp r{};
+        if (!idledSend(smash::idled::kOpQuery, n, idled_buf_) || !idledRecv(&r, sizeof(r)) || r.n != n ||
+            !idledRecv(idled_out_, n)) { idledDrop(); return false; }
+        // 1 = accessed or not eligible (hot); 0 idle; 2 not present, which the
+        // in-process path also counts as not accessed.
+        for (uint32_t k = 0; k < n; ++k) idle_hit_[idled_buf_[k]] = idled_out_[k] == 1;
+        idled_queried_ += n;
+        return true;
+    }
+    // After Phase 2 and after tick(): send the arms still queued.
+    void idledFlushArms() {
+        if (!idledLive()) return;
+        pthread_mutex_lock(&idled_mu_);
+        idledArmSendLocked();
+        pthread_mutex_unlock(&idled_mu_);
+    }
+    // Before Phase 1: the read check for every armed page, in one pass.
+    void idledQuery(size_t committed) {
+        if (!idledLive()) return;
+        const size_t end = committed < idled_npages_ ? committed : idled_npages_;
+        uint32_t n = 0;
+        for (size_t i = 0; i < end; ++i) {
+            idle_hit_[i] = 1;
+            if (states_->get(i) != PageState::ACTIVE_MONITORING && !(read_armed_ && read_armed_[i])) continue;
+            idled_buf_[n++] = static_cast<uint32_t>(i);
+            if (n == smash::idled::kMaxBatch) { if (!idledQueryBatch(n)) return; n = 0; }
+        }
+        if (n) idledQueryBatch(n);
+    }
+#else
+    void idledFlushArms() {}
+#endif
+
     bool ensureIdleReadFds() {
 #ifdef __linux__
         if (idle_read_ok_ >= 0) return idle_read_ok_ == 1;
@@ -3139,23 +3985,25 @@ private:
         if (mode == -1) return false;
         if (!ensureSoftDirtyFds()) return false;  // need pagemap for PFNs
 
-        // (2) Can we read a real PFN? Probe our own region's first committed page.
-        if (vm_) {
-            void* pa = vm_->pageAddress(0);
-            if (pa) {
-                uint64_t off = (reinterpret_cast<uintptr_t>(pa) / kPageSize) * sizeof(uint64_t);
-                uint64_t e = 0;
-                if (pread(pagemap_fd_, &e, sizeof(e), off) == (ssize_t)sizeof(e)) {
-                    bool present = (e >> 63) & 1;
-                    uint64_t pfn = e & ((1ULL << 55) - 1);
-                    if (!present || pfn == 0) {
-                        if (mode == 1) {
-                            const char m[] = "[smash] SMASH_IDLE_READ_TRACK=1 but PFN redacted (need CAP_SYS_ADMIN); falling back\n";
-                            (void)!::write(2, m, sizeof(m) - 1);
-                        }
-                        return false;
-                    }
+        // (2) Can we read a real PFN? Probe a page that is certainly present
+        // (a just-written stack byte): only then does pfn == 0 mean the kernel
+        // redacted it. Probing VmRegion page 0 (as before) misread a page that
+        // was not yet faulted in, or already reclaimed, as "redacted" and
+        // disabled read tracking for good even under root.
+        {
+            volatile char probe = 1;
+            probe = probe + 1;
+            uint64_t off = (reinterpret_cast<uintptr_t>(&probe) / kPageSize) * sizeof(uint64_t);
+            uint64_t e = 0;
+            if (pread(pagemap_fd_, &e, sizeof(e), off) != (ssize_t)sizeof(e)) return false;
+            const bool present = (e >> 63) & 1;
+            const uint64_t pfn = e & ((1ULL << 55) - 1);
+            if (present && pfn == 0) {
+                if (mode == 1) {
+                    const char m[] = "[smash] SMASH_IDLE_READ_TRACK=1 but PFN redacted (need CAP_SYS_ADMIN); falling back\n";
+                    (void)!::write(2, m, sizeof(m) - 1);
                 }
+                return false;
             }
         }
         // (1) Open the idle bitmap O_RDWR.
@@ -3251,6 +4099,20 @@ private:
     bool restorePageContents(void* page_addr, const void* src) {
         if (!page_addr || !vm_->contains(reinterpret_cast<uintptr_t>(page_addr))) {
             return true;  // not ours: nothing to restore
+        }
+        if (uffd_mode_) {
+            const size_t pi = vm_->pageIndex(reinterpret_cast<uintptr_t>(page_addr));
+            if (pi < vm_->contigPages()) {
+                // Dropped page (MISSING): install the bytes atomically. A
+                // page protected PROT_NONE for a fork gets RW back first;
+                // until the copy lands it is still MISSING, so a racing
+                // access faults and waits on the page lock we hold.
+                if (prot_none_[pi]) {
+                    if (!vm::protectPages(page_addr, kPageSize, true, true)) return false;
+                    prot_none_[pi] = 0;
+                }
+                return uffdCopy(page_addr, src);
+            }
         }
 #ifdef __linux__
         if (self_mem_fd_ < 0) {
@@ -3575,7 +4437,8 @@ private:
                 compressed_[k] = {};
                 if (page_tier_) page_tier_[k] = kTierNone;
                 states_->set(k, PageState::ACTIVE);
-                cold_count_[k] = 0;
+                cold_count_[k] = refaultColdStart();
+                if (restore_mark_) { restore_mark_[k] = restoreMarkTicks(); migBitSet(k); migrate_count_[k] = 0; if (probed_) probed_[k] = 0; }
             } else if (st == PageState::ACTIVE_MONITORING) {
                 states_->set(k, PageState::ACTIVE);
             }
@@ -3623,6 +4486,63 @@ private:
     // Read pagemap entries for the smash region [start, end) and OR the
     // soft-dirty bit (PTE bit 55, exposed in pagemap bit 55) into
     // accessed_[i]. Reads in a single bulk pread; no syscall per page.
+    // uffd-wp write tracking: written arena pages since the last call →
+    // accessed_, and re-protect them (PM_SCAN_WP_MATCHING). Returns false if
+    // the scan failed (caller falls back to soft-dirty for this tick).
+    bool scanWrittenPages(size_t committed) {
+#ifdef __linux__
+        if (!wp_scan_ || pagemap_fd_ < 0) return false;
+        const size_t contig = committed < vm_->contigPages() ? committed : vm_->contigPages();
+        const uint64_t base = reinterpret_cast<uintptr_t>(vm_->base());
+        constexpr size_t kVec = 512;
+        struct page_region vec[kVec];
+        uint64_t start = base;
+        const uint64_t end = base + contig * kPageSize;
+        // Walk in 16 MiB chunks: each ioctl holds mmap_lock READ for its walk,
+        // and a whole-heap walk (~1 ms on 400 MB) convoys a writer and every
+        // reader queued behind it (an app page fault included).
+        constexpr uint64_t kChunk = 16ull << 20;
+        while (start < end) {
+            struct pm_scan_arg a{};
+            a.size = sizeof(a);
+            a.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+            a.start = start;
+            a.end = start + kChunk < end ? start + kChunk : end;
+            a.vec = reinterpret_cast<uintptr_t>(vec);
+            a.vec_len = kVec;
+            a.category_mask = PAGE_IS_WRITTEN;
+            a.return_mask = PAGE_IS_WRITTEN;
+            const long n = ioctl(pagemap_fd_, PAGEMAP_SCAN, &a);
+            if (n < 0) {
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) == 0) {
+                    char b[96];
+                    int m = smash::safe_snprintf(b, sizeof(b), "[smash] PAGEMAP_SCAN failed (errno %d); soft-dirty\n", errno);
+                    if (m > 0) (void)!write(2, b, (size_t)m);
+                }
+                wp_scan_ = false;
+                return false;
+            }
+            for (long r = 0; r < n; ++r) {
+                const size_t lo = (vec[r].start - base) / kPageSize, hi = (vec[r].end - base) / kPageSize;
+                for (size_t k = lo; k < hi && k < contig; ++k)
+                    accessed_[k].store(true, std::memory_order_relaxed);
+            }
+            if (a.walk_end <= start) break;
+            start = a.walk_end;
+        }
+        // External (non-arena) pages are not uffd-tracked: with clear_refs
+        // gone their soft-dirty bits never reset, so treat them as written
+        // (never compressed) in this mode.
+        for (size_t i = vm_->contigPages(); i < committed; ++i)
+            accessed_[i].store(true, std::memory_order_relaxed);
+        return true;
+#else
+        (void)committed;
+        return false;
+#endif
+    }
+
     void readSoftDirty(size_t start, size_t end) {
 #ifdef __linux__
         if (pagemap_fd_ < 0 || end <= start) return;
@@ -4110,7 +5030,7 @@ private:
         // fault-driven decompression (which mprotect(PROT_RW)s pages and MERGES
         // their VMAs back) has freed headroom. Re-sync the real count every
         // kVmaResyncRuns runs to correct estimate drift (merges/other mmaps).
-        long vma_now = readVmaCount();
+        long vma_now = vmaCountNow();
         const long vma_cap = vmaMaxMapCount() - cfg_vma_margin_;
         long applied_since_resync = 0;
         constexpr long kVmaResyncRuns = 256;
@@ -4194,7 +5114,7 @@ private:
                 // conservative; resync to the real count periodically.
                 vma_now += 2;
                 if (++applied_since_resync >= kVmaResyncRuns) {
-                    vma_now = readVmaCount();
+                    vma_now = vmaCountNow();
                     applied_since_resync = 0;
                 }
             }
@@ -4209,6 +5129,7 @@ private:
 
     __attribute__((cold)) void tick() {
         ++tick_counter_;
+        resident_pages_last_ = p1_resident_acc_.exchange(0, std::memory_order_relaxed);
         if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
         // Time-budget recompute is cheap (~144-4600 buckets sorted) and only
@@ -4264,7 +5185,7 @@ private:
         // on the per-tick path.
         const long max_map_count = vmaMaxMapCount();
         const long kVmaSafetyMargin = cfg_vma_margin_;
-        vma_count_cached_ = readVmaCount();
+        vma_count_cached_ = vmaCountNow();
         // Re-anchor the fault path's estimate to the real count. Faults that
         // race with this store lose their increments; the next tick fixes it.
         const bool have_cap = max_map_count > 0 && vma_count_cached_ > 0;
@@ -4369,18 +5290,23 @@ private:
         // Soft-dirty: bulk-read kernel-tracked write bits into accessed_
         // BEFORE Phase 1 consumes them, then clear for the next tick.
         bool softdirty = isSoftDirtyEnabled() && ensureSoftDirtyFds();
+        softdirty_now_ = softdirty;
+        bool scanned = false;
         if (softdirty) {
-            readSoftDirty(0, committed);
+            scanned = scanWrittenPages(committed);
+            if (!scanned) readSoftDirty(0, committed);
         }
 #ifdef __linux__
         // Probe idle-page read tracking once (cached). No-op + fallback when the
         // kernel lacks CONFIG_IDLE_PAGE_TRACKING or we lack CAP_SYS_ADMIN (the
         // common unprivileged/LD_PRELOAD case). When active, phase1 reads the
         // idle bit for ACTIVE_MONITORING pages as the fault-free read signal.
-        (void)ensureIdleReadFds();
+        if (!ensureIdleReadFds() && !idled_tried_) idledConnect();
+        if (idled_) idledQuery(committed);
 #endif
 
         dispatch(1);  // Phase 1: access tracking
+        probeMigration();
 
         if (!defer_phases && isDeferredReclaimMode())
             dispatch(4);  // Phase B: reclaim confirmed-cold shadow pages
@@ -4390,7 +5316,7 @@ private:
         // the tick-start count is stale whenever Phase B ran.
         vma_budget_on_ = false;
         if (!defer_phases && max_map_count > 0 && vma_count_cached_ > 0) {
-            const long vma_now = isDeferredReclaimMode() ? readVmaCount()
+            const long vma_now = isDeferredReclaimMode() ? vmaCountNow()
                                                          : vma_count_cached_;
             vma_budget_.store(max_map_count - kVmaSafetyMargin - vma_now,
                               std::memory_order_relaxed);
@@ -4398,6 +5324,7 @@ private:
         }
 
         if (!defer_phases) dispatch(2);  // Phase 2: compression
+        idledFlushArms();
         // Phase 3 mprotects ACTIVE pages to PROT_READ for write-fault tracking.
         // This breaks any syscall / Mach trap that writes into a smash-managed
         // buffer it doesn't know to pin (e.g. mach_msg from CFRunLoop).
@@ -4441,7 +5368,7 @@ private:
         if (!no_monitor && !defer_phases && !skip_phase3 && !softdirty) {
             dispatch(3);  // Phase 3: monitoring
         }
-        if (softdirty) {
+        if (softdirty && !scanned) {
             // End-of-tick clear so app writes during the next tick get
             // freshly tracked. One syscall, no per-page cost.
             clearSoftDirty();
@@ -4460,6 +5387,13 @@ private:
         // Runs after all phase work so the sweeper observes the freshly
         // queued pages from this tick at full TTL on the next pass.
         sweepDeferredMadvise();
+
+        // Return CompressStore pages whose blobs were all released (refaults,
+        // frees) this tick. Without it a region keeps every freed byte
+        // resident until its last blob goes: after a mass refault the few
+        // survivors pin all regions, and RSS ends above the no-compression
+        // baseline (Redis hot-set run: ~34 MB stranded).
+        if (store_) store_->trim();
     }
 
     // Adapt active worker count using Little's Law (see class comment above).
@@ -4705,9 +5639,27 @@ private:
         pthread_sigmask(SIG_BLOCK, &set, nullptr);
     }
 
+    // SMASH_COMPRESSOR_IDLE=1: compressor threads run SCHED_IDLE, so they
+    // only use otherwise-idle CPU and never preempt the application (perf on
+    // Redis: the main thread's residual tail was timer preemption).
+    static void maybeIdleSched() {
+#ifdef __linux__
+        static const bool idle = [] {
+            const char* e = std::getenv("SMASH_COMPRESSOR_IDLE");
+            return e && e[0] == '1';
+        }();
+        if (idle) {
+            struct sched_param sp{};
+            sp.sched_priority = 0;
+            (void)pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp);
+        }
+#endif
+    }
+
     __attribute__((cold)) static void* coordEntry(void* arg) {
         g_compressor_thread = true;
         blockAsyncSignalsOnSelf();
+        maybeIdleSched();
         auto* self = static_cast<CompressorThread*>(arg);
         while (self->running_.load(std::memory_order_relaxed)) {
             // Sleep in 10ms intervals, checking running_ flag each time.
@@ -4746,10 +5698,12 @@ private:
             if (pstats::enabled()) [[unlikely]] {
                 uint64_t c0 = pstats::threadCpuNs();
                 self->tick();
+                self->idledFlushArms();
                 self->pressure_.coord_cpu_ns += pstats::threadCpuNs() - c0;
                 self->pressureSample();
             } else {
                 self->tick();
+                self->idledFlushArms();
             }
             self->in_tick_.store(false, std::memory_order_release);
         }
@@ -4764,6 +5718,7 @@ private:
     __attribute__((cold)) static void* helperEntry(void* arg) {
         g_compressor_thread = true;
         blockAsyncSignalsOnSelf();
+        maybeIdleSched();
         auto* ha = static_cast<HelperArg*>(arg);
         auto* self = ha->self;
         int helper_id = ha->id;
@@ -4818,6 +5773,36 @@ public:
         compressed_ = bootstrapArray<CompressedPageInfo>(max_pages);
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
+        restore_mark_ = bootstrapArray<uint8_t>(max_pages);
+        if (const char* e = std::getenv("SMASH_READ_CHECK")) read_check_ = std::atoi(e) != 0;
+        if (const char* e = std::getenv("SMASH_READ_CHECK_TICKS")) {
+            const int v = std::atoi(e);
+            read_check_ticks_ = static_cast<uint32_t>(v < 1 ? 1 : v > 60 ? 60 : v);
+        }
+        if (read_check_) {
+            read_armed_ = bootstrapArray<uint8_t>(max_pages);
+            arm_cc_ = bootstrapArray<uint8_t>(max_pages);
+        }
+        if (const char* e = std::getenv("SMASH_MIGRATE_PROBE_PCT")) {
+            const int v = std::atoi(e);
+            probe_pct_ = static_cast<unsigned>(v < 0 ? 0 : v > 100 ? 100 : v);
+        }
+        if (probe_pct_) {
+            probe_level_ = bootstrapArray<uint8_t>(max_pages);
+            probe_skip_ = bootstrapArray<uint8_t>(max_pages);
+            probed_ = bootstrapArray<uint8_t>(max_pages);
+        }
+        if (const char* e = std::getenv("SMASH_RESTORE_MARK_TICKS")) {
+            const int v = std::atoi(e);
+            restore_mark_ticks_ = static_cast<uint8_t>(v < 1 ? 1 : v > 255 ? 255 : v);
+        }
+        if (const char* on = std::getenv("SMASH_ADAPTIVE_COLD"); on && std::atoi(on) != 0) {
+            const char* r = std::getenv("SMASH_ADAPTIVE_COLD_REF_MB");
+            const long mb = r ? std::atol(r) : 64;
+            adaptive_ref_pages_ = static_cast<size_t>(mb > 0 ? mb : 64) * 1024 * 1024 / kPageSize;
+        }
+        migrate_count_ = bootstrapArray<uint8_t>(max_pages);
+        mig_bits_ = bootstrapArray<std::atomic<uint64_t>>((max_pages + 63) / 64);
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
         compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
         // Soft-dirty ROI per-page arrays: only allocate when the gate is on
@@ -5177,6 +6162,7 @@ public:
     }
 
     void start() {
+        uffdInit();
         running_.store(true, std::memory_order_release);
         start_steady_time_ = std::chrono::steady_clock::now();
 
@@ -5476,7 +6462,19 @@ public:
             if (!locks_->tryLock(i)) continue;
             PageState st = states_->get(i);
             void* page_addr = vm_->pageAddress(i);
-            if (st == PageState::COMPRESSED ||
+            if (st == PageState::COMPRESSED_SHADOW && uffdPage(i)) {
+                // uffd shadow: the frame is still mapped (writes are only
+                // tracked by async WP, not blocked), so the live bytes may be
+                // NEWER than the blob. Just drop the blob. Restoring here hit
+                // UFFDIO_COPY EEXIST on the mapped page every shutdown.
+                if (deferred_pending_)
+                    deferred_pending_[i].store(false, std::memory_order_release);
+                releaseBlob(i);
+                compressed_[i] = {};
+                if (shadow_tick_) shadow_tick_[i] = 0;
+                if (page_tier_) page_tier_[i] = kTierNone;
+                states_->set(i, PageState::ACTIVE);
+            } else if (st == PageState::COMPRESSED ||
                 st == PageState::COMPRESSED_SHADOW) {
                 CompressAlgo algo = compressed_[i].algorithm();
                 uint8_t sc = lookupSizeClass(i);
@@ -5528,7 +6526,126 @@ public:
         uint64_t last_phase_cpu = 0, last_phase_wall = 0;
         uint64_t last_helper_cpu = 0, last_coord_cpu = 0;
         uint64_t last_psi_some = 0, last_psi_full = 0;
+        uint32_t samples = 0;
     } pressure_;
+
+    // Every kOccEvery samples: resident small-object pages by slot occupancy
+    // (deciles of live bytes / page) split hot (cold streak below the
+    // cooling-close telemetry threshold) vs cold, plus the free bytes sitting
+    // on hot pages — the memory a Mesh-style merge or hot-hole reuse could
+    // recover (cold pages' holes compress away). Approximate: span bitmaps are
+    // read without the slab lock, and objects parked in thread caches count
+    // as live. Spans under a per-page cap (capped bits read as allocated) are
+    // skipped.
+    static constexpr uint32_t kOccEvery = 5;
+    void pressureOccupancy(uint64_t t_ms) {
+        if (!page_map_) return;
+        const size_t committed = vm_->committedPages();
+        const int hot_ticks = coolingCloseDefaultTicks();
+        uint64_t hot[10] = {}, cold[10] = {};
+        uint64_t hot_free_kb = 0, hot_sparse = 0, skipped = 0;
+        // Resident pages by object size (where does uncompressed RSS live?).
+        constexpr int kCls = 48;
+        uint32_t cls_sz[kCls] = {}; uint64_t cls_pg[kCls] = {}, cls_live[kCls] = {};
+        uint64_t no_span = 0, large_pg = 0, at_floor = 0, failed = 0, rc_pos = 0, rc_sum = 0;
+        const uint32_t floor_now = effectiveColdFloor(ROIConfig::instance().cold_ticks_floor);
+        auto clsIdx = [&](uint32_t sz) {
+            for (int k = 0; k < kCls; ++k) {
+                if (cls_sz[k] == sz) return k;
+                if (cls_sz[k] == 0) { cls_sz[k] = sz; return k; }
+            }
+            return kCls - 1;
+        };
+        uint64_t cls_cpg[kCls] = {}, cls_rc[kCls] = {};
+        for (size_t i = 0; i < committed; ++i) {
+            PageState st = states_->get(i);
+            if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) {
+                // Compressed pages and every page's refault count, by class.
+                if (st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW) {
+                    void* cpa = vm_->pageAddress(i);
+                    Span* csp = cpa ? page_map_->get(reinterpret_cast<uintptr_t>(cpa)) : nullptr;
+                    if (csp && !csp->is_large && csp->object_size) {
+                        const int ck = clsIdx(csp->object_size);
+                        ++cls_cpg[ck];
+                        if (recompress_count_) cls_rc[ck] += recompress_count_[i];
+                    }
+                }
+                continue;
+            }
+            void* pa = vm_->pageAddress(i);
+            if (!pa) continue;
+            Span* span = page_map_->get(reinterpret_cast<uintptr_t>(pa));
+            if (!span) { ++no_span; continue; }
+            if (span->is_large || span->object_size == 0 || !span->bitmap) { ++large_pg; continue; }
+            const int ck = clsIdx(span->object_size);
+            ++cls_pg[ck];
+            if (recompress_count_) cls_rc[ck] += recompress_count_[i];
+            if (span->current_cap_per_page != 0) { ++skipped; continue; }
+            const size_t obj = span->object_size;
+            const size_t page_off = reinterpret_cast<uintptr_t>(pa) -
+                                    reinterpret_cast<uintptr_t>(span->base);
+            const size_t page_end = page_off + kPageSize;
+            size_t live = 0;
+            for (size_t slot = page_off / obj; slot < span->object_count; ++slot) {
+                const size_t a = slot * obj;
+                if (a >= page_end) break;
+                if (span->bitmap[slot / 64] & (1ULL << (slot % 64))) continue;  // free
+                const size_t lo = a > page_off ? a : page_off;
+                const size_t hi = a + obj < page_end ? a + obj : page_end;
+                live += hi - lo;
+            }
+            cls_live[ck] += live;
+            if (cold_count_[i] >= floor_now) ++at_floor;
+            if (compress_fail_count_ && compress_fail_count_[i]) ++failed;
+            if (recompress_count_ && recompress_count_[i]) { ++rc_pos; rc_sum += recompress_count_[i]; }
+            int d = static_cast<int>(live * 10 / kPageSize);
+            if (d > 9) d = 9;
+            const bool is_hot = cold_count_[i] < hot_ticks;
+            if (is_hot) {
+                ++hot[d];
+                hot_free_kb += (kPageSize - live) / 1024;
+                if (live * 2 < kPageSize) ++hot_sparse;
+            } else {
+                ++cold[d];
+            }
+        }
+        char buf[512];
+        int n = smash::safe_snprintf(buf, sizeof(buf),
+            "occ pid=%d t_ms=%llu hot=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu"
+            " cold=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu"
+            " hot_sparse=%llu hot_free_kb=%llu capped_skipped=%llu\n",
+            (int)getpid(), (unsigned long long)t_ms,
+            (unsigned long long)hot[0], (unsigned long long)hot[1], (unsigned long long)hot[2],
+            (unsigned long long)hot[3], (unsigned long long)hot[4], (unsigned long long)hot[5],
+            (unsigned long long)hot[6], (unsigned long long)hot[7], (unsigned long long)hot[8],
+            (unsigned long long)hot[9],
+            (unsigned long long)cold[0], (unsigned long long)cold[1], (unsigned long long)cold[2],
+            (unsigned long long)cold[3], (unsigned long long)cold[4], (unsigned long long)cold[5],
+            (unsigned long long)cold[6], (unsigned long long)cold[7], (unsigned long long)cold[8],
+            (unsigned long long)cold[9],
+            (unsigned long long)hot_sparse, (unsigned long long)hot_free_kb,
+            (unsigned long long)skipped);
+        if (n > 0) (void)!write(pressure_.fd, buf, (size_t)n);
+        // cls line: size:resident_pages:live_kb for classes with >= 64 pages.
+        char cb[2048];
+        int m = smash::safe_snprintf(cb, sizeof(cb),
+                                     "cls pid=%d t_ms=%llu mv_ok=%llu mv_fail=%llu floor=%u at_floor=%llu failed=%llu rc_pos=%llu rc_sum=%llu no_span=%llu large=%llu",
+                                     (int)getpid(), (unsigned long long)t_ms,
+                                     (unsigned long long)uffd_move_ok_.load(std::memory_order_relaxed),
+                                     (unsigned long long)uffd_move_fail_.load(std::memory_order_relaxed), floor_now,
+                                     (unsigned long long)at_floor, (unsigned long long)failed,
+                                     (unsigned long long)rc_pos, (unsigned long long)rc_sum,
+                                     (unsigned long long)no_span, (unsigned long long)large_pg);
+        for (int k = 0; k < kCls && cls_sz[k] && m > 0 && m < (int)sizeof(cb) - 48; ++k) {
+            if (cls_pg[k] + cls_cpg[k] < 64) continue;
+            // size:resident_pages:live_kb:compressed_pages:refault_count_sum
+            m += smash::safe_snprintf(cb + m, sizeof(cb) - m, " %u:%llu:%llu:%llu:%llu", cls_sz[k],
+                                      (unsigned long long)cls_pg[k],
+                                      (unsigned long long)(cls_live[k] / 1024),
+                                      (unsigned long long)cls_cpg[k], (unsigned long long)cls_rc[k]);
+        }
+        if (m > 0 && m < (int)sizeof(cb) - 1) { cb[m++] = '\n'; (void)!write(pressure_.fd, cb, (size_t)m); }
+    }
 
     void pressureInit(size_t num_pages) {
         const char* path = std::getenv("SMASH_PRESSURE_LOG");
@@ -5661,7 +6778,7 @@ public:
             " proc_cpu_us=%llu comp_cpu_us=%llu phase_cpu_us=%llu"
             " phase_wall_us=%llu fault_us=%llu decomp_us=%llu"
             " psi_some_us=%llu psi_full_us=%llu load_x100=%d threads=%d"
-            " cap=%d workers=%d\n",
+            " cap=%d workers=%d trim_pg=%zu\n",
             (int)getpid(),
             (unsigned long long)((now - pstats::g_base_ns) / 1000000),
             (unsigned long long)((now - ps.last_ns) / 1000000),
@@ -5683,8 +6800,10 @@ public:
             (unsigned long long)(psi_some - ps.last_psi_some),
             (unsigned long long)(psi_full - ps.last_psi_full),
             load_x100, countOwnThreads(), cpu_pressure_cached_cap_,
-            active_workers_);
+            active_workers_, store_ ? store_->trimmedPages() : size_t{0});
         if (n > 0) (void)!write(ps.fd, buf, (size_t)n);
+        if (++ps.samples % kOccEvery == 0)
+            pressureOccupancy((now - pstats::g_base_ns) / 1000000);
 
         ps.last_ns = now; ps.last_proc_cpu_ns = proc_cpu;
         ps.last_entries = entries;
@@ -5780,8 +6899,16 @@ public:
         // mimalloc cleanup) hit ordinary memory instead of our about-to-
         // be-uninstalled signal handler.
         trace_msg("draining compressed pages...");
+        const uint64_t copy_fail_run = uffd_copy_fail_.load(std::memory_order_relaxed);
         drainAllForShutdown();
         trace_msg("drain complete");
+        if (uffd_mode_) {
+            char b[128];
+            const uint64_t all = uffd_copy_fail_.load(std::memory_order_relaxed);
+            int n = smash::safe_snprintf(b, sizeof(b), "[smash] UFFDIO_COPY failures: %llu while running, %llu in shutdown drain\n",
+                                         (unsigned long long)copy_fail_run, (unsigned long long)(all - copy_fail_run));
+            if (n > 0) (void)!write(2, b, (size_t)n);
+        }
         // P3: write the profile file so future runs benefit from this
         // run's per-bucket ratio + cost observations.
         trace_msg("saving profile...");
@@ -5821,6 +6948,27 @@ public:
 
     // Called by the fault handler when a protected page is accessed.
     // Returns true if the fault was handled (page restored).
+    // smash_migrate_hint(): 1 if page `i` is compressed (or being compressed /
+    // shadowed) or was restored from compressed within kRestoreMarkTicks.
+    // At most `cap` grants per page per restore (see migrate_count_).
+    // Cheap pre-check for smash_migrate_hint (two byte loads): could page i
+    // grant a hint at all? Most calls (hot pages) answer no here, before the
+    // caller pays for the span lookup that sizes the cap.
+    const std::atomic<uint64_t>* migBits() const { return mig_bits_; }
+    bool migrateCandidate(size_t i) const {
+        if (!mig_bits_ || i >= vm_->totalPages()) return false;
+        return (mig_bits_[i >> 6].load(std::memory_order_relaxed) >> (i & 63)) & 1;
+    }
+    bool migrateHint(size_t i, unsigned cap) {
+        if (!states_ || !migrate_count_ || i >= vm_->totalPages()) return false;
+        if (migrate_count_[i] >= cap) { probeCapHit(i); return false; }
+        const PageState st = states_->get(i);
+        const bool cold = st == PageState::COMPRESSED || st == PageState::COMPRESSING ||
+                          st == PageState::COMPRESSED_SHADOW || restore_mark_[i] != 0;
+        if (cold) ++migrate_count_[i];
+        return cold;
+    }
+
     bool handleFault(uintptr_t addr) {
         if (!vm_->contains(addr)) return false;
 
@@ -5833,7 +6981,15 @@ public:
         // runs on that same thread; calling locks_->lock(page_idx)
         // would self-deadlock on the non-recursive spinlock.  Detect
         // and bail so the SIGSEGV propagates with a real backtrace.
-        if (locks_->heldByThisThread(page_idx)) return false;
+        if (locks_->heldByThisThread(page_idx)) {
+            // uffd: smash itself touched a MISSING page it holds locked (not
+            // a dropped one: those are COMPRESSED). Zero-fill and go on.
+            if (uffdFault(page_idx) && states_->get(page_idx) != PageState::COMPRESSED) {
+                uffdResolve(vm_->pageAddress(page_idx));
+                return true;
+            }
+            return false;
+        }
 
         const uint64_t pst_t0 = pstats::enabled() ? pstats::monoNs() : 0;
         locks_->lock(page_idx);
@@ -5901,14 +7057,19 @@ public:
             const void* buf = fault_slots_[slot].buf;
             // A page whose neighbors are both plain RW is alone in its VMA:
             // the single-page restore merges, so skip the /proc/self/maps scan.
-            const int split = inaccessibleNeighbors(page_idx);
-            const bool near_cap = split > 0 && vma_near_cap_.load(std::memory_order_relaxed);
-            bool restored = near_cap && restoreNearCap(page_idx, buf);
-            if (!restored) {
+            bool restored;
+            if (uffdPage(page_idx)) {
                 restored = restorePageContents(page_addr, buf);
-                if (restored) noteFaultSplits(split);
+            } else {
+                const int split = inaccessibleNeighbors(page_idx);
+                const bool near_cap = split > 0 && vma_near_cap_.load(std::memory_order_relaxed);
+                restored = near_cap && restoreNearCap(page_idx, buf);
+                if (!restored) {
+                    restored = restorePageContents(page_addr, buf);
+                    if (restored) noteFaultSplits(split);
+                }
+                if (!restored) restored = restoreWholeVma(page_idx, buf);
             }
-            if (!restored) restored = restoreWholeVma(page_idx, buf);
             releaseFaultSlot(slot);
             if (!restored) {
                 // Could not make the page accessible (a neighbor in its VMA
@@ -5939,7 +7100,8 @@ public:
                         dec_t1 - dec_t0).count(), std::memory_order_relaxed);
             }
             states_->set(page_idx, PageState::ACTIVE);
-            cold_count_[page_idx] = 0;
+            cold_count_[page_idx] = refaultColdStart();
+            if (restore_mark_) { restore_mark_[page_idx] = restoreMarkTicks(); migBitSet(page_idx); migrate_count_[page_idx] = 0; if (probed_) probed_[page_idx] = 0; }
             compress_fail_count_[page_idx] = 0;  // access → verdict stale
             locks_->unlock(page_idx);
             if (pst_t0) [[unlikely]]
@@ -6040,7 +7202,9 @@ public:
             // 576 benchmark runs with __builtin_trap() (zero crashes).
             // Retained as defensive fallback.
             void* page_addr = vm_->pageAddress(page_idx);
-            if (!vm::commitPages(page_addr, kPageSize)) {
+            if (uffdFault(page_idx)) {
+                uffdResolve(page_addr);
+            } else if (!vm::commitPages(page_addr, kPageSize)) {
                 vm::remapPages(page_addr, kPageSize, true, true);
             }
             states_->set(page_idx, PageState::ACTIVE);
@@ -6052,7 +7216,9 @@ public:
 
         case PageState::ACTIVE_MONITORING: {
             void* page_addr = vm_->pageAddress(page_idx);
-            if (!makeResidentPageWritable(page_idx, page_addr)) {
+            if (uffdFault(page_idx)) {
+                uffdResolve(page_addr);
+            } else if (!makeResidentPageWritable(page_idx, page_addr)) {
                 // VMA cap, neighbor busy: stay monitored, re-fault, retry.
                 locks_->unlock(page_idx);
 #ifdef __linux__
@@ -6070,6 +7236,12 @@ public:
             // Race: Phase 3's batched mprotect(PROT_READ) can overwrite a
             // per-page PROT_RW restoration done by a concurrent fault handler.
             void* page_addr = vm_->pageAddress(page_idx);
+            if (uffdFault(page_idx)) {
+                // MISSING page (first touch / decommitted).
+                uffdResolve(page_addr);
+                locks_->unlock(page_idx);
+                return true;
+            }
             bool writable = makeResidentPageWritable(page_idx, page_addr);
             locks_->unlock(page_idx);
 #ifdef __linux__
@@ -6085,7 +7257,8 @@ public:
             // Fault means Phase 3 set PROT_READ and a write occurred.
             // Discard the shadow blob, restore to ACTIVE.
             void* page_addr = vm_->pageAddress(page_idx);
-            vm::protectPages(page_addr, kPageSize, true, true);
+            if (uffdFault(page_idx)) uffdResolve(page_addr);  // racing MISSING
+            else vm::protectPages(page_addr, kPageSize, true, true);
             releaseBlob(page_idx);
             compressed_[page_idx] = {};
             if (shadow_tick_) shadow_tick_[page_idx] = 0;
@@ -6101,6 +7274,13 @@ public:
         }
 
         default:
+            if (uffdFault(page_idx) && page_idx < vm_->committedPages()) {
+                // EMPTY / never-tracked page in the registered arena: a
+                // first touch arrives as a MISSING fault.
+                uffdResolve(vm_->pageAddress(page_idx));
+                locks_->unlock(page_idx);
+                return true;
+            }
             locks_->unlock(page_idx);
             return false;
         }

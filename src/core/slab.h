@@ -39,6 +39,9 @@ class Slab {
     IntrusiveList<Span> partial_;
     IntrusiveList<Span> full_;
     IntrusiveList<Span> empty_;
+    // SMASH_AGE_ORDER: spans that filled up once and have since had frees.
+    // Never allocated from; a span leaves when it becomes empty.
+    IntrusiveList<Span> aged_;
     std::atomic<uint32_t> resident_empty_count_{0};  // resident spans in empty_
     PageMap* page_map_;   // set during init, shared across all slabs
     VmRegion* vm_region_ = nullptr;
@@ -200,16 +203,35 @@ class Slab {
     // Caller holds lock_. Shared by deallocateBatch (resolves spans itself)
     // and deallocateBatchResolved (spans pre-resolved by the caller).
     void deallocateOne(void* ptr, Span* span) {
+        if (densityEnabled()) return deallocateOneDensity(ptr, span);
         const bool was_full = span->full();
+        const bool reuse = ageOrderEnabled() && span->aged && hotHoleReuse(span, ptr);
         span->deallocate(ptr);
 
         if (was_full) {
             full_.remove(span);
+            if (ageOrderEnabled() && !reuse) {
+                span->aged = true;
+                if (!span->empty()) { aged_.pushFront(span); return; }
+                span->aged = false;
+                retireEmptySpan(span);
+                empty_.pushFront(span);
+                return;
+            }
+            if (ageOrderEnabled()) span->aged = false;
             partial_.pushFront(span);
         } else if (span->empty()) {
-            partial_.remove(span);
+            if (ageOrderEnabled() && span->aged) { aged_.remove(span); span->aged = false; }
+            else partial_.remove(span);
             retireEmptySpan(span);
             empty_.pushFront(span);
+        } else if (reuse) {
+            // SMASH_AGE_ORDER=2: a hole on a warm page of an aged span. The
+            // page is resident anyway, so let new objects fill it: back to
+            // partial_ (allocateWarm still skips its cooling/compressed pages).
+            aged_.remove(span);
+            span->aged = false;
+            partial_.pushFront(span);
         }
     }
 
@@ -295,6 +317,7 @@ public:
             if (sp->resident_empty && now - sp->empty_tick >= kResidentEmptyTicks) {
                 clearResident(sp);
                 vm::decommitPages(sp->base, sp->page_count * kPageSize);
+                vm::uffdZeroFill(sp->base, sp->page_count * kPageSize);
             }
         }
     }
@@ -361,6 +384,7 @@ private:
         }
         size_t bytes = span->page_count * kPageSize;
         vm::decommitPages(span->base, bytes);
+        vm::uffdZeroFill(span->base, bytes);
         if (page_states_ && vm_region_) {
             size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
             page_states_->setRange(idx, span->page_count, PageState::EMPTY);
@@ -441,6 +465,21 @@ public:
             maybeWiden(span);
             Span::AllocFallback fb;
             void* ptr = span->allocateWarm(&fb);
+            if (!ptr && fb.any() && tapEnabled() &&
+                span->fallbackPageLivePct(fb) >= tap_sparse_pct_) {
+                // TAP: never fill a cold, non-sparse hole; use an empty or
+                // new span instead (no partial scan on this rare path).
+                Span* ns = empty_.popFront();
+                if (ns) recommitEmptySpan(ns);
+                else ns = allocateNewSpan();
+                if (ns) {
+                    partial_.remove(span);
+                    partial_.pushBack(span);
+                    void* p = ns->allocate();
+                    if (ns->full()) pushFull(ns); else partial_.pushFront(ns);
+                    return p;
+                }
+            }
             if (!ptr && fb.any()) {
                 // The span's only free slots are on cooling/compressed pages.
                 // Prefer a decommitted empty span: committing one of its
@@ -462,9 +501,13 @@ public:
                     ptr = span->consumeFallback(fb);
                 }
             }
+            if (!ptr && densityEnabled() && !span->full()) {
+                parkSpan(span);   // only dense-page holes; use another span
+                return allocate();
+            }
             if (span->full()) {
                 partial_.remove(span);
-                full_.pushFront(span);
+                pushFull(span);
             }
             return ptr;
         }
@@ -481,7 +524,7 @@ public:
 
         void* ptr = span->allocate();
         if (span->full()) {
-            full_.pushFront(span);
+            pushFull(span);
         } else {
             partial_.pushFront(span);
         }
@@ -493,11 +536,28 @@ public:
         LockGuard guard(lock_);
 
         bool was_full = span->full();
+        const bool reuse = ageOrderEnabled() && span->aged && hotHoleReuse(span, ptr);
         span->deallocate(ptr);
 
         if (was_full) {
-            // Transition: full → partial
+            // Transition: full → partial (or → aged under SMASH_AGE_ORDER)
             full_.remove(span);
+            if (ageOrderEnabled() && !reuse) {
+                span->aged = true;
+                if (!span->empty()) { aged_.pushFront(span); return; }
+                span->aged = false;
+                empty_.pushFront(span);
+                return;
+            }
+            if (ageOrderEnabled()) span->aged = false;
+            partial_.pushFront(span);
+        } else if (ageOrderEnabled() && span->empty() && span->aged) {
+            aged_.remove(span);
+            span->aged = false;
+            empty_.pushFront(span);
+        } else if (reuse) {
+            aged_.remove(span);
+            if (ageOrderEnabled()) span->aged = false;
             partial_.pushFront(span);
         } else if (span->empty()) {
             // Transition: partial → empty.  Move to empty list; the
@@ -528,6 +588,8 @@ public:
         // refill can't churn the empty list; after that, fallbacks are
         // consumed normally. Never allocates a NEW span for this.
         bool redirected = false;
+        int tap_scans = 0;
+        bool parked_now = false;
 
         while (allocated < count) {
             Span* span = partial_.front();
@@ -548,6 +610,20 @@ public:
             while (allocated < count) {
                 Span::AllocFallback fb;
                 void* ptr = span->allocateWarm(&fb);
+                if (!ptr && fb.any() && tapEnabled() &&
+                    span->fallbackPageLivePct(fb) >= tap_sparse_pct_) {
+                    // TAP: don't fill a hole on a cold, non-sparse page.
+                    // Rotate this span back and try others, then an empty
+                    // span, then a new one (outer loop re-reads front()).
+                    partial_.remove(span);
+                    partial_.pushBack(span);
+                    if (++tap_scans <= kTapScan && partial_.front() != span) break;
+                    Span* ns = empty_.popFront();
+                    if (ns) recommitEmptySpan(ns);
+                    else ns = allocateNewSpan();
+                    if (!ns) { ptr = span->consumeFallback(fb); }  // out of memory: fall back
+                    else { partial_.pushFront(ns); tap_scans = 0; break; }
+                }
                 if (!ptr && fb.any()) {
                     if (!redirected && empty_.front()) {
                         // Rotate the warmless span to the back so it cools
@@ -562,6 +638,11 @@ public:
                         break;  // outer loop re-reads partial_.front()
                     }
                     ptr = span->consumeFallback(fb);
+                }
+                if (!ptr && !fb.any() && densityEnabled() && !span->full()) {
+                    parkSpan(span);   // only dense-page holes left
+                    parked_now = true;
+                    break;
                 }
                 if (!ptr) break;
                 if (kPageLocalBatch) {
@@ -579,9 +660,10 @@ public:
                 out[allocated++] = ptr;
             }
 
+            if (parked_now) { parked_now = false; continue; }
             if (span->full()) {
                 partial_.remove(span);
-                full_.pushFront(span);
+                pushFull(span);
             }
         }
         return allocated;
@@ -635,6 +717,151 @@ public:
         drainPending();
         for (size_t i = 0; i < count; ++i)
             if (spans[i]) deallocateOne(ptrs[i], spans[i]);
+    }
+
+    // SMASH_AGE_ORDER=1 (default off): age-ordered placement, after
+    // Archipelago. A span that has filled once never has its freed slots
+    // handed out again until every object in it is gone, so new objects go
+    // only to the allocation frontier (a never-filled span) or to empty
+    // spans, and objects written at the same time share pages. Old spans
+    // are left with holes; the compressor zeroes free slots, so when such a
+    // span cools its holes compress to almost nothing. Frees into aged spans
+    // also bypass the thread cache (SmashHeap::free), which would otherwise
+    // hand an old slot straight to the next allocation of that size — e.g.
+    // a Redis overwrite placing the new value where the old one was.
+    //
+    // SMASH_AGE_ORDER=2 adds hot-hole reuse: a hole on a WARM page of an aged
+    // span (not cooling, not compressed — Span::classifySlotPage) is reused
+    // normally, since that page is resident whether or not the hole is
+    // filled. Only holes on cooling/cold pages stay empty, to compress away.
+    // Captures the Mesh-like win for hot sparse pages without remapping.
+    //
+    // Plain flags (no function-local static guard on the free/drain paths),
+    // set once by initAgeOrder() at heap init, before any slab is used.
+    static inline bool age_order_ = false;
+    static inline bool age_hot_reuse_ = false;
+    // SMASH_AGE_ORDER=3: temperature-aware placement (TAP). No aged spans.
+    // (1) a free on a cooling/compressed page bypasses the thread cache
+    //     (SmashHeap::free), so the slot is not handed straight back out —
+    //     the path by which a rewrite plants a hot object on a cold page;
+    // (2) when a span's only free slots are on cooling/compressed pages,
+    //     allocation tries up to kTapScan other partial spans, then an empty
+    //     span, then a NEW span, instead of filling the cold hole;
+    // (3) except when that page is under SMASH_AGE_SPARSE_PCT (default 25)
+    //     percent live: re-heating a nearly empty page costs little and
+    //     refilling it bounds growth.
+    // Warm pages behave exactly as without the flag, so churn reuses slots.
+    static inline bool tap_ = false;
+    static inline int tap_sparse_pct_ = 25;
+    static constexpr int kTapScan = 4;
+    static void initAgeOrder() {
+        const char* v = std::getenv("SMASH_AGE_ORDER");
+        age_order_ = v && (v[0] == '1' || v[0] == '2');
+        age_hot_reuse_ = v && v[0] == '2';
+        tap_ = v && v[0] == '3';
+        if (const char* p = std::getenv("SMASH_AGE_SPARSE_PCT")) tap_sparse_pct_ = std::atoi(p);
+        density_ = v && v[0] == '4';
+        int pct = 50;
+        if (const char* p = std::getenv("SMASH_AGE_DENSE_PCT")) pct = std::atoi(p);
+        if (pct < 1) pct = 1;
+        if (pct > 100) pct = 100;
+        Span::dense_bytes_ = density_ ? static_cast<uint32_t>(kPageSize * pct / 100) : 0;
+    }
+    // SMASH_AGE_ORDER=4: density-based age order. A span is aged once it has
+    // been full (pushFull); in an aged span a free slot is reusable only if
+    // its page is below SMASH_AGE_DENSE_PCT (default 50) percent live
+    // (Span::slotOnDensePage), whatever the page's temperature. Frees that
+    // leave a dense page bypass the thread cache. An aged span with no
+    // reusable slot is parked on aged_ (off the allocation list) until a free
+    // makes one of its pages sparse. Growth is bounded by ~1/threshold; the
+    // holes are zeroed by the compressor, so cold dense pages compress them
+    // away. Unlike TAP, an application write to an old object (Redis's LRU
+    // update on lookup) cannot make its page eligible again.
+    static inline bool density_ = false;
+    static bool densityEnabled() { return kPlacementExperiments && density_; }
+    // Free routing: true if, after freeing `ptr`, its page stays dense.
+    static bool densityKeepHole(const Span* span, const void* ptr) {
+        if (!span->aged) return false;
+        const size_t off = static_cast<size_t>(
+            static_cast<const char*>(ptr) - static_cast<const char*>(span->base));
+        const size_t live = span->pageLiveBytes(off / kPageSize * kPageSize);
+        const size_t obj = span->object_size < kPageSize ? span->object_size : kPageSize;
+        return live >= obj && live - obj >= Span::dense_bytes_;
+    }
+    static bool tapEnabled() { return kPlacementExperiments && tap_; }
+    // TAP free routing: true if `ptr`'s page is not warm (cooling/compressed).
+    static bool tapColdSlot(const Span* span, const void* ptr) {
+        const size_t off = static_cast<size_t>(
+            static_cast<const char*>(ptr) - static_cast<const char*>(span->base));
+        return span->classifySlotPage(off, getCoolingCloseTicks()) !=
+               Span::SlotPageClass::WARM;
+    }
+    // Compile-time gate: without -DSMASH_PLACEMENT_EXPERIMENTS every check
+    // below folds to false, so the default build's alloc/free paths are
+    // unchanged (measured: the runtime-only checks cost 4-16% on Larson).
+#ifdef SMASH_PLACEMENT_EXPERIMENTS
+    static constexpr bool kPlacementExperiments = true;
+#else
+    static constexpr bool kPlacementExperiments = false;
+#endif
+    static bool ageOrderEnabled() { return kPlacementExperiments && age_order_; }
+    // True if a free of `ptr` (in an aged span) should go the normal way.
+    static bool hotHoleReuse(const Span* span, const void* ptr) {
+        if (!kPlacementExperiments || !age_hot_reuse_) return false;
+        const size_t off = static_cast<size_t>(
+            static_cast<const char*>(ptr) - static_cast<const char*>(span->base));
+        return span->classifySlotPage(off, getCoolingCloseTicks()) ==
+               Span::SlotPageClass::WARM;
+    }
+
+    // SMASH_AGE_ORDER=4 list maintenance (caller holds lock_). span->parked
+    // means "on aged_": aged, not full, no reusable slot.
+    void deallocateOneDensity(void* ptr, Span* span) {
+        const bool was_full = span->full();
+        const size_t off = static_cast<size_t>(
+            static_cast<char*>(ptr) - static_cast<char*>(span->base));
+        span->deallocate(ptr);
+        if (span->empty()) {
+            if (was_full) full_.remove(span);
+            else if (span->parked) aged_.remove(span);
+            else partial_.remove(span);
+            span->parked = false;
+            span->aged = false;
+            retireEmptySpan(span);
+            empty_.pushFront(span);
+            return;
+        }
+        const bool sparse = !span->aged ||
+            span->pageLiveBytes(off / kPageSize * kPageSize) < Span::dense_bytes_;
+        if (was_full) {
+            full_.remove(span);
+            if (sparse) partial_.pushFront(span);
+            else { span->parked = true; aged_.pushFront(span); }
+        } else if (span->parked && sparse) {
+            aged_.remove(span);
+            span->parked = false;
+            partial_.pushFront(span);
+        }
+    }
+    // In partial_ but nothing reusable left (all free slots on dense pages).
+    void parkSpan(Span* span) {
+        partial_.remove(span);
+        span->parked = true;
+        aged_.pushFront(span);
+    }
+
+    // A span just filled. Under SMASH_AGE_ORDER it is aged from now on, so its
+    // frees bypass the thread cache instead of being handed straight back out.
+    void pushFull(Span* span) {
+        if (ageOrderEnabled() || densityEnabled()) span->aged = true;
+        full_.pushFront(span);
+    }
+
+    // Free one object straight to its (aged) span, bypassing the thread cache.
+    void deallocateDirect(Span* span, void* ptr) {
+        LockGuard guard(lock_);
+        drainPending();
+        deallocateOne(ptr, span);
     }
 
     static bool magazineEnabled() {

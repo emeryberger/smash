@@ -9,6 +9,10 @@
 // macOS, MADV_DONTNEED on Linux), releasing physical memory back to the OS
 // while keeping the virtual mapping.  If the region is reused, the OS
 // zero-fills on access and the bump allocator is reset.
+//
+// Partial reclamation: per-page live-blob counts let trim() (once per
+// compressor tick) return individual pages whose blobs have all been freed,
+// so a mostly-drained region does not keep its freed bytes resident.
 #pragma once
 
 #include "smash/config.h"
@@ -19,6 +23,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace smash {
 
@@ -63,19 +71,84 @@ class CompressStore {
     };
     static_assert(sizeof(FreeNode) <= 16, "FreeNode must fit minimum-alignment slot");
 
+    static constexpr size_t kRegionSize = 16 * 1024 * 1024;  // 16MB per region
+    // Per-page bookkeeping is sized for the smallest page size (4 KiB); larger
+    // OS pages (16/64 KiB) use a prefix of the arrays.
+    static constexpr size_t kMaxRegionPages = kRegionSize / 4096;
+
     // Regions for blob storage (own mmap, not from VmRegion or bootstrap)
+    //
+    // Partial reclamation: a region is decommitted wholesale only when ALL its
+    // blobs are gone, but after a mass refault (e.g. a hot set touching most
+    // compressed pages) the few surviving blobs pin every region and the freed
+    // bytes stay resident on the free lists. page_live[] counts live blobs
+    // touching each OS page; when one drops to zero the page is flagged in
+    // dead_bits and trim() (compressor tick, never the fault path) unlinks the
+    // free-list nodes stored on it and returns it to the OS.
     struct Region {
         char* base;
         size_t capacity;
         std::atomic<size_t> offset;
         std::atomic<size_t> live_bytes;  // bytes currently in use (not freed)
         uint32_t free_head;              // offset of first free slot, 0 = none
+        uint32_t dead_count;             // pages flagged in dead_bits
         Region* next;
+        uint16_t page_live[kMaxRegionPages];      // live blobs touching page
+        uint64_t dead_bits[kMaxRegionPages / 64]; // page_live hit 0; trim pending
     };
 
-    static constexpr size_t kRegionSize = 16 * 1024 * 1024;  // 16MB per region
     // Data starts after the header, rounded up to 16-byte alignment.
     static constexpr size_t kDataStart = (sizeof(Region) + 15) & ~15ULL;
+
+    static size_t pageShift() {
+        static const size_t s = [] {
+            size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+            size_t sh = 12;
+            while ((size_t{1} << sh) < ps) ++sh;
+            return sh;
+        }();
+        return s;
+    }
+
+    static bool isDead(const Region* r, size_t p) {
+        return (r->dead_bits[p >> 6] >> (p & 63)) & 1;
+    }
+    static void setDead(Region* r, size_t p) {
+        if (!isDead(r, p)) { r->dead_bits[p >> 6] |= 1ULL << (p & 63); ++r->dead_count; }
+    }
+    static void clearDead(Region* r, size_t p) {
+        if (isDead(r, p)) { r->dead_bits[p >> 6] &= ~(1ULL << (p & 63)); --r->dead_count; }
+    }
+
+    // A slot [off, off+size) became live (delta=+1) or free (delta=-1).
+    // Caller holds the shard lock.
+    static void accountSlot(Region* r, size_t off, size_t size, int delta) {
+        const size_t sh = pageShift();
+        const size_t first = off >> sh, last = (off + size - 1) >> sh;
+        for (size_t p = first; p <= last; ++p) {
+            if (delta > 0) {
+                ++r->page_live[p];
+                clearDead(r, p);
+            } else if (--r->page_live[p] == 0) {
+                setDead(r, p);
+            }
+        }
+    }
+
+    // Return [addr, addr+len) of a region to the OS. Not vm::decommitPages:
+    // its bounds check traps on short ranges outside the VmRegion.
+    void decommitStore(char* addr, size_t len) {
+        if (pin_mode_ == PinMode::kMlock) vm::unlockPages(addr, len);
+#if defined(__linux__)
+        (void)madvise(addr, len, MADV_DONTNEED);
+#elif defined(__APPLE__)
+        (void)madvise(addr, len, MADV_FREE_REUSABLE);
+#else
+        vm::decommitPages(addr, len);
+#endif
+    }
+
+    std::atomic<size_t> trimmed_pages_{0};
 
     // Per-shard state: independent lock and region chain
     struct Shard {
@@ -108,6 +181,7 @@ class CompressStore {
         r->offset.store(kDataStart, std::memory_order_relaxed);
         r->live_bytes.store(0, std::memory_order_relaxed);
         r->free_head = 0;
+        r->dead_count = 0;
         r->next = nullptr;
 
         if (pin_mode_ == PinMode::kMlock) {
@@ -140,7 +214,10 @@ class CompressStore {
         }
         r->offset.store(kDataStart, std::memory_order_relaxed);
         r->free_head = 0;
-        // live_bytes is already 0
+        // live_bytes and every page_live[] are already 0; the whole data
+        // range was just decommitted, so no trim is pending.
+        std::memset(r->dead_bits, 0, sizeof(r->dead_bits));
+        r->dead_count = 0;
     }
 
     // Try to satisfy an allocation from a region's free list (LIFO,
@@ -184,6 +261,13 @@ class CompressStore {
                     *out_alloc_size = static_cast<uint32_t>(requested);
                     r->live_bytes.fetch_add(requested,
                         std::memory_order_relaxed);
+                    accountSlot(r, cur_off, requested, +1);
+                    // The remainder's header may sit on a page with no live
+                    // blob (possibly one trim() already returned and this
+                    // write just faulted back in): flag it so trim() drops
+                    // the node and returns the page again.
+                    if (r->page_live[rem_off >> pageShift()] == 0)
+                        setDead(r, rem_off >> pageShift());
                     return r->base + cur_off;
                 }
                 // No-split: hand the whole slot to caller — remainder
@@ -196,6 +280,7 @@ class CompressStore {
                 }
                 *out_alloc_size = slot_size;
                 r->live_bytes.fetch_add(slot_size, std::memory_order_relaxed);
+                accountSlot(r, cur_off, slot_size, +1);
                 return r->base + cur_off;
             }
             prev_off = cur_off;
@@ -219,6 +304,7 @@ class CompressStore {
                 if (r->offset.compare_exchange_weak(off, aligned + size,
                         std::memory_order_relaxed)) {
                     r->live_bytes.fetch_add(size, std::memory_order_relaxed);
+                    accountSlot(r, aligned, size, +1);
                     *out_alloc_size = size;
                     return r->base + aligned;
                 }
@@ -240,6 +326,7 @@ class CompressStore {
                         if (scan->offset.compare_exchange_weak(off, aligned + size,
                                 std::memory_order_relaxed)) {
                             scan->live_bytes.fetch_add(size, std::memory_order_relaxed);
+                            accountSlot(scan, aligned, size, +1);
                             *out_alloc_size = size;
                             return scan->base + aligned;
                         }
@@ -258,6 +345,7 @@ class CompressStore {
         size_t aligned = (off + 15) & ~15ULL;
         nr->offset.store(aligned + size, std::memory_order_relaxed);
         nr->live_bytes.store(size, std::memory_order_relaxed);
+        accountSlot(nr, aligned, size, +1);
         *out_alloc_size = size;
         return nr->base + aligned;
     }
@@ -328,6 +416,8 @@ public:
 
         Region* r = regionOf(ptr);
         size_t prev = r->live_bytes.fetch_sub(alloc_size, std::memory_order_relaxed);
+        accountSlot(r, static_cast<size_t>(static_cast<char*>(ptr) - r->base),
+                    alloc_size, -1);
 
         if (prev <= alloc_size) {
             // Region is now empty — decommit its data pages.  This also
@@ -346,6 +436,56 @@ public:
             r->free_head = off;
         }
     }
+
+    // Return pages whose blobs have all been released (page_live == 0) to the
+    // OS. Call periodically from the compressor thread — never from the fault
+    // handler (it walks free lists and makes syscalls). Free-list nodes whose
+    // header lies on such a page are unlinked first, so no node ever lives on
+    // a decommitted page; a free slot that merely extends onto one is kept
+    // (reusing it faults the page back in as zeros, and accountSlot marks it
+    // live again). Returns the number of pages decommitted.
+    size_t trim() {
+        const size_t sh = pageShift();
+        const size_t ps = size_t{1} << sh;
+        const size_t npages = kRegionSize >> sh;
+        const size_t first_data = (kDataStart + ps - 1) >> sh;  // header pages stay
+        size_t total = 0;
+        for (int s = 0; s < kCompressStoreShards; ++s) {
+            LockGuard guard(shards_[s].lock);
+            for (Region* r = shards_[s].current; r; r = r->next) {
+                if (r->dead_count == 0) continue;
+                // 1. Unlink free nodes stored on dead pages.
+                uint32_t prev_off = 0, cur = r->free_head;
+                while (cur != 0) {
+                    auto* node = reinterpret_cast<FreeNode*>(r->base + cur);
+                    uint32_t next = node->next_offset;
+                    if (isDead(r, cur >> sh)) {
+                        if (prev_off == 0) r->free_head = next;
+                        else reinterpret_cast<FreeNode*>(r->base + prev_off)->next_offset = next;
+                    } else {
+                        prev_off = cur;
+                    }
+                    cur = next;
+                }
+                // 2. Decommit dead pages in contiguous runs.
+                size_t p = first_data;
+                while (p < npages) {
+                    if (!isDead(r, p)) { ++p; continue; }
+                    size_t q = p;
+                    while (q < npages && isDead(r, q)) ++q;
+                    decommitStore(r->base + (p << sh), (q - p) << sh);
+                    total += q - p;
+                    p = q;
+                }
+                std::memset(r->dead_bits, 0, sizeof(r->dead_bits));
+                r->dead_count = 0;
+            }
+        }
+        trimmed_pages_.fetch_add(total, std::memory_order_relaxed);
+        return total;
+    }
+
+    size_t trimmedPages() const { return trimmed_pages_.load(std::memory_order_relaxed); }
 };
 
 } // namespace smash

@@ -54,6 +54,11 @@ struct Span {
     // Empty span whose pages are still resident (decommit deferred; see
     // Slab::retireEmptySpan), and the slab tick at which it became empty.
     bool resident_empty;
+    // SMASH_AGE_ORDER: the span has been full since it last left the empty
+    // list. Its freed slots are not reused until it is empty again (see
+    // Slab::ageOrderEnabled).
+    bool aged;
+    bool parked;   // SMASH_AGE_ORDER=4: on Slab::aged_ (no reusable slot)
     uint32_t empty_tick;
 
     // Intrusive list pointers (used by Slab's partial/full/empty lists)
@@ -104,6 +109,8 @@ struct Span {
         allocated_count = 0;
         free_hint_word = 0;
         resident_empty = false;
+        aged = false;
+        parked = false;
         empty_tick = 0;
         list_prev = nullptr;
         list_next = nullptr;
@@ -230,6 +237,8 @@ struct Span {
         allocated_count = 1;
         free_hint_word = 0;
         resident_empty = false;
+        aged = false;
+        parked = false;
         empty_tick = 0;
         bitmap = nullptr;
         list_prev = nullptr;
@@ -307,13 +316,48 @@ struct Span {
     // first COMPRESSED-page slot seen (only if the caller hasn't already
     // recorded one elsewhere) — allocate() falls back to those, in that
     // order, when the whole span has no warm slot.
+    // SMASH_AGE_ORDER=4 (density-based age order): live-byte threshold per
+    // page, 0 = off. Set once by Slab::initAgeOrder().
+    static inline uint32_t dense_bytes_ = 0;
+
+    // Live bytes of the page at span byte offset `page_off` (page-aligned).
+    size_t pageLiveBytes(size_t page_off) const {
+        const size_t page_end = page_off + kPageSize;
+        size_t live = 0;
+        for (size_t slot = page_off / object_size; slot < object_count; ++slot) {
+            const size_t a = slot * object_size;
+            if (a >= page_end) break;
+            if (bitmap[slot / 64] & (1ULL << (slot % 64))) continue;  // free
+            const size_t lo = a > page_off ? a : page_off;
+            const size_t hi = a + object_size < page_end ? a + object_size : page_end;
+            live += hi - lo;
+        }
+        return live;
+    }
+    // Density rule: a slot of an aged span is reusable only on a page below
+    // dense_bytes_ live. `cache_page`/`cache_dense` memoize the last page.
+    bool slotOnDensePage(size_t off, size_t* cache_page, bool* cache_dense) const {
+        if (!dense_bytes_ || !aged) return false;
+        const size_t pg = off / kPageSize;
+        if (pg != *cache_page) {
+            *cache_page = pg;
+            *cache_dense = pageLiveBytes(pg * kPageSize) >= dense_bytes_;
+        }
+        return *cache_dense;
+    }
+
     inline int pickActiveBit(size_t word_idx, uint64_t word, int close_ticks,
                              int* cool_word, int* cool_bit,
-                             int* comp_word, int* comp_bit) const {
+                             int* comp_word, int* comp_bit,
+                             size_t* cache_page, bool* cache_dense) const {
         while (word) {
             int bit = ctz(word);
             size_t slot = word_idx * 64 + bit;
             size_t off  = slot * object_size;
+            if (slotOnDensePage(off, cache_page, cache_dense)) {  // not reusable
+                word &= word - 1;
+                continue;
+            }
             switch (classifySlotPage(off, close_ticks)) {
             case SlotPageClass::WARM:
                 return bit;
@@ -367,6 +411,8 @@ struct Span {
     // utilization.
     void* allocateWarm(AllocFallback* fb) {
         size_t num_words = (full_capacity + 63) / 64;
+        size_t cache_page = SIZE_MAX;
+        bool cache_dense = false;
         const int close_ticks = cold_counts ? getCoolingCloseTicks() : 0;
         const int telem_ticks = cold_counts ? coolingCloseDefaultTicks() : 0;
 
@@ -375,7 +421,8 @@ struct Span {
             if (!w) continue;
             int bit = pickActiveBit(i, w, close_ticks,
                                     &fb->cool_word, &fb->cool_bit,
-                                    &fb->comp_word, &fb->comp_bit);
+                                    &fb->comp_word, &fb->comp_bit,
+                                    &cache_page, &cache_dense);
             if (bit < 0) continue;
             return takeSlot(static_cast<int>(i), bit, true, telem_ticks);
         }
@@ -384,11 +431,33 @@ struct Span {
             if (!w) continue;
             int bit = pickActiveBit(i, w, close_ticks,
                                     &fb->cool_word, &fb->cool_bit,
-                                    &fb->comp_word, &fb->comp_bit);
+                                    &fb->comp_word, &fb->comp_bit,
+                                    &cache_page, &cache_dense);
             if (bit < 0) continue;
             return takeSlot(static_cast<int>(i), bit, true, telem_ticks);
         }
         return nullptr;  // no warm slot; fb holds any fallbacks
+    }
+
+    // Live-slot fraction (0..100) of the page holding the slot a fallback
+    // would hand out (cooling first, as consumeFallback). For the
+    // SMASH_AGE_ORDER=3 sparse-page exception. Off the fast path.
+    int fallbackPageLivePct(const AllocFallback& fb) const {
+        int w = fb.cool_word >= 0 ? fb.cool_word : fb.comp_word;
+        int b = fb.cool_word >= 0 ? fb.cool_bit : fb.comp_bit;
+        if (w < 0 || object_size == 0) return 100;
+        const size_t off = (static_cast<size_t>(w) * 64 + static_cast<size_t>(b)) * object_size;
+        const size_t page_off = off / kPageSize * kPageSize, page_end = page_off + kPageSize;
+        size_t live = 0;
+        for (size_t slot = page_off / object_size; slot < object_count; ++slot) {
+            const size_t a = slot * object_size;
+            if (a >= page_end) break;
+            if (bitmap[slot / 64] & (1ULL << (slot % 64))) continue;  // free
+            const size_t lo = a > page_off ? a : page_off;
+            const size_t hi = a + object_size < page_end ? a + object_size : page_end;
+            live += hi - lo;
+        }
+        return static_cast<int>(live * 100 / kPageSize);
     }
 
     // Consume a fallback recorded by allocateWarm(): cooling first (streak

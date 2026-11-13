@@ -31,6 +31,46 @@
 
 namespace smash::vm {
 
+// userfaultfd mode (SMASH_UFFD): the arena range registered for MISSING
+// faults. Only pages smash drops on purpose (compressed) may be MISSING
+// there: a kernel-mode access (read()/write() on a heap buffer) to a MISSING
+// page fails with EFAULT, so every page the allocator commits or releases is
+// immediately mapped to the shared zero page (no RSS; first write is an
+// ordinary CoW fault the kernel handles itself).
+inline int g_uffd_fd = -1;
+inline bool g_uffd_wp = false;  // arena also registered for (async) uffd-wp
+inline uintptr_t g_uffd_lo = 0, g_uffd_hi = 0;
+inline void uffdZeroFill(void* addr, size_t size) {
+#if defined(__linux__)
+    if (g_uffd_fd < 0 || size == 0) return;
+    uintptr_t lo = reinterpret_cast<uintptr_t>(addr), hi = lo + size;
+    if (lo < g_uffd_lo) lo = g_uffd_lo;
+    if (hi > g_uffd_hi) hi = g_uffd_hi;
+    const uintptr_t ps = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    lo &= ~(ps - 1);
+    if (g_uffd_wp) {
+        // A zap (MADV_DONTNEED) of a uffd-wp'd PTE leaves a wp marker, which
+        // ZEROPAGE refuses (EEXIST) while the access still faults MISSING:
+        // resolving wp over the range clears the markers first.
+        struct { uint64_t start, len, mode; } w{lo, hi - lo, 0};
+        // _IOWR(0xAA, 0x06, struct uffdio_writeprotect) = UFFDIO_WRITEPROTECT
+        const unsigned long kWp = (3UL << 30) | (sizeof(w) << 16) | (0xAAUL << 8) | 0x06UL;
+        (void)syscall(SYS_ioctl, g_uffd_fd, kWp, &w);
+    }
+    while (lo < hi) {
+        struct { uint64_t start, len, mode; int64_t zeropage; } z{lo, hi - lo, 0, 0};
+        // _IOWR(0xAA, 0x04, struct uffdio_zeropage) = UFFDIO_ZEROPAGE
+        const unsigned long kZero = (3UL << 30) | (sizeof(z) << 16) | (0xAAUL << 8) | 0x04UL;
+        if (syscall(SYS_ioctl, g_uffd_fd, kZero, &z) == 0) return;
+        if (z.zeropage > 0) { lo += static_cast<uintptr_t>(z.zeropage); continue; }
+        if (errno == EAGAIN) continue;
+        lo += ps;  // EEXIST (page present) or other: skip this page
+    }
+#else
+    (void)addr; (void)size;
+#endif
+}
+
 // Global bounds for smash's VmRegion. Set during init; protectPages/remapPages/
 // decommitPages assert all calls target addresses within this range.
 inline void* g_vm_bounds_base = nullptr;

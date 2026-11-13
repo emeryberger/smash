@@ -314,9 +314,80 @@ static void testReleaseCompressedPages() {
           static_cast<int>(states.get(page_idx)));
 }
 
+// Partial reclamation: after most blobs are released, trim() returns the
+// pages with no live blob, and every survivor and later reuse of the free
+// lists (including slots that extend onto trimmed pages, and split
+// remainders) stays byte-exact.
+static void fillBlob(char* p, size_t size, uint32_t id) {
+    for (size_t j = 0; j < size; ++j) p[j] = static_cast<char>((id * 131u + j * 7u) & 0xff);
+}
+static bool blobOk(const char* p, size_t size, uint32_t id) {
+    for (size_t j = 0; j < size; ++j)
+        if (p[j] != static_cast<char>((id * 131u + j * 7u) & 0xff)) return false;
+    return true;
+}
+
+static void testCompressStoreTrim() {
+    CompressStore store;
+    store.init();
+    constexpr uint32_t kN = 20000;
+    struct B { void* p; size_t req, alloc; uint32_t id; bool live; };
+    auto* b = static_cast<B*>(BootstrapAlloc::instance().allocate(sizeof(B) * kN * 2, 16));
+    char tmp[1400];
+    uint32_t next_id = 1;
+    auto put = [&](B& x, size_t page_idx) {
+        x.req = 48 + (x.id * 37u) % 1200;  // 48..1247 B: many slots straddle pages
+        fillBlob(tmp, x.req, x.id);
+        x.p = store.store(tmp, x.req, &x.alloc, page_idx);
+        x.live = x.p != nullptr;
+        CHECK(x.p, "store failed id=%u", x.id);
+    };
+    for (uint32_t i = 0; i < kN; ++i) { b[i].id = next_id++; put(b[i], i); }
+
+    // Mass release: keep 1 in 10, in runs of 400 (blobs are sharded by
+    // page_idx % 8, so a run of 400 is 50 consecutive blobs per shard). With
+    // 16 KiB pages (Apple silicon) scattered survivors would pin every page.
+    for (uint32_t i = 0; i < kN; ++i)
+        if ((i / 400) % 10) { store.release(b[i].p, b[i].alloc, i); b[i].live = false; }
+    size_t t1 = store.trim();
+    CHECK(t1 > 0, "trim returned no pages after releasing 90%% of blobs");
+    CHECK(store.trim() == 0, "second trim with nothing released should be a no-op");
+    for (uint32_t i = 0; i < kN; ++i)
+        if (b[i].live) CHECK(blobOk(static_cast<char*>(b[i].p), b[i].req, b[i].id),
+                             "survivor id=%u corrupted after trim", b[i].id);
+
+    // Refill through the (trimmed) free lists, then check everything.
+    for (uint32_t i = kN; i < 2 * kN - 2000; ++i) { b[i].id = next_id++; put(b[i], i - kN); }
+    for (uint32_t i = 0; i < 2 * kN - 2000; ++i)
+        if (b[i].live) CHECK(blobOk(static_cast<char*>(b[i].p), b[i].req, b[i].id),
+                             "blob id=%u corrupted after refill", b[i].id);
+
+    // Second cycle: release a different subset, trim, verify.
+    for (uint32_t i = 0; i < 2 * kN - 2000; ++i)
+        if (b[i].live && ((i / 400) % 3) != 0) {
+            store.release(b[i].p, b[i].alloc, i >= kN ? i - kN : i); b[i].live = false;
+        }
+    size_t t2 = store.trim();
+    CHECK(t2 > 0, "second trim returned no pages");
+    for (uint32_t i = 0; i < 2 * kN - 2000; ++i)
+        if (b[i].live) CHECK(blobOk(static_cast<char*>(b[i].p), b[i].req, b[i].id),
+                             "blob id=%u corrupted after second trim", b[i].id);
+    CHECK(store.trimmedPages() == t1 + t2, "trimmedPages %zu != %zu", store.trimmedPages(), t1 + t2);
+
+    // Release everything (regions reset) and make sure the store still works.
+    for (uint32_t i = 0; i < 2 * kN - 2000; ++i)
+        if (b[i].live) { store.release(b[i].p, b[i].alloc, i >= kN ? i - kN : i); b[i].live = false; }
+    store.trim();
+    B z{nullptr, 0, 0, next_id++, false};
+    put(z, 7);
+    CHECK(z.p && blobOk(static_cast<char*>(z.p), z.req, z.id), "store after full drain failed");
+    fprintf(stderr, "compress store trim: %zu + %zu pages returned\n", t1, t2);
+}
+
 int main() {
     testCompressEngine();
     testCompressStore();
+    testCompressStoreTrim();
     testCompressorRoundtrip();
     testIncompressibleData();
     testAccessTracking();

@@ -116,6 +116,7 @@ struct ThreadState {
     ThreadCache* thread_cache = nullptr;
     ThreadCache* fast_tc = nullptr;     // see g_fast_tc
     uintptr_t arena_stack_base = 0;
+    uintptr_t arena_entry_frame = 0;    // see g_arena_entry_frame
     int full_mode_cached = -1;
     uint64_t magic = kThreadStateMagic; // identifies our object in the slot
     ThreadState* next_free = nullptr;   // free-list link after thread exit
@@ -141,6 +142,7 @@ void threadStateAtforkChild();
 #define g_fast_tc          (::smash::threadState()->fast_tc)
 #define g_full_mode_cached (::smash::threadState()->full_mode_cached)
 #define g_arena_stack_base (::smash::threadState()->arena_stack_base)
+#define g_arena_entry_frame (::smash::threadState()->arena_entry_frame)
 #define g_arena_memo       (::smash::threadState()->arena_memo)
 #else
 extern __attribute__((tls_model("initial-exec")))
@@ -174,6 +176,8 @@ extern __attribute__((tls_model("initial-exec")))
 // drift while preserving the depth signal.
 extern __attribute__((tls_model("initial-exec")))
     thread_local uintptr_t g_arena_stack_base;
+extern __attribute__((tls_model("initial-exec")))
+    thread_local uintptr_t g_arena_entry_frame;
 #endif  // SMASH_USE_TSD
 
 #if !defined(SMASH_USE_TSD)
@@ -221,6 +225,82 @@ inline uintptr_t threadStackBase() {
         base = computeThreadStackBase(
             reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
     return base;
+}
+
+// ── Arena routing key: (call site, stack-depth bucket, size class) ──────────
+// The depth bucket is the allocation's frame offset below the thread's stack
+// base in 2^kArenaDepthShift-byte units (default 16 KB; build with
+// -DSMASH_ARENA_DEPTH_SHIFT=N to change). It is part of BOTH the routing hash
+// and the per-thread memo key: keying the memo on (ra, sc) alone froze each
+// site's arena at the depth of its first allocation on the thread.
+//
+// The stack pointer must be read at the same point on every path, or the lean
+// entry (inlined into xxmalloc) and the full path (a couple of frames deeper)
+// would compute different buckets for one call site and the lean path would
+// never hit the memo. So the lean entry passes its SP to the full path in
+// g_arena_entry_frame (set only when it falls through); the full path uses
+// that if present, else its own.
+//
+// Cost: the memo is per-thread and a thread's stack never moves, so the KEY
+// uses the absolute bucket (sp >> shift) — one register read, no TLS load.
+// Only the miss path's hash needs the thread-relative depth; it measures it
+// from the stack base rounded up to a bucket boundary, so relative and
+// absolute buckets coincide and one key always maps to one arena.
+#ifndef SMASH_ARENA_DEPTH_SHIFT
+#define SMASH_ARENA_DEPTH_SHIFT 14
+#endif
+inline constexpr unsigned kArenaDepthShift = SMASH_ARENA_DEPTH_SHIFT;
+
+[[gnu::always_inline]]
+inline uintptr_t currentStackPointer() {
+    uintptr_t sp;
+#if defined(__x86_64__)
+    __asm__("mov %%rsp, %0" : "=r"(sp));
+#elif defined(__aarch64__)
+    __asm__("mov %0, sp" : "=r"(sp));
+#else
+    sp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+#endif
+    return sp;
+}
+
+// Memo-key component: absolute bucket of the stack pointer.
+[[gnu::always_inline]]
+inline uint8_t arenaKeyDepth(uintptr_t sp) {
+#if defined(SMASH_ABLATION_NO_DEPTH)
+    (void)sp;
+    return 0;
+#else
+    return static_cast<uint8_t>((sp >> kArenaDepthShift) & 0xFF);
+#endif
+}
+
+// Routing-hash component (miss path): thread-relative depth bucket, measured
+// from the bucket-aligned stack base so it is a function of arenaKeyDepth().
+inline uint8_t arenaDepthBucket(uintptr_t sp) {
+#if defined(SMASH_ABLATION_NO_DEPTH)
+    (void)sp;
+    return 0;
+#else
+    const uintptr_t top = (threadStackBase() >> kArenaDepthShift) + 1;  // bucket above base
+    const uintptr_t b = sp >> kArenaDepthShift;
+    return top > b ? static_cast<uint8_t>((top - b - 1) & 0xFF) : 0;
+#endif
+}
+
+// User-space addresses fit in 48 bits, so depth (bits 48-55) and size class
+// (56-63) never alias the return address.
+[[gnu::always_inline]]
+inline uintptr_t arenaMemoKey(uintptr_t ra, uint8_t sc, uint8_t depth) {
+    return ra ^ (static_cast<uintptr_t>(sc) << 56) ^ (static_cast<uintptr_t>(depth) << 48);
+}
+
+// Frame to measure depth from in the full malloc path (see above).
+[[gnu::always_inline]]
+inline uintptr_t takeArenaEntryFrame(uintptr_t own_frame) {
+    uintptr_t f = g_arena_entry_frame;
+    if (f) { g_arena_entry_frame = 0; return f; }
+    return own_frame;
 }
 
 [[gnu::always_inline]]
@@ -337,6 +417,9 @@ inline bool leanEntriesAllowed() {
     return false;
 #else
     if constexpr (kColdArenaFeedback || kMeasureCohorts) return false;
+    // Age ordering routes frees by span age in SmashHeap::free. (TAP keeps
+    // the lean paths: the lean free reads page temperature from the tag.)
+    if (Slab::ageOrderEnabled()) return false;
     return fullMallocPath() && !freeDiagnosticsActive();
 #endif
 }
@@ -684,9 +767,9 @@ class SmashHeap {
     // register spills and stack-protector canary on every call (x86-64 perf:
     // callsiteArena was 13% of malloc+free cycles, almost all prologue/epilogue).
     [[gnu::always_inline]]
-    uint8_t callsiteArena(uint8_t sc, uintptr_t ra) {
+    uint8_t callsiteArena(uint8_t sc, uintptr_t ra, uintptr_t sp) {
 #if !defined(SMASH_ABLATION_NO_CALLSITE_ARENA) && !defined(SMASH_NO_ARENA_MEMO)
-        const uintptr_t memo_key = ra ^ (static_cast<uintptr_t>(sc) << 56);
+        const uintptr_t memo_key = arenaMemoKey(ra, sc, arenaKeyDepth(sp));
         const size_t memo_slot =
             (memo_key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
         const ArenaMemo& memo = g_arena_memo[memo_slot];
@@ -699,11 +782,12 @@ class SmashHeap {
             return base;
         }
 #endif
-        return callsiteArenaSlow(sc, ra);
+        return callsiteArenaSlow(sc, ra, sp);
     }
 
     [[gnu::noinline, gnu::cold]]
-    uint8_t callsiteArenaSlow(uint8_t sc, uintptr_t ra) {
+    uint8_t callsiteArenaSlow(uint8_t sc, uintptr_t ra, uintptr_t sp) {
+        const uint8_t depth_bucket = arenaDepthBucket(sp);
 #ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
         (void)ra;
         uint8_t base = 0;
@@ -714,15 +798,14 @@ class SmashHeap {
         // murmur3 finalizer that computes it is a chain of dependent 64-bit
         // multiplies that stalls the pipeline on EVERY malloc (measured: 1-thread
         // IPC 1.26 vs glibc 1.66, the whole contention-free deficit — see PLAN).
-        // Memoize `base` in a tiny direct-mapped TLS cache keyed on (ra, sc) so the
-        // hash runs once per call-site/class per thread. Routing is unchanged: the
-        // hash is deterministic in (ra, sc) within a thread (depth_bucket only
-        // varies with recursion depth at the same call site, a rare corner we
-        // accept — the arena is a compression-homogeneity hint, not correctness).
+        // Memoize `base` in a tiny direct-mapped TLS cache keyed on (ra, sc, SP
+        // bucket) so the hash runs once per call-site/class/depth per thread.
+        // Routing is unchanged: within a thread the SP bucket determines
+        // depth_bucket (see arenaDepthBucket), so the key determines the arena.
         // The cold-bias check below is intentionally NOT memoized (must stay live).
         // (Memo hit is handled inline in callsiteArena(); this re-check is
         // the miss path's own lookup so it can fill the same slot below.)
-        const uintptr_t memo_key = ra ^ (static_cast<uintptr_t>(sc) << 56);
+        const uintptr_t memo_key = arenaMemoKey(ra, sc, arenaKeyDepth(sp));
         const size_t memo_slot =
             (memo_key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
         ArenaMemo& memo = g_arena_memo[memo_slot];
@@ -759,19 +842,9 @@ class SmashHeap {
         // measurement gate for quantifying how much depth segregation buys on
         // sub-page objects; production always builds with depth ON. Do NOT make
         // this the default — see feedback_llama_segregation.
-#ifdef SMASH_ABLATION_NO_DEPTH
-        uint8_t depth_bucket = 0;
-#else
-        // Depth bucket: current frame's offset below the thread's true stack
-        // base, in 16 KB units, truncated to 8 bits. Anchored to a fixed,
-        // ASLR-invariant base (threadStackBase()) so the same call path always
-        // yields the same bucket — no history drift.
-        uintptr_t frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-        uintptr_t stack_base = threadStackBase();
-        uint8_t depth_bucket = (stack_base > frame)
-            ? static_cast<uint8_t>(((stack_base - frame) >> 14) & 0xFF)
-            : 0;
-#endif
+        // depth_bucket: computed by the caller (arenaDepthBucket) from the
+        // allocation's entry frame, in 2^kArenaDepthShift-byte units, anchored
+        // to the thread's true stack base (ASLR-invariant, no history drift).
 
         // Mix with murmur3 finalizer to spread closely-spaced addresses
         // across arenas. Without this, adjacent noinline functions (differing
@@ -1267,6 +1340,11 @@ public:
             if (!compress_only) {
                 const int num_arenas = getNumArenas();
                 const int total_arenas = getTotalArenas();
+                Slab::initAgeOrder();
+                if (const char* e = std::getenv("SMASH_MIGRATE_PAGE_PCT"))
+                    migrate_page_pct_ = static_cast<unsigned>(std::atoi(e));
+                g_refault_probation = Slab::tapEnabled();
+                g_tag_density = Slab::densityEnabled();
                 for (int a = 0; a < total_arenas; ++a) {
                     // Hot sub-arenas (a < num_arenas): no per-page cap.
                     // Cold sub-arenas (a >= num_arenas, only when A3 on):
@@ -1390,7 +1468,7 @@ public:
     // noinline+cold so the fast-path body stays small and the prologue
     // can be a single register save pair.
     [[gnu::noinline, gnu::cold]]
-    void* mallocSlow(size_t size, uintptr_t caller_ra = 0) {
+    void* mallocSlow(size_t size, uintptr_t caller_ra = 0, uintptr_t frame = 0) {
         // SMASH_PASSTHROUGH=1: pass ALL allocations to system malloc.
         // Lazy-resolve if needed so we never fall through to smash's heap —
         // a smash-allocated pointer leaking into passthrough mode causes
@@ -1437,7 +1515,8 @@ public:
         if (sc < kNumClasses) {
             ThreadCache* tc = getOrCreateThreadCache();
             uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
-            uint8_t arena = callsiteArena(sc, ra_for_arena);
+            uint8_t arena = callsiteArena(sc, ra_for_arena,
+                frame ? frame : currentStackPointer());
             void* ptr = tc->allocate(sc, arena);
             if (!ptr) ptr = tc->refill(sc, arena, &slab(arena, sc));
             if constexpr (kMeasureCohorts) {
@@ -1474,16 +1553,17 @@ public:
         // App call site for arena routing, captured by the alloc8 wrapper
         // entry (see appCallerRA()).
         uintptr_t caller_ra = appCallerRA();
+        const uintptr_t frame = takeArenaEntryFrame(currentStackPointer());
         if (fullMallocPath() && size > 0 && size <= kMaxSmallSize) [[likely]] {
             uint8_t sc = sizeToClass(size);
             if (ThreadCache* tc = currentThreadCache()) [[likely]] {
-                uint8_t arena = callsiteArena(sc, caller_ra);
+                uint8_t arena = callsiteArena(sc, caller_ra, frame);
                 if (void* ptr = tc->allocate(sc, arena)) [[likely]] return ptr;
                 if (void* ptr = tc->refill(sc, arena, &slab(arena, sc)))
                     return ptr;
             }
         }
-        return mallocSlow(size, caller_ra);
+        return mallocSlow(size, caller_ra, frame);
     }
 
     // A non-null, full-mode, smash-owned pointer is resolved to its span via
@@ -1517,6 +1597,12 @@ public:
         if (span->is_large) [[unlikely]] { large_alloc_.deallocate(span); return; }
         const auto sc = span->size_class;
         const uint8_t arena = span->arena_id;
+        if ((Slab::ageOrderEnabled() && span->aged && !Slab::hotHoleReuse(span, ptr)) ||
+            (Slab::tapEnabled() && Slab::tapColdSlot(span, ptr)) ||
+            (Slab::densityEnabled() && Slab::densityKeepHole(span, ptr))) [[unlikely]] {
+            slab(arena, sc).deallocateDirect(span, ptr);
+            return;
+        }
         ThreadCache* tc = currentThreadCache();
         if (!tc) [[unlikely]] return freeSlow(ptr);
         if (!tc->deallocate(sc, arena, ptr)) { tc->drain(sc, arena, slabs_, &page_map_); tc->deallocate(sc, arena, ptr); }
@@ -1835,6 +1921,38 @@ public:
     // uses it to assert distinct call sites don't collapse into one arena
     // (the LTO/interposition return-address bug fixed in the RA-capture change).
     // Same span resolution as free()/getSize().
+    // Smash-friendly applications (see smash_migrate_hint in smash_heap.cpp).
+    unsigned migrate_page_pct_ = 25;  // SMASH_MIGRATE_PAGE_PCT, read at init
+    // Backs smash_migrate_map(): the migration pre-filter bitset (1 bit per
+    // contig-arena page, page = (addr - base) >> 12) so a caller can skip the
+    // hint call for the common hot-page case with one inline bit test.
+    int migrateMap(const uint64_t** bits, uintptr_t* base, size_t* npages) {
+        if (isCompressOnlyMode() || isPassthroughMode()) return 0;
+        const auto* b = compressor_.migBits();
+        if (!b || !vm_region_.hasSpanTable()) return 0;
+        static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t), "bitset layout");
+        *bits = reinterpret_cast<const uint64_t*>(b);
+        *base = reinterpret_cast<uintptr_t>(vm_region_.base());
+        *npages = vm_region_.contigPages();
+        return 1;
+    }
+    int migrateHint(const void* ptr) {
+        if (!ptr || isCompressOnlyMode() || isPassthroughMode()) return 0;
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (!vm_region_.inContigArena(addr)) return 0;
+        const size_t page = vm_region_.contigPageIndex(addr);
+        if (!compressor_.migrateCandidate(page)) return 0;  // common case: hot page
+        if (!vm_region_.hasSpanTable()) return 0;
+        const Span* span = vm_region_.getSpan(page);
+        if (!span || span->object_size == 0 || span->object_size >= kPageSize) return 0;
+        // Grant at most SMASH_MIGRATE_PAGE_PCT% of a page's slots (default
+        // 25%; read once in init(), never lazily on this path).
+        const unsigned pct = migrate_page_pct_;
+        unsigned cap = static_cast<unsigned>(kPageSize / span->object_size) * pct / 100;
+        if (cap > 255) cap = 255;
+        return compressor_.migrateHint(page, cap) ? 1 : 0;
+    }
+
     int arenaFor(const void* ptr) {
         if (!ptr) return -1;
         if (BootstrapAlloc::instance().owns(ptr)) return -1;

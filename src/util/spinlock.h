@@ -38,9 +38,26 @@ class SMASH_CAPABILITY("mutex") Spinlock {
     static constexpr unsigned kSpinsBeforeYield = 1024;
 
 public:
-    void lock() SMASH_ACQUIRE() {
-        // Fast path: uncontended acquire.
-        if (tryLockRelaxed()) return;
+    // The uncontended acquire is always inlined; the contended loop lives
+    // out of line. Left to the inliner, lock() as a whole is inlined or not
+    // depending on unrelated code growth elsewhere in the LTO unit, and when
+    // it isn't, every lock on the malloc/free path pays a call (larson and
+    // threadtest at 8 threads lost 23-39% that way after an unrelated change).
+    [[gnu::always_inline]] void lock() SMASH_ACQUIRE() {
+        if (tryLockRelaxed()) [[likely]] return;
+        lockSlow();
+    }
+
+    [[gnu::always_inline]] void unlock() SMASH_RELEASE() {
+        state_.store(0, std::memory_order_release);
+    }
+
+    [[gnu::always_inline]] bool tryLock() SMASH_TRY_ACQUIRE(true) {
+        return tryLockRelaxed();
+    }
+
+private:
+    [[gnu::noinline]] void lockSlow() SMASH_NO_TS_ANALYSIS {
         unsigned backoff = 1;
         for (;;) {
             // Read-spin: no atomic RMW, line stays Shared, zero coherence
@@ -60,17 +77,8 @@ public:
         }
     }
 
-    void unlock() SMASH_RELEASE() {
-        state_.store(0, std::memory_order_release);
-    }
-
-    bool tryLock() SMASH_TRY_ACQUIRE(true) {
-        return tryLockRelaxed();
-    }
-
-private:
     // Single atomic acquire attempt. Acquire ordering on success.
-    bool tryLockRelaxed() {
+    [[gnu::always_inline]] bool tryLockRelaxed() {
         uint8_t expected = 0;
         return state_.compare_exchange_strong(
             expected, 1, std::memory_order_acquire, std::memory_order_relaxed);

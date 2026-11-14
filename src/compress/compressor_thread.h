@@ -2182,6 +2182,13 @@ private:
                 // neither does one that extends this worker's run (the read
                 // check arms whole cold runs PROT_NONE; charging each page as
                 // it flips back made SQLite's cold wave wait on the budget).
+                // Shadow cap: a shadow page holds its blob AND its frame, so
+                // the bytes in flight are a transient RSS increase above the
+                // pre-compression level. Stop shadowing once this tick's
+                // budget is spent; Phase B frees room as it reclaims.
+                if (shadow_cap_on_ &&
+                    shadow_budget_.load(std::memory_order_relaxed) <= 0)
+                    return;
                 size_t& crun = compress_run_end_[worker_id];
                 if ((st == PageState::ACTIVE_MONITORING || !isDeferredReclaimMode()) &&
                     crun != i && !chargeVmaBudget(2))
@@ -2987,6 +2994,11 @@ private:
         }
 
         if (deferred) {
+            if (shadow_cap_on_) {
+                shadow_budget_.fetch_sub(static_cast<int64_t>(compressed_[page_idx].alloc_size),
+                                         std::memory_order_relaxed);
+                shadow_made_.store(true, std::memory_order_relaxed);
+            }
             shadow_tick_[page_idx] = tick_counter_;
             // Writes after the snapshot reach accessed_ via the next write
             // scan; Phase 1 leaves shadow pages' bits alone, so at reclaim
@@ -3629,6 +3641,53 @@ private:
 #else
         for (int k = 0; k < n; ++k) locks_->unlock(rb[k]);
 #endif
+    }
+
+    // ── Shadow cap ────────────────────────────────────────────────────────
+    // Deferred reclaim keeps a compressed page's frame resident for
+    // getDeferredReclaimDelay() ticks next to its blob, so every byte of blob
+    // in COMPRESSED_SHADOW is RSS above what the process held before
+    // compression. Unbounded, a cold wave shadowed the whole heap at once and
+    // RSS overshot the end-of-fill level by up to 27% (Redis 280 -> 355 MB)
+    // before Phase B brought it down. Cap the blob bytes in shadow at
+    // 1/SMASH_SHADOW_CAP_DIV of the committed heap (default 8, 0 = off),
+    // never below kMinShadowCap so small heaps are not slowed. With the
+    // 1-tick reclaim delay this bounds the overshoot to ~6% (Redis 280 ->
+    // 298 MB) while reaching the idle floor within ~1 s of uncapped;
+    // 1/16 with a 2-tick delay left SQLite's cool phase half-compressed.
+    static constexpr int64_t kMinShadowCap = int64_t{4} << 20;
+    std::atomic<int64_t> shadow_budget_{0};
+    bool shadow_cap_on_ = false;
+    int64_t shadow_out_last_ = 0;           // shadow blob bytes at last scan
+    std::atomic<bool> shadow_made_{false};  // Phase 2 shadowed a page since
+
+    static int shadowCapDiv() {
+        static const int d = [] {
+            const char* v = std::getenv("SMASH_SHADOW_CAP_DIV");
+            return (v && v[0]) ? std::atoi(v) : 8;
+        }();
+        return d;
+    }
+
+    void armShadowBudget(bool defer_phases) {
+        shadow_cap_on_ = false;
+        const int div = shadowCapDiv();
+        if (defer_phases || div <= 0 || !isDeferredReclaimMode()) return;
+        const size_t committed = vm_->committedPages();
+        // Shadow pages are only created by Phase 2 and leave within a few
+        // ticks, so the scan is needed only while some exist or were just
+        // made; an idle heap pays nothing.
+        int64_t out = 0;
+        if (shadow_made_.exchange(false, std::memory_order_relaxed) || shadow_out_last_ > 0) {
+            for (size_t i = 0; i < committed; ++i)
+                if (states_->get(i) == PageState::COMPRESSED_SHADOW)
+                    out += compressed_[i].alloc_size;
+        }
+        shadow_out_last_ = out;
+        int64_t cap = static_cast<int64_t>(committed * kPageSize) / div;
+        if (cap < kMinShadowCap) cap = kMinShadowCap;
+        shadow_budget_.store(cap - out, std::memory_order_relaxed);
+        shadow_cap_on_ = true;
     }
 
     void reclaimShadowRange(size_t start, size_t end) {
@@ -5348,6 +5407,7 @@ private:
 
         if (!defer_phases && isDeferredReclaimMode())
             dispatch(4);  // Phase B: reclaim confirmed-cold shadow pages
+        armShadowBudget(defer_phases);
 
         // Arm the Phase 2/3 VMA budget from a fresh count: Phase B above
         // creates VMAs too (its own mid-loop budget reads the live count), so

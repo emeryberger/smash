@@ -4725,18 +4725,29 @@ private:
 
         // Publish efficiency_x256 to every worker's view of each bucket so
         // saveProfileFile can persist a sane warm-start hint.
+        //
+        // Store only on change. sc_stats is lazily backed; an untouched
+        // bucket reads as zeros from the shared zero page and costs no RSS,
+        // but an unconditional store here (and in setHint) every
+        // kBudgetRecomputeEveryTicks made every worker's whole array
+        // resident (~7 MB), undoing the lazy backing. Unused buckets have
+        // efficiency 0 and hint kBudgetExplore (0), so they are never
+        // written.
         for (size_t i = 0; i < total; ++i) {
+            const auto eff = static_cast<uint16_t>(aggs[i].efficiency_x256);
             for (int w = 0; w < kMaxCompressorWorkers; ++w) {
-                workers_[w].sc_stats[i].efficiency_x256 =
-                    static_cast<uint16_t>(aggs[i].efficiency_x256);
+                auto& s = workers_[w].sc_stats[i];
+                if (s.efficiency_x256 != eff) s.efficiency_x256 = eff;
             }
         }
 
         // Default decision when budget knob is unset: COMPRESS for every
         // bucket past exploration. Keeps behavior unchanged from legacy.
         auto setHint = [&](size_t i, uint8_t hint) {
-            for (int w = 0; w < kMaxCompressorWorkers; ++w)
-                workers_[w].sc_stats[i].budget_decision_hint = hint;
+            for (int w = 0; w < kMaxCompressorWorkers; ++w) {
+                auto& s = workers_[w].sc_stats[i];
+                if (s.budget_decision_hint != hint) s.budget_decision_hint = hint;
+            }
         };
 
         if (budget_pct < 0 || budget_pct >= 100) {

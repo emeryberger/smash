@@ -1,5 +1,6 @@
 // Test real fault handler: allocate → compress → read (triggers SIGSEGV) → verify data
 #include "vm/vm_region.h"
+#include <memory>
 #include "vm/page_state.h"
 #include "vm/fault_handler.h"
 #include "compress/compress_store.h"
@@ -54,7 +55,13 @@ static void testFaultCycleBasic() {
     PageMap page_map;
     page_map.init();
 
-    CompressorThread compressor;
+    // Heap, not stack: CompressorThread is several MB (per-arena x per-class
+
+    // stats) and overflowed the 8 MB default stack once size classes grew.
+
+    auto compressor_owner = std::make_unique<CompressorThread>();
+
+    CompressorThread& compressor = *compressor_owner;
     compressor.init(&vm, &states, &locks, &store, &engine, &page_map);
     g_compressor = &compressor;
 
@@ -140,7 +147,13 @@ static void testFaultCycleMultipleRounds() {
     PageMap page_map;
     page_map.init();
 
-    CompressorThread compressor;
+    // Heap, not stack: CompressorThread is several MB (per-arena x per-class
+
+    // stats) and overflowed the 8 MB default stack once size classes grew.
+
+    auto compressor_owner = std::make_unique<CompressorThread>();
+
+    CompressorThread& compressor = *compressor_owner;
     compressor.init(&vm, &states, &locks, &store, &engine, &page_map);
     g_compressor = &compressor;
 

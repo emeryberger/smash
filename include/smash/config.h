@@ -17,7 +17,7 @@ inline constexpr int kPageShift = (kPageSize == 16384) ? 14 : 12;
 
 // ── Size classes ─────────────────────────────────────────────────────────────
 inline constexpr size_t kMaxSmallSize = 16384;
-inline constexpr int kNumClasses = 36;
+inline constexpr int kNumClasses = 52;
 inline constexpr size_t kMinAlignment = 16;
 
 // ── Large-allocation pseudo size-classes (compression-tracking only) ─────────

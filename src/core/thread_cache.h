@@ -28,7 +28,7 @@ class ThreadCache {
     // while keeping total footprint bounded.
     //
     // Depth per lane = kThreadCacheMaxPerClass / kCacheLanes (= 4 with defaults).
-    // Total = kCacheLanes * kNumClasses * depth * 8 = 16 * 36 * 16 * 8 = 72 KB
+    // Total = kCacheLanes * kNumClasses * depth * 8 = 16 * 52 * 16 * 8 = 104 KB
     // of pointers (+ 2 bytes of count per lane), whatever the lane split.
     // Shallow depth (4) trades refill frequency for segregation quality.
     // Overridable: fewer lanes → deeper per-lane cache → far fewer slab-lock

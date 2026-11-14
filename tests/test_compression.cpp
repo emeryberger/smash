@@ -1,5 +1,6 @@
 // Test end-to-end compression: compress cold pages, decompress on fault
 #include "vm/vm_region.h"
+#include <memory>
 #include "vm/page_state.h"
 #include "compress/compress_store.h"
 #include "compress/compress_engine.h"
@@ -87,7 +88,13 @@ static void testCompressorRoundtrip() {
     CompressEngine engine;
     engine.init();
 
-    CompressorThread compressor;
+    // Heap, not stack: CompressorThread is several MB (per-arena x per-class
+
+    // stats) and overflowed the 8 MB default stack once size classes grew.
+
+    auto compressor_owner = std::make_unique<CompressorThread>();
+
+    CompressorThread& compressor = *compressor_owner;
     compressor.init(&vm, &states, &locks, &store, &engine);
 
     // Allocate a page and fill with compressible data
@@ -153,7 +160,13 @@ static void testIncompressibleData() {
     CompressEngine engine;
     engine.init();
 
-    CompressorThread compressor;
+    // Heap, not stack: CompressorThread is several MB (per-arena x per-class
+
+    // stats) and overflowed the 8 MB default stack once size classes grew.
+
+    auto compressor_owner = std::make_unique<CompressorThread>();
+
+    CompressorThread& compressor = *compressor_owner;
     compressor.init(&vm, &states, &locks, &store, &engine);
 
     // Allocate a page and fill with pseudo-random data (incompressible)
@@ -213,7 +226,13 @@ static void testAccessTracking() {
     CompressEngine engine;
     engine.init();
 
-    CompressorThread compressor;
+    // Heap, not stack: CompressorThread is several MB (per-arena x per-class
+
+    // stats) and overflowed the 8 MB default stack once size classes grew.
+
+    auto compressor_owner = std::make_unique<CompressorThread>();
+
+    CompressorThread& compressor = *compressor_owner;
     compressor.init(&vm, &states, &locks, &store, &engine);
 
     // Allocate a page
@@ -289,7 +308,13 @@ static void testReleaseCompressedPages() {
     CompressEngine engine;
     engine.init();
 
-    CompressorThread compressor;
+    // Heap, not stack: CompressorThread is several MB (per-arena x per-class
+
+    // stats) and overflowed the 8 MB default stack once size classes grew.
+
+    auto compressor_owner = std::make_unique<CompressorThread>();
+
+    CompressorThread& compressor = *compressor_owner;
     compressor.init(&vm, &states, &locks, &store, &engine);
 
     // Allocate, compress, then release

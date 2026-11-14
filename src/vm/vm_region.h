@@ -827,7 +827,7 @@ public:
         return lookupIdx(addr) != 0;
     }
 
-    size_t pageIndex(uintptr_t addr) const {
+    [[gnu::always_inline]] size_t pageIndex(uintptr_t addr) const {
         if (tracking_mode_) return lookupIdx(addr);
         auto b = reinterpret_cast<uintptr_t>(base_);
         if (addr >= b && addr < b + contig_pages_ * kPageSize)

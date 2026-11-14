@@ -478,7 +478,12 @@ class CompressorThread {
     // is a protection fault and takes the classic path.
     bool uffdFault(size_t i) const { return uffdPage(i) && vm::faultSignal() == SIGBUS; }
     void* scratchPage(int slot) const { return uffd_scratch_ + static_cast<size_t>(slot) * kPageSize; }
-    static void uffdLog(const char* msg) { (void)!write(2, msg, std::strlen(msg)); }
+    // uffd messages print only when SMASH_UFFD was set explicitly; the
+    // default (try uffd, fall back quietly) must not write to the app's stderr.
+    bool uffd_verbose_ = false;
+    void uffdLog(const char* msg) const {
+        if (uffd_verbose_) (void)!write(2, msg, std::strlen(msg));
+    }
 #ifdef __linux__
     bool uffdCopy(void* dst, const void* src) {
         struct uffdio_copy c{};
@@ -551,8 +556,11 @@ class CompressorThread {
     void uffdInit() {
         if (uffd_init_done_) return;
         uffd_init_done_ = true;
+        // Default on where the kernel supports it (UFFDIO_MOVE: Linux 6.8+);
+        // SMASH_UFFD=0 opts out, SMASH_UFFD=1 also reports why it is off.
         const char* e = std::getenv("SMASH_UFFD");
-        if (!e || e[0] != '1') return;
+        if (e && e[0] == '0') return;
+        uffd_verbose_ = e && e[0] == '1';
         const char* mf = std::getenv("SMASH_MADV_FREE");
         if (!isDeferredReclaimMode() || (mf && mf[0] == '1') || vm_->contigPages() == 0) {
             uffdLog("[smash] SMASH_UFFD needs deferred reclaim and MADV_DONTNEED; off\n");
@@ -591,7 +599,7 @@ class CompressorThread {
         auto fail = [&](const char* what) {
             char b[160];
             int n = smash::safe_snprintf(b, sizeof(b), "[smash] SMASH_UFFD: %s failed (errno %d); off\n", what, errno);
-            if (n > 0) (void)!write(2, b, (size_t)n);
+            if (n > 0 && uffd_verbose_) (void)!write(2, b, (size_t)n);
             close(fd);
         };
         // Scratch: one page per fault slot plus one for the self-test.

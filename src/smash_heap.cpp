@@ -1421,9 +1421,9 @@ struct SmashFastRedirect : SmashRedirect {
             if (tag & VmRegion::kPageTagSmall) [[likely]] {
                 const uint8_t sc = tag & 63;
                 const uint8_t arena = static_cast<uint8_t>(tag >> 6);
-                // TAP: cold page → slow path (the bit is only ever set when
-                // SMASH_AGE_ORDER=3; compiled in only for experiments).
-                if (Slab::kPlacementExperiments && (tag & VmRegion::kPageTagCold)) [[unlikely]]
+                // TAP: cold page → slow path (the bit is only ever set under
+                // SMASH_AGE_ORDER=3, the default).
+                if (tag & VmRegion::kPageTagCold) [[unlikely]]
                     return freeFull(p);
                 if (tc->deallocate(sc, arena, p)) [[likely]] return;
             }

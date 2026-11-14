@@ -303,7 +303,9 @@ set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 # below the cap (the test uses them up itself; no root), a teardown-like
 # stride walk over 128 MiB of compressed large blocks must neither hang nor
 # return wrong data. Linux only (no VMA cap elsewhere). The test exits 77
-# (skipped) if the cap is too large to approach quickly.
+# (skipped) if the cap is too large to approach quickly. It tests the
+# mprotect reclaim path (compressed = PROT_NONE), so uffd mode, the default
+# on Linux 6.8+, is turned off.
 if(NOT APPLE)
   add_executable(vma_cap_test vma_cap_test.cpp)
   set_target_properties(vma_cap_test PROPERTIES CXX_STANDARD 20)
@@ -311,6 +313,7 @@ if(NOT APPLE)
     NAME test_vma_cap
     COMMAND ${CMAKE_COMMAND} -E env
       "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_UFFD=0"
       "SMASH_LARGE_ONLY=1"
       "SMASH_DEFER_PHASES_MS=0"
       "SMASH_COLD_TIMEOUT_SEC=1"

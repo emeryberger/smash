@@ -754,8 +754,10 @@ public:
     static inline bool tap_ = false;
     static inline int tap_sparse_pct_ = 25;
     static constexpr int kTapScan = 4;
+    // Default: TAP (3). SMASH_AGE_ORDER=0 turns placement policy off.
     static void initAgeOrder() {
         const char* v = std::getenv("SMASH_AGE_ORDER");
+        if (!v || !v[0]) v = "3";
         age_order_ = v && (v[0] == '1' || v[0] == '2');
         age_hot_reuse_ = v && v[0] == '2';
         tap_ = v && v[0] == '3';
@@ -778,7 +780,7 @@ public:
     // away. Unlike TAP, an application write to an old object (Redis's LRU
     // update on lookup) cannot make its page eligible again.
     static inline bool density_ = false;
-    static bool densityEnabled() { return kPlacementExperiments && density_; }
+    static bool densityEnabled() { return density_; }
     // Free routing: true if, after freeing `ptr`, its page stays dense.
     static bool densityKeepHole(const Span* span, const void* ptr) {
         if (!span->aged) return false;
@@ -788,7 +790,7 @@ public:
         const size_t obj = span->object_size < kPageSize ? span->object_size : kPageSize;
         return live >= obj && live - obj >= Span::dense_bytes_;
     }
-    static bool tapEnabled() { return kPlacementExperiments && tap_; }
+    static bool tapEnabled() { return tap_; }
     // TAP free routing: true if `ptr`'s page is not warm (cooling/compressed).
     static bool tapColdSlot(const Span* span, const void* ptr) {
         const size_t off = static_cast<size_t>(
@@ -796,18 +798,15 @@ public:
         return span->classifySlotPage(off, getCoolingCloseTicks()) !=
                Span::SlotPageClass::WARM;
     }
-    // Compile-time gate: without -DSMASH_PLACEMENT_EXPERIMENTS every check
-    // below folds to false, so the default build's alloc/free paths are
-    // unchanged (measured: the runtime-only checks cost 4-16% on Larson).
-#ifdef SMASH_PLACEMENT_EXPERIMENTS
-    static constexpr bool kPlacementExperiments = true;
-#else
-    static constexpr bool kPlacementExperiments = false;
-#endif
-    static bool ageOrderEnabled() { return kPlacementExperiments && age_order_; }
+    // These checks used to sit behind a compile-time gate
+    // (SMASH_PLACEMENT_EXPERIMENTS) on a measured 4-16% Larson cost. Re-measured
+    // 2026-11-13 (x86 c7a, 1/4/8 threads, 5 reps): larson and
+    // linux-scalability within +-2%; threadtest is multimodal in every build,
+    // master included. They are plain runtime flags now.
+    static bool ageOrderEnabled() { return age_order_; }
     // True if a free of `ptr` (in an aged span) should go the normal way.
     static bool hotHoleReuse(const Span* span, const void* ptr) {
-        if (!kPlacementExperiments || !age_hot_reuse_) return false;
+        if (!age_hot_reuse_) return false;
         const size_t off = static_cast<size_t>(
             static_cast<const char*>(ptr) - static_cast<const char*>(span->base));
         return span->classifySlotPage(off, getCoolingCloseTicks()) ==

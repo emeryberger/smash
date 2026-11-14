@@ -82,9 +82,13 @@ def check_bench_rss(build_dir: Path, libsmash: Path) -> tuple[bool, str]:
     # a task_info reporting artifact with zero actual reclaim — which masked
     # how tight the window was for the real pipeline.) The best-reduction gate
     # is unchanged; we just give the real reclaim enough wall-clock to occur.
+    #
+    # 40 s, not 20: GitHub's macOS runners reclaim at ~15-16 s (vs ~7 s on
+    # an M-series laptop), so a 20 s window failed whenever a tick slipped
+    # a few seconds (master 78c9ba7 and f9bc562 failed this way).
     env = smash_env(libsmash, dict(os.environ))
     env.setdefault("SMASH_COLD_TIMEOUT_SEC", "2")
-    out = run([str(build_dir / "bench" / "bench_rss"), "--wait", "20"], env=env)
+    out = run([str(build_dir / "bench" / "bench_rss"), "--wait", "40"], env=env)
     # Check BEST reduction across the entire window.
     # On busy CI runners, timing jitter can cause the t=10 snapshot to
     # catch a brief decompression spike. The peak reduction proves the

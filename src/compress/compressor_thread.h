@@ -47,6 +47,7 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 
 #include <algorithm>
 #include <atomic>
+#include <type_traits>
 #include <chrono>
 #include <pthread.h>
 #include <cstddef>
@@ -1218,7 +1219,8 @@ class CompressorThread {
             efficiency_x256 = in.efficiency_x256;
             // v6: load stable_cold and best_tier for profile-driven optimization
             profile_stable_cold = in.stable_cold;
-            profile_best_tier = in.best_tier;
+            profile_best_tier_p1 = (in.best_tier == 255) ? 0
+                : static_cast<uint8_t>(in.best_tier + 1);
             // v6+: load thrash_rate so phase2 can back off buckets that
             // churned badly last run (compress→fault→decompress is wasted
             // CPU; deferring those buckets cuts wall time AND reduces churn).
@@ -1256,7 +1258,9 @@ class CompressorThread {
         std::atomic<uint32_t> decompress_count{0}; // fault-triggered decompressions
         // Loaded from profile: if stable_cold=1, skip cold observation period
         uint8_t profile_stable_cold = 0;
-        uint8_t profile_best_tier = 255;  // 255=unknown, 0=LZ4, 1=zstd
+        // Persisted best tier + 1 (0 = unknown, 1 = LZ4, 2 = zstd), so the
+        // all-zero state of a freshly mapped sc_stats array means unknown.
+        uint8_t profile_best_tier_p1 = 0;
         // Loaded from profile: prior-run thrash rate (0-255 = decompress/compress).
         // High values mark buckets where compression was wasted churn; phase2
         // multiplies the cold floor for these so they must stay quiescent much
@@ -1302,7 +1306,14 @@ class CompressorThread {
         // sliding window per bucket.  Bucket is the slab size_class for
         // small allocs or kNumClasses + log2(page_count) for large allocs;
         // index via statsIndex(arena, bucket).
-        SizeClassStats sc_stats[kNumArenas * kTotalBucketsPerArena]{};
+        //
+        // Lazily backed: points at zero-filled anonymous memory mapped in
+        // init(), so only the (arena, bucket) entries a workload actually
+        // uses become resident. As an inline array it made CompressorThread
+        // 7 MB (8 workers x 128 arenas x 44 buckets x 160 B), all zeroed --
+        // and so resident -- when the heap was constructed, the bulk of
+        // smash's fixed per-process RSS.
+        SizeClassStats* sc_stats = nullptr;
         // Per-arena UCB aggregate used as warm-start prior under
         // SMASH_UCB_WARMSTART=1.  Indexed by arena_id.
         ArenaArmStats arena_arm[kNumArenas]{};
@@ -2537,7 +2548,8 @@ private:
         // don't have enough data yet. Only applies when UCB is active.
         uint8_t profile_best_tier = 255;
         if (have_span && sc < kTotalBucketsPerArena) {
-            profile_best_tier = worker.sc_stats[stats_idx].profile_best_tier;
+            const uint8_t p1 = worker.sc_stats[stats_idx].profile_best_tier_p1;
+            profile_best_tier = p1 ? static_cast<uint8_t>(p1 - 1) : 255;
         }
 
         if (cfg.use_ucb && cfg.num_profiles > 1) {
@@ -4772,18 +4784,29 @@ private:
 
         // Publish efficiency_x256 to every worker's view of each bucket so
         // saveProfileFile can persist a sane warm-start hint.
+        //
+        // Store only on change. sc_stats is lazily backed; an untouched
+        // bucket reads as zeros from the shared zero page and costs no RSS,
+        // but an unconditional store here (and in setHint) every
+        // kBudgetRecomputeEveryTicks made every worker's whole array
+        // resident (~7 MB), undoing the lazy backing. Unused buckets have
+        // efficiency 0 and hint kBudgetExplore (0), so they are never
+        // written.
         for (size_t i = 0; i < total; ++i) {
+            const auto eff = static_cast<uint16_t>(aggs[i].efficiency_x256);
             for (int w = 0; w < kMaxCompressorWorkers; ++w) {
-                workers_[w].sc_stats[i].efficiency_x256 =
-                    static_cast<uint16_t>(aggs[i].efficiency_x256);
+                auto& s = workers_[w].sc_stats[i];
+                if (s.efficiency_x256 != eff) s.efficiency_x256 = eff;
             }
         }
 
         // Default decision when budget knob is unset: COMPRESS for every
         // bucket past exploration. Keeps behavior unchanged from legacy.
         auto setHint = [&](size_t i, uint8_t hint) {
-            for (int w = 0; w < kMaxCompressorWorkers; ++w)
-                workers_[w].sc_stats[i].budget_decision_hint = hint;
+            for (int w = 0; w < kMaxCompressorWorkers; ++w) {
+                auto& s = workers_[w].sc_stats[i];
+                if (s.budget_decision_hint != hint) s.budget_decision_hint = hint;
+            }
         };
 
         if (budget_pct < 0 || budget_pct >= 100) {
@@ -5866,6 +5889,14 @@ public:
         fault_handler_ = fault_handler;
         pre_tick_fn_ = nullptr;
         pressureInit(states->numPages());
+
+        // An all-zero SizeClassStats is its default state, so zero pages
+        // from the bootstrap mapping need no construction.
+        static_assert(std::is_trivially_destructible_v<SizeClassStats>);
+        for (auto& w : workers_)
+            if (!w.sc_stats)
+                w.sc_stats = bootstrapArray<SizeClassStats>(
+                    static_cast<size_t>(kNumArenas) * kTotalBucketsPerArena);
 
         size_t max_pages = vm->totalPages();
         compressed_ = bootstrapArray<CompressedPageInfo>(max_pages);

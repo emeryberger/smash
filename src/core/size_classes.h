@@ -1,14 +1,18 @@
 // smash/src/core/size_classes.h - Size class table and fast mapping
 //
-// ~36 size classes with sub-linear spacing:
+// 52 size classes with sub-linear spacing:
 //   step 16:   16 .. 128     (8 classes)
 //   step 32:   160 .. 256    (4 classes)
 //   step 64:   320 .. 512    (4 classes)
 //   step 128:  640 .. 1024   (4 classes)
-//   step 256:  1280 .. 2048  (4 classes)
-//   step 512:  2560 .. 4096  (4 classes)
-//   step 1024: 5120 .. 8192  (4 classes)
-//   step 2048: 10240 .. 16384 (4 classes)
+//   step 128:  1152 .. 2048  (8 classes)
+//   step 256:  2304 .. 4096  (8 classes)
+//   step 512:  4608 .. 8192  (8 classes)
+//   step 1024: 9216 .. 16384 (8 classes)
+// Above 1 KiB the classes are 8 per doubling (worst-case rounding 12.5%,
+// was 25% at 4 per doubling). The coarse spacing cost SQLite ~25%: its
+// in-memory DB pages are ~4.37 KB, which rounded to 5120 and packed 6 to a
+// 32 KiB span (5461 B each); they now take the 4608 class, 7 per span.
 #pragma once
 
 #include "smash/config.h"
@@ -31,17 +35,35 @@ constexpr uint32_t kClassSizes[kNumClasses] = {
     160,   192,   224,   256,                                // step 32
     320,   384,   448,   512,                                // step 64
     640,   768,   896,   1024,                               // step 128
-    1280,  1536,  1792,  2048,                               // step 256
-    2560,  3072,  3584,  4096,                               // step 512
-    5120,  6144,  7168,  8192,                               // step 1024
-    10240, 12288, 14336, 16384,                              // step 2048
+    1152,  1280,  1408,  1536,  1664,  1792,  1920,  2048,   // step 128
+    2304,  2560,  2816,  3072,  3328,  3584,  3840,  4096,   // step 256
+    4608,  5120,  5632,  6144,  6656,  7168,  7680,  8192,   // step 512
+    9216,  10240, 11264, 12288, 13312, 14336, 15360, 16384,  // step 1024
 };
 
 constexpr SizeClassInfo computeClassInfo(uint32_t size) {
     uint32_t target_bytes = kTargetObjectsPerSpan * size;
     uint32_t pages = (target_bytes + kPageSize - 1) / kPageSize;
     if (pages < 1) pages = 1;
-    if (pages > static_cast<uint32_t>(kMaxSpanPages)) pages = kMaxSpanPages;
+    if (pages > static_cast<uint32_t>(kMaxSpanPages)) {
+        // Capped classes (large objects): pick the span length in
+        // [kMaxSpanPages/2, kMaxSpanPages] that wastes the least tail, ties
+        // to the longer span. E.g. 5120 B: 5 pages hold 4 exactly, where 8
+        // pages held 6 and wasted 2 KiB per span.
+        uint32_t best = kMaxSpanPages, best_waste = ~0u;
+        for (uint32_t p = kMaxSpanPages; p >= kMaxSpanPages / 2; --p) {
+            const uint32_t bytes = p * static_cast<uint32_t>(kPageSize);
+            if (bytes < size) break;
+            const uint32_t waste = bytes % size;
+            // Compare waste as a fraction of the span: waste/bytes.
+            if (best_waste == ~0u ||
+                static_cast<uint64_t>(waste) * best * kPageSize <
+                static_cast<uint64_t>(best_waste) * bytes) {
+                best = p; best_waste = waste;
+            }
+        }
+        pages = best;
+    }
     uint32_t objects = (pages * kPageSize) / size;
     return {size, pages, objects};
 }
@@ -94,9 +116,9 @@ inline uint8_t sizeToClass(size_t size) {
         int bits = 63 - __builtin_clzll(size - 1);   // floor(log2(size-1))
         int group = bits - 10;                         // 0..3
         size_t groupBase = 1ULL << bits;               // 1024, 2048, 4096, 8192
-        // step = groupBase / 4 (256, 512, 1024, 2048): a shift, not a div.
-        int sub = static_cast<int>((size - groupBase - 1) >> (bits - 2));
-        return static_cast<uint8_t>(20 + group * 4 + sub);
+        // step = groupBase / 8 (128, 256, 512, 1024): a shift, not a div.
+        int sub = static_cast<int>((size - groupBase - 1) >> (bits - 3));
+        return static_cast<uint8_t>(20 + group * 8 + sub);
     }
     return kNumClasses;
 }

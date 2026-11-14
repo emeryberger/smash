@@ -1,5 +1,6 @@
 // Test prefetch: fault on middle page decompresses adjacent, boundary clipping
 #include "vm/vm_region.h"
+#include <memory>
 #include "vm/page_state.h"
 #include "compress/compress_store.h"
 #include "compress/compress_engine.h"
@@ -49,7 +50,13 @@ static void testPrefetchAdjacentPages() {
     PageMap page_map;
     page_map.init();
 
-    CompressorThread compressor;
+    // Heap, not stack: CompressorThread is several MB (per-arena x per-class
+
+    // stats) and overflowed the 8 MB default stack once size classes grew.
+
+    auto compressor_owner = std::make_unique<CompressorThread>();
+
+    CompressorThread& compressor = *compressor_owner;
     compressor.init(&vm, &states, &locks, &store, &engine, &page_map);
 
     // Allocate a contiguous run of 8 pages (simulating a span)
@@ -158,7 +165,13 @@ static void testPrefetchBoundaryClipping() {
     PageMap page_map;
     page_map.init();
 
-    CompressorThread compressor;
+    // Heap, not stack: CompressorThread is several MB (per-arena x per-class
+
+    // stats) and overflowed the 8 MB default stack once size classes grew.
+
+    auto compressor_owner = std::make_unique<CompressorThread>();
+
+    CompressorThread& compressor = *compressor_owner;
     compressor.init(&vm, &states, &locks, &store, &engine, &page_map);
 
     // Allocate two adjacent spans

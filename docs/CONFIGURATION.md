@@ -32,7 +32,8 @@ Pick at most one; otherwise smash runs in full mode (it is the program's `malloc
 | `SMASH_UFFD=0\|1` | auto | `userfaultfd` tracking is on automatically when the kernel supports it (Linux 6.8+, `UFFDIO_MOVE`). `0` turns it off; `1` also reports why it is unavailable. |
 | `SMASH_READ_CHECK_TICKS=N` | 1 | Without `userfaultfd` or `smash-idled`, how many ticks a cold candidate page stays protected to catch reads before it is compressed (1–60). |
 | `SMASH_DEFERRED_RECLAIM=0` | on | Release a page's memory as soon as it is compressed, instead of keeping the original until it is confirmed unwritten. Off is not recommended: the immediate path can deadlock with concurrent faults. |
-| `SMASH_DEFERRED_RECLAIM_DELAY=N` | 2 | Ticks a compressed page's original is kept before its memory is released. A write in that window discards the compressed copy. |
+| `SMASH_DEFERRED_RECLAIM_DELAY=N` | 1 | Ticks a compressed page's original is kept before its memory is released. A write in that window discards the compressed copy. |
+| `SMASH_SHADOW_CAP_DIV=N` | 8 | Caps compressed copies whose originals are still held (the deferred-reclaim window) at 1/N of the committed heap, minimum 4 MB, which bounds the RSS spike while a large cold wave is compressed. `0` removes the cap. |
 | `SMASH_AGE_ORDER=N` | 3 | Placement policy. `3` is temperature-aware placement (TAP): never fill a free slot on a cold page. `0` turns placement policy off. `1`, `2` and `4` are experimental alternatives. |
 | `SMASH_EMPTY_RESIDENT_MB=N` | RAM/32 (64 MB–1 GB) | How much memory in fully empty spans to keep resident for reuse before returning it to the kernel. |
 | `SMASH_NUM_ARENAS=N` | from CPU count | Number of call-site arenas (a power of 2). |
@@ -97,7 +98,7 @@ From [`include/smash/config.h`](../include/smash/config.h):
 | `kMinCompressRatio` | 0.75 | Keep a compressed page only below this ratio |
 | `kPrefetchWindow` | 2 | Neighboring pages restored in each direction on a fault |
 | `kDictTrainSamples` | 0 | Pages sampled before training a dictionary (0 = off) |
-| `kNumClasses` | 36 | Small-object size classes (16 B–16 KB) |
+| `kNumClasses` | 52 | Small-object size classes (16 B–16 KB; 8 per doubling above 1 KB) |
 | `kMaxArenas` | 128 | Upper bound on call-site arenas |
 | `kMaxCompressorWorkers` | 8 | Cap on compressor worker threads |
 | `kCompressStoreShards` | 8 | Lock shards in the compressed-page store |

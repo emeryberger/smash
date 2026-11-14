@@ -739,10 +739,16 @@ inline bool isDeferredReclaimMode() {
     return v == 1;
 }
 
+// Ticks a COMPRESSED_SHADOW page keeps its frame before Phase B reclaims
+// it. 1 (was 2): every tick of delay holds another tick's worth of blobs
+// resident next to their frames, so the delay multiplies the RSS overshoot
+// during a cold wave (and, under the shadow cap, divides throughput). On
+// Redis serving workloads (LRU writes on every read) 1 vs 2 changed p99 by
+// <= 7% and p99.9 not at all.
 inline int getDeferredReclaimDelay() {
     static int ticks = []{
         const char* env = getenv("SMASH_DEFERRED_RECLAIM_DELAY");
-        return (env && atoi(env) > 0) ? atoi(env) : 2;
+        return (env && atoi(env) > 0) ? atoi(env) : 1;
     }();
     return ticks;
 }

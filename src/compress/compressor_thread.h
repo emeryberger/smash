@@ -2466,15 +2466,17 @@ private:
             locks_->lock(page_idx);
         }
 
-        // Verify still eligible
+        // Verify still eligible and claim the page. A CAS, not get+set:
+        // releaseCompressedPages() retires untouched ACTIVE pages lock-free
+        // with a CAS ACTIVE -> EMPTY, so the transition out of ACTIVE must
+        // be atomic for exactly one side to win.
         PageState st = states_->get(page_idx);
-        if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) {
+        if (!((st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) &&
+              states_->transition(page_idx, st, PageState::COMPRESSING))) {
             locks_->unlock(page_idx);
             return false;
         }
-
-        // Mark as compressing
-        states_->set(page_idx, PageState::COMPRESSING);
+        if (pstats::g_stamp) [[unlikely]] states_->set(page_idx, PageState::COMPRESSING);
         migBitSet(page_idx);
 
         // ROI-based compression decision (replaces fixed shouldSkip + selectAlgorithm).
@@ -6938,9 +6940,11 @@ public:
         const uint64_t copy_fail_run = uffd_copy_fail_.load(std::memory_order_relaxed);
         drainAllForShutdown();
         trace_msg("drain complete");
-        if (uffd_mode_) {
+        const uint64_t all = uffd_copy_fail_.load(std::memory_order_relaxed);
+        // uffd is on by default, so stay quiet unless asked (SMASH_UFFD=1)
+        // or something actually failed.
+        if (uffd_mode_ && (uffd_verbose_ || all > 0)) {
             char b[128];
-            const uint64_t all = uffd_copy_fail_.load(std::memory_order_relaxed);
             int n = smash::safe_snprintf(b, sizeof(b), "[smash] UFFDIO_COPY failures: %llu while running, %llu in shutdown drain\n",
                                          (unsigned long long)copy_fail_run, (unsigned long long)(all - copy_fail_run));
             if (n > 0) (void)!write(2, b, (size_t)n);
@@ -7325,6 +7329,28 @@ public:
     // Release any compressed data for a range of pages (called during span release)
     void releaseCompressedPages(size_t start_page, size_t num_pages) {
         for (size_t i = start_page; i < start_page + num_pages; ++i) {
+#ifndef SMASH_TT_LOCKED_RELEASE
+            // Fast path: a page still ACTIVE owns no blob, so there is nothing
+            // to free and no reason to take its lock. Every compressor exit
+            // from ACTIVE is itself a CAS (compressPage, armReadCheck), so
+            // claiming the page with ACTIVE -> EMPTY decides the race: if we
+            // win, the compressor's CAS fails and it leaves the page alone.
+            // Retiring empty spans took the per-page lock on every page;
+            // that locked RMW plus the owner/unlock stores was ~half of
+            // threadtest's time and its cost swung 2x with ASLR layout.
+            if (states_->transition(i, PageState::ACTIVE, PageState::EMPTY)) {
+                if (pstats::g_stamp) [[unlikely]] states_->set(i, PageState::EMPTY);
+                if (deferred_pending_ && deferred_pending_[i].load(std::memory_order_relaxed))
+                    deferred_pending_[i].store(false, std::memory_order_release);
+                if (shadow_tick_ && shadow_tick_[i]) shadow_tick_[i] = 0;
+                if (cold_count_[i]) cold_count_[i] = 0;
+                if (recompress_count_[i]) recompress_count_[i] = 0;
+                if (compress_fail_count_[i]) compress_fail_count_[i] = 0;
+                if (accessed_[i].load(std::memory_order_relaxed))
+                    accessed_[i].store(false, std::memory_order_relaxed);
+                continue;
+            }
+#endif
             locks_->lock(i);
             // Clear deferred-madvise pending BEFORE the state transitions
             // away from COMPRESSED. Sweeper double-checks state under the

@@ -555,7 +555,15 @@ def run_sqlite(build_dir, smash_lib, quick):
             metrics["metric_source"] = footprint.METRIC_SOURCE
             metrics["rss_timeline"] = rss_timeline
             metrics["total_auc_mb_sec"] = sum(rss_timeline)
-            metrics["peak_rss_mb"] = max(rss_timeline) if rss_timeline else metrics.get("peak_rss_mb", 0)
+            # Peak over the workload itself. The sampler above keeps polling
+            # until the process exits, so its last sample can land in
+            # teardown (smash's shutdown drain decompresses every page), which
+            # is not part of the workload. bench_sqlite reports the maximum of
+            # its own samples, taken through the end of the re-access phase.
+            if "run_peak_rss_mb" in metrics:
+                metrics["peak_rss_mb"] = metrics["run_peak_rss_mb"]
+            else:
+                metrics["peak_rss_mb"] = max(rss_timeline)
             metrics["min_rss_mb"] = min(rss_timeline) if rss_timeline else metrics.get("min_rss_mb", 0)
             # Prefer the bench-computed cool-phase AUC (exact); fall back to total
             if "cool_auc_mb_sec" not in metrics:

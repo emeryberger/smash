@@ -479,6 +479,14 @@ int main(int argc, char* argv[]) {
     printf("METRIC cold_p99_us %.2f\n", cold_p99);
     printf("METRIC post_reaccess_rss_mb %.1f\n", post_reaccess_rss / (1024.0 * 1024.0));
 
+    // Highest RSS while the workload ran (fill, cool, serve, re-access), from
+    // this process's own once-a-second samples. An external sampler that
+    // keeps polling until the process is gone also catches teardown (smash
+    // decompresses everything at exit), which is not part of the workload.
+    double run_peak_mb = 0;
+    for (const auto& s : g_rss_timeline) run_peak_mb = std::max(run_peak_mb, s.rss_mb);
+    printf("METRIC run_peak_rss_mb %.1f\n", run_peak_mb);
+
     // Dump RSS timeline if requested
     if (const char* rss_dir = std::getenv("SMASH_RSS_DIR")) {
         dumpRssTimeline((std::string(rss_dir) + "/sqlite_rss.csv").c_str());

@@ -32,7 +32,7 @@ Each workload fills its data, sits idle, then serves queries that touch only the
 
 | Workload | Peak RSS (glibc / jemalloc / smash) | Idle RSS (glibc → smash) | RSS while serving (glibc → smash) | Throughput vs glibc |
 |---|---|---|---|---|
-| SQLite (in-memory) | 475 / 555 / **405 MB** | 356 → **114 MB** (−68%) | 487 → **185 MB** (−62%) | 0.92× |
+| SQLite (in-memory) | 487 / 569 / **405 MB** | 356 → **114 MB** (−68%) | 487 → **185 MB** (−62%) | 0.92× |
 | RocksDB (block cache) | 279 / 411 / 298 MB | 274 → **42 MB** (−85%) | 280 → **61 MB** (−78%) | 0.98× |
 | memcached | 290 / 298 / 314 MB | 290 → **31 MB** (−89%) | 290 → **50 MB** (−83%) | 1.03× |
 | Redis | 264 / 275 / 288 MB | 264 → **116 MB** (−56%) | 264 → **116 MB** (−56%) | 0.94× |
@@ -40,7 +40,7 @@ Each workload fills its data, sits idle, then serves queries that touch only the
 
 How to read it:
 - **Idle and serving memory drop by 56% to almost 90%.** The cold data is compressed, and it stays compressed while the hot 5% is served. SQLite's serving memory grows because its workload keeps inserting rows; glibc grows by more over the same phase.
-- **Peak memory is roughly a wash.** During a fast fill everything is hot, so there is little to compress yet. On SQLite smash's peak is 15% *below* glibc's, because its size classes fit SQLite's ~4.4 KB pages more tightly; on the others it is 7–11% above glibc's (allocator overhead during the fill, plus a capped amount of compression in flight). jemalloc's peak is higher than both on SQLite and RocksDB. If you size machines by peak, allow about 10% headroom over glibc.
+- **Peak memory is roughly a wash.** During a fast fill everything is hot, so there is little to compress yet. On SQLite smash's peak is 17% *below* glibc's, because its size classes fit SQLite's ~4.4 KB pages more tightly; on the others it is 7–11% above glibc's (allocator overhead during the fill, plus a capped amount of compression in flight). jemalloc's peak is higher than both on SQLite and RocksDB. If you size machines by peak, allow about 10% headroom over glibc.
 - **Throughput stays within 8% of glibc.** The first touch of a compressed page costs a decompression (on the order of 100 µs); after that the page is ordinary memory.
 - **Redis gains the least.** `redis-benchmark` fills values with random text, which compresses to only about 40% of its size. Real data usually compresses better.
 

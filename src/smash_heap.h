@@ -1228,10 +1228,10 @@ public:
         compression_started_.store(false, std::memory_order_release);
     }
 
-    // Stop compressor and drain compressed pages back to PROT_RW. Called
-    // from a high-priority destructor in smash_heap.cpp to run before
-    // CPython's __cxa_finalize, so any post-shutdown access to a smash
-    // page reads ordinary memory instead of faulting on PROT_NONE.
+    // Stop the compressor threads at exit. Compressed pages stay compressed
+    // and the fault handler stays installed, so a later access (CPython's
+    // __cxa_finalize, TLS destructors) decompresses on demand. Called from a
+    // high-priority destructor in smash_heap.cpp and from atexit.
     void shutdownCompressor() {
         if (compression_inited_ && compression_started_.load(std::memory_order_acquire)) {
             compressor_.stop();

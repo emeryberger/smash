@@ -521,8 +521,12 @@ struct Span {
 // Lock-free Span descriptor cache. Recycles large-alloc Span descriptors
 // to avoid unbounded BootstrapAlloc growth under alloc/free churn.
 inline std::atomic<Span*>& spanFreeList() {
-    static std::atomic<Span*> head{nullptr};
-    return head;
+    // Whole cache line: pushed/popped as spans are created and retired, so it
+    // must not share a line with read-mostly allocator flags (see
+    // SlabEmptyCounters).
+    struct alignas(64) Head { std::atomic<Span*> v{nullptr}; };
+    static Head head;
+    return head.v;
 }
 
 inline Span* newSpanDescriptor() {

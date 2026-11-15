@@ -125,6 +125,19 @@ if(APPLE)
 endif()
 add_test(NAME test_contention COMMAND test_contention)
 
+# Exit path: stop() keeps compressed pages compressed and the fault handler
+# installed; a read after stop() decompresses on demand (needs LZ4 + zstd).
+add_executable(test_stop_no_drain test_stop_no_drain.cpp ${printf_SOURCE_DIR}/printf.cpp)
+target_include_directories(test_stop_no_drain PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
+target_link_libraries(test_stop_no_drain PRIVATE alloc8::headers lz4_static libzstd_static)
+if(APPLE)
+  target_compile_options(test_stop_no_drain PRIVATE -ftls-model=initial-exec)
+endif()
+add_test(NAME test_stop_no_drain COMMAND test_stop_no_drain)
+set_tests_properties(test_stop_no_drain PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TIMEOUT_SEC=1;SMASH_NO_ATEXIT=1;SMASH_DEFER_PHASES_MS=0"
+  TIMEOUT 90)
+
 # Fault cycle test - real SIGSEGV handling (needs LZ4 + zstd)
 add_executable(test_fault_cycle test_fault_cycle.cpp ${printf_SOURCE_DIR}/printf.cpp)
 target_include_directories(test_fault_cycle PRIVATE ${SMASH_TEST_INCLUDE_DIRS})

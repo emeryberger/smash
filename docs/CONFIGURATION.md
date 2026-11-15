@@ -47,6 +47,8 @@ Pick at most one; otherwise smash runs in full mode (it is the program's `malloc
 | `SMASH_DEFER_PHASES_MS=N` | 0 | Don't compress or protect pages for the first N ms. For programs that set up IPC buffers in heap memory at startup (Firefox: 30000). |
 | `SMASH_NO_MONITOR=1` | unset | Never write-protect pages for access tracking. Trades accuracy for compatibility with code that checks page protection synchronously. |
 | `SMASH_CPU_PRESSURE_CAP=0` | on | Let the compressor scale up its workers even when the CPU is saturated. |
+| `SMASH_EXIT_DRAIN=1` | unset | Decompress every compressed page when the process exits and uninstall the fault handler (the old behaviour). By default compressed pages stay compressed at exit and the fault handler serves any late access, so exit never grows RSS back to the uncompressed heap size. |
+| `SMASH_PROMPT_TRIM_MB=N` | 0 (off) | Return freed compressed-store pages to the kernel as soon as N MB have accumulated, instead of once a second. Lowers the peak while a program reads back a lot of cold data at once (SQLite's close: about 620 → 520 MB), but on memcached it occasionally cost up to 40% throughput, so it is off by default. |
 | `SMASH_NO_COMPRESSOR=1` | unset | Run as a plain allocator with no compression (diagnostic). |
 | `SMASH_EAGER_ZERO=1` | unset | Zero memory on `malloc` instead of in the background after `free`. For programs that wrongly assume `malloc` returns zeroed memory. |
 

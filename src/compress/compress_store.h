@@ -149,6 +149,10 @@ class CompressStore {
     }
 
     std::atomic<size_t> trimmed_pages_{0};
+    // Pages flagged dead since the last trim(), all shards. Lets the
+    // coordinator trim between ticks during a refault burst
+    // (deadBytesSinceTrim).
+    std::atomic<size_t> dead_since_trim_{0};
 
     // Per-shard state: independent lock and region chain
     struct Shard {
@@ -416,8 +420,12 @@ public:
 
         Region* r = regionOf(ptr);
         size_t prev = r->live_bytes.fetch_sub(alloc_size, std::memory_order_relaxed);
+        const uint32_t dead_before = r->dead_count;
         accountSlot(r, static_cast<size_t>(static_cast<char*>(ptr) - r->base),
                     alloc_size, -1);
+        if (r->dead_count > dead_before)
+            dead_since_trim_.fetch_add(r->dead_count - dead_before,
+                                       std::memory_order_relaxed);
 
         if (prev <= alloc_size) {
             // Region is now empty — decommit its data pages.  This also
@@ -445,6 +453,7 @@ public:
     // (reusing it faults the page back in as zeros, and accountSlot marks it
     // live again). Returns the number of pages decommitted.
     size_t trim() {
+        dead_since_trim_.store(0, std::memory_order_relaxed);
         const size_t sh = pageShift();
         const size_t ps = size_t{1} << sh;
         const size_t npages = kRegionSize >> sh;
@@ -486,6 +495,12 @@ public:
     }
 
     size_t trimmedPages() const { return trimmed_pages_.load(std::memory_order_relaxed); }
+
+    // Bytes of store pages whose blobs have all been released since the last
+    // trim() (approximate: a page reused before the trim still counts).
+    size_t deadBytesSinceTrim() const {
+        return dead_since_trim_.load(std::memory_order_relaxed) << pageShift();
+    }
 };
 
 } // namespace smash

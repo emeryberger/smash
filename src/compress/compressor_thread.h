@@ -5791,6 +5791,7 @@ private:
                  slept < kCompressIntervalMs && self->running_.load(std::memory_order_relaxed);
                  slept += kSleepIntervalMs) {
                 usleep(kSleepIntervalMs * 1000);
+                self->maybePromptTrim();
             }
             if (!self->running_.load(std::memory_order_relaxed)) break;
             // Skip the tick if a fork is in progress. The atfork prepare
@@ -5829,6 +5830,32 @@ private:
             self->in_tick_.store(false, std::memory_order_release);
         }
         return nullptr;
+    }
+
+    // A burst of refaults (an application reading back or tearing down its
+    // cold data: SQLite's close reads every page header) releases blobs far
+    // faster than the once-a-tick trim() returns their store pages, so the
+    // decompressed page and its dead blob are both resident for up to a
+    // second: SQLite's close peaks ~100 MB above the uncompressed heap.
+    // SMASH_PROMPT_TRIM_MB=N: between ticks the coordinator trims as soon as
+    // N MB of store pages has died. Off by default: at 1 and 8 MB it cut
+    // SQLite's close peak from ~620 to ~520 MB, but memcached's serve phase
+    // (steady refaults) then trimmed often enough that 1 run in 4 lost ~40%
+    // throughput. Same fork fence as a tick (see coordEntry).
+    static size_t promptTrimBytes() {
+        static const size_t b = [] {
+            const char* e = std::getenv("SMASH_PROMPT_TRIM_MB");
+            const long mb = e ? std::atol(e) : kPromptTrimDefaultMb;
+            return mb > 0 ? static_cast<size_t>(mb) << 20 : SIZE_MAX;
+        }();
+        return b;
+    }
+    static constexpr long kPromptTrimDefaultMb = 0;
+    void maybePromptTrim() {
+        if (!store_ || store_->deadBytesSinceTrim() < promptTrimBytes()) [[likely]] return;
+        in_tick_.store(true, std::memory_order_seq_cst);
+        if (!paused_.load(std::memory_order_seq_cst)) store_->trim();
+        in_tick_.store(false, std::memory_order_release);
     }
 
     struct HelperArg {
@@ -7023,10 +7050,27 @@ public:
         for (int i = 0; i < helpers_created_; ++i)
             pthread_join(helper_threads_[i], nullptr);
         trace_msg("all helpers joined");
-        // After threads are joined, drain compressed pages back to RW so
-        // post-shutdown faults (CPython __cxa_finalize, TLS destructors,
-        // mimalloc cleanup) hit ordinary memory instead of our about-to-
-        // be-uninstalled signal handler.
+        // Compressed pages stay compressed at exit. Decompressing them all
+        // here grew RSS to the uncompressed heap size plus the not-yet-
+        // trimmed store (Redis: 40 -> 208 MB during a SIGTERM shutdown, an
+        // OOM risk under a cgroup cap) and took ~250 ms, for memory the
+        // process was about to free anyway. Instead the
+        // fault handler stays installed: faults are served in the faulting
+        // thread and need only state that lives until exit (the heap is
+        // never destroyed), so late accesses (CPython __cxa_finalize, TLS
+        // destructors, the SMASH_STATS walk) decompress on demand as they do
+        // while running. SMASH_EXIT_DRAIN=1 restores the old full drain and
+        // handler uninstall.
+        static const bool exit_drain = [] {
+            const char* v = std::getenv("SMASH_EXIT_DRAIN");
+            return v && v[0] == '1';
+        }();
+        if (!exit_drain) {
+            trace_msg("saving profile...");
+            saveProfileFile();
+            trace_msg("stop() complete (no drain; fault handler stays)");
+            return;
+        }
         trace_msg("draining compressed pages...");
         const uint64_t copy_fail_run = uffd_copy_fail_.load(std::memory_order_relaxed);
         drainAllForShutdown();

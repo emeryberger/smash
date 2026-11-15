@@ -23,6 +23,12 @@
 
 namespace smash {
 
+// Slab::empty_counters_: written counters padded to a cache line of their own.
+struct alignas(64) SlabEmptyCounters {
+    std::atomic<size_t> resident_empty_bytes{0};
+    std::atomic<uint32_t> slab_tick{0};
+};
+
 class Slab {
     uint8_t size_class_;
     uint8_t arena_id_ = 0;
@@ -273,8 +279,14 @@ class Slab {
         }
         return v;
     }
-    static inline std::atomic<size_t> resident_empty_bytes_{0};
-    static inline std::atomic<uint32_t> slab_tick_{0};
+    // Written from every thread's span retire/reuse path. Padded to a whole
+    // cache line: alignas on the atomics alone still let the linker pack the
+    // read-on-every-allocation flags (age_order_, density_, Span::dense_bytes_)
+    // into the rest of their line, and whether it did depended on unrelated
+    // code. When it did, larson and threadtest at 8 threads ran 30-40% slower.
+    static inline SlabEmptyCounters empty_counters_;
+    static inline std::atomic<size_t>& resident_empty_bytes_ = empty_counters_.resident_empty_bytes;
+    static inline std::atomic<uint32_t>& slab_tick_ = empty_counters_.slab_tick;
 
     void retireEmptySpan(Span* span) {
         const size_t bytes = span->page_count * kPageSize;

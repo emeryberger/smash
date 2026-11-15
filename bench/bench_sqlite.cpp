@@ -481,8 +481,9 @@ int main(int argc, char* argv[]) {
 
     // Highest RSS while the workload ran (fill, cool, serve, re-access), from
     // this process's own once-a-second samples. An external sampler that
-    // keeps polling until the process is gone also catches teardown (smash
-    // decompresses everything at exit), which is not part of the workload.
+    // keeps polling until the process is gone also catches teardown
+    // (sqlite3_close reads every cached page, faulting compressed ones back
+    // in), which is not part of the workload.
     double run_peak_mb = 0;
     for (const auto& s : g_rss_timeline) run_peak_mb = std::max(run_peak_mb, s.rss_mb);
     printf("METRIC run_peak_rss_mb %.1f\n", run_peak_mb);

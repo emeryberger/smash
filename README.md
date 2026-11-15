@@ -32,16 +32,16 @@ Each workload fills its data, sits idle, then serves queries that touch only the
 
 | Workload | Peak RSS (glibc / jemalloc / smash) | Idle RSS (glibc → smash) | RSS while serving (glibc → smash) | Throughput vs glibc |
 |---|---|---|---|---|
-| SQLite (in-memory) | 482 / 563 / 509 MB | 356 → **123 MB** (−65%) | 487 → **208 MB** (−57%) | 0.91× |
-| RocksDB (block cache) | 279 / 412 / 320 MB | 273 → **47 MB** (−83%) | 279 → **72 MB** (−74%) | 0.97× |
-| memcached | 290 / 299 / 322 MB | 290 → **37 MB** (−87%) | 290 → **56 MB** (−81%) | 1.01× |
-| Redis | 263 / 276 / 350 MB | 263 → **122 MB** (−54%) | 263 → **122 MB** (−54%) | 0.94× |
-| Redis, half the keys deleted | 264 / 274 / 338 MB | 264 → **97 MB** (−63%) | 264 → **97 MB** (−63%) | 0.99× |
+| SQLite (in-memory) | 475 / 555 / **405 MB** | 356 → **114 MB** (−68%) | 487 → **185 MB** (−62%) | 0.92× |
+| RocksDB (block cache) | 279 / 411 / 298 MB | 274 → **42 MB** (−85%) | 280 → **61 MB** (−78%) | 0.98× |
+| memcached | 290 / 298 / 314 MB | 290 → **31 MB** (−89%) | 290 → **50 MB** (−83%) | 1.03× |
+| Redis | 264 / 275 / 288 MB | 264 → **116 MB** (−56%) | 264 → **116 MB** (−56%) | 0.94× |
+| Redis, half the keys deleted | 264 / 274 / 293 MB | 264 → **92 MB** (−65%) | 264 → **92 MB** (−65%) | 0.99× |
 
 How to read it:
-- **Idle and serving memory drop by half to almost 90%.** The cold data is compressed, and it stays compressed while the hot 5% is served. SQLite's serving memory grows because its workload keeps inserting rows; glibc grows by more over the same phase.
-- **Peak memory is not reduced.** During a fast fill everything is hot, so there is nothing to compress yet. smash's peak is currently 5–33% above glibc's. Part of that is allocator overhead during the fill, and part is a brief spike while the first round of compression is in flight. If you size machines by peak, plan for that headroom.
-- **Throughput stays within 10% of glibc.** The first touch of a compressed page costs a decompression (on the order of 100 µs); after that the page is ordinary memory.
+- **Idle and serving memory drop by 56% to almost 90%.** The cold data is compressed, and it stays compressed while the hot 5% is served. SQLite's serving memory grows because its workload keeps inserting rows; glibc grows by more over the same phase.
+- **Peak memory is roughly a wash.** During a fast fill everything is hot, so there is little to compress yet. On SQLite smash's peak is 15% *below* glibc's, because its size classes fit SQLite's ~4.4 KB pages more tightly; on the others it is 7–11% above glibc's (allocator overhead during the fill, plus a capped amount of compression in flight). jemalloc's peak is higher than both on SQLite and RocksDB. If you size machines by peak, allow about 10% headroom over glibc.
+- **Throughput stays within 8% of glibc.** The first touch of a compressed page costs a decompression (on the order of 100 µs); after that the page is ordinary memory.
 - **Redis gains the least.** `redis-benchmark` fills values with random text, which compresses to only about 40% of its size. Real data usually compresses better.
 
 Measured on an AWS c7a.2xlarge (AMD EPYC 9R14, 8 vCPUs, 16 GB, Ubuntu 22.04, Linux 6.8) with `bench/run_paper_experiments.py`, which runs `SMASH_COLD_TIMEOUT_SEC=1` so the runs stay short. With the default 10 s, expect the same idle numbers about 10 seconds later.
@@ -52,7 +52,7 @@ The defaults are the tuned configuration. Each one targets a way a compressing a
 
 - **Only cold data is compressed.** smash tracks every page and compresses one only after it has gone untouched for the cold timeout. A page that stays in use is never compressed, so the hot path pays nothing.
 - **Tracking is cheap.** On Linux 6.8+ smash uses `userfaultfd` with no setup. Writes are tracked with write-protection, and a compressed page that gets touched comes back through a lightweight fault instead of a signal. On older kernels and macOS it falls back to `mprotect`-based tracking. The optional `smash-idled` helper (below) gives exact read tracking from the kernel's idle-page bitmap.
-- **A page is released only after it proves it is cold.** smash first compresses a copy and keeps the original page for a couple of seconds. If the program writes to it in that window, the copy is discarded and nothing is lost. Redis, for example, updates an object's LRU field on every read.
+- **A page is released only after it proves it is cold.** smash first compresses a copy and keeps the original page for about a second. If the program writes to it in that window, the copy is discarded and nothing is lost. Redis, for example, updates an object's LRU field on every read.
 - **New objects stay off cold pages.** smash's temperature-aware placement (TAP) never puts a new object into a free slot on a cold page; it uses a warm or empty page instead. Cold pages stay cold and stay compressed, instead of being woken up by one new object.
 - **Similar data lands together.** Allocations from the same call site share an arena, so pages hold similar objects. That compresses better and makes each page's compressibility predictable.
 - **Incompressible pages are skipped.** A return-on-investment check compares each page group's observed compression ratio and CPU cost against how long the page has been idle. Data that won't shrink is left alone. Compression uses zstd level 1.
@@ -65,7 +65,7 @@ The defaults are the tuned configuration. Each one targets a way a compressing a
 **Poor fits:**
 - **Short-lived processes** (compilers, batch jobs) finish before anything goes cold.
 - **Memory that is constantly in use**, where nothing is ever cold, gains nothing.
-- **Workloads that must not exceed a memory cap at their peak.** smash lowers steady-state memory, not peak.
+- **Workloads that must not exceed a memory cap at their peak.** smash lowers steady-state memory; its peak can be up to about 10% above glibc's.
 
 ### smash and zswap
 

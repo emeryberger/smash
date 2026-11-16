@@ -6514,9 +6514,19 @@ public:
     // Dump per-(arena, size_class) bucket compressibility and coldness stats.
     // Output format: one line per bucket with samples, sorted by sample count.
     // Columns: arena, sc, obj_size, samples, ratio%, compress, decompress, thrash%
-    static void dumpBucketStats() {
+    // noinline + static summary storage: the table is kNumArenas ×
+    // kTotalBucketsPerArena entries (~180-240 KB since the finer size
+    // classes). On the stack, and inlined into sigusr1Handler, it made every
+    // stats line (SMASH_DEBUG on the 128 KiB coordinator stack, or SIGUSR2 on
+    // an app thread) probe ~246 KB of stack and die with SIGBUS on macOS.
+    // A try-lock keeps concurrent dumps (signal on two threads) from sharing
+    // the buffer; a dump that loses the race is skipped.
+    __attribute__((noinline, cold)) static void dumpBucketStats() {
         auto* self = s_stats_instance_;
         if (!self) return;
+        static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+        if (busy.test_and_set(std::memory_order_acquire)) return;
+        struct Release { ~Release() { busy.clear(std::memory_order_release); } } release;
 
         // Aggregate across workers: take worker with max count per bucket
         struct BucketSummary {
@@ -6529,7 +6539,7 @@ public:
             uint32_t decompress_count;
         };
         constexpr size_t kMaxBuckets = kNumArenas * kTotalBucketsPerArena;
-        BucketSummary summaries[kMaxBuckets];
+        static BucketSummary summaries[kMaxBuckets];
         size_t num_summaries = 0;
 
         for (int arena = 0; arena < kNumArenas; ++arena) {

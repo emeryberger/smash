@@ -329,6 +329,22 @@ add_test(
     -P ${CMAKE_CURRENT_SOURCE_DIR}/calibration_file_test.cmake
 )
 set_tests_properties(test_calibration_file PROPERTIES TIMEOUT 60)
+# SMASH_DEBUG periodic stats from the coordinator thread (small stack).
+add_executable(debug_stats_payload debug_stats_payload.cpp)
+if(APPLE)
+  set(_dbg_preload DYLD_INSERT_LIBRARIES)
+else()
+  set(_dbg_preload LD_PRELOAD)
+endif()
+add_test(
+  NAME test_debug_stats
+  COMMAND ${CMAKE_COMMAND}
+    -DPRELOAD_VAR=${_dbg_preload}
+    -DLIB=$<TARGET_FILE:smash>
+    -DPROG=$<TARGET_FILE:debug_stats_payload>
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/debug_stats_test.cmake
+)
+set_tests_properties(test_debug_stats PROPERTIES TIMEOUT 60)
 
 # vm.max_map_count regression guard (#94): with the process held 12K VMAs
 # below the cap (the test uses them up itself; no root), a teardown-like

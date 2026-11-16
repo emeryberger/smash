@@ -1,14 +1,19 @@
 name: Release
 
-# Produces drop-in libsmash binaries for every supported platform and
-# attaches them to the GitHub Release:
+# Produces drop-in libsmash binaries and packages for every supported platform
+# and attaches them to the GitHub Release:
 #
-#   libsmash-linux-x86_64.so    (glibc 2.17 floor — AL2023, Ubuntu 20.04+,
-#   libsmash-linux-aarch64.so    Debian 11+, RHEL/CentOS 7+, Fedora, …)
+#   libsmash-linux-x86_64.so    (glibc 2.28 floor — AL2023, Ubuntu 20.04+,
+#   libsmash-linux-aarch64.so    Debian 11+, RHEL/Alma/Rocky 8+, Fedora, …)
+#   smash-linux-{x86_64,aarch64}.{deb,rpm,tar.gz}   (same .so + bin/smash)
 #   libsmash-macos-arm64.dylib   (Apple Silicon)
+#   libsmash-macos-fat.zip       (arm64 + arm64e)
 #
-# Linux artifacts are built inside manylinux2014 containers so they import
-# only glibc ≤ 2.17 symbols. Combined with smash's exported-symbol version
+# and pushes the FROM-scratch distribution image (packaging/docker/Dockerfile)
+# to ghcr.io/<owner>/smash:<tag> and :latest.
+#
+# Linux artifacts are built inside manylinux_2_28 containers so they import
+# only glibc ≤ 2.28 symbols. Combined with smash's exported-symbol version
 # script (src/smash_version_script.map.in, which re-exports malloc/new/stat
 # at the higher GLIBC_2.33/2.34 versions modern binaries request), this makes
 # a single .so per arch interpose correctly across distros without rebuilding.
@@ -32,6 +37,7 @@ on:
 
 permissions:
   contents: write          # needed to upload assets to the Release
+  packages: write          # needed to push the container image to GHCR
 
 jobs:
   # ── Linux x86-64 and ARM64 inside manylinux_2_28 (glibc 2.28) ─────────────
@@ -73,29 +79,33 @@ jobs:
           repository: emeryberger/alloc8
           path: alloc8
 
-      - name: Build libsmash inside manylinux_2_28 (glibc 2.28)
+      - name: Package version from the release tag
+        id: ver
+        # v0.0.4-alpha -> 0.0.4~alpha: rpm forbids '-' in Version, and '~'
+        # sorts before the bare version in both dpkg and rpm. Anything that
+        # doesn't look like a version tag (workflow_dispatch on a branch)
+        # leaves it empty, so CMake's project(VERSION) is used.
+        env:
+          TAG: ${{ github.event.release.tag_name || github.event.inputs.ref }}
+        run: |
+          v="${TAG#v}"
+          if printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-~][0-9A-Za-z.]+)?$'; then
+            echo "pkg=$(printf '%s' "$v" | tr '-' '~')" >> "$GITHUB_OUTPUT"
+          else
+            echo "pkg=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build libsmash + .deb/.rpm/.tar.gz inside manylinux_2_28 (glibc 2.28)
+        # packaging/linux/build-manylinux.sh: pip cmake/ninja, Release build
+        # of the smash target against the sibling alloc8 checkout (lz4/zstd
+        # still FetchContent), then cpack -G "DEB;RPM;TGZ" into build/pkg.
+        # The packages wrap the very libsmash.so staged below (CPack doesn't
+        # strip), so they share its glibc floor and its checksum.
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work \
             quay.io/pypa/manylinux_2_28_${{ matrix.manylinux_arch }} \
-            bash -euo pipefail -c '
-              # manylinux ships gcc-toolset (C++20-capable) on PATH; cmake/
-              # ninja via the bundled CPython pip.
-              /opt/python/cp312-cp312/bin/python -m pip install --upgrade cmake ninja >/dev/null
-              ln -sf /opt/python/cp312-cp312/bin/cmake /usr/local/bin/cmake
-              ln -sf /opt/python/cp312-cp312/bin/ninja /usr/local/bin/ninja
-              cmake --version; gcc --version
-              # Point at the sibling alloc8 checkout (no network fetch of
-              # alloc8; lz4/zstd are still FetchContent. Library only.
-              cmake -S smash -B smash/build -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DALLOC8_DIR=/work/alloc8 \
-                -DSMASH_BUILD_TESTS=OFF \
-                -DSMASH_BUILD_BENCH=OFF
-              cmake --build smash/build --target smash -j
-              # Build runs as container root; make outputs world-readable so
-              # the host steps (objdump, upload-artifact) can read them.
-              chmod -R a+rX smash/build
-            '
+            bash smash/packaging/linux/build-manylinux.sh \
+              /work/smash /work/alloc8 "${{ steps.ver.outputs.pkg }}"
 
       - name: Stage artifact and verify glibc floor
         working-directory: smash
@@ -123,12 +133,60 @@ jobs:
           echo "Highest imported glibc symbol: $MAXREQ (floor $FLOOR) — OK"
           echo "=== shared library dependencies (should be only libc/libstdc++/libdl/libpthread/libm) ==="
           ldd "out/libsmash-linux-${{ matrix.arch }}.so" || true
+          # Packages, under stable arch-named asset names (the CPack names
+          # carry '~' from the version).
+          cp build/pkg/smash_*.deb           "out/smash-linux-${{ matrix.arch }}.deb"
+          cp build/pkg/smash-*.rpm           "out/smash-linux-${{ matrix.arch }}.rpm"
+          cp build/pkg/smash-*-linux-*.tar.gz "out/smash-linux-${{ matrix.arch }}.tar.gz"
+          ls -l out
+
+      - name: Verify the .deb installs and preloads (host runner, Ubuntu)
+        working-directory: smash
+        run: |
+          dpkg-deb -c "out/smash-linux-${{ matrix.arch }}.deb"
+          # The packaged .so must be the raw asset, byte for byte.
+          dpkg-deb --fsys-tarfile "out/smash-linux-${{ matrix.arch }}.deb" \
+            | tar -xO ./usr/lib/libsmash.so | cmp - "out/libsmash-linux-${{ matrix.arch }}.so"
+          sudo dpkg -i "out/smash-linux-${{ matrix.arch }}.deb"
+          printf '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nint main(void){char*p=malloc(4<<20);if(!p)return 1;memset(p,1,4<<20);free(p);puts("probe ok");return 0;}\n' > /tmp/probe.c
+          cc -O2 -o /tmp/probe /tmp/probe.c
+          for mode in 0 1; do
+            out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode /usr/bin/smash /tmp/probe 2>&1)
+            echo "SMASH_LARGE_ONLY=$mode: $out"
+            grep -q 'probe ok' <<<"$out"
+            grep -q '\[smash stats\]' <<<"$out"
+          done
+          sudo dpkg -r smash
+          test ! -e /usr/lib/libsmash.so
+
+      - name: Verify the .rpm installs and preloads (AlmaLinux 8, glibc 2.28)
+        working-directory: smash
+        run: |
+          docker run --rm -v "$PWD/out:/out:ro" \
+            quay.io/pypa/manylinux_2_28_${{ matrix.manylinux_arch }} \
+            bash -euo pipefail -c '
+              rpm -i /out/smash-linux-${{ matrix.arch }}.rpm
+              rpm -qi smash
+              printf "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nint main(void){char*p=malloc(4<<20);if(!p)return 1;memset(p,1,4<<20);free(p);puts(\"probe ok\");return 0;}\n" > /tmp/probe.c
+              gcc -O2 -o /tmp/probe /tmp/probe.c
+              for mode in 0 1; do
+                out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode /usr/bin/smash /tmp/probe 2>&1)
+                echo "SMASH_LARGE_ONLY=$mode: $out"
+                grep -q "probe ok" <<<"$out"
+                grep -q "\[smash stats\]" <<<"$out"
+              done
+              rpm -e smash
+            '
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: libsmash-linux-${{ matrix.arch }}
-          path: smash/out/libsmash-linux-${{ matrix.arch }}.so
+          path: |
+            smash/out/libsmash-linux-${{ matrix.arch }}.so
+            smash/out/smash-linux-${{ matrix.arch }}.deb
+            smash/out/smash-linux-${{ matrix.arch }}.rpm
+            smash/out/smash-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   # ── macOS arm64 (Apple Silicon) ──────────────────────────────────────────
@@ -270,10 +328,91 @@ jobs:
             echo "::warning::runner cannot exec third-party arm64e; skipped dynamic load check (static arm64e slice + signature checks ran in build-macos)."
           fi
 
+  # ── Container image: ghcr.io/<owner>/smash (push on release events only) ──
+  #    Packages the already-built, already-verified Linux .so assets
+  #    (SMASH_FROM=prebuilt) instead of recompiling, so the image's libsmash.so
+  #    is byte-identical to libsmash-linux-<arch>.so, and the arm64 half needs
+  #    no QEMU (the prebuilt stage is COPY-only). workflow_dispatch builds the
+  #    multi-arch image but does not push it.
+  docker:
+    name: container-image
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout smash
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libsmash-linux-*
+          path: dist
+
+      - name: Stage prebuilt/<arch> build context
+        run: |
+          set -euo pipefail
+          for pair in amd64:x86_64 arm64:aarch64; do
+            d=${pair%%:*}; a=${pair##*:}
+            mkdir -p "ctx/prebuilt/$d/lib" "ctx/prebuilt/$d/bin"
+            cp "dist/libsmash-linux-$a/libsmash-linux-$a.so" "ctx/prebuilt/$d/lib/libsmash.so"
+            chmod 0644 "ctx/prebuilt/$d/lib/libsmash.so"
+            install -m 0755 bin/smash "ctx/prebuilt/$d/bin/smash"
+          done
+          find ctx -type f -exec ls -l {} +
+
+      - name: Image name and tags
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          image="ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/smash"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          if [ -n "$TAG" ]; then
+            echo "tags=$image:$TAG,$image:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=$image:dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'release'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and on release, push) linux/amd64 + linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          file: packaging/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: SMASH_FROM=prebuilt
+          tags: ${{ steps.meta.outputs.tags }}
+          push: ${{ github.event_name == 'release' }}
+
+      - name: Smoke-test the image via COPY --from (amd64)
+        # Rebuild the amd64 image into the local daemon (cached) and run the
+        # example user Dockerfile against it.
+        run: |
+          docker buildx build --load --platform linux/amd64 \
+            -f packaging/docker/Dockerfile --build-arg SMASH_FROM=prebuilt \
+            -t smash:ci ctx
+          docker buildx build --load --platform linux/amd64 \
+            --build-arg SMASH_IMAGE=smash:ci -t smash-example:ci packaging/docker/example
+          out=$(docker run --rm smash-example:ci 2>&1); echo "$out"
+          grep -q 'example ok' <<<"$out"
+          grep -q '\[smash stats\]' <<<"$out"
+
   # ── Attach all artifacts to the Release (release events only) ─────────────
   publish:
     name: publish-to-release
-    needs: [build-linux, build-macos, verify-macos-arm64e]
+    needs: [build-linux, build-macos, verify-macos-arm64e, docker]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
@@ -285,13 +424,24 @@ jobs:
       - name: Flatten and checksum
         run: |
           mkdir -p release
-          find dist -type f \( -name '*.so' -o -name '*.dylib' -o -name '*.zip' \) \
+          find dist -type f \( -name '*.so' -o -name '*.dylib' -o -name '*.zip' \
+            -o -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' \) \
             -exec cp {} release/ \;
           cd release
-          sha256sum * > SHA256SUMS.txt
+          sha256sum -- * > SHA256SUMS.txt
           echo "=== release assets ==="
           ls -l
           cat SHA256SUMS.txt
+
+      - name: Source tarball sha256 (for the Homebrew formula)
+        # packaging/homebrew/smash.rb carries a placeholder sha256; this is
+        # the value `brew bump-formula-pr` / a manual formula bump needs.
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/$TAG.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          echo "Homebrew: url \"$url\"  sha256 \"$sha\"" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload assets to Release
         uses: softprops/action-gh-release@v2
@@ -308,6 +458,20 @@ jobs:
             **Linux** (`libsmash-linux-{x86_64,aarch64}.so`)
             ```sh
             LD_PRELOAD=./libsmash-linux-x86_64.so SMASH_LARGE_ONLY=1 ./your_program
+            ```
+
+            **Linux packages** (`smash-linux-{x86_64,aarch64}.{deb,rpm,tar.gz}`)
+            install `/usr/lib/libsmash.so` and the `/usr/bin/smash` launcher:
+            ```sh
+            sudo apt install ./smash-linux-x86_64.deb    # Debian 11+/Ubuntu 20.04+
+            sudo dnf install ./smash-linux-x86_64.rpm    # RHEL/Alma/Rocky 8+, AL2023, Fedora
+            smash ./your_program
+            ```
+
+            **Docker** — copy the FROM-scratch image into any glibc ≥ 2.28 image:
+            ```dockerfile
+            COPY --from=ghcr.io/emeryberger/smash:<this tag> /smash /opt/smash
+            ENV LD_PRELOAD=/opt/smash/lib/libsmash.so
             ```
 
             **macOS** (Apple Silicon) — two artifacts:
@@ -339,6 +503,12 @@ jobs:
           files: |
             release/libsmash-linux-x86_64.so
             release/libsmash-linux-aarch64.so
+            release/smash-linux-x86_64.deb
+            release/smash-linux-aarch64.deb
+            release/smash-linux-x86_64.rpm
+            release/smash-linux-aarch64.rpm
+            release/smash-linux-x86_64.tar.gz
+            release/smash-linux-aarch64.tar.gz
             release/libsmash-macos-arm64.dylib
             release/libsmash-macos-fat.zip
             release/SHA256SUMS.txt

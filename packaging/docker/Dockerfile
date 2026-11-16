@@ -41,6 +41,8 @@ FROM scratch AS alloc8
 
 FROM manylinux-${TARGETARCH} AS out-source
 ARG ALLOC8_FROM_CONTEXT=0
+# Parallel build jobs (empty = nproc). Set it on shared build hosts.
+ARG JOBS=
 RUN /opt/python/cp312-cp312/bin/python -m pip install --no-cache-dir cmake ninja >/dev/null \
  && ln -sf /opt/python/cp312-cp312/bin/cmake /usr/local/bin/cmake \
  && ln -sf /opt/python/cp312-cp312/bin/ninja /usr/local/bin/ninja
@@ -57,7 +59,7 @@ RUN set -eu; \
       -DSMASH_BUILD_BENCH=OFF \
       -DCMAKE_INSTALL_PREFIX=/stage \
       $a8; \
-    cmake --build /build --target smash -j"$(nproc)"; \
+    cmake --build /build --target smash -j"${JOBS:-$(nproc)}"; \
     cmake --install /build; \
     max=$(objdump -T /stage/lib/libsmash.so | grep '\*UND\*' \
           | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1); \

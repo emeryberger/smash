@@ -178,6 +178,34 @@ jobs:
               rpm -e smash
             '
 
+      - name: Verify the .deb on the oldest supported glibc (Ubuntu 20.04, Debian 11 — glibc 2.31)
+        # glibc < 2.34's dlsym callocs its dlerror state, which re-enters a
+        # half-initialised smash; that once hung (full mode) and stack-
+        # overflowed (large-only) every preloaded process on glibc 2.31. The
+        # host runner's glibc is too new to catch it. The probe is compiled in
+        # manylinux_2_28 (glibc 2.28) so it runs in both images without apt
+        # (Debian 11's archive is EOL).
+        working-directory: smash
+        run: |
+          mkdir -p probe
+          printf '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nint main(void){char*p=malloc(4<<20);if(!p)return 1;memset(p,1,4<<20);free(p);puts("probe ok");return 0;}\n' > probe/probe.c
+          docker run --rm -v "$PWD/probe:/p" \
+            quay.io/pypa/manylinux_2_28_${{ matrix.manylinux_arch }} gcc -O2 -o /p/probe /p/probe.c
+          for img in ubuntu:20.04 debian:11; do
+            docker run --rm -v "$PWD/out:/out:ro" -v "$PWD/probe:/p:ro" "$img" \
+              bash -euo pipefail -c '
+                . /etc/os-release; echo "== $PRETTY_NAME"
+                dpkg -i /out/smash-linux-${{ matrix.arch }}.deb >/dev/null
+                for mode in 0 1; do
+                  out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode timeout 60 /usr/bin/smash /p/probe 2>&1)
+                  echo "SMASH_LARGE_ONLY=$mode: $out"
+                  grep -q "probe ok" <<<"$out"
+                  grep -q "\[smash stats\]" <<<"$out"
+                done
+                dpkg -r smash >/dev/null
+              '
+          done
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:

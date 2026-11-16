@@ -22,7 +22,7 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All tests must pass (`ctest` lists them; some are macOS-only). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Five of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All tests must pass (`ctest` lists them; some are macOS-only). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Many of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -30,6 +30,9 @@ All tests must pass (`ctest` lists them; some are macOS-only). CI (`.github/work
 - `test_malloc_compression` and `test_large_only_compression` are the **same executable** (`mode_compression_test.cpp`) run twice, differing only in `SMASH_LARGE_ONLY` (`0` = full, `1` = large-only — the production-supported config). The mode is read from the env at runtime, never a compile flag, so the two modes execute byte-identical assertions and cannot drift apart in coverage. The body allocates large chunks (≥ 1 MiB, so they clear `kLargeAllocVmThreshold` and enter the compressible VmRegion in **both** modes) interleaved with small chunks (≤ 16 KiB — smash slab in full mode, system passthrough in large-only). It sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2`, parses `compressed=N` from the stats line, asserts `N > 0`, then verifies a byte-exact read-back of **both** classes — proving full-mode slab integrity / large-only passthrough is never corrupted, and that fault-decompress restores the compressed large chunks. (Registered via the `add_mode_compression_test(name, large_only)` helper in `tests/CMakeLists.txt`.)
 - `test_compression_ratio` (in-process, direct-linked, no compressor thread) compresses a realistically-compressible page with LZ4 and zstd and asserts the achieved ratio against the paper's RQ2 figures (evaluation.tex: LZ4 4.7–12.3×, zstd-1 8.8–20.4×). Two-tier: a hard floor that fails the test (2.5× LZ4 / 4× zstd — catches "stored uncompressed" regressions) plus a WARN if it falls short of the paper's best-case number. Also asserts byte-exact roundtrip. Unlike `test_malloc_compression` (which only checks compression *happened*), this pins the codec *ratio*.
 
+- `test_report` / `test_report_large_only` run `tests/report_test.cpp` (compress, fault back, exit) under interposition with `SMASH_REPORT=path` + `SMASH_METRICS_FILE=path`, and `tests/check_report.sh` asserts the report shows compressions, decompression faults and latency quantiles, and that the Prometheus file is well-formed, histogram-consistent and written atomically (no `.tmp.` left).
+- `test_launcher` / `test_launcher_large_only` drive `build/bin/smash` (`tests/check_launcher.sh`): library discovery relative to the script, preload, `--report` (including the zero-compression hint for a short process), `smash stats` refusing a target without `SMASH_STATS_SIGNAL=1` and delivering with `--stats-signal`, and the macOS SIP warning.
+- `test_profile_*` (6 environments, one binary) pin `SMASH_PROFILE` resolution: profile values apply, explicit variables win, `balanced` equals unset.
 After ctest, CI also runs `bench/run_quick_ci.py` which drives `bench_rss` (in-process: 64 MiB compressible alloc → ≥30 % peak-RSS reduction at t=10 s) and `bench_sqlite --quick` under the preloaded libsmash (≥5 % cooling-phase RSS reduction). Local baselines are ~46 % and ~13 % respectively, so the thresholds are well below noise; a real regression in the compressor or the malloc-interposed path will trip them. Configured with `-DSMASH_BUILD_BENCH=ON -DSMASH_BUILD_BENCH_DEPS=OFF -DSMASH_BUILD_BENCH_ALLOCATORS=OFF` so the CI build skips Redis/memcached/RocksDB/tcmalloc/jemalloc/hoard/mesh/etc. — only the smash-internal benches are needed.
 
 ### Verifying paper claims end-to-end (`bench/verify_paper_claims.py`)
@@ -89,6 +92,13 @@ Small `malloc`/`free`/`calloc`/`realloc` are served by lean entry points (`Smash
 - **Background threads** (compressor helpers, VmRegion decommit drainer) block on a `Waker` (condition variable) instead of polling with `usleep(100)`; `Spinlock` yields after a bounded spin.
 
 Measured on x86-64 (Xeon 8175M) and Graviton3, glibc 2.35: faster than glibc on every microbenchmark (e.g. malloc+free pairs 0.78×/0.86×, 16 KiB–1 MiB churn 0.22×/0.09×), g++ -O2 compile at parity, Python churn 0.67×/0.64×; `bench_rss`/`bench_sqlite` RSS reductions unchanged.
+
+## Operability: profile, exit report, metrics, launcher
+
+- `SMASH_PROFILE=latency|balanced|memory` (config.h `kProfileSettings`): readers of a profile-covered variable call `envOrProfile()` instead of `getenv()`; an explicit variable always wins and `balanced` supplies nothing. A profile's cold timeout moves `cold_ticks_floor` without setting `cold_ticks_overridden` (the ROI gate stays on). Values and reasoning: [agents/env-vars.md](agents/env-vars.md), which also classifies every `SMASH_*` variable.
+- `src/util/run_stats.h`: always-on relaxed counters, including the decompression-fault latency histogram recorded at the end of `handleFault`'s COMPRESSED case (lock wait + decompress + restore + prefetch; atomics and `clock_gettime` only, so async-signal-safe), compressions/bytes, ratio rejects, per-compressor-thread CPU (each thread publishes its own `CLOCK_THREAD_CPUTIME_ID`) and per-tick RSS samples. Reset in the fork child.
+- `SMASH_REPORT=1|path`: `CompressorThread::writeReport()` from an atexit handler registered before the stop() handler (LIFO, so it runs after the threads are joined). `SMASH_METRICS_FILE=path`: `writeMetricsFile()` from the coordinator after each tick once `SMASH_METRICS_INTERVAL_SEC` has passed, and once more in `stop()`; temp file + `rename`, buffer from BootstrapAlloc.
+- `bin/smash.in` → `build/bin/smash` (configure_file); `install()` puts it in `${prefix}/bin` and libsmash in `${prefix}/lib` (packaging relies on these paths).
 
 ## Syscall & Buffered I/O Compatibility
 
@@ -212,7 +222,9 @@ Key constants in `include/smash/config.h`:
 - `kChunkSize = 64`: Pages per chunk for scan bitmap
 - `kLargeAllocVmThreshold = 1MB`: Only large allocs above this go in VmRegion
 
-Runtime environment variables:
+Runtime environment variables (full classified list: [agents/env-vars.md](agents/env-vars.md)):
+- `SMASH_PROFILE=latency|balanced|memory`: Defaults for the expert knobs; explicit variables win
+- `SMASH_REPORT=1|path`, `SMASH_METRICS_FILE=path`, `SMASH_METRICS_INTERVAL_SEC=N`: Exit report and Prometheus metrics file (`%p` = pid)
 - `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc. Production-supported config for concurrent workloads
 - `SMASH_DEFER_MADVISE=1`: Default ON. Defers `madvise(MADV_DONTNEED)` to a per-tick sweeper after `SMASH_DEFER_MADVISE_TICKS` quiescent ticks (default 50). Load-bearing for correctness; do not disable in production
 - `SMASH_DEFER_MADVISE_TICKS=N`: Number of ticks (default 50, ≈500 ms) a page must be quiescent before sweeper madvises it

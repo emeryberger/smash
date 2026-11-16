@@ -551,3 +551,16 @@ foreach(lo 0 1)
       ${CMAKE_CURRENT_BINARY_DIR}/${_name}.d)
   set_tests_properties(${_name} PROPERTIES TIMEOUT 60)
 endforeach()
+# smash-estimate (Linux): launch mode against a target with known idle/hot
+# regions; runs unprivileged (soft-dirty or the referenced fallback; idle-page
+# tracking when run as root). The _referenced variant forces the per-mapping
+# fallback, the only method on kernels without soft-dirty or page_idle access.
+if(TARGET smash-estimate)
+  add_executable(estimate_target estimate_target.cpp)
+  add_executable(estimate_test estimate_test.cpp)
+  add_test(NAME test_smash_estimate
+           COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target>)
+  add_test(NAME test_smash_estimate_referenced
+           COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> referenced)
+  set_tests_properties(test_smash_estimate test_smash_estimate_referenced PROPERTIES TIMEOUT 60)
+endif()

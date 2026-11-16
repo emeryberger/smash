@@ -74,6 +74,10 @@ GLIBC_2.2.5 {
     # Hint for smash-friendly applications (on-access hot-object migration).
     smash_migrate_hint;
     smash_migrate_map;
+    # Kill switch + safety status (include/smash/smash.h).
+    smash_disable;
+    smash_enable;
+    smash_safety_status;
 
     # Smash syscall wrappers for kernel buffer access
     read;

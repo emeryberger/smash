@@ -574,3 +574,102 @@ if(TARGET smash-estimate)
            COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> referenced)
   set_tests_properties(test_smash_estimate test_smash_estimate_referenced PROPERTIES TIMEOUT 60)
 endif()
+
+# ── Deployment safety: kill switch, watchdog, SLO controller (agents/safety.md) ──
+# Unit: compress/safety.h pure logic (signal parsing, latency histogram,
+# watchdog / controller state machine). Deterministic, no compressor.
+smash_add_test(test_safety test_safety.cpp)
+
+# smash_add_preload_test(<name> <target> ARGS ... ENV ... [TIMEOUT n])
+# Runs <target> under DYLD_INSERT_LIBRARIES (macOS) / LD_PRELOAD (Linux).
+function(smash_add_preload_test name target)
+  cmake_parse_arguments(P "" "TIMEOUT" "ARGS;ENV" ${ARGN})
+  if(APPLE)
+    set(_pre "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_pre "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(NAME ${name}
+    COMMAND ${CMAKE_COMMAND} -E env ${_pre} ${P_ENV} $<TARGET_FILE:${target}> ${P_ARGS})
+  if(NOT P_TIMEOUT)
+    set(P_TIMEOUT 120)
+  endif()
+  set_tests_properties(${name} PROPERTIES TIMEOUT ${P_TIMEOUT})
+endfunction()
+
+add_executable(kill_switch_test kill_switch_test.cpp)
+set_target_properties(kill_switch_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(kill_switch_test PRIVATE ${CMAKE_DL_LIBS})
+add_executable(storm_test storm_test.cpp)
+set_target_properties(storm_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(storm_test PRIVATE ${CMAKE_DL_LIBS})
+
+foreach(lo 0 1)
+  if(lo)
+    set(_sfx _large_only)
+  else()
+    set(_sfx "")
+  endif()
+  # One kill-switch test per trigger and mode. SIGUSR1 disables, SIGUSR2
+  # enables (the stats signal is not enabled here, so SIGUSR2 is free).
+  foreach(mech api signal file)
+    smash_add_preload_test(test_kill_switch_${mech}${_sfx} kill_switch_test
+      ARGS ${mech}
+      ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+          "SMASH_DISABLE_SIGNAL=SIGUSR1" "SMASH_ENABLE_SIGNAL=SIGUSR2"
+          "SMASH_CONTROL_FILE=${CMAKE_CURRENT_BINARY_DIR}/kill_switch_${mech}${_sfx}.ctl")
+  endforeach()
+  smash_add_preload_test(test_watchdog_rate${_sfx} storm_test
+    ARGS watchdog-rate
+    ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+        "SMASH_RECOMPRESS_BACKOFF=0" "SMASH_WATCHDOG_FAULT_RATE=200" "SMASH_WATCHDOG_WINDOW=2")
+  smash_add_preload_test(test_watchdog_p99${_sfx} storm_test
+    ARGS watchdog-p99
+    ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+        "SMASH_RECOMPRESS_BACKOFF=0" "SMASH_WATCHDOG_P99_US=1" "SMASH_WATCHDOG_WINDOW=2")
+  smash_add_preload_test(test_slo_controller${_sfx} storm_test
+    ARGS controller
+    ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+        "SMASH_RECOMPRESS_BACKOFF=0" "SMASH_MAX_FAULT_RATE=200")
+endforeach()
+
+# Concurrency soak: threads alloc/free/realloc across size classes with
+# randomized idle gaps (so pages compress) and read a reclaimed cold set
+# (concurrent decompress faults), with the kill switch flipped underneath.
+# Short in ctest; the CI "stress" job runs it for minutes (SMASH_SOAK_SEC).
+add_executable(soak_test soak_test.cpp)
+set_target_properties(soak_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(soak_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+foreach(lo 0 1)
+  if(lo)
+    set(_sfx _large_only)
+  else()
+    set(_sfx "")
+  endif()
+  smash_add_preload_test(test_soak${_sfx} soak_test
+    ARGS 15 8
+    ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+        "SMASH_SOAK_TOGGLE=1"
+    TIMEOUT 180)
+  set_tests_properties(test_soak${_sfx} PROPERTIES LABELS "soak")
+endforeach()
+
+# fork() safety under threads (issue #61): Linux only (macOS restricts a
+# multithreaded fork child to async-signal-safe calls; smash's fault handler
+# there is a Mach exception thread the child does not inherit).
+if(NOT APPLE)
+  add_executable(fork_stress_test fork_stress_test.cpp)
+  set_target_properties(fork_stress_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(fork_stress_test PRIVATE Threads::Threads)
+  foreach(lo 0 1)
+    if(lo)
+      set(_sfx _large_only)
+    else()
+      set(_sfx "")
+    endif()
+    smash_add_preload_test(test_fork_stress${_sfx} fork_stress_test
+      ARGS 120 6
+      ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+      TIMEOUT 300)
+  endforeach()
+endif()

@@ -138,6 +138,10 @@
     sbrk;
     __sbrk;
 
+    # Keep SIGSEGV/SIGBUS deliverable (fault-driven decompression)
+    pthread_sigmask;
+    sigprocmask;
+
     # fstat / stat family — glibc remaps fstat → fstat64 with
     # _FILE_OFFSET_BITS=64 (Ubuntu C++ default); glibc < 2.33 routes through
     # __fxstat / __xstat / __lxstat / __fxstatat (and _64 variants). Cover
@@ -288,6 +292,13 @@ GLIBC_2.30 {
     getdents64;
     getdents64_230;
 } GLIBC_2.28;
+
+# pthread_sigmask moved into libc in glibc 2.32 and binaries built since
+# reference pthread_sigmask@GLIBC_2.32 (see linux_syscall_wrappers.cpp).
+GLIBC_2.32 {
+  global:
+    pthread_sigmask_232;
+} @SMASH_GLIBC_BASE_VERSION@;
 
 GLIBC_2.33 {
   global:

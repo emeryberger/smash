@@ -1211,6 +1211,39 @@ extern "C" int smash_mprotect(void* addr, size_t len, int prot) {
     return rc;
 }
 
+// ── pthread_sigmask / sigprocmask ───────────────────────────────────────────
+// Never let a thread block SIGSEGV/SIGBUS: a synchronous fault on a thread
+// that blocks them is not delivered to smash's decompression handler, the
+// process dies instead (jemalloc's background thread blocks every signal).
+// See the Linux wrappers in linux_syscall_wrappers.cpp.
+using sigmask_fn = int(*)(int, const sigset_t*, sigset_t*);
+namespace {
+inline const sigset_t* keepFaultSignals(int how, const sigset_t* set, sigset_t* copy) {
+    if (!set || how == SIG_UNBLOCK) return set;
+    if (!sigismember(set, SIGSEGV) && !sigismember(set, SIGBUS)) return set;
+    *copy = *set;
+    sigdelset(copy, SIGSEGV);
+    sigdelset(copy, SIGBUS);
+    return copy;
+}
+}  // namespace
+
+extern "C" int smash_pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
+SMASH_INTERPOSE(smash_pthread_sigmask, pthread_sigmask);
+extern "C" int smash_pthread_sigmask(int how, const sigset_t* set, sigset_t* old) {
+    sigset_t copy;
+    return reinterpret_cast<sigmask_fn>(smash_interpose_smash_pthread_sigmask.original)(
+        how, keepFaultSignals(how, set, &copy), old);
+}
+
+extern "C" int smash_sigprocmask(int how, const sigset_t* set, sigset_t* old);
+SMASH_INTERPOSE(smash_sigprocmask, sigprocmask);
+extern "C" int smash_sigprocmask(int how, const sigset_t* set, sigset_t* old) {
+    sigset_t copy;
+    return reinterpret_cast<sigmask_fn>(smash_interpose_smash_sigprocmask.original)(
+        how, keepFaultSignals(how, set, &copy), old);
+}
+
 // ── mach_vm_allocate / mach_vm_deallocate ────────────────────────────────────
 //
 // SpiderMonkey on macOS uses mach_vm_allocate (not POSIX mmap) for its GC

@@ -1220,6 +1220,62 @@ SMASH_VISIBLE void* __sbrk(intptr_t inc) {
     return trackedSbrk(real___sbrk, inc);
 }
 
+// pthread_sigmask / sigprocmask: never let a thread block SIGSEGV / SIGBUS.
+// smash decompresses on the fault; a synchronous fault on a thread that has
+// them blocked is not delivered — the kernel resets the action to SIG_DFL and
+// kills the process. jemalloc's background purge thread is created with
+// every signal blocked (background_thread_create_signals_masked) and then
+// walks extent metadata smash may have compressed: under
+// SMASH_TRACK_EXTERNAL=1 bundled-jemalloc Valkey died this way within
+// seconds. Blocking a synchronous fault signal has no useful effect anyway
+// (it can't be postponed), so the only observable change is that an
+// asynchronous kill(SIGSEGV/SIGBUS) is no longer held pending.
+namespace {
+inline const sigset_t* keepFaultSignals(int how, const sigset_t* set, sigset_t* copy) {
+    if (!set || how == SIG_UNBLOCK) return set;
+    if (sigismember(set, SIGSEGV) != 1 && sigismember(set, SIGBUS) != 1) return set;
+    *copy = *set;
+    sigdelset(copy, SIGSEGV);
+    sigdelset(copy, SIGBUS);
+    return copy;
+}
+
+// Fallback before dlsym resolves: raw rt_sigprocmask, also stripping glibc's
+// internal SIGCANCEL / SIGSETXID (32, 33) as glibc itself does — blocking
+// SIGSETXID would hang setuid() in multithreaded processes.
+inline int rawSigmask(int how, const sigset_t* set, sigset_t* old) {
+    sigset_t copy;
+    if (set && how != SIG_UNBLOCK) {
+        copy = *set;
+        sigdelset(&copy, 32);
+        sigdelset(&copy, 33);
+        set = &copy;
+    }
+    return static_cast<int>(syscall(SYS_rt_sigprocmask, how, set, old, _NSIG / 8));
+}
+}  // namespace
+
+SMASH_VISIBLE int pthread_sigmask(int how, const sigset_t* set, sigset_t* old) {
+    using fn_t = int(*)(int, const sigset_t*, sigset_t*);
+    SMASH_LAZY_RESOLVE(fn_t, pthread_sigmask);
+    sigset_t copy;
+    set = keepFaultSignals(how, set, &copy);
+    if (!real_pthread_sigmask) return rawSigmask(how, set, old) == 0 ? 0 : errno;
+    return real_pthread_sigmask(how, set, old);
+}
+SMASH_VISIBLE int pthread_sigmask_232(int how, const sigset_t* set, sigset_t* old) {
+    return pthread_sigmask(how, set, old);
+}
+
+SMASH_VISIBLE int sigprocmask(int how, const sigset_t* set, sigset_t* old) {
+    using fn_t = int(*)(int, const sigset_t*, sigset_t*);
+    SMASH_LAZY_RESOLVE(fn_t, sigprocmask);
+    sigset_t copy;
+    set = keepFaultSignals(how, set, &copy);
+    if (!real_sigprocmask) return rawSigmask(how, set, old);
+    return real_sigprocmask(how, set, old);
+}
+
 // madvise: allocators purge freed extents with DONTNEED / FREE. Drop smash's
 // blob for those pages first, or a later access would decompress stale data
 // over memory the allocator believes is zero (jemalloc's calloc fast path).
@@ -1288,6 +1344,7 @@ SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int
 __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 __asm__(".symver epoll_pwait_232,epoll_pwait@GLIBC_2.3.2");
 __asm__(".symver fstat_233,fstat@GLIBC_2.33");
+__asm__(".symver pthread_sigmask_232,pthread_sigmask@GLIBC_2.32");
 __asm__(".symver fstat64_233,fstat64@GLIBC_2.33");
 __asm__(".symver stat_233,stat@GLIBC_2.33");
 __asm__(".symver stat64_233,stat64@GLIBC_2.33");

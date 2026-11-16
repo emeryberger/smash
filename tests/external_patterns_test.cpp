@@ -27,6 +27,8 @@
 //   shared     MAP_SHARED|MAP_ANON pages are never compressed (a child's
 //              write must stay visible to the parent).
 //   sbrk       program-break growth (gperftools tcmalloc) is tracked (Linux).
+//   sigmask    a thread with every signal blocked (jemalloc's background
+//              thread) reads compressed pages without being killed.
 //   churn      after mapping/unmapping more pages than the external slot
 //              budget (CPython arena churn), a fresh mapping is still tracked
 //              and compressed.
@@ -40,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -337,6 +340,34 @@ bool testSbrk() {
 }
 #endif
 
+// jemalloc's background purge thread runs with every signal blocked. A
+// thread that blocks SIGSEGV must still be able to touch compressed memory:
+// smash keeps SIGSEGV/SIGBUS out of every sigmask (otherwise the kernel kills
+// the process on the first decompression fault).
+struct MaskedArg { void* p; size_t len; bool ok; };
+void* maskedReader(void* v) {
+    auto* a = static_cast<MaskedArg*>(v);
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_SETMASK, &all, nullptr);
+    a->ok = check(a->p, a->len, 13) == SIZE_MAX;
+    return nullptr;
+}
+bool testSigmask() {
+    void* p = mapAnon(kLen);
+    fill(p, kLen, 13);
+    Region r{p, kLen, "sigmask"};
+    if (!waitCompressed(&r, 1)) FAIL("[sigmask]: never compressed");
+    MaskedArg a{p, kLen, false};
+    pthread_t t;
+    if (pthread_create(&t, nullptr, maskedReader, &a) != 0) FAIL("[sigmask]: pthread_create");
+    pthread_join(t, nullptr);
+    if (!a.ok) FAIL("[sigmask]: data wrong when read from a fully-masked thread");
+    munmap(p, kLen);
+    fprintf(stderr, "external_patterns_test: sigmask PASSED\n");
+    return true;
+}
+
 // MAP_SHARED|MAP_ANON memory is shared with forked children (PostgreSQL
 // shared buffers, multiprocessing). It must never be compressed: a blob in
 // the parent is stale as soon as the child writes, and decompressing it would
@@ -392,6 +423,7 @@ int main(int argc, char** argv) {
     if (want("guard") && !testGuard()) return 1;
     if (want("fork") && !testFork()) return 1;
     if (want("shared") && !testSharedAnon()) return 1;
+    if (want("sigmask") && !testSigmask()) return 1;
 #ifdef __linux__
     if (want("sbrk") && !testSbrk()) return 1;
 #endif

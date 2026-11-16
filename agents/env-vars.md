@@ -33,7 +33,7 @@ All variables are read once, at startup or at first use, and never on the fault 
 - **The ROI threshold is not in any profile.** `AlgoProfile::computeROI` divides the benefit (`page_size · ratio_255 · cold_ticks / 255`) by the calibrated codec cost per page. With the calibrated zstd-1 speeds it clears even 4096 within a few ticks for any page that passes the 0.75 ratio gate, so the cold floor is what binds and moving `SMASH_ROI_THRESHOLD` has little effect. Measured with the calibration code (`tools/roi_probe.cpp`: `CompressEngine::init` + `ROIConfig::init`, then `computeROI` over cold ticks), 3 runs per machine. On cloudnew (EPYC 9R14, 24-core taskset slice) the fast tier calibrated at 3690–3757 / 1612–1638 MB/s compress (high/low compressibility). There a page that saves 25% reaches ROI ≥ 1024 at 2 ticks and ≥ 4096 at 8 ticks; a page that saves 50% reaches 1024 at 1 tick and 4096 at 4. On an Apple M-series laptop (5868–10349 / 1289–2587 MB/s) a page that saves 25% reaches 1024 at 1–2 ticks and 4096 at 4–7. Every one of these is below the 10 s floor, so the floor is what binds and a profile ROI value would change little; it is left out.
 - **Left alone on purpose.** `SMASH_NO_MONITOR` stays off in every profile: without Phase 3 the compressor cannot tell written pages from idle ones, which means more decompression faults, the opposite of what *latency* wants. `SMASH_COOLING_CLOSE_TICKS` already derives from the cold timeout (`getColdTicks()/2`), so every profile moves it implicitly. `SMASH_SHADOW_CAP_DIV` keeps 8, because the comment there records that 1/16 left SQLite's cool phase half-compressed. `SMASH_DEFER_MADVISE`, the VMA guards and the other safety mechanisms are never touched by a profile.
 
-Dev measurements of the profiles (Linux VM, not for results tables) are in [the last section](#dev-measurements-of-the-profiles).
+Dev measurements of the profiles (cloudnew, not for results tables) are in [the last section](#dev-measurements-of-the-profiles).
 
 ## User-facing
 
@@ -129,6 +129,19 @@ Dev measurements of the profiles (Linux VM, not for results tables) are in [the 
 
 ## Dev measurements of the profiles
 
-Linux VM (Apple M-series host, aarch64 Ubuntu 24.04 guest, kernel 6.8, 3 vCPUs shared with other jobs). These are development numbers only and belong in no results table.
+Development numbers only; they belong in no results table. Measured on cloudnew (EPYC 9R14, Amazon Linux 2023, kernel 6.12, uffd tracking) inside a 24-core `taskset` slice, with other agents' jobs on the other cores. The workload was `bench/bench_sqlite --quick --cool 40 --serve 20` (250K rows; fill, 40 s idle, 20 s serving the newest 5%). The 40 s cool phase is longer than every profile's timeout. 5 runs per configuration, randomly interleaved (`shuf`); the table shows the median with the [min–max] range. The driver loops over `glibc` (no preload), `unset` (libsmash, no profile), `SMASH_PROFILE=memory` and `SMASH_PROFILE=latency`, and records each run's `METRIC` lines.
 
-(See the section below; it was filled in from the runs recorded there.)
+| config | peak RSS MB | RSS after cool MB | cool AUC MB·s | serve AUC MB·s | serve ops/s | cold p99 µs |
+|---|---|---|---|---|---|---|
+| glibc | 179.9 [179.9–180.0] | 180.1 | 7203 [7203–7204] | 5070 [5062–5082] | 99316 [98721–100068] | 1.9 [1.8–2.0] |
+| unset (= balanced) | 198.5 [198.4–198.5] | 62.9 [62.8–63.0] | 4365 [4362–4370] | 3746 [3328–3753] | 94806 [83842–95060] | 17.7 [16.6–18.5] |
+| memory | 198.5 [198.4–198.5] | 62.9 [62.8–63.0] | 3269 [3266–3271] | 3337 [3036–3569] | 89750 [83764–94766] | 16.7 [16.5–80.2] |
+| latency | 198.4 [198.4–198.5] | 61.8 [61.7–63.0] | 7070 [7066–7073] | 3733 [3722–3753] | 95167 [94937–95280] | 18.2 [17.8–19.6] |
+
+What this run shows:
+
+- *memory* reaches the same floor (about 63 MB) earlier. Its RSS integral over the cool phase is 25% below the default's (3269 vs 4365 MB·s) and 9% below over the serve phase. Serve throughput was 5% lower (median 89750 vs 94806 ops/s) and varied more between runs.
+- *latency* compresses nothing until 30 s, so its cool-phase integral is close to glibc's. After that it reaches the same floor, and serve throughput matched the default's (95167 vs 94806).
+- This workload cannot show the tail-latency purpose of *latency*. Its serve phase reads only the hot 5%, which no configuration compresses, and its cold reads come after the cool phase in every configuration.
+
+Not measured here: memcached/Redis serving under each profile (the prompt-trim throughput risk recorded in `promptTrimBytes()` came from memcached), and large-only mode.

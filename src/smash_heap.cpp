@@ -3,6 +3,7 @@
 #include "smash_heap.h"
 #include "smash/smash.h"
 #include "vm/syscall_compat.h"
+#include "external_track.h"
 #include <alloc8/alloc8.h>
 #include <cstdio>
 #include <cstdlib>
@@ -253,6 +254,7 @@ smash::PageStateTable* smash::g_smash_page_states_for_external = nullptr;
 // munmap / Mach VM deallocate interposers can take the per-page lock while
 // untracking an external page, serializing against compressPage's snapshot.
 smash::PageLockTable* smash::g_smash_page_locks_for_external = nullptr;
+std::atomic<smash::ExternalDetachFn> smash::g_smash_external_detach{nullptr};
 
 // g_smash_skip_external_tracking is now an inline variable defined in
 // compress/compressor_thread.h (single definition across libsmash and the
@@ -1133,101 +1135,48 @@ extern "C" int smash_fflush(FILE* stream) {
 
 // ── External-mapping interposers ────────────────────────────────────────────
 //
-// Standard smash's main allocator hands out memory from a single big
-// MAP_ANON reservation that smash itself owns; the compressor compresses
-// pages within that reservation. Application code that calls mmap() /
-// vm_allocate() *directly* (SpiderMonkey JS GC arenas, Skia surfaces via
-// mozalloc_aligned, etc.) bypasses the malloc path entirely and so escapes
-// the compressor.
+// Application code that calls mmap() / vm_allocate() directly (bundled
+// allocators, SpiderMonkey GC arenas, Skia surfaces) bypasses the malloc path
+// and so escapes the compressor. With SMASH_TRACK_EXTERNAL=1 these
+// interposers register such mappings via VmRegion's external-page hash, and
+// munmap / madvise / mprotect / vm_deallocate first settle smash's state for
+// tracked pages (free the blob, restore contents, untrack). Policy and the
+// shared helpers live in external_track.h (same code as the Linux wrappers).
 //
-// The interposers below register such mappings via VmRegion's external-
-// page hash so the compressor's tick can see them. Strict filters apply:
-//
-//   • mmap     — only MAP_ANON | PROT_WRITE. File-backed mappings would
-//                break msync semantics under compression and the OS
-//                already evicts them; non-writable mappings won't dirty.
-//   • mach_vm_allocate — anonymous by design; tracked when caller-
-//                requested protection includes VM_PROT_WRITE.
-//
-// munmap / vm_deallocate counterparts mark the pages EMPTY so the
-// compressor stops scanning them. Compressed-page leakage on unmap is
-// possible (we don't free associated compressed buffers) but bounded
-// by the workload's churn rate.
-//
-// External tracking is OFF by default. Set SMASH_TRACK_EXTERNAL=1 to
-// enable. Firefox 5-tab Wikipedia at 90 s crashes ~25 s earlier with
-// tracking on (35 s vs 60 s pre-port baseline) — the cause hasn't been
-// root-caused yet. Targets that don't have Firefox's allocation patterns
-// (e.g., a one-shot redb workload) are safe to opt in. The interposers
-// themselves still install (cost: one branch per mmap / mach_vm call);
-// only the page registration path is gated.
+//   • mmap     — private anonymous, exactly PROT_READ|PROT_WRITE.
+//   • mach_vm_allocate — anonymous by design; tracked in our own task.
 
 namespace {
 
-inline bool externalTrackingEnabled() {
-    static const bool enabled = []{
-        const char* v = std::getenv("SMASH_TRACK_EXTERNAL");
-        return v && v[0] == '1';
-    }();
-    return enabled;
-}
-
-// Register every page in [base, base+len) with the VmRegion's external
-// tracker and set its initial PageState to ACTIVE.
 inline void registerExternalRange(smash::VmRegion* vm, void* base, size_t len) {
-    if (!vm || !base || !len) return;
-    if (!externalTrackingEnabled()) return;
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
-    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
-               & ~(uintptr_t{smash::kPageSize} - 1);
-    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        size_t idx = vm->trackExternalPage(p);
-        if (idx == 0) continue;  // table full or page in contiguous arena
-        smash::g_smash_page_states_for_external
-            ? smash::g_smash_page_states_for_external->set(idx, smash::PageState::ACTIVE)
-            : (void)0;
-    }
+    smash::ext::registerRange(vm, base, len);
 }
 
 inline void deregisterExternalRange(smash::VmRegion* vm, void* base, size_t len) {
-    if (!vm || !base || !len) return;
-    if (!externalTrackingEnabled()) return;
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
-    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
-               & ~(uintptr_t{smash::kPageSize} - 1);
-    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        // Untrack UNDER the per-page lock: serializes against a compressor
-        // worker that may be mid-snapshot on this external page, so the real
-        // munmap (in the caller, AFTER this returns) can't pull the mapping out
-        // from under the worker's memcpy. Proven necessary + deadlock-free by
-        // model/SmashExternalRace.{lean,tla}. No mprotect/munmap is done while
-        // the lock is held here.
-        vm->untrackExternalPageLocked(p,
-            smash::g_smash_page_locks_for_external,
-            smash::g_smash_page_states_for_external);
-    }
+    smash::ext::detachRange(vm, base, len, smash::ext::kUnmap);
 }
 
 }  // namespace
 
-// ── mmap / munmap ───────────────────────────────────────────────────────────
+// ── mmap / munmap / madvise / mprotect ──────────────────────────────────────
 
 using mmap_fn = void*(*)(void*, size_t, int, int, int, off_t);
 using munmap_fn = int(*)(void*, size_t);
+using madvise_fn = int(*)(void*, size_t, int);
+using mprotect_fn = int(*)(void*, size_t, int);
 
 extern "C" void* smash_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset);
 SMASH_INTERPOSE(smash_mmap, mmap);
 extern "C" void* smash_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    auto* vm = smash::g_smash_vm_region;
+    // MAP_FIXED replaces the old mapping; restore tracked pages first (if the
+    // call fails the old mapping survives and must keep its data).
+    if (vm && (flags & MAP_FIXED) && addr && len)
+        smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
     void* ret = reinterpret_cast<mmap_fn>(smash_interpose_smash_mmap.original)(
         addr, len, prot, flags, fd, offset);
-    if (ret == MAP_FAILED) return ret;
-    // Filter to anonymous, writable, non-zero-length mappings. File-backed
-    // (fd != -1 or !MAP_ANON) and read-only mappings are ineligible.
-    bool anon = (flags & MAP_ANON) != 0;
-    bool writable = (prot & PROT_WRITE) != 0;
-    if (!anon || !writable || len == 0) return ret;
-    auto* vm = smash::g_smash_vm_region;
-    if (vm) registerExternalRange(vm, ret, len);
+    if (ret == MAP_FAILED || len == 0) return ret;
+    if (vm && smash::ext::eligibleMapping(prot, flags)) registerExternalRange(vm, ret, len);
     return ret;
 }
 
@@ -1237,6 +1186,29 @@ extern "C" int smash_munmap(void* addr, size_t len) {
     auto* vm = smash::g_smash_vm_region;
     if (vm && addr && len) deregisterExternalRange(vm, addr, len);
     return reinterpret_cast<munmap_fn>(smash_interpose_smash_munmap.original)(addr, len);
+}
+
+extern "C" int smash_madvise(void* addr, size_t len, int advice);
+SMASH_INTERPOSE(smash_madvise, madvise);
+extern "C" int smash_madvise(void* addr, size_t len, int advice) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len && smash::ext::discardAdvice(advice))
+        smash::ext::detachRange(vm, addr, len, smash::ext::kPurge);
+    return reinterpret_cast<madvise_fn>(smash_interpose_smash_madvise.original)(addr, len, advice);
+}
+
+extern "C" int smash_mprotect(void* addr, size_t len, int prot);
+SMASH_INTERPOSE(smash_mprotect, mprotect);
+extern "C" int smash_mprotect(void* addr, size_t len, int prot) {
+    auto* vm = smash::g_smash_vm_region;
+    size_t tracked = 0;
+    if (vm && addr && len)
+        tracked = smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    int rc = reinterpret_cast<mprotect_fn>(smash_interpose_smash_mprotect.original)(addr, len, prot);
+    if (rc == 0 && tracked && prot == (PROT_READ | PROT_WRITE) &&
+        tracked == (smash::ext::pageUp(addr, len) - smash::ext::pageDown(addr)) / smash::kPageSize)
+        registerExternalRange(vm, addr, len);
+    return rc;
 }
 
 // ── mach_vm_allocate / mach_vm_deallocate ────────────────────────────────────

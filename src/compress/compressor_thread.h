@@ -89,6 +89,9 @@ struct pm_scan_arg {
 #define PM_SCAN_CHECK_WPASYNC (1ULL << 1)
 #define PAGE_IS_WRITTEN (1ULL << 1)
 #endif
+#ifndef PAGE_IS_PRESENT
+#define PAGE_IS_PRESENT (1ULL << 3)
+#endif
 #ifndef UFFDIO_MOVE  // Linux 6.8 uAPI; older headers lack it
 #define UFFD_FEATURE_MOVE (1ULL << 16)
 #define _UFFDIO_MOVE (0x05)
@@ -1956,7 +1959,20 @@ private:
 
     void rebuildChunkBitmap(size_t committed) {
         size_t nchunks = (committed + kChunkSize - 1) / kChunkSize;
+        // With external pages tracked, committed spans the whole contiguous
+        // reservation (externals sit above it). Pages in [bump, contig) were
+        // never handed out and are EMPTY: skip those chunks instead of
+        // reading millions of state bytes every tick.
+        const size_t contig = vm_->contigPages();
+        const size_t bump = vm_->rawNextPage();
+        const size_t gap_lo = (bump + kChunkSize - 1) / kChunkSize;
+        const size_t gap_hi = contig / kChunkSize;
         for (size_t c = 0; c < nchunks; ++c) {
+            if (c >= gap_lo && c < gap_hi && committed > contig) {
+                live_chunks_[c] = 0;
+                c = gap_hi - 1;
+                continue;
+            }
             uint64_t mask = 0;
             size_t base = c * kChunkSize;
             size_t end = base + kChunkSize;
@@ -3576,7 +3592,7 @@ private:
                 uintptr_t start = a & ~(uintptr_t)(kPageSize - 1);
                 size_t len = (a + new_comp_size) - start;
                 len = (len + kPageSize - 1) & ~(size_t)(kPageSize - 1);
-                (void)madvise(reinterpret_cast<void*>(start), len, MADV_PAGEOUT);
+                (void)vm::rawMadvise(reinterpret_cast<void*>(start), len, MADV_PAGEOUT);
             }
 #endif
         }
@@ -5015,7 +5031,10 @@ private:
     bool scanWrittenPages(size_t committed) {
 #ifdef __linux__
         if (!wp_scan_ || pagemap_fd_ < 0) return false;
-        const size_t contig = committed < vm_->contigPages() ? committed : vm_->contigPages();
+        // With external pages tracked, committed spans the whole reservation;
+        // the arena part in use ends at the bump pointer.
+        const size_t contig = committed <= vm_->contigPages() ? committed
+            : (vm_->rawNextPage() < vm_->contigPages() ? vm_->rawNextPage() : vm_->contigPages());
         const uint64_t base = reinterpret_cast<uintptr_t>(vm_->base());
         constexpr size_t kVec = 512;
         struct page_region vec[kVec];
@@ -5054,15 +5073,98 @@ private:
             if (a.walk_end <= start) break;
             start = a.walk_end;
         }
-        // External (non-arena) pages are not uffd-tracked: with clear_refs
-        // gone their soft-dirty bits never reset, so treat them as written
-        // (never compressed) in this mode.
-        for (size_t i = vm_->contigPages(); i < committed; ++i)
-            accessed_[i].store(true, std::memory_order_relaxed);
+        if (committed > vm_->contigPages()) scanExternalWritten(committed);
         return true;
 #else
         (void)committed;
         return false;
+#endif
+    }
+
+    // uffd-wp write tracking for EXTERNAL (SMASH_TRACK_EXTERNAL) pages. With
+    // clear_refs gone in wp mode their soft-dirty bits never reset, so they
+    // used to be treated as always-written — i.e. never compressed on any
+    // kernel with async uffd-wp (x86-64 6.7+). Instead, register each run of
+    // address-contiguous tracked pages for async write-protect (WP only, no
+    // MISSING: first touch stays an ordinary kernel zero-fill, nothing reaches
+    // smash's SIGBUS path) on first sight, then PAGEMAP_SCAN it each tick like
+    // the arena. A run that can't be registered (e.g. the mapping is gone)
+    // falls back to "written". Registration does not survive fork (no
+    // EVENT_FORK) or mremap (no EVENT_REMAP); the child uses soft-dirty and a
+    // moved range is re-registered by mremap's re-track.
+    uint8_t* ext_wp_ = nullptr;  // per page idx: 0 = not registered, 1 = registered
+    void scanExternalWritten(size_t committed) {
+#ifdef __linux__
+        if (!ext_wp_) return;
+        constexpr size_t kMaxRun = 4096;  // 16 MiB per ioctl (mmap_lock READ hold)
+        constexpr size_t kVec = 256;
+        struct page_region vec[kVec];
+        auto markAll = [&](size_t lo, size_t hi) {
+            for (size_t k = lo; k < hi; ++k) accessed_[k].store(true, std::memory_order_relaxed);
+        };
+        size_t i = vm_->contigPages();
+        while (i < committed) {
+            const uintptr_t a0 = reinterpret_cast<uintptr_t>(vm_->pageAddress(i));
+            if (!a0 || states_->get(i) == PageState::EMPTY) { ++i; continue; }
+            size_t j = i + 1;
+            bool registered = ext_wp_[i] == 1;
+            while (j < committed && j - i < kMaxRun &&
+                   reinterpret_cast<uintptr_t>(vm_->pageAddress(j)) == a0 + (j - i) * kPageSize &&
+                   states_->get(j) != PageState::EMPTY) {
+                registered = registered && ext_wp_[j] == 1;
+                ++j;
+            }
+            const uint64_t len = (j - i) * kPageSize;
+            if (!registered) {
+                struct uffdio_register reg{};
+                reg.range.start = a0;
+                reg.range.len = len;
+                reg.mode = UFFDIO_REGISTER_MODE_WP;
+                if (ioctl(uffd_, UFFDIO_REGISTER, &reg) == 0)
+                    for (size_t k = i; k < j; ++k) ext_wp_[k] = 1;
+                // Unknown write history this tick either way.
+                markAll(i, j);
+                i = j;
+                continue;
+            }
+            uint64_t start = a0;
+            const uint64_t end = a0 + len;
+            while (start < end) {
+                struct pm_scan_arg a{};
+                a.size = sizeof(a);
+                a.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+                a.start = start;
+                a.end = end;
+                a.vec = reinterpret_cast<uintptr_t>(vec);
+                a.vec_len = kVec;
+                // Match pages that were written OR are not present. A
+                // never-touched page of a big reservation (mimalloc maps 1 GiB
+                // arenas MAP_NORESERVE) holds nothing to save; "compressing"
+                // it would only turn the app's first touch into a SIGSEGV +
+                // mprotect round trip. Both count as not-cold.
+                a.category_inverted = PAGE_IS_PRESENT;
+                a.category_anyof_mask = PAGE_IS_WRITTEN | PAGE_IS_PRESENT;
+                a.return_mask = PAGE_IS_WRITTEN | PAGE_IS_PRESENT;
+                const long n = ioctl(pagemap_fd_, PAGEMAP_SCAN, &a);
+                if (n < 0) {
+                    // Registration lost (range remapped / unmapped): re-register
+                    // next tick, count as written now.
+                    for (size_t k = i; k < j; ++k) ext_wp_[k] = 0;
+                    markAll(i, j);
+                    break;
+                }
+                for (long r = 0; r < n; ++r) {
+                    const size_t lo = i + (vec[r].start - a0) / kPageSize;
+                    const size_t hi = i + (vec[r].end - a0) / kPageSize;
+                    markAll(lo, hi < j ? hi : j);
+                }
+                if (a.walk_end <= start) break;
+                start = a.walk_end;
+            }
+            i = j;
+        }
+#else
+        (void)committed;
 #endif
     }
 
@@ -5119,7 +5221,11 @@ private:
                     sizeof(uint64_t);
                 uint64_t entry = 0;
                 ssize_t got = pread(pagemap_fd_, &entry, sizeof(entry), pfn_off);
-                if (got == sizeof(entry) && (entry & (1ULL << 55))) {
+                // Written (soft-dirty, bit 55) or neither present (63) nor
+                // swapped (62): a never-touched page of a reservation has
+                // nothing to compress (see scanExternalWritten).
+                if (got == sizeof(entry) &&
+                    ((entry & (1ULL << 55)) || !(entry & (3ULL << 62)))) {
                     accessed_[i].store(true, std::memory_order_relaxed);
                 }
             }
@@ -5517,7 +5623,7 @@ private:
             uintptr_t s = a & ~(uintptr_t)(kPageSize - 1);
             size_t len = (a + csz) - s;
             len = (len + kPageSize - 1) & ~(size_t)(kPageSize - 1);
-            (void)madvise(reinterpret_cast<void*>(s), len, MADV_PAGEOUT);
+            (void)vm::rawMadvise(reinterpret_cast<void*>(s), len, MADV_PAGEOUT);
         }
 #endif
         locks_->unlock(page_idx);
@@ -5572,7 +5678,11 @@ private:
         // Buffer of page indices in the current contiguous run we hold locks on.
         size_t run[kSweepCoalesceMax];
         size_t i = 0;
+        // Never-allocated contiguous pages [bump, contig) hold no pending bit;
+        // with external pages tracked, total spans them — skip the gap.
+        const size_t gap_lo = vm_->rawNextPage(), gap_hi = vm_->contigPages();
         while (i < total) {
+            if (i >= gap_lo && i < gap_hi) { i = gap_hi; continue; }
             // VMA budget: stop arming new PROT_NONE regions when near the cap.
             // Leave remaining pending pages for a later tick (no crash, no
             // livelock — they're still COMPRESSED and fault-decompress fine).
@@ -6912,6 +7022,7 @@ public:
         // Always allocate; sweeper short-circuits on the env knob anyway,
         // and unconditional init keeps pointer-null checks out of fault path.
         deferred_pending_ = bootstrapArray<std::atomic<bool>>(max_pages);
+        ext_wp_ = bootstrapArray<uint8_t>(max_pages);  // demand-zero; external pages only
         deferred_queue_tick_ = bootstrapArray<uint32_t>(max_pages);
 
         // Per-bucket recompression EMA table (kNumArenas × kNumClasses entries).
@@ -7625,6 +7736,19 @@ public:
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
         if (n > 0) (void)!write(2, buf, (size_t)n);
+        {
+            // External (SMASH_TRACK_EXTERNAL) pages: live tracked pages,
+            // how many are compressed now, slot high-water.
+            const size_t contig = self->vm_->contigPages();
+            size_t ext_c = 0;
+            for (size_t i = contig; i < total; ++i)
+                if (self->states_->get(i) == PageState::COMPRESSED) ++ext_c;
+            n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash stats] external live=%zu cpages=%zu slots_hw=%zu\n",
+                self->vm_->externalLivePages(), ext_c,
+                total > contig ? total - contig : size_t{0});
+            if (n > 0) (void)!write(2, buf, (size_t)n);
+        }
 
         // SMASH_BUCKET_STATS=1: dump per-(arena, size_class) stats
         static const bool bucket_stats = []{
@@ -9258,6 +9382,112 @@ public:
     }
 
     // Release any compressed data for a range of pages (called during span release)
+    // ── External-page lifecycle (SMASH_TRACK_EXTERNAL) ────────────────────
+    //
+    // An application (or a bundled allocator: jemalloc, mimalloc, CPython's
+    // obmalloc) keeps operating on memory smash has registered — and possibly
+    // compressed — with mmap/munmap/madvise/mprotect/mremap. The interposers
+    // call detachExternalRange BEFORE the real syscall so smash's view of each
+    // page is settled first:
+    //
+    //   kUnmap   munmap: free the blob, untrack, recycle the slot. (Before,
+    //            the blob leaked and the slot was never reused.)
+    //   kPurge   madvise(DONTNEED/FREE/REMOVE): the app is discarding the
+    //            contents. Free the blob and make a compressed page accessible
+    //            again so the app's madvise acts on it. Stays tracked (the
+    //            allocator will reuse the range). Without this, a later access
+    //            decompressed the STALE blob over a page the app had purged —
+    //            jemalloc treats DONTNEED'd extents as zeroed, so calloc
+    //            returned old data.
+    //   kRestore mprotect / mremap / MAP_FIXED-over: the app changes the
+    //            mapping itself. Put the real contents back (decompress via the
+    //            fault path), then untrack and recycle. Without this the app's
+    //            mprotect(PROT_READ) exposed a decommitted (zero) page, mremap
+    //            moved a PROT_NONE page whose blob was then orphaned, and an
+    //            app guard page (PROT_NONE) was compressed and came back zero.
+    //
+    // Returns the number of pages that were tracked. Runs on an application
+    // thread outside any signal handler; takes only per-page locks (and
+    // VmRegion's leaf track_lock_), so lock order matches handleFault.
+    enum class ExtDetach : uint8_t { kUnmap, kPurge, kRestore };
+
+    size_t detachExternalRange(uintptr_t start, uintptr_t end, ExtDetach mode) {
+        if (!vm_ || !states_ || !locks_) return 0;
+        const size_t contig = vm_->contigPages();
+        size_t n = 0;
+        for (uintptr_t p = start; p < end; p += kPageSize) {
+            size_t idx = vm_->pageIndex(p);
+            if (idx == 0 || idx < contig) continue;  // not an external page
+            if (detachExternalPage(p, idx, mode)) ++n;
+        }
+        return n;
+    }
+
+    bool detachExternalPage(uintptr_t addr, size_t idx, ExtDetach mode) {
+        for (;;) {
+            locks_->lock(idx);
+            if (vm_->pageIndex(addr) != idx) {  // concurrently untracked
+                locks_->unlock(idx);
+                return false;
+            }
+            const PageState st = states_->get(idx);
+            if (mode == ExtDetach::kRestore &&
+                (st == PageState::COMPRESSED || st == PageState::ACTIVE_MONITORING)) {
+                // Materialize through the ordinary fault path (decompress +
+                // restore PROT_RW), then re-check under the lock: the page
+                // cannot be recompressed in between without first going back
+                // through ACTIVE for kColdTicks.
+                locks_->unlock(idx);
+                handleFault(addr);
+#ifdef __linux__
+                if (states_->get(idx) == st) syscall(SYS_sched_yield);
+#endif
+                continue;
+            }
+            if (deferred_pending_)
+                deferred_pending_[idx].store(false, std::memory_order_release);
+            if ((st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW) &&
+                compressed_[idx].data)
+                releaseBlob(idx);
+            compressed_[idx] = {};
+            resetExternalPageMeta(idx);
+            if (mode == ExtDetach::kPurge) {
+                if (st == PageState::COMPRESSED) {
+                    // PROT_NONE, blob gone: make it accessible. If that fails
+                    // (VMA cap) the next access takes the ACTIVE fault path,
+                    // which restores PROT_RW; the app's madvise has dropped
+                    // the old bytes by then either way.
+                    (void)makeResidentPageWritable(idx, reinterpret_cast<void*>(addr));
+                }
+                if (st != PageState::ACTIVE_MONITORING && st != PageState::EMPTY)
+                    states_->set(idx, PageState::ACTIVE);
+                locks_->unlock(idx);
+                return true;
+            }
+            states_->set(idx, PageState::EMPTY);
+            vm_->untrackExternalPage(addr, /*recycle=*/true);
+            locks_->unlock(idx);
+            return true;
+        }
+    }
+
+    // Per-page history reset for an external slot that is being purged or
+    // recycled: the next contents (or the next page given this index) must
+    // not inherit the old page's coldness, thrash count or tier.
+    void resetExternalPageMeta(size_t i) {
+        if (page_tier_) page_tier_[i] = kTierNone;
+        if (shadow_tick_) shadow_tick_[i] = 0;
+        cold_count_[i] = 0;
+        recompress_count_[i] = 0;
+        compress_fail_count_[i] = 0;
+        accessed_[i].store(false, std::memory_order_relaxed);
+        if (restore_mark_) restore_mark_[i] = 0;
+        if (migrate_count_) migrate_count_[i] = 0;
+        if (probed_) probed_[i] = 0;
+        if (write_clean_streak_) write_clean_streak_[i] = 0;
+        if (ext_wp_) ext_wp_[i] = 0;
+    }
+
     void releaseCompressedPages(size_t start_page, size_t num_pages) {
         for (size_t i = start_page; i < start_page + num_pages; ++i) {
 #ifndef SMASH_TT_LOCKED_RELEASE

@@ -125,6 +125,14 @@ inline void* rawMmap(void* addr, size_t size, int prot, int flags) {
 inline int rawMunmap(void* addr, size_t size) {
     return static_cast<int>(syscall(SYS_munmap, addr, size));
 }
+// libsmash also exports madvise/mprotect (SMASH_TRACK_EXTERNAL lifecycle
+// hooks); smash's own calls must not re-enter them.
+inline int rawMadvise(void* addr, size_t size, int advice) {
+    return static_cast<int>(syscall(SYS_madvise, addr, size, advice));
+}
+inline int rawMprotect(void* addr, size_t size, int prot) {
+    return static_cast<int>(syscall(SYS_mprotect, addr, size, prot));
+}
 #elif !defined(_WIN32)
 // macOS: DYLD __interpose rewrites callers OUTSIDE the interposing image only;
 // libsmash's own calls to mmap/munmap are not self-interposed, so the libc
@@ -133,6 +141,8 @@ inline void* rawMmap(void* addr, size_t size, int prot, int flags) {
     return mmap(addr, size, prot, flags, -1, 0);
 }
 inline int rawMunmap(void* addr, size_t size) { return munmap(addr, size); }
+inline int rawMadvise(void* addr, size_t size, int advice) { return madvise(addr, size, advice); }
+inline int rawMprotect(void* addr, size_t size, int prot) { return mprotect(addr, size, prot); }
 #endif
 
 // Map anonymous private pages. Returns nullptr on failure.
@@ -167,7 +177,7 @@ inline bool commitPages(void* addr, size_t size) {
 #if defined(_WIN32)
     return VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 #else
-    return mprotect(addr, size, PROT_READ | PROT_WRITE) == 0;
+    return rawMprotect(addr, size, PROT_READ | PROT_WRITE) == 0;
 #endif
 }
 
@@ -225,7 +235,7 @@ inline void decommitPages(void* addr, size_t size) {
     // SMASH_MADV_FREE=1 selects the lazy path; default DONTNEED preserves the
     // current eager-reclaim RSS behavior.
     static const int madv = madvMode();
-    madvise(addr, size, madv);
+    rawMadvise(addr, size, madv);
 #elif defined(__APPLE__)
     // MADV_FREE_REUSABLE tells the kernel to reclaim physical backing immediately.
     // Must be called while pages are still accessible (PROT_READ or PROT_RW);
@@ -385,7 +395,7 @@ inline void unlockPages(void* addr, size_t size) {
 // just a strong keep-in-RAM signal.
 inline void willNeedPages(void* addr, size_t size) {
 #if !defined(_WIN32)
-    madvise(addr, size, MADV_WILLNEED);
+    rawMadvise(addr, size, MADV_WILLNEED);
 #endif
 }
 

@@ -22,6 +22,7 @@
 
 #include "smash_heap.h"
 #include "vm/syscall_compat.h"
+#include "external_track.h"
 
 #include <atomic>
 #include <dlfcn.h>
@@ -1126,109 +1127,48 @@ SMASH_VISIBLE ssize_t pwritev2_226(int fd, const struct iovec* iov, int iovcnt, 
     return pwritev2(fd, iov, iovcnt, offset, flags);
 }
 
-// ── External-mapping interposers (mmap / munmap) ────────────────────────────
+// ── External-mapping interposers (mmap / munmap / madvise / mprotect / mremap)
 //
-// Application-direct mmap calls (e.g., SpiderMonkey GC arenas, jemalloc
-// internal slabs in projects that bundle it) bypass smash's malloc and so
-// escape compression. Track MAP_ANONYMOUS + PROT_WRITE mappings via
-// VmRegion's external-page hash so the compressor's tick can see them.
-// File-backed and read-only mappings are explicitly skipped (the former
-// would break msync semantics under compression; the latter never need it).
+// Application-direct mmap calls (bundled jemalloc / mimalloc arenas, CPython
+// obmalloc arenas, FFmpeg frame pools) bypass smash's malloc and so escape
+// compression. With SMASH_TRACK_EXTERNAL=1, private anonymous RW mappings are
+// registered with VmRegion's external-page hash so the compressor's tick sees
+// them (policy: ext::eligibleMapping in external_track.h), and every later
+// call that changes such memory first settles smash's state for it
+// (ext::detachRange → CompressorThread::detachExternalRange).
 //
-// External tracking is OFF by default; set SMASH_TRACK_EXTERNAL=1 to
-// enable. Same opt-in polarity as the macOS path — see smash_heap.cpp
-// for the rationale (Firefox-on-macOS regression with the registration
-// path active).
-
-namespace {
-
-inline bool externalTrackingEnabledLinux() {
-    static const bool enabled = []{
-        const char* v = std::getenv("SMASH_TRACK_EXTERNAL");
-        return v && v[0] == '1';
-    }();
-    return enabled;
-}
-
-inline void registerLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {
-    if (!vm || !base || !len) return;
-    if (!externalTrackingEnabledLinux()) return;
-    // Profile-driven skip: if we already know external pages are hot from a
-    // prior run, skip the O(pages) registration loop entirely.
-    if (smash::g_smash_skip_external_tracking.load(std::memory_order_acquire)) return;
-    // Safety check: page_states must be initialized
-    if (!smash::g_smash_page_states_for_external) return;
-
-    size_t npages = (len + smash::kPageSize - 1) / smash::kPageSize;
-
-    // Oversized single mapping guard. A mapping larger than the entire
-    // external-page slot budget can never be fully tracked, and such mappings
-    // are invariably app-managed arenas (a DB buffer pool, a JVM/GC heap) that
-    // the application keeps warm — so compressing them is counterproductive
-    // AND the registration loop would burn O(slot-budget) work inside the
-    // caller's mmap() (observed wedging mariadbd startup for minutes on a
-    // 6 GiB InnoDB buffer pool). Skip the whole mapping rather than tracking a
-    // useless prefix. Logged once so the coverage gap is never silent.
-    if (npages > vm->externalSlotCapacity()) {
-        static std::atomic<bool> warned{false};
-        bool expected = false;
-        if (warned.compare_exchange_strong(expected, true,
-                                           std::memory_order_relaxed)) {
-            char buf[192];
-            int n = smash::safe_snprintf(buf, sizeof(buf),
-                "[smash] SMASH_TRACK_EXTERNAL: skipping mmap of %zu pages "
-                "(> %zu slot budget) at %p — likely an app-managed arena kept "
-                "warm; not compressible. Further such skips are silent.\n",
-                npages, vm->externalSlotCapacity(), base);
-            if (n > 0) (void)!::write(2, buf, (size_t)n);
-        }
-        return;
-    }
-
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
-    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
-               & ~(uintptr_t{smash::kPageSize} - 1);
-    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        size_t idx = vm->trackExternalPage(p);
-        if (idx == 0) continue;
-        smash::g_smash_page_states_for_external->set(idx, smash::PageState::ACTIVE);
-    }
-}
-
-inline void deregisterLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {
-    if (!vm || !base || !len) return;
-    if (!externalTrackingEnabledLinux()) return;
-    // Safety check: page_states must be initialized
-    if (!smash::g_smash_page_states_for_external) return;
-
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
-    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
-               & ~(uintptr_t{smash::kPageSize} - 1);
-    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        // Untrack UNDER the per-page lock so a compressor worker mid-snapshot on
-        // this external page can't race the real munmap (in the caller, AFTER
-        // this returns) and read an unmapped page. Proven necessary +
-        // deadlock-free by model/SmashExternalRace.{lean,tla}: no
-        // mprotect/munmap is performed while the per-page lock is held.
-        vm->untrackExternalPageLocked(p,
-            smash::g_smash_page_locks_for_external,
-            smash::g_smash_page_states_for_external);
-    }
-}
-
-}  // namespace
+// smash's own mmap/madvise/mprotect go through raw syscalls (platform_mem.h),
+// so none of these wrappers ever sees smash-internal memory.
 
 SMASH_VISIBLE void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     using fn_t = void*(*)(void*, size_t, int, int, int, off_t);
     SMASH_LAZY_RESOLVE(fn_t, mmap);
     if (!real_mmap) return MAP_FAILED;
-    void* ret = real_mmap(addr, len, prot, flags, fd, offset);
-    if (ret == MAP_FAILED) return ret;
-    bool anon = (flags & MAP_ANONYMOUS) != 0;
-    bool writable = (prot & PROT_WRITE) != 0;
-    if (!anon || !writable || len == 0) return ret;
     auto* vm = smash::g_smash_vm_region;
-    if (vm) registerLinuxExternalRange(vm, ret, len);
+    // MAP_FIXED replaces whatever was mapped there: settle tracked pages
+    // first. Restore (not discard): if the mmap fails, the old mapping may
+    // survive and must still hold its data.
+    if (vm && (flags & MAP_FIXED) && addr && len)
+        smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    void* ret = real_mmap(addr, len, prot, flags, fd, offset);
+    if (ret == MAP_FAILED || len == 0) return ret;
+    if (vm && smash::ext::eligibleMapping(prot, flags))
+        smash::ext::registerRange(vm, ret, len);
+    return ret;
+}
+
+// mmap64 is the LFS (Large File Support) version used internally by glibc
+SMASH_VISIBLE void* mmap64(void* addr, size_t len, int prot, int flags, int fd, off64_t offset) {
+    using fn_t = void*(*)(void*, size_t, int, int, int, off64_t);
+    SMASH_LAZY_RESOLVE(fn_t, mmap64);
+    if (!real_mmap64) return MAP_FAILED;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && (flags & MAP_FIXED) && addr && len)
+        smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    void* ret = real_mmap64(addr, len, prot, flags, fd, offset);
+    if (ret == MAP_FAILED || len == 0) return ret;
+    if (vm && smash::ext::eligibleMapping(prot, flags))
+        smash::ext::registerRange(vm, ret, len);
     return ret;
 }
 
@@ -1237,26 +1177,81 @@ SMASH_VISIBLE int munmap(void* addr, size_t len) {
     SMASH_LAZY_RESOLVE(fn_t, munmap);
     if (!real_munmap) return -1;
     auto* vm = smash::g_smash_vm_region;
-    if (vm && addr && len) deregisterLinuxExternalRange(vm, addr, len);
+    // Untrack + free blobs under the per-page lock BEFORE the real munmap, so
+    // a compressor worker mid-snapshot can't read an unmapped page
+    // (model/SmashExternalRace.{lean,tla}); no syscall runs under the lock.
+    if (vm && addr && len) smash::ext::detachRange(vm, addr, len, smash::ext::kUnmap);
     return real_munmap(addr, len);
 }
 
-// mmap64 is the LFS (Large File Support) version used internally by glibc
-SMASH_VISIBLE void* mmap64(void* addr, size_t len, int prot, int flags, int fd, off64_t offset) {
-    using fn_t = void*(*)(void*, size_t, int, int, int, off64_t);
-    SMASH_LAZY_RESOLVE(fn_t, mmap64);
-    if (!real_mmap64) return MAP_FAILED;
-    void* ret = real_mmap64(addr, len, prot, flags, fd, offset);
-    if (ret == MAP_FAILED) return ret;
-    bool anon = (flags & MAP_ANONYMOUS) != 0;
-    bool writable = (prot & PROT_WRITE) != 0;
-    if (!anon || !writable || len == 0) return ret;
+// sbrk / __sbrk: bundled allocators that grow the program break themselves
+// (gperftools tcmalloc's SbrkSysAllocator calls __sbrk) get private anonymous
+// RW heap. glibc malloc's own break growth is an internal call and never
+// reaches these wrappers.
+namespace {
+using sbrk_fn = void* (*)(intptr_t);
+void* trackedSbrk(sbrk_fn real, intptr_t inc) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm) registerLinuxExternalRange(vm, ret, len);
-    return ret;
+    if (vm && inc < 0) {
+        // Shrink: [brk+inc, brk) goes away. Drop smash's state first (same
+        // ordering as munmap, so no worker is mid-snapshot on it).
+        char* cur = static_cast<char*>(real(0));
+        if (cur != reinterpret_cast<char*>(-1))
+            smash::ext::detachRange(vm, cur + inc, static_cast<size_t>(-inc), smash::ext::kUnmap);
+    }
+    void* old = real(inc);
+    if (vm && inc > 0 && old != reinterpret_cast<void*>(-1))
+        smash::ext::registerRange(vm, old, static_cast<size_t>(inc));
+    return old;
+}
+}  // namespace
+
+SMASH_VISIBLE void* sbrk(intptr_t inc) {
+    using fn_t = void*(*)(intptr_t);
+    SMASH_LAZY_RESOLVE(fn_t, sbrk);
+    if (!real_sbrk) { errno = ENOMEM; return reinterpret_cast<void*>(-1); }
+    return trackedSbrk(real_sbrk, inc);
 }
 
-// mremap can grow/move mappings — track new range, untrack old if moved
+SMASH_VISIBLE void* __sbrk(intptr_t inc) {
+    using fn_t = void*(*)(intptr_t);
+    SMASH_LAZY_RESOLVE(fn_t, __sbrk);
+    if (!real___sbrk) { errno = ENOMEM; return reinterpret_cast<void*>(-1); }
+    return trackedSbrk(real___sbrk, inc);
+}
+
+// madvise: allocators purge freed extents with DONTNEED / FREE. Drop smash's
+// blob for those pages first, or a later access would decompress stale data
+// over memory the allocator believes is zero (jemalloc's calloc fast path).
+SMASH_VISIBLE int madvise(void* addr, size_t len, int advice) {
+    // Direct syscall (glibc's madvise is a bare syscall wrapper): no dlsym
+    // resolution window in which the call could fail.
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len && smash::ext::discardAdvice(advice))
+        smash::ext::detachRange(vm, addr, len, smash::ext::kPurge);
+    return static_cast<int>(syscall(SYS_madvise, addr, len, advice));
+}
+
+// mprotect: the app takes over the protection of these pages (guard pages,
+// read-only freezing, W^X). Put compressed contents back and untrack them,
+// then re-register if the range ends up plain RW again.
+SMASH_VISIBLE int mprotect(void* addr, size_t len, int prot) {
+    auto* vm = smash::g_smash_vm_region;
+    size_t tracked = 0;
+    if (vm && addr && len)
+        tracked = smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    int rc = static_cast<int>(syscall(SYS_mprotect, addr, len, prot));
+    // Only re-track a range that was wholly tracked before (so it is known
+    // private anonymous memory).
+    if (rc == 0 && tracked && prot == (PROT_READ | PROT_WRITE) &&
+        tracked == (smash::ext::pageUp(addr, len) - smash::ext::pageDown(addr)) / smash::kPageSize)
+        smash::ext::registerRange(vm, addr, len);
+    return rc;
+}
+
+// mremap can grow / shrink / move a mapping, carrying its (possibly PROT_NONE
+// compressed) pages along. Restore + untrack the old range first, re-register
+// the result.
 SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int flags, ...) {
     using fn_t = void*(*)(void*, size_t, size_t, int, ...);
     SMASH_LAZY_RESOLVE(fn_t, mremap);
@@ -1270,32 +1265,19 @@ SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int
         va_end(ap);
     }
 
-    void* ret;
-    if (flags & MREMAP_FIXED) {
-        ret = real_mremap(old_addr, old_size, new_size, flags, new_addr);
-    } else {
-        ret = real_mremap(old_addr, old_size, new_size, flags);
-    }
-
-    if (ret == MAP_FAILED) return ret;
-
     auto* vm = smash::g_smash_vm_region;
-    if (vm && externalTrackingEnabledLinux()) {
-        // If mapping moved (ret != old_addr), untrack old and track new
-        if (ret != old_addr) {
-            deregisterLinuxExternalRange(vm, old_addr, old_size);
-            registerLinuxExternalRange(vm, ret, new_size);
-        } else if (new_size > old_size) {
-            // Grew in place — track additional pages
-            registerLinuxExternalRange(vm,
-                reinterpret_cast<char*>(ret) + old_size,
-                new_size - old_size);
-        } else if (new_size < old_size) {
-            // Shrunk — untrack removed pages
-            deregisterLinuxExternalRange(vm,
-                reinterpret_cast<char*>(ret) + new_size,
-                old_size - new_size);
-        }
+    size_t tracked = 0;
+    if (vm && old_addr && old_size)
+        tracked = smash::ext::detachRange(vm, old_addr, old_size, smash::ext::kRestore);
+    if (vm && (flags & MREMAP_FIXED) && new_addr && new_size)
+        smash::ext::detachRange(vm, new_addr, new_size, smash::ext::kRestore);
+
+    void* ret = (flags & MREMAP_FIXED)
+        ? real_mremap(old_addr, old_size, new_size, flags, new_addr)
+        : real_mremap(old_addr, old_size, new_size, flags);
+    if (vm && tracked) {
+        if (ret != MAP_FAILED) smash::ext::registerRange(vm, ret, new_size);
+        else smash::ext::registerRange(vm, old_addr, old_size);  // unchanged
     }
     return ret;
 }

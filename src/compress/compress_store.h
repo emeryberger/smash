@@ -140,9 +140,9 @@ class CompressStore {
     void decommitStore(char* addr, size_t len) {
         if (pin_mode_ == PinMode::kMlock) vm::unlockPages(addr, len);
 #if defined(__linux__)
-        (void)madvise(addr, len, MADV_DONTNEED);
+        (void)vm::rawMadvise(addr, len, MADV_DONTNEED);
 #elif defined(__APPLE__)
-        (void)madvise(addr, len, MADV_FREE_REUSABLE);
+        (void)vm::rawMadvise(addr, len, MADV_FREE_REUSABLE);
 #else
         vm::decommitPages(addr, len);
 #endif

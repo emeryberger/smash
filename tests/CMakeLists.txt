@@ -208,6 +208,34 @@ set_tests_properties(test_external_mapping PROPERTIES
 # in issue #84 (self-interposition registered smash's own direct-mmap fallback
 # pages as external; free-path routing then poisoned the arena free list).
 
+# External-tracking allocator-pattern regressions: the mmap/madvise/mprotect/
+# mremap/fork/churn patterns bundled allocators (jemalloc, mimalloc), CPython
+# arenas and coroutine stacks apply to memory smash has registered and
+# compressed. One executable, run in BOTH malloc modes (external tracking is
+# independent of SMASH_LARGE_ONLY).
+add_executable(external_patterns_test external_patterns_test.cpp)
+set_target_properties(external_patterns_test PROPERTIES CXX_STANDARD 20)
+function(add_external_patterns_test test_name large_only)
+  if(APPLE)
+    set(_preload "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_preload "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(
+    NAME ${test_name}
+    COMMAND ${CMAKE_COMMAND} -E env
+      ${_preload}
+      "SMASH_LARGE_ONLY=${large_only}"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_TRACK_EXTERNAL=1"
+      $<TARGET_FILE:external_patterns_test>
+  )
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+endfunction()
+add_external_patterns_test(test_external_patterns 0)             # full mode
+add_external_patterns_test(test_external_patterns_large_only 1)  # large-only
+
 # Mode compression test: ONE executable (mode_compression_test.cpp), run twice
 # with SMASH_LARGE_ONLY={0,1}, so FULL mode (test_malloc_compression) and
 # LARGE-ONLY mode (test_large_only_compression) execute byte-identical

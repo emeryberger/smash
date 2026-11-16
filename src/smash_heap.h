@@ -79,6 +79,12 @@ extern PageStateTable* g_smash_page_states_for_external;
 // see model/SmashExternalRace.{lean,tla}). Same lifetime as the above.
 extern PageLockTable* g_smash_page_locks_for_external;
 
+// Detach hook into the compressor (CompressorThread::detachExternalRange) for
+// the external-mapping interposers (src/external_track.h); mode is a
+// CompressorThread::ExtDetach. Published with the globals above.
+using ExternalDetachFn = size_t (*)(uintptr_t start, uintptr_t end, int mode);
+extern std::atomic<ExternalDetachFn> g_smash_external_detach;
+
 // Profile-driven skip flag for external page tracking. Set by the
 // compressor when loading a profile that marks external pages as hot.
 // When true, mmap interposers skip the per-page tracking loop entirely,
@@ -1159,6 +1165,8 @@ private:
     std::atomic<bool> compression_started_{false};
     std::atomic<int> warmup_count_{0};
 
+    static inline SmashHeap* s_external_self_ = nullptr;
+
     // Fault callback: decompress on access to compressed/monitored pages
     static bool faultCallback(uintptr_t fault_addr, void* ctx) {
         auto* self = static_cast<SmashHeap*>(ctx);
@@ -1402,6 +1410,13 @@ public:
             // interposers can serialize external-page untracking against a
             // compressor worker's snapshot read (full-mode external-page race).
             g_smash_page_locks_for_external = &page_locks_;
+            s_external_self_ = this;
+            g_smash_external_detach.store(
+                +[](uintptr_t start, uintptr_t end, int mode) -> size_t {
+                    return s_external_self_->compressor_.detachExternalRange(
+                        start, end, static_cast<CompressorThread::ExtDetach>(mode));
+                },
+                std::memory_order_release);
 
             // When external mmap tracking is active (SMASH_TRACK_EXTERNAL=1),
             // tracked pages live at addresses OUTSIDE the contiguous arena, so

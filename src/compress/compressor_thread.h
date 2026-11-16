@@ -699,7 +699,15 @@ class CompressorThread {
     void uffdInit() {}
     void uffdPrepareFork() {}
 #endif
-    long vmaCountNow() const { return uffd_mode_ ? 1 : readVmaCount(); }
+    // uffd mode never splits arena VMAs, so it skips the /proc scan — but
+    // EXTERNAL pages always take the classic mprotect path, which splits
+    // their VMAs. With external pages tracked the VMA guard must see the
+    // real count: a scattered PROT_NONE pattern over a 1 GiB mimalloc arena
+    // ran into vm.max_map_count, the PROT_NONE mprotect failed with ENOMEM,
+    // and the page lost its contents while still accessible.
+    long vmaCountNow() const {
+        return (uffd_mode_ && vm_->externalLivePages() == 0) ? 1 : readVmaCount();
+    }
 
     bool read_check_ = true;
     uint32_t read_check_ticks_ = 1;  // SMASH_READ_CHECK_TICKS: unread ticks after arming
@@ -4275,23 +4283,28 @@ private:
                 // the memcmp and now would have faulted (handler discards
                 // blob and sets ACTIVE). Safe to reclaim.
                 (void)uf;
-                if (uffd_mode_ && i < vm_->contigPages()) prot_none_[i] = 1;  // classic drop
-                if (fixavEnabled()) {
-                    // FixAv: PROT_NONE → membarrier → madvise so a remote
-                    // reader can never observe a DROPPED+RO page (the
-                    // mprotect IPI shoots down the TLB; any post-madvise
-                    // access faults visibly and the handler decompresses).
-                    vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
+                // PROT_NONE first and CHECK it: if the mprotect fails (VMA
+                // cap, ENOMEM) the page is still readable, and decommitting
+                // it would hand the app a zero page. Keep the data instead.
+                if (!vm::protectPages(page_addr, kPageSize, false, false)) {  // PROT_NONE
+                    releaseBlob(i);
+                    compressed_[i] = {};
                     shadow_tick_[i] = 0;
-                    states_->set(i, PageState::COMPRESSED);
-                    membarrierSyncCore();
-                    vm::decommitPages(page_addr, kPageSize);
-                } else {
-                    vm::decommitPages(page_addr, kPageSize);
-                    vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
-                    shadow_tick_[i] = 0;
-                    states_->set(i, PageState::COMPRESSED);
+                    if (page_tier_) page_tier_[i] = kTierNone;
+                    vm::protectPages(page_addr, kPageSize, true, true);
+                    states_->set(i, PageState::ACTIVE);
+                    locks_->unlock(i);
+                    continue;
                 }
+                if (uffd_mode_ && i < vm_->contigPages()) prot_none_[i] = 1;  // classic drop
+                shadow_tick_[i] = 0;
+                states_->set(i, PageState::COMPRESSED);
+                // FixAv: PROT_NONE → membarrier → madvise so a remote reader
+                // can never observe a DROPPED+RO page (the mprotect IPI shoots
+                // down the TLB; any post-madvise access faults visibly and the
+                // handler decompresses).
+                if (fixavEnabled()) membarrierSyncCore();
+                vm::decommitPages(page_addr, kPageSize);
                 locks_->unlock(i);
                 // Charge this reclaim against the VMA budget. The PROT_NONE
                 // above splits ~1 VMA; resync to the real count periodically

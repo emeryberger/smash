@@ -35,6 +35,8 @@
 //              inaccessible; the touched part compresses.
 //   thp        a MADV_HUGEPAGE region compresses, round-trips, and a partial
 //              DONTNEED of it reads back zero.
+//   vmacap     near vm.max_map_count, aging external pages never lose data
+//              (Linux; the classic PROT_NONE path splits VMAs).
 //   churn      after mapping/unmapping more pages than the external slot
 //              budget (CPython arena churn), a fresh mapping is still tracked
 //              and compressed.
@@ -465,6 +467,71 @@ bool testThp() {
 }
 #endif
 
+#ifdef __linux__
+long readLongFile(const char* path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char b[64];
+    ssize_t n = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    b[n] = 0;
+    return strtol(b, nullptr, 10);
+}
+long vmaCount() {
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    long n = 0;
+    static char b[65536];
+    ssize_t r;
+    while ((r = read(fd, b, sizeof(b))) > 0)
+        for (ssize_t k = 0; k < r; ++k) n += b[k] == '\n';
+    close(fd);
+    return n;
+}
+
+// External pages always take the classic mprotect path, which splits VMAs.
+// Near vm.max_map_count a PROT_NONE mprotect fails with ENOMEM; the reclaim
+// then decommitted the still-readable page and the app read zeros (seen on a
+// 1 GiB mimalloc arena in uffd mode, where the VMA guard assumed no splits).
+// Use up VMAs to just below the cap, then let a region with alternating
+// hot/cold pages age: every page must keep its data.
+bool testVmaCap() {
+    const long cap = readLongFile("/proc/sys/vm/max_map_count");
+    if (cap <= 0 || cap > (1L << 20)) {
+        fprintf(stderr, "external_patterns_test: vmacap SKIPPED (max_map_count=%ld)\n", cap);
+        return true;
+    }
+    constexpr long kHeadroom = 3000;
+    const long need = cap - kHeadroom - vmaCount();
+    char* filler = nullptr;
+    size_t filler_len = 0;
+    if (need > 0) {
+        filler_len = static_cast<size_t>(need + 2) * g_page;
+        filler = static_cast<char*>(mmap(nullptr, filler_len, PROT_NONE,
+                                         MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0));
+        if (filler == MAP_FAILED) FAIL("[vmacap]: filler mmap errno=%d", errno);
+        for (long k = 0; k < need; k += 2)
+            if (mprotect(filler + k * g_page, g_page, PROT_READ) != 0) break;
+    }
+    constexpr size_t kRegion = 32 * 1024 * 1024;
+    char* p = static_cast<char*>(mapAnon(kRegion));
+    fill(p, kRegion, 16);
+    const size_t pages = kRegion / g_page;
+    double t0 = nowSec();
+    while (nowSec() - t0 < 6) {  // keep odd pages hot, let even pages age
+        for (size_t i = 1; i < pages; i += 2) p[i * g_page] = static_cast<char>(((i + 16) & 0xff) | 1);
+        usleep(100 * 1000);
+    }
+    size_t bad = check(p, kRegion, 16);
+    if (filler) munmap(filler, filler_len);
+    if (bad != SIZE_MAX) FAIL("[vmacap]: page %zu lost its data near vm.max_map_count", bad);
+    munmap(p, kRegion);
+    fprintf(stderr, "external_patterns_test: vmacap PASSED\n");
+    return true;
+}
+#endif
+
 // MAP_SHARED|MAP_ANON memory is shared with forked children (PostgreSQL
 // shared buffers, multiprocessing). It must never be compressed: a blob in
 // the parent is stale as soon as the child writes, and decompressing it would
@@ -528,6 +595,7 @@ int main(int argc, char** argv) {
 #ifdef __linux__
     if (want("sbrk") && !testSbrk()) return 1;
     if (want("ucstack") && !testCoroutineStack()) return 1;
+    if (want("vmacap") && !testVmaCap()) return 1;
 #endif
     if (want("churn") && !testChurn()) return 1;
     if (g_failures) return 1;

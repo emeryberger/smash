@@ -338,8 +338,8 @@ struct ProfileSetting {
 inline constexpr ProfileSetting kProfileSettings[] = {
     // Idle seconds before a page may be compressed (built-in: 10).
     {"SMASH_COLD_TIMEOUT_SEC", "30", "2"},
-    // ROI cutoff, byte-seconds saved per us of codec CPU (built-in: 1024).
-    {"SMASH_ROI_THRESHOLD", "4096", "256"},
+    // Resident empty-span budget, MB (built-in: RAM/32 clamped to 64..1024).
+    {"SMASH_EMPTY_RESIDENT_MB", nullptr, "64"},
     // Trim the compressed store between ticks once N MB died (built-in: off).
     {"SMASH_PROMPT_TRIM_MB", nullptr, "8"},
     // Compressor threads at SCHED_IDLE (Linux; built-in: normal priority).

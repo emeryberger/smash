@@ -449,8 +449,9 @@ set_tests_properties(test_syscall_efault PROPERTIES TIMEOUT 180)
 
 # SMASH_PROFILE resolution: one binary, run per environment; argv carries the
 # expected cold floor (ticks), whether it counts as an explicit override (which
-# bypasses the ROI gate), the ROI threshold, SMASH_PROMPT_TRIM_MB and
-# SMASH_COMPRESSOR_IDLE ("-" = not set). balanced must equal unset.
+# bypasses the ROI gate), the ROI threshold, SMASH_PROMPT_TRIM_MB,
+# SMASH_COMPRESSOR_IDLE and SMASH_EMPTY_RESIDENT_MB ("-" = not set). balanced
+# must equal unset.
 add_executable(test_profile test_profile.cpp ${printf_SOURCE_DIR}/printf.cpp)
 target_include_directories(test_profile PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
 target_link_libraries(test_profile PRIVATE alloc8::headers lz4_static libzstd_static)
@@ -458,14 +459,14 @@ function(add_profile_test name env)
   add_test(NAME ${name} COMMAND test_profile ${ARGN})
   set_tests_properties(${name} PROPERTIES ENVIRONMENT "SMASH_CALIBRATE=never;${env}")
 endfunction()
-add_profile_test(test_profile_unset "SMASH_PROFILE_UNUSED=1" 10 0 1024 - -)
-add_profile_test(test_profile_balanced "SMASH_PROFILE=balanced" 10 0 1024 - -)
-add_profile_test(test_profile_latency "SMASH_PROFILE=latency" 30 0 4096 - 1)
-add_profile_test(test_profile_memory "SMASH_PROFILE=memory" 2 0 256 8 -)
+add_profile_test(test_profile_unset "SMASH_PROFILE_UNUSED=1" 10 0 1024 - - -)
+add_profile_test(test_profile_balanced "SMASH_PROFILE=balanced" 10 0 1024 - - -)
+add_profile_test(test_profile_latency "SMASH_PROFILE=latency" 30 0 1024 - 1 -)
+add_profile_test(test_profile_memory "SMASH_PROFILE=memory" 2 0 1024 8 - 64)
 add_profile_test(test_profile_explicit_wins
   "SMASH_PROFILE=memory;SMASH_COLD_TIMEOUT_SEC=5;SMASH_ROI_THRESHOLD=777;SMASH_PROMPT_TRIM_MB=0"
-  5 1 777 0 -)
-add_profile_test(test_profile_cold_ticks_wins "SMASH_PROFILE=latency;SMASH_COLD_TICKS=3" 3 1 4096 - 1)
+  5 1 777 0 - 64)
+add_profile_test(test_profile_cold_ticks_wins "SMASH_PROFILE=latency;SMASH_COLD_TICKS=3" 3 1 1024 - 1 -)
 
 # SMASH_REPORT + SMASH_METRICS_FILE end to end, both modes: report_test
 # compresses, faults back and exits; check_report.sh asserts on the report

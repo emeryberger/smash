@@ -2,7 +2,7 @@
 // different environments (tests/CMakeLists.txt) and passes the expected
 // effective values on the command line:
 //   test_profile <cold_floor_ticks> <cold_overridden 0|1> <roi_threshold>
-//                <prompt_trim_mb or -> <compressor_idle or ->
+//                <prompt_trim_mb or -> <compressor_idle or -> <empty_resident_mb or ->
 // Checks that a profile supplies its values, that an explicit expert variable
 // beats the profile, and that balanced / unset changes nothing.
 #include "smash/config.h"
@@ -21,11 +21,13 @@ static bool sameOpt(const char* got, const char* want) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 6) { std::fprintf(stderr, "usage: see source\n"); return 2; }
+    if (argc != 7) { std::fprintf(stderr, "usage: see source\n"); return 2; }
 
     // Table invariants (independent of the environment).
     CHECK(profileDefault(SmashProfile::Balanced, "SMASH_COLD_TIMEOUT_SEC") == nullptr);
-    CHECK(profileDefault(SmashProfile::Balanced, "SMASH_ROI_THRESHOLD") == nullptr);
+    CHECK(profileDefault(SmashProfile::Balanced, "SMASH_PROMPT_TRIM_MB") == nullptr);
+    // The ROI threshold is deliberately not profile-covered (agents/env-vars.md).
+    CHECK(profileDefault(SmashProfile::Memory, "SMASH_ROI_THRESHOLD") == nullptr);
     CHECK(profileDefault(SmashProfile::Latency, "SMASH_NOT_A_KNOB") == nullptr);
     CHECK(parseSmashProfile("latency") == SmashProfile::Latency);
     CHECK(parseSmashProfile("memory") == SmashProfile::Memory);
@@ -50,6 +52,7 @@ int main(int argc, char** argv) {
     CHECK(cfg.roi_threshold == want_roi);
     CHECK(sameOpt(envOrProfile("SMASH_PROMPT_TRIM_MB"), argv[4]));
     CHECK(sameOpt(envOrProfile("SMASH_COMPRESSOR_IDLE"), argv[5]));
+    CHECK(sameOpt(envOrProfile("SMASH_EMPTY_RESIDENT_MB"), argv[6]));
     // getColdTicks (cooling-close, telemetry) agrees with the ROI floor
     // unless SMASH_COLD_TICKS is what set it (it only reads the timeout).
     if (!std::getenv("SMASH_COLD_TICKS")) CHECK(getColdTicks() == static_cast<int>(want_floor));

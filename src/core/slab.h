@@ -259,7 +259,7 @@ class Slab {
     // kResidentEmptyTicks ticks while another class grows.
     // SMASH_EMPTY_RESIDENT_MB=N overrides it (0 = decommit at once).
     static size_t residentEmptyMaxBytesInit() {
-        if (const char* e = std::getenv("SMASH_EMPTY_RESIDENT_MB"))
+        if (const char* e = envOrProfile("SMASH_EMPTY_RESIDENT_MB"))
             return static_cast<size_t>(std::atol(e)) << 20;
         long pages = sysconf(_SC_PHYS_PAGES);
         long psz = sysconf(_SC_PAGESIZE);

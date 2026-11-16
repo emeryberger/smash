@@ -22,6 +22,26 @@ smash leaves a page alone until it has gone **10 seconds** without being touched
 
 On macOS, a downloaded dylib needs its quarantine flag cleared first (`xattr -d com.apple.quarantine libsmash-macos-arm64.dylib`). macOS also strips `DYLD_*` variables from SIP-protected system binaries, so smash applies to your own programs, not to `/bin` tools or `/usr/bin/python3`; `smash run` warns when that happens.
 
+## Will smash help me?
+
+Find out without risk before running it for real:
+
+- **`smash-estimate <pid>`** (Linux, built with smash): attaches to a running process, no preload and
+  no restart. It watches which anonymous pages stay idle for a window (default 10 s), compresses a
+  sample of them the way smash would, and prints the projected RSS reduction with a confidence
+  interval, per mapping, with notes on which memory smash manages. It never writes the target's
+  memory. Reading page contents needs ptrace access (root, or launch the program through it:
+  `smash-estimate -- ./your_server`).
+- **`SMASH_MODE=observe`**: run with smash preloaded in dry-run mode. Cold detection and
+  compression run as usual, but every compressed result is thrown away: no page is ever
+  unmapped, protected against reads, or changed. It reports projected savings, the compression
+  ratio histogram and an estimated refault rate on stderr (and as JSON with
+  `SMASH_OBSERVE_REPORT=path`). It still uses smash's allocator, so add `SMASH_LARGE_ONLY=1` for the
+  most conservative run.
+
+Both overestimated the measured reduction on our SQLite benchmark (by 6.6 and 10.8 points); see
+[agents/estimator.md](agents/estimator.md) for what they do and don't capture.
+
 ## What it does for real servers
 
 Each workload fills its data, sits idle, then serves queries that touch only the newest 5% of the data. Out-of-the-box smash compared with glibc `malloc` and jemalloc, median of 3 runs:
@@ -80,6 +100,7 @@ Everything below is optional; the defaults are what the results above use.
 | `SMASH_LARGE_ONLY=1` (`--large-only`) | Only manage allocations over 16 KB and pass small ones to the system allocator. For runtimes with their own small-object allocator, such as Python 3.13+. |
 | `SMASH_REPORT=1\|path` (`--report`) | Print a summary at exit. |
 | `SMASH_METRICS_FILE=path` (`--metrics`) | Keep a Prometheus-format metrics file up to date (every 10 s), for node_exporter's textfile collector. No network port is opened. |
+| `SMASH_MODE=observe` | Dry run: detect and compress cold pages but discard the result, reporting projected savings instead (`SMASH_OBSERVE_REPORT=path` for JSON, `SMASH_OBSERVE_INTERVAL=N` seconds between reports). See "Will smash help me?" above. |
 | `SMASH_MODE=compress_only` | Don't replace `malloc` at all; just compress cold heap pages, whichever allocator owns them. For programs linked against jemalloc or tcmalloc. |
 
 Every other variable (tuning, compatibility and diagnostics) is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).

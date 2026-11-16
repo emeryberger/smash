@@ -129,8 +129,8 @@ Options parse(int argc, char** argv) {
 enum Class { kHeap, kArena, kAnon, kStack, kNumClass };
 const char* kClassName[kNumClass] = {"heap", "malloc-arena", "anon-mmap", "stack"};
 const char* kClassNote[kNumClass] = {
-    "brk heap (glibc small allocations): managed in full mode; large-only mode manages only "
-    "allocations >= 1 MiB",
+    "brk heap (glibc small allocations): managed in full mode; large-only mode only manages "
+    "allocations >= 1 MiB (rare here)",
     "glibc thread arena (small allocations): managed in full mode only",
     "anonymous mmap: managed if these are malloc allocations >= 1 MiB (both modes); direct mmaps "
     "need SMASH_TRACK_EXTERNAL=1",
@@ -257,8 +257,9 @@ bool readSmaps(pid_t pid, std::vector<Mapping>& maps, int point) {
         const char* l = txt.c_str() + pos;
         unsigned long s, e;
         if (sscanf(l, "%lx-%lx ", &s, &e) == 2 && strchr(std::string(l, nl - pos).c_str(), ' ')) {
+            // Match on start only: a growing brk heap keeps its start.
             auto it = by.find(s);
-            cur = (it != by.end() && it->second->end == e) ? it->second : nullptr;
+            cur = it != by.end() ? it->second : nullptr;
         } else if (cur) {
             unsigned long kb;
             if (point < 0 && sscanf(l, "Rss: %lu kB", &kb) == 1) cur->rss_kb = kb;
@@ -517,6 +518,7 @@ int main(int argc, char** argv) {
         int mappings = 0;
     } agg[kNumClass];
     for (auto& a : agg) a.idle_at.assign(static_cast<size_t>(o.points), 0);
+    int n_polluted = 0;
     for (auto& m : maps) {
         auto& a = agg[m.cls];
         const double anon_b = static_cast<double>(m.anon_kb) * 1024;
@@ -536,6 +538,25 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < o.points; ++k)
                     if (m.first_hot[j] > k) idle_k[k] += static_cast<double>(g_page);
                 if (m.first_hot[j] == 255) mc.push_back({&m, j});
+            }
+            // A VMA that changed during the window (brk growth, mremap, a
+            // neighbouring mprotect) gets VM_SOFTDIRTY and pagemap then reports
+            // EVERY page in it dirty. Written pages are a subset of referenced
+            // ones, so more dirty bytes than referenced bytes means the bits
+            // are polluted: fall back to Referenced for this mapping.
+            bool polluted = false;
+            if (method == "soft-dirty" && can_clear) {
+                double live = 0;
+                for (size_t j = 0; j < m.pages.size(); ++j) if (!m.gone[j]) live += static_cast<double>(g_page);
+                const double dirty = live - idle_k.back();
+                const double ref = live - std::min(live, unref.back());
+                polluted = dirty > ref + std::max(4.0 * static_cast<double>(g_page), 0.05 * live);
+                if (polluted) {
+                    ++n_polluted;
+                    idle_k.assign(idle_k.size(), live);
+                    mc.clear();
+                    for (size_t j = 0; j < m.pages.size(); ++j) if (!m.gone[j]) mc.push_back({&m, j});
+                }
             }
             double last = 0;
             for (int k = 0; k < o.points; ++k) {
@@ -575,6 +596,9 @@ int main(int argc, char** argv) {
         a.idle = a.idle_at.back();
     }
 
+    if (n_polluted)
+        notes.push_back(std::to_string(n_polluted) + " mapping(s) changed during the window (soft-dirty "
+                        "reports every page of a changed VMA dirty); used smaps Referenced for them");
     // ── sample idle pages and compress ─────────────────────────────────
     double total_cand = 0;
     for (auto& a : agg) total_cand += static_cast<double>(a.cand.size());

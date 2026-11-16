@@ -469,3 +469,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash-idled PRIVATE Threads::Threads)
 endif()
 
+# ── Launcher + install ───────────────────────────────────────────────────────
+# bin/smash (POSIX sh) finds libsmash at ../lib (installed) or ../ (build tree:
+# build/bin/smash -> build/libsmash.*). Install layout: ${prefix}/bin/smash and
+# ${prefix}/lib/libsmash.{so,dylib} — packaging depends on these exact paths.
+set(SMASH_VERSION "${PROJECT_VERSION}")
+configure_file(bin/smash.in ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen @ONLY)
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/bin
+     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                      GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+file(RENAME ${CMAKE_CURRENT_BINARY_DIR}/bin/smash-launcher.gen
+     ${CMAKE_CURRENT_BINARY_DIR}/bin/smash)
+install(TARGETS smash LIBRARY DESTINATION lib)
+install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/smash DESTINATION bin)

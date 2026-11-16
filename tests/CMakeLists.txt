@@ -485,3 +485,20 @@ foreach(lo 0 1)
   set_tests_properties(${_name} PROPERTIES TIMEOUT 90)
 endforeach()
 
+# bin/smash launcher, both modes: library discovery relative to the script,
+# preload, --report/--large-only/--profile, `smash stats` refusal and
+# --stats-signal delivery, and the macOS SIP warning.
+add_executable(launcher_test launcher_test.cpp)
+set_target_properties(launcher_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(launcher_test PRIVATE ${CMAKE_DL_LIBS})
+foreach(lo 0 1)
+  set(_name test_launcher)
+  if(lo)
+    set(_name test_launcher_large_only)
+  endif()
+  add_test(NAME ${_name}
+    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/check_launcher.sh
+      ${CMAKE_BINARY_DIR}/bin/smash $<TARGET_FILE:launcher_test> ${lo}
+      ${CMAKE_CURRENT_BINARY_DIR}/${_name}.d)
+  set_tests_properties(${_name} PROPERTIES TIMEOUT 60)
+endforeach()

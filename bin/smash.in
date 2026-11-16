@@ -1,0 +1,288 @@
+#!/bin/sh
+# smash - run a program with the smash compressing allocator preloaded.
+#
+#   smash run [options] [--] command [args...]
+#   smash version | doctor | stats <pid> | help
+#
+# Installed to ${prefix}/bin/smash; finds libsmash in ${prefix}/lib (or next
+# to the build tree's bin/), or wherever SMASH_LIB points. POSIX sh only.
+
+SMASH_LAUNCHER_VERSION="@SMASH_VERSION@"
+
+case "$(uname -s)" in
+    Darwin) os=darwin; libname=libsmash.dylib; preload_var=DYLD_INSERT_LIBRARIES ;;
+    *)      os=linux;  libname=libsmash.so;    preload_var=LD_PRELOAD ;;
+esac
+
+die() { echo "smash: $*" >&2; exit 2; }
+warn() { echo "smash: warning: $*" >&2; }
+
+# Directory of this script, with symlinks resolved (no readlink -f: not on
+# older macOS).
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case "$link" in
+        /*) self=$link ;;
+        *)  self=$(dirname "$self")/$link ;;
+    esac
+done
+here=$(cd "$(dirname "$self")" 2>/dev/null && pwd)
+
+find_lib() {
+    if [ -n "${SMASH_LIB:-}" ]; then
+        [ -f "$SMASH_LIB" ] || die "SMASH_LIB=$SMASH_LIB does not exist"
+        echo "$SMASH_LIB"; return 0
+    fi
+    for cand in "$here/../lib/$libname" "$here/../$libname" "$here/$libname"; do
+        if [ -f "$cand" ]; then
+            (cd "$(dirname "$cand")" && echo "$(pwd)/$libname"); return 0
+        fi
+    done
+    return 1
+}
+
+need_lib() {
+    lib=$(find_lib) || die "cannot find $libname (looked in $here/../lib and $here/..); set SMASH_LIB=/path/to/$libname"
+}
+
+usage() {
+    cat <<EOF
+usage: smash run [options] [--] command [args...]
+       smash version
+       smash doctor
+       smash stats <pid>
+
+run options:
+  --large-only        only manage allocations > 16 KiB (SMASH_LARGE_ONLY=1)
+  --profile P         latency | balanced | memory (SMASH_PROFILE)
+  --report[=PATH]     print a summary at exit (SMASH_REPORT; default stderr,
+                      %p in PATH expands to the pid)
+  --metrics PATH      write Prometheus metrics to PATH every 10 s
+                      (SMASH_METRICS_FILE)
+  --stats-signal      let 'smash stats <pid>' request a stats line via SIGUSR2
+                      (SMASH_STATS_SIGNAL=1)
+  --lib PATH          use this libsmash instead of the one next to smash
+
+Any other SMASH_* variable in the environment is passed through unchanged.
+EOF
+}
+
+# macOS strips DYLD_* variables when exec'ing SIP-protected binaries.
+sip_protected() {
+    case "$1" in
+        /usr/local/*|/usr/local) return 1 ;;
+        /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/usr/libexec/*|/System/*|/usr/lib/*) return 0 ;;
+    esac
+    return 1
+}
+
+sip_check() {
+    [ "$os" = darwin ] || return 0
+    target=$1
+    case "$target" in
+        */*) path=$target ;;
+        *)   path=$(command -v "$target" 2>/dev/null) || return 0 ;;
+    esac
+    case "$path" in /*) ;; *) return 0 ;; esac
+    if sip_protected "$path"; then
+        warn "$path is a SIP-protected system binary; macOS strips $preload_var"
+        warn "before it runs, so smash will NOT be loaded. Use a non-system build"
+        warn "(e.g. Homebrew's python3 instead of /usr/bin/python3)."
+        return 0
+    fi
+    # A script whose interpreter is protected (#!/usr/bin/env, #!/bin/sh, ...)
+    # loses the variable at the interpreter's exec.
+    if [ -f "$path" ] && [ -r "$path" ]; then
+        first=$(head -c 2 "$path" 2>/dev/null)
+        if [ "$first" = "#!" ]; then
+            interp=$(head -n 1 "$path" | sed 's/^#![[:space:]]*//; s/[[:space:]].*//')
+            if sip_protected "$interp"; then
+                warn "$path is a script run by $interp, a SIP-protected binary;"
+                warn "macOS strips $preload_var there, so smash will NOT be loaded."
+                warn "Run the script with a non-system interpreter directly, e.g."
+                warn "  smash run -- /opt/homebrew/bin/python3 $path"
+            fi
+        fi
+    fi
+}
+
+cmd_run() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --large-only) SMASH_LARGE_ONLY=1; export SMASH_LARGE_ONLY ;;
+            --profile) [ $# -ge 2 ] || die "--profile needs a value"; shift
+                       SMASH_PROFILE=$1; export SMASH_PROFILE ;;
+            --profile=*) SMASH_PROFILE=${1#--profile=}; export SMASH_PROFILE ;;
+            --report) SMASH_REPORT=1; export SMASH_REPORT ;;
+            --report=*) SMASH_REPORT=${1#--report=}; export SMASH_REPORT ;;
+            --metrics) [ $# -ge 2 ] || die "--metrics needs a path"; shift
+                       SMASH_METRICS_FILE=$1; export SMASH_METRICS_FILE ;;
+            --metrics=*) SMASH_METRICS_FILE=${1#--metrics=}; export SMASH_METRICS_FILE ;;
+            --stats-signal) SMASH_STATS_SIGNAL=1; export SMASH_STATS_SIGNAL ;;
+            --lib) [ $# -ge 2 ] || die "--lib needs a path"; shift; SMASH_LIB=$1 ;;
+            --lib=*) SMASH_LIB=${1#--lib=} ;;
+            -h|--help) usage; exit 0 ;;
+            --) shift; break ;;
+            -*) die "unknown option $1 (see 'smash help')" ;;
+            *) break ;;
+        esac
+        shift
+    done
+    [ $# -gt 0 ] || die "no command given (usage: smash run [options] -- command args...)"
+    case "${SMASH_PROFILE:-balanced}" in
+        latency|balanced|memory) ;;
+        *) die "unknown profile '$SMASH_PROFILE' (latency | balanced | memory)" ;;
+    esac
+    need_lib
+    if [ "$os" = darwin ]; then
+        sip_check "$1"
+        DYLD_INSERT_LIBRARIES=$lib${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}
+        export DYLD_INSERT_LIBRARIES
+    else
+        LD_PRELOAD=$lib${LD_PRELOAD:+:$LD_PRELOAD}
+        export LD_PRELOAD
+    fi
+    exec "$@"
+}
+
+cmd_version() {
+    echo "smash $SMASH_LAUNCHER_VERSION"
+    if l=$(find_lib); then echo "library: $l"; else echo "library: not found (set SMASH_LIB)"; fi
+}
+
+ok()   { printf '  [ok]   %s\n' "$*"; }
+bad()  { printf '  [FAIL] %s\n' "$*"; doctor_fail=1; }
+note() { printf '  [info] %s\n' "$*"; }
+wrn()  { printf '  [warn] %s\n' "$*"; }
+
+# Run a trivial program with libsmash preloaded; print its stderr.
+probe() {
+    if [ "$os" = darwin ]; then
+        # /usr/bin/true is SIP-protected and its Apple signature enforces
+        # library validation, so DYLD vars are ignored. An ad-hoc re-signed
+        # copy accepts them (macOS 26; earlier releases kill third-party
+        # arm64e binaries, and the probe then reports nothing).
+        pdir=$(mktemp -d "${TMPDIR:-/tmp}/smash-doctor.XXXXXX") || return 1
+        cp /usr/bin/true "$pdir/true" 2>/dev/null &&
+            codesign --remove-signature "$pdir/true" 2>/dev/null &&
+            codesign -f -s - "$pdir/true" 2>/dev/null || { rm -rf "$pdir"; return 1; }
+        env "$@" DYLD_INSERT_LIBRARIES="$lib" SMASH_BANNER=1 "$pdir/true" 2>&1
+        rc=$?
+        rm -rf "$pdir"
+        return $rc
+    fi
+    t=$(command -v true 2>/dev/null)
+    case "$t" in /*) ;; *) t=/bin/true ;; esac
+    env "$@" LD_PRELOAD="$lib" SMASH_BANNER=1 "$t" 2>&1
+}
+
+cmd_doctor() {
+    doctor_fail=0
+    echo "smash doctor ($SMASH_LAUNCHER_VERSION)"
+    note "platform: $(uname -s) $(uname -r) $(uname -m)"
+    if lib=$(find_lib); then
+        ok "library: $lib"
+    else
+        bad "library $libname not found (looked in $here/../lib; set SMASH_LIB)"
+        return 1
+    fi
+    out=$(probe SMASH_UFFD=1)
+    if printf '%s\n' "$out" | grep -q '\[smash\].* loaded pid='; then
+        ok "library loads into a test program"
+    elif [ "$os" = darwin ]; then
+        wrn "could not probe-load the library here (needs codesign; macOS < 26 kills the re-signed probe)."
+        wrn "check your own program instead: SMASH_BANNER=1 smash run -- ./yourapp"
+    else
+        bad "library did not load (no banner). Output: $out"
+    fi
+    if [ "$os" = darwin ]; then
+        if command -v xattr >/dev/null 2>&1 && xattr -p com.apple.quarantine "$lib" >/dev/null 2>&1; then
+            wrn "library is quarantined; run: xattr -d com.apple.quarantine $lib"
+        fi
+        if command -v csrutil >/dev/null 2>&1; then
+            note "$(csrutil status 2>/dev/null | head -n 1 | sed "s/\.$//"); DYLD_INSERT_LIBRARIES is stripped for /usr/bin, /bin, /System binaries"
+        fi
+        note "page tracking: mprotect (userfaultfd is Linux-only)"
+        [ $doctor_fail = 0 ]; return
+    fi
+    # Linux: userfaultfd tracking (Linux 6.8+, UFFDIO_MOVE)
+    uline=$(printf '%s\n' "$out" | grep 'userfaultfd mode on\|SMASH_UFFD' | head -n 1)
+    case "$uline" in
+        *"mode on"*) ok "userfaultfd tracking available (${uline#\[smash\] })" ;;
+        "") note "userfaultfd: no report from the probe" ;;
+        *) wrn "userfaultfd tracking unavailable, mprotect fallback is used: ${uline#\[smash\] }" ;;
+    esac
+    if [ -r /proc/sys/vm/unprivileged_userfaultfd ]; then
+        note "vm.unprivileged_userfaultfd=$(cat /proc/sys/vm/unprivileged_userfaultfd) (smash asks for user-mode-only faults, which do not need it)"
+    fi
+    if [ -r /proc/sys/vm/max_map_count ]; then
+        mmc=$(cat /proc/sys/vm/max_map_count)
+        if [ "$mmc" -lt 65530 ]; then
+            wrn "vm.max_map_count=$mmc is below the kernel default 65530; smash budgets its mappings under it, but less compression fits"
+        else
+            ok "vm.max_map_count=$mmc"
+        fi
+    fi
+    # cgroup memory limits (compressed data counts against the cgroup)
+    cg=$(sed -n 's/^0::\(.*\)$/\1/p' /proc/self/cgroup 2>/dev/null | head -n 1)
+    if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.max" ]; then
+        note "cgroup v2 $cg: memory.max=$(cat "/sys/fs/cgroup$cg/memory.max") memory.high=$(cat "/sys/fs/cgroup$cg/memory.high" 2>/dev/null)"
+    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        note "cgroup v1 memory.limit_in_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+    else
+        note "no cgroup memory limit found"
+    fi
+    if [ -e /sys/kernel/mm/page_idle/bitmap ]; then
+        if [ -r /sys/kernel/mm/page_idle/bitmap ]; then
+            ok "page_idle bitmap readable (smash-idled can give exact read tracking)"
+        else
+            note "page_idle bitmap present but root-only: run 'sudo smash-idled' for exact read tracking (optional)"
+        fi
+    else
+        note "page_idle not available (CONFIG_IDLE_PAGE_TRACKING off); smash-idled cannot run (optional)"
+    fi
+    [ $doctor_fail = 0 ]
+}
+
+# Environment of another process, one VAR=value per line.
+proc_env() {
+    if [ -r "/proc/$1/environ" ]; then
+        tr '\0' '\n' < "/proc/$1/environ"
+    else
+        ps eww -o command= -p "$1" 2>/dev/null | tr ' ' '\n'
+    fi
+}
+
+cmd_stats() {
+    [ $# -eq 1 ] || die "usage: smash stats <pid>"
+    pid=$1
+    kill -0 "$pid" 2>/dev/null || die "no process $pid (or not yours)"
+    envs=$(proc_env "$pid")
+    mf=$(printf '%s\n' "$envs" | sed -n 's/^SMASH_METRICS_FILE=//p' | head -n 1)
+    if [ -n "$mf" ]; then
+        mf=$(printf '%s' "$mf" | sed "s/%p/$pid/g")
+        if [ -r "$mf" ]; then
+            echo "# $mf"
+            grep -v '^#' "$mf"
+            return 0
+        fi
+    fi
+    if printf '%s\n' "$envs" | grep -q '^SMASH_STATS_SIGNAL=1$'; then
+        kill -USR2 "$pid" || die "kill -USR2 $pid failed"
+        echo "smash: sent SIGUSR2; process $pid prints a '[smash stats]' line on its own stderr"
+        return 0
+    fi
+    die "process $pid was not started with SMASH_METRICS_FILE or SMASH_STATS_SIGNAL=1.
+SIGUSR2's default action would terminate it, so nothing was sent. Start it with
+'smash run --metrics PATH' or 'smash run --stats-signal'."
+}
+
+case "${1:-help}" in
+    run) shift; cmd_run "$@" ;;
+    version|--version|-V) cmd_version ;;
+    doctor) cmd_doctor ;;
+    stats) shift; cmd_stats "$@" ;;
+    help|-h|--help) usage ;;
+    *) echo "smash: unknown command '$1'" >&2; usage >&2; exit 2 ;;
+esac

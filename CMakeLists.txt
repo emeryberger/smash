@@ -236,6 +236,7 @@ add_library(smash SHARED
   ${_SMASH_COMMON_SOURCES}
 )
 target_include_directories(smash PRIVATE ${printf_SOURCE_DIR})
+target_compile_definitions(smash PRIVATE SMASH_VERSION_STRING="${PROJECT_VERSION}")
 
 # macOS arm64: keep hot per-thread state in a reserved pthread TSD slot (one
 # `mrs` + load) instead of thread_locals (a _tlv_get_addr call each on Mach-O).
@@ -467,3 +468,4 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_package(Threads REQUIRED)
   target_link_libraries(smash-idled PRIVATE Threads::Threads)
 endif()
+

@@ -217,8 +217,10 @@ struct ROIConfig {
         initialized = true;
 
         // 1. Read policy env vars
-        roi_threshold = static_cast<uint32_t>(
-            roiEnvInt("SMASH_ROI_THRESHOLD", kRoiThresholdDefault));
+        {
+            const char* rt = envOrProfile("SMASH_ROI_THRESHOLD");
+            roi_threshold = static_cast<uint32_t>(rt ? std::atoi(rt) : kRoiThresholdDefault);
+        }
         min_compress_ratio = roiEnvDouble("SMASH_MIN_COMPRESS_RATIO",
                                           kMinCompressRatio);
         use_ucb = roiEnvInt("SMASH_UCB", 0) != 0;
@@ -250,6 +252,16 @@ struct ROIConfig {
         } else if (ct_env) {
             cold_ticks_floor = static_cast<uint32_t>(std::atoi(ct_env));
             cold_ticks_overridden = true;
+        } else if (const char* pt = profileColdTimeout()) {
+            // A profile moves the floor but, unlike an explicit timeout,
+            // keeps the ROI gate (cold_ticks_overridden stays false), so the
+            // profile's SMASH_ROI_THRESHOLD still decides marginal pages.
+            double sec = std::atof(pt);
+            if (sec > 0) {
+                cold_ticks_floor = static_cast<uint32_t>(
+                    sec * 1000.0 / kCompressIntervalMs + 0.5);
+                if (cold_ticks_floor < 1) cold_ticks_floor = 1;
+            }
         }
 
         const char* vct_env = std::getenv("SMASH_VERY_COLD_TICKS");

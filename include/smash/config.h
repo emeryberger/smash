@@ -9,6 +9,11 @@
 #include <cstring>
 #include <unistd.h>
 
+// Release version; CMake passes the project version for libsmash builds.
+#ifndef SMASH_VERSION_STRING
+#define SMASH_VERSION_STRING "0.1.0"
+#endif
+
 namespace smash {
 
 // ── Page size ────────────────────────────────────────────────────────────────
@@ -290,14 +295,89 @@ inline constexpr int kColdTicksDefault = SMASH_COLD_TICKS;
 #endif
 inline constexpr double kMinCompressRatio = 0.75;
 
+// ── SMASH_PROFILE: one knob over the expert knobs ───────────────────────────
+// SMASH_PROFILE=latency|balanced|memory supplies defaults for a few expert
+// variables. An explicitly set expert variable always wins over the profile;
+// `balanced` (and unset) supplies nothing, so it is exactly the built-in
+// defaults. Readers of a profile-covered variable call envOrProfile() instead
+// of getenv(); it never allocates. The values and the reasoning behind them
+// are in agents/env-vars.md.
+enum class SmashProfile : int { Balanced = 0, Latency = 1, Memory = 2 };
+
+inline SmashProfile parseSmashProfile(const char* v) {
+    if (!v) return SmashProfile::Balanced;
+    if (strcmp(v, "latency") == 0) return SmashProfile::Latency;
+    if (strcmp(v, "memory") == 0) return SmashProfile::Memory;
+    return SmashProfile::Balanced;  // "balanced", or unknown (warned at start)
+}
+
+inline SmashProfile getSmashProfile() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        v = static_cast<int>(parseSmashProfile(getenv("SMASH_PROFILE")));
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return static_cast<SmashProfile>(v);
+}
+
+inline const char* smashProfileName(SmashProfile p) {
+    switch (p) {
+    case SmashProfile::Latency: return "latency";
+    case SmashProfile::Memory: return "memory";
+    default: return "balanced";
+    }
+}
+
+// One row per profile-covered variable; nullptr = built-in default.
+struct ProfileSetting {
+    const char* name;
+    const char* latency;
+    const char* memory;
+};
+inline constexpr ProfileSetting kProfileSettings[] = {
+    // Idle seconds before a page may be compressed (built-in: 10).
+    {"SMASH_COLD_TIMEOUT_SEC", "30", "2"},
+    // ROI cutoff, byte-seconds saved per us of codec CPU (built-in: 1024).
+    {"SMASH_ROI_THRESHOLD", "4096", "256"},
+    // Trim the compressed store between ticks once N MB died (built-in: off).
+    {"SMASH_PROMPT_TRIM_MB", nullptr, "8"},
+    // Compressor threads at SCHED_IDLE (Linux; built-in: normal priority).
+    {"SMASH_COMPRESSOR_IDLE", "1", nullptr},
+};
+
+// The profile's value for `name`, or nullptr if the profile leaves it alone.
+inline const char* profileDefault(SmashProfile p, const char* name) {
+    if (p == SmashProfile::Balanced) return nullptr;
+    for (const auto& s : kProfileSettings) {
+        if (strcmp(s.name, name) != 0) continue;
+        return p == SmashProfile::Latency ? s.latency : s.memory;
+    }
+    return nullptr;
+}
+
+// getenv(name) if set, else the active profile's value (or nullptr).
+inline const char* envOrProfile(const char* name) {
+    if (const char* v = getenv(name)) return v;
+    return profileDefault(getSmashProfile(), name);
+}
+
+// The cold timeout from the profile, honoured only when neither
+// SMASH_COLD_TIMEOUT_SEC nor the lower-level SMASH_COLD_TICKS is set.
+inline const char* profileColdTimeout() {
+    if (getenv("SMASH_COLD_TIMEOUT_SEC") || getenv("SMASH_COLD_TICKS")) return nullptr;
+    return profileDefault(getSmashProfile(), "SMASH_COLD_TIMEOUT_SEC");
+}
+
 // Runtime cold timeout: SMASH_COLD_TIMEOUT_SEC overrides kColdTicks.
 // This is the primary time-space tradeoff dial.  Lower values compress
 // sooner (more space savings, more decompression faults on re-access).
 // Higher values are conservative (less savings, fewer faults).
-// Default: kColdTicksDefault * kCompressIntervalMs / 1000.
+// Default: kColdTicksDefault * kCompressIntervalMs / 1000, or the profile's.
 inline int getColdTicks() {
     static int ticks = []() {
         const char* env = getenv("SMASH_COLD_TIMEOUT_SEC");
+        if (!env) env = profileColdTimeout();
         if (env) {
             double sec = atof(env);
             if (sec > 0)

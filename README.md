@@ -135,6 +135,19 @@ Linux's zswap also compresses memory, but only *reactively*: it compresses pages
 
 Under a tight cgroup memory limit the picture is mixed. smash's compressed data lives in the process and counts against the cgroup, so the kernel can swap it out, and reaching it then costs two faults. Earlier measurements had smash ahead on memcached and zswap ahead on SQLite and Redis inside a tight cap. Those numbers predate the current defaults and are being re-measured; see [docs/ZSWAP.md](docs/ZSWAP.md).
 
+## Deploying safely, and backing out
+
+smash can be switched off inside a running process, by hand or automatically, without restarting it.
+
+- **Kill switch.** `smash_disable()` (C API), a signal you choose (`SMASH_DISABLE_SIGNAL=SIGUSR1`), or a control file (`SMASH_CONTROL_FILE=/run/myapp/smash`, write `disable`) stops compression and decompresses every compressed page back in place. It also removes every page protection smash applied. The process keeps running with smash as a plain allocator, and smash causes no further page faults. `smash_enable()`, `SMASH_ENABLE_SIGNAL`, or writing `enable` turns compression back on. `SMASH_START_DISABLED=1` starts a process with compression off, so it can be turned on later. No signal is taken unless you name one.
+- **Watchdog (fail-open).** With `SMASH_WATCHDOG_FAULT_RATE=N` (decompression faults per second, averaged over `SMASH_WATCHDOG_WINDOW` seconds) or `SMASH_WATCHDOG_P99_US=N` (fault-service p99), smash disables itself when the limit is exceeded and prints one line to stderr saying why. A decompression failure always trips it (`SMASH_WATCHDOG_DECOMP_FAIL`, default 1).
+- **Refault budget.** `SMASH_MAX_FAULT_RATE=N` adapts instead of tripping. While refaults exceed N per second, smash waits longer before compressing a page: the cold threshold doubles each second the budget is exceeded and relaxes once refaults are under half of it.
+- **Status.** `smash_safety_status()` reports whether smash is disabled, how many pages are compressed, fault counts and rates, the current cold threshold, and the reason for the last disable. The stats line (`SMASH_STATS=1`) carries the same fields.
+
+Details, and what is and isn't covered, are in [agents/safety.md](agents/safety.md).
+
+**Formal models.** `model/` holds TLA+ models and Lean 4 proofs of smash's page state machine and of specific races that caused real bugs. The Lean proofs are machine-checked and use no `sorry`. `SmashCoreConc.lean` proves that, in the model, a page is never marked ACTIVE while still protected, and that a compressed page is always inaccessible, has its compressed copy, and holds no physical memory. This holds for any number of pages and threads and every interleaving. (The code has one known race outside this abstraction: a batched Phase 3 `mprotect` can leave a just-restored ACTIVE page read-only until its next write fault. The kill switch repairs it.) Other proofs cover the decompress-on-fault restore (no reader sees a readable page before its data is in place), the fork-pause handshake (a fork never lands mid-tick), the deferred-reclaim snapshot, the external-mapping munmap race, the free-pool race, and creating worker threads early. Each bug model also has its pre-fix variant, which TLC shows violates the property. What is *not* proven: that the C++ code matches the models (they are hand-written abstractions, with no refinement proof); sequentially consistent memory is assumed; the userfaultfd path, the compression codecs, the kill switch, and liveness under the `vm.max_map_count` limit are not modeled; and the TLC runs of the larger models are bounded. See [model/README.md](model/README.md).
+
 ## Options worth knowing
 
 Everything below is optional; the defaults are what the results above use.
@@ -148,6 +161,8 @@ Everything below is optional; the defaults are what the results above use.
 | `SMASH_METRICS_FILE=path` (`--metrics`) | Keep a Prometheus-format metrics file up to date (every 10 s), for node_exporter's textfile collector. No network port is opened. |
 | `SMASH_MODE=observe` | Dry run: detect and compress cold pages but discard the result, reporting projected savings instead (`SMASH_OBSERVE_REPORT=path` for JSON, `SMASH_OBSERVE_INTERVAL=N` seconds between reports). See "Will smash help me?" above. |
 | `SMASH_MODE=compress_only` | Don't replace `malloc` at all; just compress cold heap pages, whichever allocator owns them. For programs linked against jemalloc or tcmalloc. |
+| `SMASH_DISABLE_SIGNAL=SIG` / `SMASH_CONTROL_FILE=path` | Kill switch: a signal or a file (`disable` / `enable`) that turns compression off and restores every page, or back on. See above. |
+| `SMASH_WATCHDOG_FAULT_RATE=N` / `SMASH_MAX_FAULT_RATE=N` | Disable compression when refaults exceed N/s, or back off the cold threshold to stay under N/s. |
 
 Every other variable (tuning, compatibility and diagnostics) is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
@@ -164,7 +179,9 @@ LD_PRELOAD=$PWD/build/libsmash.so ./your_server
 #include <smash/smash.h>
 smash_hint_cold(ptr, size);   // compress this region now
 smash_hint_hot(ptr, size);    // keep this region uncompressed
-SmashStats stats; smash_get_stats(&stats);
+smash_disable();              // stop compressing, restore every page
+smash_enable();               // resume
+struct SmashSafetyStatus st; smash_safety_status(&st);
 ```
 
 ## How it works

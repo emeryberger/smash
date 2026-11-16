@@ -78,6 +78,24 @@ At startup smash measures compression speed on this machine to feed its cost mod
 | `SMASH_CALIBRATION_FILE=path` | unset | Save calibration results and reuse them on later runs (faster startup). |
 | `SMASH_FAST_COMP_MBS_HI/LO`, `SMASH_FAST_DECOMP_MBS_HI/LO` | calibrated | Override the measured compression/decompression speed (MB/s) for highly and poorly compressible pages. |
 
+## Safety: kill switch, watchdog, refault budget
+
+See [agents/safety.md](../agents/safety.md) for the mechanism and its guarantees.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMASH_DISABLE_SIGNAL=SIG` | unset | Signal (name like `SIGUSR1`, `SIGRTMIN+3`, or a number) that disables compression and restores every page. Fault signals and the stats signal are refused. |
+| `SMASH_ENABLE_SIGNAL=SIG` | unset | Signal that re-enables compression. |
+| `SMASH_CONTROL_FILE=path` | unset | Polled once a second; a change of its first word to `disable`/`off`/`0` or `enable`/`on`/`1` disables or enables compression. |
+| `SMASH_START_DISABLED=1` | unset | Start with compression off (enable later via API, signal or control file). |
+| `SMASH_WATCHDOG_FAULT_RATE=N` | off | Disable compression when decompress faults/s, averaged over the window, exceed N. |
+| `SMASH_WATCHDOG_P99_US=N` | off | Disable compression when the fault-service p99 exceeds N µs for the whole window (ticks with < `SMASH_WATCHDOG_MIN_SAMPLES`=20 faults are ignored). Turns on fault timing. |
+| `SMASH_WATCHDOG_DECOMP_FAIL=N` | 1 | Disable compression after N decompression failures. `0` turns this off. |
+| `SMASH_WATCHDOG_WINDOW=N` | 5 | Watchdog window in ticks (seconds), 1..120. |
+| `SMASH_MAX_FAULT_RATE=N` | off | Refault budget: while decompress faults/s exceed N the cold threshold doubles each tick (up to 255×); below N/2 it decays by 1/8 per tick. |
+
+C API (`include/smash/smash.h`): `smash_disable()`, `smash_enable()`, `smash_safety_status()`.
+
 ## Diagnostics
 
 | Variable | Default | Effect |

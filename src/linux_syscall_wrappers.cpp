@@ -1276,6 +1276,16 @@ SMASH_VISIBLE int sigprocmask(int how, const sigset_t* set, sigset_t* old) {
     return real_sigprocmask(how, set, old);
 }
 
+// sigaltstack: signal handlers (smash's included, SA_ONSTACK) run on the
+// alternate stack, so it must never be compressed: untrack it (restoring
+// any compressed page) before the kernel starts using it.
+SMASH_VISIBLE int sigaltstack(const stack_t* ss, stack_t* old) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && ss && !(ss->ss_flags & SS_DISABLE) && ss->ss_sp && ss->ss_size)
+        smash::ext::detachRange(vm, ss->ss_sp, ss->ss_size, smash::ext::kRestore);
+    return smash::vm::rawSigaltstack(ss, old);
+}
+
 // madvise: allocators purge freed extents with DONTNEED / FREE. Drop smash's
 // blob for those pages first, or a later access would decompress stale data
 // over memory the allocator believes is zero (jemalloc's calloc fast path).

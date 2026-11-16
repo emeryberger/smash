@@ -1244,6 +1244,18 @@ extern "C" int smash_sigprocmask(int how, const sigset_t* set, sigset_t* old) {
         how, keepFaultSignals(how, set, &copy), old);
 }
 
+// sigaltstack: never compress an alternate signal stack (handlers, smash's
+// SA_ONSTACK one included, run on it). Same as the Linux wrapper.
+using sigaltstack_fn = int(*)(const stack_t*, stack_t*);
+extern "C" int smash_sigaltstack(const stack_t* ss, stack_t* old);
+SMASH_INTERPOSE(smash_sigaltstack, sigaltstack);
+extern "C" int smash_sigaltstack(const stack_t* ss, stack_t* old) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && ss && !(ss->ss_flags & SS_DISABLE) && ss->ss_sp && ss->ss_size)
+        smash::ext::detachRange(vm, ss->ss_sp, ss->ss_size, smash::ext::kRestore);
+    return reinterpret_cast<sigaltstack_fn>(smash_interpose_smash_sigaltstack.original)(ss, old);
+}
+
 // ── mach_vm_allocate / mach_vm_deallocate ────────────────────────────────────
 //
 // SpiderMonkey on macOS uses mach_vm_allocate (not POSIX mmap) for its GC

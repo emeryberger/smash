@@ -5168,6 +5168,34 @@ private:
 #endif
     }
 
+#ifndef __linux__
+    // macOS: no pagemap. Count never-touched external pages (untouched parts
+    // of a MAP_NORESERVE / mach_vm reservation) as "accessed" so they never
+    // age into monitoring or compression: there is nothing to save, and
+    // protecting them would turn the app's first touch into a fault. One
+    // mincore per run of address-contiguous tracked pages.
+    void markNonResidentExternal(size_t committed) {
+        constexpr size_t kMaxRun = 1024;
+        unsigned char vec[kMaxRun];
+        size_t i = vm_->contigPages();
+        while (i < committed) {
+            const uintptr_t a0 = reinterpret_cast<uintptr_t>(vm_->pageAddress(i));
+            const PageState st0 = states_->get(i);
+            if (!a0 || (st0 != PageState::ACTIVE && st0 != PageState::ACTIVE_MONITORING)) { ++i; continue; }
+            size_t j = i + 1;
+            while (j < committed && j - i < kMaxRun &&
+                   reinterpret_cast<uintptr_t>(vm_->pageAddress(j)) == a0 + (j - i) * kPageSize)
+                ++j;
+            if (mincore(reinterpret_cast<void*>(a0), (j - i) * kPageSize,
+                        reinterpret_cast<char*>(vec)) == 0) {
+                for (size_t k = i; k < j; ++k)
+                    if (!(vec[k - i] & 1)) accessed_[k].store(true, std::memory_order_relaxed);
+            }
+            i = j;
+        }
+    }
+#endif
+
     void readSoftDirty(size_t start, size_t end) {
 #ifdef __linux__
         if (pagemap_fd_ < 0 || end <= start) return;
@@ -6432,6 +6460,9 @@ private:
             scanned = scanWrittenPages(committed);
             if (!scanned) readSoftDirty(0, committed);
         }
+#ifndef __linux__
+        if (committed > vm_->contigPages()) markNonResidentExternal(committed);
+#endif
 #ifdef __linux__
         // Probe idle-page read tracking once (cached). No-op + fallback when the
         // kernel lacks CONFIG_IDLE_PAGE_TRACKING or we lack CAP_SYS_ADMIN (the

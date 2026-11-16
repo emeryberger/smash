@@ -29,6 +29,12 @@
 //   sbrk       program-break growth (gperftools tcmalloc) is tracked (Linux).
 //   sigmask    a thread with every signal blocked (jemalloc's background
 //              thread) reads compressed pages without being killed.
+//   ucstack    a suspended makecontext coroutine stack (plain RW mmap) gets
+//              compressed; resuming it must not kill the process (Linux).
+//   noreserve  untouched pages of a MAP_NORESERVE reservation are never made
+//              inaccessible; the touched part compresses.
+//   thp        a MADV_HUGEPAGE region compresses, round-trips, and a partial
+//              DONTNEED of it reads back zero.
 //   churn      after mapping/unmapping more pages than the external slot
 //              budget (CPython arena churn), a fresh mapping is still tracked
 //              and compressed.
@@ -48,6 +54,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <ucontext.h>
+#endif
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -368,6 +377,94 @@ bool testSigmask() {
     return true;
 }
 
+#ifdef __linux__
+// Coroutine / fiber stacks are often plain mmap(PROT_READ|PROT_WRITE,
+// MAP_PRIVATE|MAP_ANON) without MAP_STACK (boost.context, folly, hand-rolled
+// makecontext). While a coroutine is suspended its stack is cold and gets
+// compressed; on resume, the first touch of a compressed stack page faults
+// with the stack pointer inside the inaccessible range, so the kernel has
+// nowhere to push the signal frame unless the handler runs on an alternate
+// stack.
+ucontext_t g_main_uc, g_co_uc;
+volatile int g_co_sum = 0;
+[[gnu::noinline]] int deepTouch(int depth) {
+    volatile char frame[2048];
+    std::memset(const_cast<char*>(frame), depth & 0x7f, sizeof(frame));
+    int r = depth ? deepTouch(depth - 1) : 0;
+    return r + frame[depth % sizeof(frame)];
+}
+void coroutineBody() {
+    g_co_sum = deepTouch(400);   // ~800 KiB of stack
+    swapcontext(&g_co_uc, &g_main_uc);  // suspend: stack goes cold
+    g_co_sum += deepTouch(400);  // resume and re-touch every page
+    swapcontext(&g_co_uc, &g_main_uc);
+}
+bool testCoroutineStack() {
+    constexpr size_t kStack = 2 * 1024 * 1024;
+    void* stk = mapAnon(kStack);
+    getcontext(&g_co_uc);
+    g_co_uc.uc_stack.ss_sp = stk;
+    g_co_uc.uc_stack.ss_size = kStack;
+    g_co_uc.uc_link = &g_main_uc;
+    makecontext(&g_co_uc, coroutineBody, 0);
+    swapcontext(&g_main_uc, &g_co_uc);
+    int first = g_co_sum;
+    // Only the used part of the stack is resident; wait for it to compress.
+    Region r{static_cast<char*>(stk) + kStack - 1024 * 1024, 1024 * 1024, "ucstack"};
+    if (!waitCompressed(&r, 1)) FAIL("[ucstack]: suspended coroutine stack never compressed");
+    swapcontext(&g_main_uc, &g_co_uc);
+    if (g_co_sum != 2 * first) FAIL("[ucstack]: sum %d want %d", g_co_sum, 2 * first);
+    munmap(stk, kStack);
+    fprintf(stderr, "external_patterns_test: ucstack PASSED\n");
+    return true;
+}
+#endif
+
+// MAP_NORESERVE reservation, mostly never touched (mimalloc maps 1 GiB
+// arenas this way). Only resident pages may be compressed: "compressing" an
+// untouched page saves nothing and turns the app's first touch into a fault.
+bool testNoreserve() {
+    constexpr size_t kRes = 64 * 1024 * 1024;
+    char* p = static_cast<char*>(mmap(nullptr, kRes, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0));
+    if (p == MAP_FAILED) FAIL("[noreserve]: mmap errno=%d", errno);
+    fill(p, kLen, 14);  // touch only the first 2 MiB
+    Region r{p, kLen, "noreserve"};
+    if (!waitCompressed(&r, 1)) FAIL("[noreserve]: touched part never compressed");
+    sleep(1);
+    if (size_t n = inaccessiblePages(p + kLen, kRes - kLen); n != 0)
+        FAIL("[noreserve]: %zu untouched pages were made inaccessible", n);
+    if (check(p, kLen, 14) != SIZE_MAX) FAIL("[noreserve]: touched part corrupted");
+    if (!allZero(p + kLen, 4 * g_page)) FAIL("[noreserve]: untouched part not zero");
+    munmap(p, kRes);
+    fprintf(stderr, "external_patterns_test: noreserve PASSED\n");
+    return true;
+}
+
+#ifdef MADV_HUGEPAGE
+// jemalloc / mimalloc may madvise(MADV_HUGEPAGE). Compressing 4 KiB pieces of
+// a THP region splits it; contents must survive, and DONTNEED of part of a
+// compressed huge region must still read back zero.
+bool testThp() {
+    constexpr size_t kHuge = 2 * 1024 * 1024, kRegion = 4 * kHuge;
+    char* raw = static_cast<char*>(mapAnon(kRegion + kHuge));
+    char* p = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(raw) + kHuge - 1) & ~(kHuge - 1));
+    (void)madvise(p, kRegion, MADV_HUGEPAGE);  // may be unsupported: still a valid test
+    fill(p, kRegion, 15);
+    Region r{p, kRegion, "thp"};
+    if (!waitCompressed(&r, 1)) FAIL("[thp]: never compressed");
+    if (madvise(p, kHuge, MADV_DONTNEED) != 0) FAIL("[thp]: dontneed errno=%d", errno);
+#ifdef __linux__
+    if (!allZero(p, kHuge)) FAIL("[thp]: purged huge page not zero");
+#endif
+    if (size_t bad = check(p + kHuge, kRegion - kHuge, 15 + kHuge / g_page); bad != SIZE_MAX)
+        FAIL("[thp]: page %zu wrong", bad);
+    munmap(raw, kRegion + kHuge);
+    fprintf(stderr, "external_patterns_test: thp PASSED\n");
+    return true;
+}
+#endif
+
 // MAP_SHARED|MAP_ANON memory is shared with forked children (PostgreSQL
 // shared buffers, multiprocessing). It must never be compressed: a blob in
 // the parent is stale as soon as the child writes, and decompressing it would
@@ -424,8 +521,13 @@ int main(int argc, char** argv) {
     if (want("fork") && !testFork()) return 1;
     if (want("shared") && !testSharedAnon()) return 1;
     if (want("sigmask") && !testSigmask()) return 1;
+    if (want("noreserve") && !testNoreserve()) return 1;
+#ifdef MADV_HUGEPAGE
+    if (want("thp") && !testThp()) return 1;
+#endif
 #ifdef __linux__
     if (want("sbrk") && !testSbrk()) return 1;
+    if (want("ucstack") && !testCoroutineStack()) return 1;
 #endif
     if (want("churn") && !testChurn()) return 1;
     if (g_failures) return 1;

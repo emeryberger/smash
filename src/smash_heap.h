@@ -2133,6 +2133,7 @@ public:
     }
 
     void threadInit() {
+        vm::installThreadAltStack();
         if (noThreadHooks()) return;
         if (!isCompressOnlyMode()) {
             getOrCreateThreadCache();
@@ -2153,6 +2154,7 @@ public:
         }
     }
     void threadCleanup() {
+        vm::releaseThreadAltStack();
         if (noThreadHooks()) return;
         if (isCompressOnlyMode()) return;
         ThreadCache*& tc = currentThreadCache();

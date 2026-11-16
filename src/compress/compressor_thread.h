@@ -475,6 +475,15 @@ class CompressorThread {
     bool wp_scan_ = false;
     std::atomic<uint64_t> uffd_move_fail_{0}, uffd_move_ok_{0}, uffd_copy_fail_{0};
     bool uffdPage(size_t i) const { return uffd_mode_ && i < vm_->contigPages(); }
+    // Record that a still-ACTIVE uffd page was armed PROT_NONE (read-check
+    // fallback). compressPage's deferred snapshot skips the PROT_RW mprotect
+    // for uffd pages unless prot_none_ says otherwise, so an unrecorded arm
+    // makes the worker read a PROT_NONE page and SIGSEGV (seen under a
+    // cgroup memory cap, run as root: the idle-page read check falls back to
+    // PROT_NONE whenever the page is swapped out and has no PFN).
+    void notePageProtNone(size_t i) {
+        if (uffdPage(i)) prot_none_[i] = 1;
+    }
     // In handleFault: this fault is a uffd MISSING fault (SIGBUS); a SIGSEGV
     // is a protection fault and takes the classic path.
     bool uffdFault(size_t i) const { return uffdPage(i) && vm::faultSignal() == SIGBUS; }
@@ -725,6 +734,7 @@ class CompressorThread {
         locks_->lock(i);
         if (states_->transition(i, PageState::ACTIVE, PageState::ACTIVE_MONITORING)) {
             vm::protectPages(vm_->pageAddress(i), kPageSize, false, false);  // PROT_NONE
+            notePageProtNone(i);
             read_armed_[i] = 1;
             arm_cc_[i] = cold_count_[i];
             run_end = i + 1;
@@ -2332,6 +2342,7 @@ private:
         if (states_->get(page_idx) == PageState::ACTIVE_MONITORING) {
             void* page_addr = vm_->pageAddress(page_idx);
             vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
+            notePageProtNone(page_idx);
         }
         locks_->unlock(page_idx);
     }

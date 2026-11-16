@@ -481,5 +481,8 @@ file(COPY ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen
                       GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 file(RENAME ${CMAKE_CURRENT_BINARY_DIR}/bin/smash-launcher.gen
      ${CMAKE_CURRENT_BINARY_DIR}/bin/smash)
-install(TARGETS smash LIBRARY DESTINATION lib)
-install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/smash DESTINATION bin)
+# COMPONENT smash: the fetched dependencies (alloc8, zstd) carry their own
+# install rules for headers and static libraries; `cmake --install build
+# --component smash` installs only these two files.
+install(TARGETS smash LIBRARY DESTINATION lib COMPONENT smash)
+install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/smash DESTINATION bin COMPONENT smash)

@@ -16,7 +16,7 @@ cmake -B build && cmake --build build -j
 build/bin/smash run --report -- ./your_server
 ```
 
-`smash run` preloads the library (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS) and starts your program. `--report` prints a summary when the program exits: peak and lowest memory, how much was compressed and how well, and how long faults on compressed pages took. `cmake --install build --prefix ~/.local` installs `bin/smash` and `lib/libsmash.*`; `smash doctor` checks the setup. With a library downloaded from a [release](https://github.com/emeryberger/smash/releases), preload it directly (`LD_PRELOAD=/path/to/libsmash.so ./your_server`) or point the launcher at it with `SMASH_LIB`.
+`smash run` preloads the library (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS) and starts your program. `--report` prints a summary when the program exits: peak and lowest memory, how much was compressed and how well, and how long faults on compressed pages took. `cmake --install build --component smash --prefix ~/.local` installs `bin/smash` and `lib/libsmash.*`; `smash doctor` checks the setup. With a library downloaded from a [release](https://github.com/emeryberger/smash/releases), preload it directly (`LD_PRELOAD=/path/to/libsmash.so ./your_server`) or point the launcher at it with `SMASH_LIB`.
 
 smash leaves a page alone until it has gone **10 seconds** without being touched, so a short test program that exits right away shows no change; the report then says why. That's intended: smash is built for services that stay up and leave most of their data idle. To see it act sooner, set `SMASH_COLD_TIMEOUT_SEC=2`.
 

@@ -2013,6 +2013,7 @@ public:
     //   slab locks -> large-alloc -> slab leaf locks (magazine, pending pool)
     //   -> VmRegion free shards, commit, decommit pool -> PageMap L2
     //   -> call-site image table -> TSD free list -> thread-cache pool
+    //   -> CompressStore shards (leaf: the fault path's releaseBlob)
     //   -> BootstrapAlloc (innermost: the others allocate from it).
     // The compressor is already paused by smash's own pthread_atfork prepare
     // handler, which runs before this.
@@ -2030,10 +2031,12 @@ public:
         threadStateAtforkPrepare();
 #endif
         ThreadCachePool::instance().lockForFork();
+        if (compression_inited_) compress_store_.lockForFork();
         BootstrapAlloc::instance().atforkPrepare();
     }
     void unlock() SMASH_NO_TS_ANALYSIS {
         BootstrapAlloc::instance().atforkParent();   // same as child: release
+        if (compression_inited_) compress_store_.unlockForFork();
         ThreadCachePool::instance().unlockForFork();
 #if defined(SMASH_USE_TSD)
         threadStateAtforkParent();

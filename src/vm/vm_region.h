@@ -459,18 +459,22 @@ public:
     // Reset decommit thread state after fork(). The thread doesn't exist in the
     // child (Linux fork only clones the calling thread), so we must reset state
     // so ensureDecommitThreadStarted() will restart it on first releasePages().
+    //
+    // Pending entries are left on the queue: the restarted thread drains them.
+    // Do NOT process them here. This runs from smash's pthread_atfork child
+    // handler, which (registered at constructor priority 202) runs BEFORE
+    // alloc8's child handler releases the locks xxmalloc_lock took in prepare
+    // (child handlers run in registration order). processDecommitEntry takes
+    // a free-shard lock this same thread still holds, so the old synchronous
+    // drain self-deadlocked the child whenever a decommit was pending at
+    // fork() (issue #61; caught by test_fork_stress in full mode on cloudnew:
+    // 1-2 hung children per 150-fork run in 3 of 4 runs; backtrace:
+    // smash_atfork_child -> resetDecommitThreadForFork -> processDecommitEntry
+    // -> Spinlock::lockSlow).
     void resetDecommitThreadForFork() {
         // Thread doesn't exist in child - don't try to join it
         decommit_running_.store(false, std::memory_order_relaxed);
         decommit_waker_.reinitAfterFork();
-        // Drain pending entries synchronously
-        DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
-        while (batch) {
-            DecommitEntry* next = batch->next;
-            processDecommitEntry(batch);
-            recycleDecommitEntry(batch);
-            batch = next;
-        }
     }
 
     // ── Allocation (full mode only) ─────────────────────────────────────────

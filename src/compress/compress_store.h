@@ -361,6 +361,19 @@ public:
             shards_[s].current = newRegion();
     }
 
+    // fork() quiesce (SmashHeap::lock/unlock via xxmalloc_lock). The fault
+    // path takes a shard lock (releaseBlob) and so does a compressor worker
+    // storing a blob; a fork landing inside either left the child with the
+    // shard locked forever, so the child's first fault on a compressed page
+    // in that shard spun (issue #61). Shard locks are leaves (they guard only
+    // the store's own mmap'd regions), so they nest inside every other lock.
+    void lockForFork() SMASH_NO_TS_ANALYSIS {
+        for (int s = 0; s < kCompressStoreShards; ++s) shards_[s].lock.lock();
+    }
+    void unlockForFork() SMASH_NO_TS_ANALYSIS {
+        for (int s = kCompressStoreShards; s-- > 0;) shards_[s].lock.unlock();
+    }
+
     // Push a fresh region to the head of each shard's chain.
     // Call before a bulk upgrade to ensure new blobs go into fresh regions
     // while old blob releases drain the old regions (enabling decommit).

@@ -16,7 +16,7 @@ namespace smash {
 
 namespace ext {
 
-enum Mode : int { kUnmap = 0, kPurge = 1, kRestore = 2 };
+enum Mode : int { kUnmap = 0, kPurge = 1, kRestore = 2, kRestoreAll = 3 };
 
 inline bool enabled() {
     static const bool on = [] {
@@ -41,11 +41,22 @@ inline uintptr_t pageUp(const void* p, size_t len) {
 //  - exactly PROT_READ|PROT_WRITE. Read-only pages are never dirtied; smash
 //    restores PROT_RW on decompress, which would strip PROT_EXEC from a JIT
 //    region.
+//  - not MAP_LOCKED (see mlock in the interposers).
 //  - no stacks (MAP_STACK / MAP_GROWSDOWN): a thread whose stack page is
 //    compressed has nowhere to push the SIGSEGV frame. No MAP_HUGETLB:
 //    hugetlbfs pages can't be split into 4 KiB protections.
+// Set by mlockall(MCL_FUTURE): every later mapping is locked, so none may
+// be tracked.
+inline std::atomic<bool> g_no_new_tracking{false};
+
 inline bool eligibleMapping(int prot, int flags) {
     if (!(flags & MAP_ANON)) return false;
+    if (g_no_new_tracking.load(std::memory_order_relaxed)) return false;
+#ifdef MAP_LOCKED
+    // Locked memory is meant to stay resident (and is often secret: keys
+    // kept out of swap); never copy it into the compressed store.
+    if (flags & MAP_LOCKED) return false;
+#endif
 #ifdef __linux__
     if ((flags & MAP_TYPE) != MAP_PRIVATE) return false;
     if (flags & (MAP_STACK | MAP_GROWSDOWN | MAP_HUGETLB)) return false;
@@ -131,6 +142,14 @@ inline size_t detachRange(VmRegion* vm, void* base, size_t len, Mode mode) {
     ExternalDetachFn fn = g_smash_external_detach.load(std::memory_order_acquire);
     if (!fn) return 0;
     return fn(pageDown(base), pageUp(base, len), mode);
+}
+
+// Untrack every external page (mlockall). Walks the external slots via the
+// compressor (address order is irrelevant for kRestore).
+inline void detachAll(VmRegion* vm) {
+    if (!vm || !enabled() || vm->externalLivePages() == 0) return;
+    ExternalDetachFn fn = g_smash_external_detach.load(std::memory_order_acquire);
+    if (fn) fn(0, 0, kRestoreAll);
 }
 
 }  // namespace ext

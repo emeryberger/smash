@@ -31,6 +31,8 @@
 //              thread) reads compressed pages without being killed.
 //   ucstack    a suspended makecontext coroutine stack (plain RW mmap) gets
 //              compressed; resuming it must not kill the process (Linux).
+//   mlock      mlock() of a compressed range restores it; it is never
+//              compressed again.
 //   noreserve  untouched pages of a MAP_NORESERVE reservation are never made
 //              inaccessible; the touched part compresses.
 //   thp        a MADV_HUGEPAGE region compresses, round-trips, and a partial
@@ -53,6 +55,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -532,6 +535,33 @@ bool testVmaCap() {
 }
 #endif
 
+// mlock'd memory must stay resident (it often holds secrets kept out of
+// swap): locking a compressed range restores it and smash never compresses
+// it again.
+bool testMlock() {
+    void* p = mapAnon(kLen);
+    fill(p, kLen, 17);
+    Region r{p, kLen, "mlock"};
+    if (!waitCompressed(&r, 1)) FAIL("[mlock]: never compressed");
+    rlimit rl{};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < 2 * kLen) {
+        fprintf(stderr, "external_patterns_test: mlock SKIPPED (RLIMIT_MEMLOCK=%llu)\n",
+                (unsigned long long)rl.rlim_cur);
+        munmap(p, kLen);
+        return true;
+    }
+    // (Before the fix, mlock of a compressed — PROT_NONE — range failed
+    // with ENOMEM.)
+    if (mlock(p, kLen) != 0) FAIL("[mlock]: mlock errno=%d", errno);
+    if (size_t bad = check(p, kLen, 17); bad != SIZE_MAX) FAIL("[mlock]: page %zu wrong", bad);
+    sleep(3);  // several cold timeouts
+    if (size_t n = inaccessiblePages(p, kLen); n != 0) FAIL("[mlock]: %zu locked pages compressed", n);
+    munlock(p, kLen);
+    munmap(p, kLen);
+    fprintf(stderr, "external_patterns_test: mlock PASSED\n");
+    return true;
+}
+
 // MAP_SHARED|MAP_ANON memory is shared with forked children (PostgreSQL
 // shared buffers, multiprocessing). It must never be compressed: a blob in
 // the parent is stale as soon as the child writes, and decompressing it would
@@ -588,6 +618,7 @@ int main(int argc, char** argv) {
     if (want("fork") && !testFork()) return 1;
     if (want("shared") && !testSharedAnon()) return 1;
     if (want("sigmask") && !testSigmask()) return 1;
+    if (want("mlock") && !testMlock()) return 1;
     if (want("noreserve") && !testNoreserve()) return 1;
 #ifdef MADV_HUGEPAGE
     if (want("thp") && !testThp()) return 1;

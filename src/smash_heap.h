@@ -1413,7 +1413,9 @@ public:
             s_external_self_ = this;
             g_smash_external_detach.store(
                 +[](uintptr_t start, uintptr_t end, int mode) -> size_t {
-                    return s_external_self_->compressor_.detachExternalRange(
+                    auto& c = s_external_self_->compressor_;
+                    if (mode == 3) return c.detachAllExternal();  // ext::kRestoreAll
+                    return c.detachExternalRange(
                         start, end, static_cast<CompressorThread::ExtDetach>(mode));
                 },
                 std::memory_order_release);

@@ -9467,6 +9467,18 @@ public:
         return n;
     }
 
+    // mlockall: restore and untrack every external page.
+    size_t detachAllExternal() {
+        if (!vm_ || !states_ || !locks_) return 0;
+        size_t n = 0;
+        const size_t end = vm_->committedPages();
+        for (size_t idx = vm_->contigPages(); idx < end; ++idx) {
+            const uintptr_t a = reinterpret_cast<uintptr_t>(vm_->pageAddress(idx));
+            if (a && detachExternalPage(a, idx, ExtDetach::kRestore)) ++n;
+        }
+        return n;
+    }
+
     bool detachExternalPage(uintptr_t addr, size_t idx, ExtDetach mode) {
         for (;;) {
             locks_->lock(idx);

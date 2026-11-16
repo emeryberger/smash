@@ -1286,6 +1286,34 @@ SMASH_VISIBLE int sigaltstack(const stack_t* ss, stack_t* old) {
     return smash::vm::rawSigaltstack(ss, old);
 }
 
+// mlock / mlock2 / mlockall: locked memory must stay resident (and may hold
+// secrets kept out of swap), so it must not be compressed. Untrack the range,
+// restoring any compressed page, before locking it. mlockall untracks every
+// external page; with MCL_FUTURE no later mapping is tracked either.
+SMASH_VISIBLE int mlock(const void* addr, size_t len) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len)
+        smash::ext::detachRange(vm, const_cast<void*>(addr), len, smash::ext::kRestore);
+    return static_cast<int>(syscall(SYS_mlock, addr, len));
+}
+SMASH_VISIBLE int mlock2(const void* addr, size_t len, unsigned int flags) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len)
+        smash::ext::detachRange(vm, const_cast<void*>(addr), len, smash::ext::kRestore);
+#ifdef SYS_mlock2
+    return static_cast<int>(syscall(SYS_mlock2, addr, len, flags));
+#else
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+SMASH_VISIBLE int mlockall(int flags) {
+    if (flags & MCL_FUTURE) smash::ext::g_no_new_tracking.store(true, std::memory_order_relaxed);
+    smash::ext::detachAll(smash::g_smash_vm_region);
+    return static_cast<int>(syscall(SYS_mlockall, flags));
+}
+
 // madvise: allocators purge freed extents with DONTNEED / FREE. Drop smash's
 // blob for those pages first, or a later access would decompress stale data
 // over memory the allocator believes is zero (jemalloc's calloc fast path).

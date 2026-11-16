@@ -1256,6 +1256,25 @@ extern "C" int smash_sigaltstack(const stack_t* ss, stack_t* old) {
     return reinterpret_cast<sigaltstack_fn>(smash_interpose_smash_sigaltstack.original)(ss, old);
 }
 
+// mlock / mlockall: never compress locked memory (see the Linux wrappers).
+using mlock_fn = int(*)(const void*, size_t);
+using mlockall_fn = int(*)(int);
+extern "C" int smash_mlock(const void* addr, size_t len);
+SMASH_INTERPOSE(smash_mlock, mlock);
+extern "C" int smash_mlock(const void* addr, size_t len) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len)
+        smash::ext::detachRange(vm, const_cast<void*>(addr), len, smash::ext::kRestore);
+    return reinterpret_cast<mlock_fn>(smash_interpose_smash_mlock.original)(addr, len);
+}
+extern "C" int smash_mlockall(int flags);
+SMASH_INTERPOSE(smash_mlockall, mlockall);
+extern "C" int smash_mlockall(int flags) {
+    if (flags & MCL_FUTURE) smash::ext::g_no_new_tracking.store(true, std::memory_order_relaxed);
+    smash::ext::detachAll(smash::g_smash_vm_region);
+    return reinterpret_cast<mlockall_fn>(smash_interpose_smash_mlockall.original)(flags);
+}
+
 // ── mach_vm_allocate / mach_vm_deallocate ────────────────────────────────────
 //
 // SpiderMonkey on macOS uses mach_vm_allocate (not POSIX mmap) for its GC

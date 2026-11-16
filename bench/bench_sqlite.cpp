@@ -46,6 +46,10 @@ static int g_cool_duration_sec = 10;
 static int g_serve_duration_sec = 20;
 static int g_num_rows = 500000;
 static double g_hot_fraction = 0.05;  // 5% hot — recent rows only
+// --batch N: COMMIT every N rows during the fill (0 = one transaction).
+// A single huge transaction rewrites every page's pcache header at COMMIT;
+// batched loads leave a page alone once its batch has committed.
+static int g_batch_rows = 0;
 
 // ── RSS sampling ────────────────────────────────────────────────────────────
 
@@ -73,6 +77,25 @@ static size_t getCurrentRSSBytes() {
         return static_cast<size_t>(resident_pages) * 4096;
     }
     return 0;
+#else
+    return 0;
+#endif
+}
+
+// Peak resident set (VmHWM) since exec; 0 where unavailable.
+static size_t getHwmBytes() {
+#if defined(__linux__)
+    int fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[4096];
+    ssize_t n = syscall(SYS_read, fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    const char* p = strstr(buf, "VmHWM:");
+    size_t kb = 0;
+    if (p) sscanf(p, "VmHWM: %zu kB", &kb);
+    return kb * 1024;
 #else
     return 0;
 #endif
@@ -166,6 +189,8 @@ int main(int argc, char* argv[]) {
             g_cool_duration_sec = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) {
             g_serve_duration_sec = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            g_batch_rows = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--quick") == 0) {
             g_cool_duration_sec = 5;
             g_serve_duration_sec = 10;
@@ -252,6 +277,10 @@ int main(int argc, char* argv[]) {
 
         sqlite3_step(insert_stmt);
         sqlite3_reset(insert_stmt);
+        if (g_batch_rows > 0 && (i + 1) % g_batch_rows == 0 && i + 1 < g_num_rows) {
+            exec_sql(db, "COMMIT");
+            exec_sql(db, "BEGIN TRANSACTION");
+        }
 
         if ((i + 1) % 100000 == 0) {
             fprintf(stderr, "  Inserted %d/%d rows...\n", i + 1, g_num_rows);
@@ -487,6 +516,13 @@ int main(int argc, char* argv[]) {
     double run_peak_mb = 0;
     for (const auto& s : g_rss_timeline) run_peak_mb = std::max(run_peak_mb, s.rss_mb);
     printf("METRIC run_peak_rss_mb %.1f\n", run_peak_mb);
+    // Kernel high-water mark (VmHWM) over the workload: the true peak, not
+    // limited to the once-a-second samples above (the fill has only one).
+    printf("METRIC hwm_rss_mb %.1f\n", getHwmBytes() / (1024.0 * 1024.0));
+    // Marker for external samplers (bench/run_peak_compare.py): everything
+    // after this line is teardown, not workload.
+    printf("METRIC workload_done 1\n");
+    fflush(stdout);
 
     // Dump RSS timeline if requested
     if (const char* rss_dir = std::getenv("SMASH_RSS_DIR")) {

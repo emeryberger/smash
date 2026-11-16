@@ -12,8 +12,9 @@
 //   * successful compressions and their input/output bytes, and pages the
 //     ratio gate rejected;
 //   * per-compressor-thread CPU time, published by each thread itself;
-//   * RSS sampled once per compressor tick: highest sample and the lowest
-//     sample taken after it.
+//   * RSS sampled once per compressor tick: highest sample, and the deepest
+//     drop below the running peak (the sample minimising rss / peak-so-far,
+//     with the peak it is measured against).
 #pragma once
 
 #include <atomic>
@@ -72,7 +73,8 @@ struct Counters {
     std::atomic<uint64_t> ratio_rejects{0};      // compressed too poorly to keep
     std::atomic<uint64_t> thread_cpu_ns[kMaxCpuSlots]{};
     std::atomic<uint64_t> rss_peak_kb{0};        // highest tick sample
-    std::atomic<uint64_t> rss_min_after_peak_kb{0};
+    std::atomic<uint64_t> rss_drop_kb{0};        // sample at the deepest drop
+    std::atomic<uint64_t> rss_drop_peak_kb{0};   // running peak it fell from
     std::atomic<uint64_t> rss_last_kb{0};
     std::atomic<uint64_t> start_ns{0};
 };
@@ -106,15 +108,23 @@ inline uint64_t compressorCpuNs() {
     return s;
 }
 
-// Coordinator thread only (single writer).
+// Coordinator thread only (single writer). The deepest drop is the sample
+// with the smallest rss / peak-so-far, so a later re-read that sets a new
+// peak does not erase an earlier, deeper saving.
 inline void sampleRss(uint64_t kb) {
     if (kb == 0) return;
     g.rss_last_kb.store(kb, std::memory_order_relaxed);
-    if (kb > g.rss_peak_kb.load(std::memory_order_relaxed)) {
+    uint64_t peak = g.rss_peak_kb.load(std::memory_order_relaxed);
+    if (kb > peak) {
         g.rss_peak_kb.store(kb, std::memory_order_relaxed);
-        g.rss_min_after_peak_kb.store(kb, std::memory_order_relaxed);
-    } else if (kb < g.rss_min_after_peak_kb.load(std::memory_order_relaxed)) {
-        g.rss_min_after_peak_kb.store(kb, std::memory_order_relaxed);
+        return;
+    }
+    const uint64_t dk = g.rss_drop_kb.load(std::memory_order_relaxed);
+    const uint64_t dp = g.rss_drop_peak_kb.load(std::memory_order_relaxed);
+    // kb/peak < dk/dp  <=>  kb*dp < dk*peak (dp == 0: no drop recorded yet)
+    if (kb < peak && (dp == 0 || kb * dp < dk * peak)) {
+        g.rss_drop_kb.store(kb, std::memory_order_relaxed);
+        g.rss_drop_peak_kb.store(peak, std::memory_order_relaxed);
     }
 }
 

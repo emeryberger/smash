@@ -31,6 +31,7 @@ nf=$(sed -n 's/.*decompression faults: \([0-9]*\).*/\1/p' "$report")
 [ "${nf:-0}" -gt 0 ] || fail "decompression faults = ${nf:-?}"
 grep -q 'service time p50 <= [0-9]* us, p99 ' "$report" || fail "latency quantiles"
 grep -q 'RSS: peak ' "$report" || fail "RSS line"
+grep -q 'deepest drop: ' "$report" || fail "no RSS drop recorded on a compressing run"
 grep -q 'hint: nothing was compressed' "$report" && fail "zero-compression hint on a compressing run"
 
 # Metrics: every sample line is `name{labels} value`, comments are HELP/TYPE.

@@ -7094,7 +7094,8 @@ public:
         g.comp_out_bytes.store(0, std::memory_order_relaxed);
         g.ratio_rejects.store(0, std::memory_order_relaxed);
         g.rss_peak_kb.store(0, std::memory_order_relaxed);
-        g.rss_min_after_peak_kb.store(0, std::memory_order_relaxed);
+        g.rss_drop_kb.store(0, std::memory_order_relaxed);
+        g.rss_drop_peak_kb.store(0, std::memory_order_relaxed);
         g.rss_last_kb.store(0, std::memory_order_relaxed);
         g.start_ns.store(rstats::monoNs(), std::memory_order_relaxed);
         metrics_last_ns_ = 0;
@@ -7142,8 +7143,12 @@ public:
 #else
         uint64_t kb = static_cast<uint64_t>(ru.ru_maxrss);         // KiB
 #endif
-        const uint64_t sampled = rstats::g.rss_peak_kb.load(std::memory_order_relaxed);
-        return kb > sampled ? kb : sampled;
+        // Linux updates hiwater_rss lazily, so ru_maxrss can trail both the
+        // tick samples and the current RSS; take the largest.
+        uint64_t best = rstats::g.rss_peak_kb.load(std::memory_order_relaxed);
+        if (kb > best) best = kb;
+        const uint64_t cur = residentKb();
+        return cur > best ? cur : best;
     }
 
     const char* modeName() const {
@@ -7303,7 +7308,7 @@ public:
         const double ran = start && now > start ? (now - start) / 1e9 : 0.0;
         const double cold = coldTimeoutSec();
         const uint64_t peak_kb = peakRssKb();
-        const uint64_t low_kb = ld(g.rss_min_after_peak_kb);
+        const uint64_t drop_kb = ld(g.rss_drop_kb), drop_peak_kb = ld(g.rss_drop_peak_kb);
         const uint64_t cur_kb = residentKb();
         const uint64_t ncomp = ld(g.compressions), in_b = ld(g.comp_in_bytes),
                        out_b = ld(g.comp_out_bytes), rej = ld(g.ratio_rejects);
@@ -7321,15 +7326,13 @@ public:
         put("[smash report] pid=%d ran %.1f s  profile=%s mode=%s tracking=%s cold-timeout=%.0f s\n",
             pid, ran, smashProfileName(getSmashProfile()), modeName(), trackingName(), cold);
         fmtBytes(a, sizeof(a), peak_kb * 1024);
-        fmtBytes(b, sizeof(b), low_kb * 1024);
         fmtBytes(c, sizeof(c), cur_kb * 1024);
-        if (low_kb && ld(g.rss_peak_kb)) {
-            const double red = 100.0 * (1.0 - static_cast<double>(low_kb) /
-                                               static_cast<double>(ld(g.rss_peak_kb)));
-            put("[smash report]   RSS: peak %s, lowest after peak %s (%.0f%% below the sampled peak), at exit %s\n",
-                a, b, red, c);
-        } else {
-            put("[smash report]   RSS: peak %s, at exit %s\n", a, c);
+        put("[smash report]   RSS: peak %s, at exit %s\n", a, c);
+        if (drop_kb && drop_peak_kb) {
+            fmtBytes(a, sizeof(a), drop_peak_kb * 1024);
+            fmtBytes(b, sizeof(b), drop_kb * 1024);
+            put("[smash report]   deepest drop: %s -> %s (%.0f%% below the peak up to then; sampled once a second)\n",
+                a, b, 100.0 * (1.0 - static_cast<double>(drop_kb) / static_cast<double>(drop_peak_kb)));
         }
         fmtBytes(a, sizeof(a), ps.managed * kPageSize);
         put("[smash report]   managed by smash: %s (%zu pages)\n", a, ps.managed);

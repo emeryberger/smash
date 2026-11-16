@@ -492,6 +492,19 @@ struct SystemAllocFns {
             malloc_size = reinterpret_cast<MallocSizeFn>(findOriginal(cur_msize));
         }
 #elif defined(__linux__)
+        // Re-entrancy guard. glibc < 2.34's dlsym allocates its dlerror state
+        // with calloc, which lands back here (large-only calloc → resolve()
+        // → dlsym → calloc → ...) and recursed until the stack overflowed:
+        // SMASH_LARGE_ONLY=1 SIGSEGV'd at startup on Ubuntu 20.04 / Debian 11
+        // (glibc 2.31). A nested call returns with the pointers still null;
+        // every caller already handles that (large-only falls through to the
+        // smash slab; the other paths return nullptr, which glibc's
+        // _dlerror_run tolerates by using its static fallback state).
+        // Global, not thread-local: a second thread racing the first
+        // resolution sees the same null-pointer fallback, which is safe.
+        static std::atomic<bool> resolving{false};
+        if (resolving.exchange(true, std::memory_order_acq_rel)) return;
+        struct Clear { ~Clear() { resolving.store(false, std::memory_order_release); } } clear;
         malloc = reinterpret_cast<MallocFn>(dlsym(RTLD_NEXT, "malloc"));
         free = reinterpret_cast<FreeFn>(dlsym(RTLD_NEXT, "free"));
         calloc = reinterpret_cast<CallocFn>(dlsym(RTLD_NEXT, "calloc"));

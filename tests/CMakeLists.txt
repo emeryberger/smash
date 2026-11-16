@@ -284,6 +284,44 @@ endfunction()
 add_observe_mode_test(test_observe_full 0)
 add_observe_mode_test(test_observe_large_only 1)
 
+# SMASH_CGROUP (container memory-limit policy). Unit test: parsers, the pure
+# policy decision, and the Monitor walking a fake pod/container cgroup tree.
+smash_add_test(test_cgroup_monitor cgroup_monitor_test.cpp)
+
+# End-to-end policy test, both modes: SMASH_CGROUP_ROOT points at a fake cgroup
+# (written by the cgroup_fake_setup fixture) with ~1% headroom; the compressor
+# must report the critical level in the SIGUSR2 stats line, still compress
+# resident idle pages, and read every byte back intact.
+add_executable(cgroup_policy_test cgroup_policy_test.cpp)
+set_target_properties(cgroup_policy_test PROPERTIES CXX_STANDARD 20)
+set(SMASH_FAKE_CGROUP_DIR ${CMAKE_CURRENT_BINARY_DIR}/fake_cgroup)
+add_test(NAME cgroup_fake_setup
+  COMMAND ${CMAKE_COMMAND} -DDIR=${SMASH_FAKE_CGROUP_DIR}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/make_fake_cgroup.cmake)
+set_tests_properties(cgroup_fake_setup PROPERTIES FIXTURES_SETUP cgroup_fake)
+function(add_cgroup_policy_test test_name large_only)
+  if(APPLE)
+    set(_preload "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_preload "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(
+    NAME ${test_name}
+    COMMAND ${CMAKE_COMMAND} -E env
+      ${_preload}
+      "SMASH_LARGE_ONLY=${large_only}"
+      "SMASH_CGROUP=1"
+      "SMASH_CGROUP_ROOT=${SMASH_FAKE_CGROUP_DIR}"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=2"
+      "SMASH_STATS_SIGNAL=1"
+      $<TARGET_FILE:cgroup_policy_test>
+  )
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 60 FIXTURES_REQUIRED cgroup_fake)
+endfunction()
+add_cgroup_policy_test(test_cgroup_policy_full 0)
+add_cgroup_policy_test(test_cgroup_policy_large_only 1)
+
 # Shadow-reclaim regression guard: slab pages that hold freed slots must
 # finish shadow reclaim. compressPage() zeroes free slots in the image it
 # compresses, so the shadow content check has to mask the live page the same

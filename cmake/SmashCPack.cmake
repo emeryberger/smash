@@ -33,7 +33,10 @@ physical memory while idle. Load it with LD_PRELOAD (or the bundled `smash`
 launcher); no code changes, root or kernel configuration are needed.")
 set(CPACK_RESOURCE_FILE_LICENSE "${PROJECT_SOURCE_DIR}/LICENSE")
 set(CPACK_RESOURCE_FILE_README "${PROJECT_SOURCE_DIR}/README.md")
-set(CPACK_STRIP_FILES ON)
+# Not stripped: the libsmash.so inside the .deb/.rpm/.tar.gz is then
+# byte-identical to the raw libsmash-linux-<arch>.so release asset built in the
+# same container run (a Release build carries no debug info anyway).
+set(CPACK_STRIP_FILES OFF)
 set(CPACK_SOURCE_GENERATOR "")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")

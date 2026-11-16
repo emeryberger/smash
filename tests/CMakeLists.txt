@@ -252,6 +252,38 @@ endfunction()
 add_mode_compression_test(test_malloc_compression 0)      # full mode
 add_mode_compression_test(test_large_only_compression 1)  # large-only mode
 
+# Observe (dry-run) mode: SMASH_MODE=observe, ONE executable run in both full
+# and large-only mode. Asserts cold regions are projected, a hot region is not,
+# rewriting a projected region counts refaults, nothing is really compressed
+# (SIGUSR2 stats compressed=0 shadow=0), RSS keeps every page, and all data
+# reads back byte-exact. Reads the JSON report SMASH_OBSERVE_REPORT rewrites
+# every SMASH_OBSERVE_INTERVAL=1 s.
+add_executable(observe_mode_test observe_mode_test.cpp)
+set_target_properties(observe_mode_test PROPERTIES CXX_STANDARD 20)
+function(add_observe_mode_test test_name large_only)
+  if(APPLE)
+    set(_preload "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_preload "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(
+    NAME ${test_name}
+    COMMAND ${CMAKE_COMMAND} -E env
+      ${_preload}
+      "SMASH_MODE=observe"
+      "SMASH_LARGE_ONLY=${large_only}"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_STATS_SIGNAL=1"
+      "SMASH_OBSERVE_INTERVAL=1"
+      "SMASH_OBSERVE_REPORT=${CMAKE_CURRENT_BINARY_DIR}/${test_name}.json"
+      $<TARGET_FILE:observe_mode_test>
+  )
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+endfunction()
+add_observe_mode_test(test_observe_full 0)
+add_observe_mode_test(test_observe_large_only 1)
+
 # Shadow-reclaim regression guard: slab pages that hold freed slots must
 # finish shadow reclaim. compressPage() zeroes free slots in the image it
 # compresses, so the shadow content check has to mask the live page the same

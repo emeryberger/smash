@@ -311,6 +311,7 @@ inline void warmupEnvStatics() {
     (void)getDeferredReclaimDelay();
     (void)getColdTicks();
     (void)getSmashMode();
+    (void)isObserveMode();
     (void)isLargeOnlyMode();
     (void)vm::noDecommitEnabled();
     (void)vm::madvMode();
@@ -567,6 +568,7 @@ class CompressorThread {
     void uffdInit() {
         if (uffd_init_done_) return;
         uffd_init_done_ = true;
+        if (observe_) return;  // observe mode never reclaims: no uffd registration
         // Default on where the kernel supports it (UFFDIO_MOVE: Linux 6.8+);
         // SMASH_UFFD=0 opts out, SMASH_UFFD=1 also reports why it is off.
         const char* e = std::getenv("SMASH_UFFD");
@@ -706,7 +708,9 @@ class CompressorThread {
     // Without the idle bitmap, uffd mode skips the read check: a PROT_NONE arm
     // is exactly the write-locked mprotect this mode removes, and a wrong
     // guess now costs one in-thread UFFDIO_COPY (refault backoff bounds it).
-    bool readCheckOff() const { return uffd_mode_ && idle_read_ok_ != 1; }
+    // Observe mode skips it for the same reason: without the idle bitmap the
+    // arm is a PROT_NONE, which observe mode never applies.
+    bool readCheckOff() const { return (uffd_mode_ || observe_) && idle_read_ok_ != 1; }
     // Per-worker end (exclusive) of the run of pages this worker armed
     // PROT_NONE (arm_run_end_) or compressed (compress_run_end_) in the
     // current Phase 2 range; SIZE_MAX = no run. Phase 2 walks a range in
@@ -723,6 +727,7 @@ class CompressorThread {
             if (pfn) { markPageIdle(pfn); read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; return; }
         }
 #endif
+        if (observe_) return;  // never PROT_NONE in observe mode
         // Charge 2 VMAs per contiguous run, not per page: page i-1 armed
         // PROT_NONE earlier in this range means the kernel merges page i into
         // its VMA. Charging every page made a large cold wave (SQLite's 110K
@@ -837,6 +842,52 @@ class CompressorThread {
     // Deferred-reclaim mode: tick at which Phase A completed for each page.
     // Non-zero only for pages in COMPRESSED_SHADOW state.
     uint32_t* shadow_tick_ = nullptr;
+
+    // ── Observe (dry-run) mode (SMASH_MODE=observe) ─────────────────────────
+    // compressPage() snapshots and compresses exactly as a real run would,
+    // but discards the blob: no PROT_NONE, no madvise, no data change. Each
+    // "virtually compressed" page walks a shadow lifecycle that mirrors the
+    // deferred-reclaim path:
+    //   kObsShadow    snapshot taken at tick obs_tick_[i]. A real run holds
+    //                 frame + blob here; a write before the Phase-B delay
+    //                 elapses cancels it (kShadowDiscard, no fault).
+    //   kObsReclaimed content still matched the snapshot hash after the
+    //                 delay — a real run would have dropped the frame. Any
+    //                 later access the tracker sees is a projected refault.
+    // Stage transitions use atomic exchange/CAS: releaseCompressedPages()
+    // clears pages lock-free from app threads, and exactly one side must
+    // account the page's bytes out of the running totals.
+    static constexpr uint8_t kObsNone = 0, kObsShadow = 1, kObsReclaimed = 2;
+    static constexpr int kObsHistBins = 7;  // see obsHistBin()
+    bool observe_ = false;
+    std::atomic<uint8_t>* obs_stage_ = nullptr;
+    uint16_t* obs_blob_ = nullptr;   // store cost of the discarded blob (0 = zero page)
+    uint32_t* obs_hash_ = nullptr;   // hash of the (free-slot-zeroed) snapshot
+    uint32_t* obs_tick_ = nullptr;   // tick the snapshot was taken
+    struct ObserveStats {
+        std::atomic<uint64_t> snapshots{0};      // pages virtually compressed
+        std::atomic<uint64_t> rejected{0};       // failed the ratio gate
+        std::atomic<uint64_t> zero{0};           // all-zero snapshots (no blob)
+        std::atomic<uint64_t> discards{0};       // written inside the shadow window
+        std::atomic<uint64_t> reclaims{0};       // reached kObsReclaimed
+        std::atomic<uint64_t> refault_w{0};      // write seen after reclaim
+        std::atomic<uint64_t> refault_r{0};      // read seen after reclaim (idle bit)
+        std::atomic<uint64_t> freed{0};          // freed while virtually compressed
+        std::atomic<int64_t> shadow_pages{0}, shadow_blob{0};
+        std::atomic<int64_t> recl_pages{0}, recl_blob{0};
+        std::atomic<uint64_t> hist[kObsHistBins] = {};
+        // Coordinator-only tick samples (no atomics needed).
+        uint64_t ticks = 0;
+        uint64_t rss_kb = 0, peak_rss_kb = 0, min_proj_rss_kb = UINT64_MAX;
+        uint64_t max_saving_kb = 0, managed_kb = 0;
+        long double sum_rss_kb = 0, sum_proj_kb = 0;
+        uint64_t first_sec = 0;
+    } obs_;
+    const char* cfg_observe_report_ = nullptr;   // SMASH_OBSERVE_REPORT=path (JSON)
+    int cfg_observe_interval_ = 10;              // SMASH_OBSERVE_INTERVAL=seconds (0 = exit only)
+    pid_t obs_pid_ = 0;                          // pid that read the config (fork children suffix)
+    std::atomic<bool> obs_final_done_{false};
+    int obs_softdirty_ok_ = -1;                  // soft-dirty actually sets bit 55 (probed once)
 
     // Deferred-madvise queue (SMASH_DEFER_MADVISE=1). Allocated alongside
     // the other per-page arrays. deferred_pending_[i]=true means page i is
@@ -1770,6 +1821,128 @@ private:
         return __builtin_memcmp(live, decompressed, kPageSize) == 0;
     }
 
+    // ── Observe-mode helpers (SMASH_MODE=observe) ─────────────────────────
+    bool obs_vm_readv_ok_ = true;  // process_vm_readv usable (seccomp may deny it)
+
+    // CompressStore::store() rounds a blob up to 16 B (minimum one FreeNode);
+    // this is the byte cost a real run would charge to the store. Store
+    // fragmentation and per-region slack are NOT modeled (see estimator.md).
+    static uint32_t obsBlobCost(size_t comp_size) {
+        size_t a = (comp_size + 15) & ~static_cast<size_t>(15);
+        return static_cast<uint32_t>(a < 16 ? 16 : a);
+    }
+    // Ratio histogram bins: 0 = failed the ratio gate (kept uncompressed),
+    // 1 = <2x, 2 = 2-4x, 3 = 4-8x, 4 = 8-16x, 5 = >=16x, 6 = all-zero page.
+    static int obsHistBin(size_t comp_size, bool zero_page) {
+        if (zero_page) return 6;
+        if (comp_size > kPageSize / 2) return 1;
+        if (comp_size > kPageSize / 4) return 2;
+        if (comp_size > kPageSize / 8) return 3;
+        if (comp_size > kPageSize / 16) return 4;
+        return 5;
+    }
+    static uint32_t obsHash(const void* p) {
+        const uint64_t* w = static_cast<const uint64_t*>(p);
+        uint64_t h = 0x9E3779B97F4A7C15ULL;
+        for (size_t k = 0; k < kPageSize / 8; ++k) {
+            h ^= w[k];
+            h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 29;
+        }
+        return static_cast<uint32_t>(h ^ (h >> 32));
+    }
+    // Read a page into buf without risking a fatal fault (see compressPage).
+    bool obsReadPage(void* buf, const void* page_addr) {
+#ifdef __linux__
+        if (obs_vm_readv_ok_) {
+            struct iovec local_iov{buf, kPageSize};
+            struct iovec remote_iov{const_cast<void*>(page_addr), kPageSize};
+            ssize_t r = process_vm_readv(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+            if (r == static_cast<ssize_t>(kPageSize)) return true;
+            if (r < 0 && (errno == ENOSYS || errno == EPERM)) obs_vm_readv_ok_ = false;
+            else return false;
+        }
+#endif
+        __builtin_memcpy(buf, page_addr, kPageSize);
+        return true;
+    }
+    // compressPage (worker, page lock held): the blob was produced and
+    // discarded; enter the shadow stage.
+    void obsRecord(size_t i, const void* snapshot, size_t comp_size,
+                   size_t alloc_size, bool zero_page) {
+        const uint32_t blob = zero_page ? 0u : static_cast<uint32_t>(alloc_size);
+        obs_blob_[i] = static_cast<uint16_t>(blob > 0xFFFF ? 0xFFFF : blob);
+        obs_hash_[i] = obsHash(snapshot);
+        obs_tick_[i] = tick_counter_;
+        obs_.snapshots.fetch_add(1, std::memory_order_relaxed);
+        if (zero_page) obs_.zero.fetch_add(1, std::memory_order_relaxed);
+        obs_.hist[obsHistBin(comp_size, zero_page)].fetch_add(1, std::memory_order_relaxed);
+        obs_.shadow_pages.fetch_add(1, std::memory_order_relaxed);
+        obs_.shadow_blob.fetch_add(obs_blob_[i], std::memory_order_relaxed);
+        obs_stage_[i].store(kObsShadow, std::memory_order_release);
+    }
+    // Leave the observe lifecycle. why: 0 = access, 1 = freed, 2 = content
+    // changed inside the shadow window. Exactly one caller wins the exchange.
+    void obsClear(size_t i, int why, bool was_write = true) {
+        const uint8_t prev = obs_stage_[i].exchange(kObsNone, std::memory_order_acq_rel);
+        if (prev == kObsNone) return;
+        const int64_t blob = obs_blob_[i];
+        if (prev == kObsShadow) {
+            obs_.shadow_pages.fetch_sub(1, std::memory_order_relaxed);
+            obs_.shadow_blob.fetch_sub(blob, std::memory_order_relaxed);
+            if (why != 1) obs_.discards.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            obs_.recl_pages.fetch_sub(1, std::memory_order_relaxed);
+            obs_.recl_blob.fetch_sub(blob, std::memory_order_relaxed);
+            if (why == 0)
+                (was_write ? obs_.refault_w : obs_.refault_r).fetch_add(1, std::memory_order_relaxed);
+        }
+        if (why == 1) obs_.freed.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Phase 1 (worker owning page i). `accessed` is the tracker's verdict for
+    // this tick (write bit, plus the idle-bit read signal when available).
+    // noinline: big stack buffers must not land in tick()'s frame (the
+    // coordinator runs on a 128 KiB stack; sigusr1Handler is deep too).
+    __attribute__((noinline, cold)) void obsPhase1(size_t i, bool accessed, bool written) {
+        const uint8_t stg = obs_stage_[i].load(std::memory_order_acquire);
+        if (stg == kObsNone) return;
+        if (accessed) { obsClear(i, 0, written); return; }
+        if (stg != kObsShadow) return;
+        if (tick_counter_ - obs_tick_[i] < static_cast<uint32_t>(getDeferredReclaimDelay()))
+            return;
+        // Phase B's content compare: a real run drops the frame only if the
+        // page still matches its blob (free slots zeroed on both sides).
+        void* pa = vm_->pageAddress(i);
+        alignas(64) unsigned char live[kPageSize];
+        if (!pa || !obsReadPage(live, pa)) { obsClear(i, 1); return; }
+#ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
+        zeroFreeSlots(live, i);
+#endif
+        if (obsHash(live) != obs_hash_[i]) { obsClear(i, 2); return; }
+        uint8_t expect = kObsShadow;
+        if (!obs_stage_[i].compare_exchange_strong(expect, kObsReclaimed,
+                                                   std::memory_order_acq_rel))
+            return;  // freed concurrently
+        const int64_t blob = obs_blob_[i];
+        obs_.shadow_pages.fetch_sub(1, std::memory_order_relaxed);
+        obs_.shadow_blob.fetch_sub(blob, std::memory_order_relaxed);
+        obs_.recl_pages.fetch_add(1, std::memory_order_relaxed);
+        obs_.recl_blob.fetch_add(blob, std::memory_order_relaxed);
+        obs_.reclaims.fetch_add(1, std::memory_order_relaxed);
+#ifdef __linux__
+        // A real run's reclaimed page faults on ANY access. Reads are only
+        // visible through the idle bitmap; arm it so phase1's existing
+        // idle-bit check reports a read as an access (fault-free).
+        if (idle_read_ok_ == 1 && read_armed_) {
+            if (idled_) {
+                if (i < idled_npages_) { read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; idledArm(i); }
+            } else if (uint64_t pfn = pfnForPage(i)) {
+                markPageIdle(pfn); read_armed_[i] = 1; arm_cc_[i] = cold_count_[i];
+            }
+        }
+#endif
+    }
+
     // ── Chunk bitmap management ───────────────────────────────────────────
 
     void rebuildChunkBitmap(size_t committed) {
@@ -1839,6 +2012,9 @@ private:
                     migBitSet(i);
             }
             PageState st = states_->get(i);
+            if (obs_stage_ && st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING &&
+                obs_stage_[i].load(std::memory_order_relaxed) != kObsNone)
+                obsClear(i, 1);  // retired without passing through the release hook
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
                 ++resident;
                 // Raw WRITE signal (soft-dirty) BEFORE the idle-read augmentation
@@ -1870,6 +2046,7 @@ private:
                     }
                 }
 #endif
+                if (obs_stage_) obsPhase1(i, accessed, written);
                 if (accessed) {
                     // Refault probation lasts the restore window: a write
                     // here is usually the burst that faulted the page in,
@@ -1977,6 +2154,9 @@ private:
             // valid. environ moves when setenv/putenv reallocs it, so the index
             // is refreshed each tick in refreshEnvironExclusion().
             if (i == environ_page_idx_) return;
+            // Observe mode: already virtually compressed — a real run would
+            // hold it COMPRESSED until an access, so don't re-snapshot it.
+            if (obs_stage_ && obs_stage_[i].load(std::memory_order_relaxed) != kObsNone) return;
             PageState st = states_->get(i);
 
             // Tiered recompression: COMPRESSED pages at the LZ4 tier
@@ -2317,6 +2497,9 @@ private:
             // PFN vanished (page swapped/migrated) → fall through to PROT_NONE.
         }
 #endif
+        // Observe mode: deep monitoring is a PROT_NONE arm — never applied.
+        // Read-hot pages stay invisible unless the idle bitmap is usable.
+        if (observe_) return;
 #if defined(__APPLE__)
         // macOS + deferred-reclaim: skip the PROT_NONE deep-monitoring arm.
         //
@@ -2494,7 +2677,11 @@ private:
     // ── Compress one page using worker's contexts ─────────────────────────
 
     __attribute__((cold)) bool compressPage(size_t page_idx, CompressWorker& worker) {
-        const bool deferred = isDeferredReclaimMode();
+        // Observe mode takes the deferred-mode lock discipline (tryLock) and
+        // skips every non-deferred restore path below; its snapshot branch
+        // never touches protection.
+        const bool observe = observe_;
+        const bool deferred = isDeferredReclaimMode() || observe;
 
         if (deferred) {
             if (!locks_->tryLock(page_idx)) return false;
@@ -2513,6 +2700,10 @@ private:
             return false;
         }
         if (pstats::g_stamp) [[unlikely]] states_->set(page_idx, PageState::COMPRESSING);
+        // State to return the page to when it is NOT compressed. Observe mode
+        // never changes protection, so a PROT_READ-monitored page must stay
+        // ACTIVE_MONITORING; the other modes restore PROT_RW and say ACTIVE.
+        const PageState restore_st = observe ? st : PageState::ACTIVE;
         migBitSet(page_idx);
 
         // ROI-based compression decision (replaces fixed shouldSkip + selectAlgorithm).
@@ -2552,7 +2743,7 @@ private:
         if (!CompressionROI::shouldCompress(cold_count_[page_idx],
                                              stats_count, stats_sum,
                                              redirty_discount_x256)) {
-            states_->set(page_idx, PageState::ACTIVE);
+            states_->set(page_idx, restore_st);
             locks_->unlock(page_idx);
             return false;
         }
@@ -2647,7 +2838,7 @@ private:
             }
         }
         if (!profile) {
-            states_->set(page_idx, PageState::ACTIVE);
+            states_->set(page_idx, restore_st);
             locks_->unlock(page_idx);
             return false;
         }
@@ -2671,7 +2862,36 @@ private:
             return false;
         }
 
-        if (deferred) {
+        if (observe) {
+            // Observe mode: read the page as-is. It is PROT_RW or PROT_READ
+            // (Phase 3) — observe mode never arms PROT_NONE — so no mprotect.
+            // A racing app write can tear the snapshot; that only perturbs
+            // the estimate, and the shadow-window hash check below treats a
+            // changed page as written (as Phase B's content compare does).
+            // Linux reads through process_vm_readv so an unexpectedly
+            // unreadable page is an EFAULT, not a fatal worker SIGSEGV.
+            bool got = false;
+#ifdef __linux__
+            if (obs_vm_readv_ok_) {
+                struct iovec local_iov{worker.page_buf, kPageSize};
+                struct iovec remote_iov{page_addr, kPageSize};
+                ssize_t r = process_vm_readv(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+                if (r == static_cast<ssize_t>(kPageSize)) {
+                    got = true;
+                } else if (r < 0 && (errno == ENOSYS || errno == EPERM)) {
+                    obs_vm_readv_ok_ = false;  // seccomp'd: plain reads from now on
+                } else {
+                    states_->set(page_idx, restore_st);
+                    locks_->unlock(page_idx);
+                    return false;
+                }
+            }
+#endif
+            if (!got) __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+#ifndef SMASH_ABLATION_NO_ZERO_DEFERRED
+            zeroFreeSlots(worker.page_buf, page_idx);
+#endif
+        } else if (deferred) {
             // Deferred mode: ensure the page is PROT_RW before the snapshot
             // read below. This mprotect is UNCONDITIONAL (was previously gated
             // on st==ACTIVE_MONITORING) because an ACTIVE page can also be
@@ -2708,7 +2928,7 @@ private:
                 __builtin_memcpy(verify_buf, page_addr, kPageSize);
                 if (__builtin_memcmp(verify_buf, worker.page_buf, kPageSize) != 0) {
                     snapshot_verify_fails_.fetch_add(1, std::memory_order_relaxed);
-                    states_->set(page_idx, PageState::ACTIVE);
+                    states_->set(page_idx, restore_st);
                     locks_->unlock(page_idx);
                     return false;
                 }
@@ -2765,7 +2985,7 @@ private:
                                                &remote_iov, 1, 0);
                 if (got != static_cast<ssize_t>(kPageSize)) {
                     vm::protectPages(page_addr, kPageSize, true, true);
-                    states_->set(page_idx, PageState::ACTIVE);
+                    states_->set(page_idx, restore_st);
                     locks_->unlock(page_idx);
                     return false;
                 }
@@ -2798,7 +3018,7 @@ private:
                 if (__builtin_memcmp(verify_buf, worker.page_buf, kPageSize) != 0) {
                     snapshot_verify_fails_.fetch_add(1, std::memory_order_relaxed);
                     vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
-                    states_->set(page_idx, PageState::ACTIVE);
+                    states_->set(page_idx, restore_st);
                     locks_->unlock(page_idx);
                     return false;
                 }
@@ -2949,11 +3169,15 @@ private:
             // for the next attempt (see phase2Range). The count resets only
             // on a real access — an idle page's contents cannot change, so
             // retries stay capped at one per kMaxEffectiveFloorTicks streak.
+            if (observe) {
+                obs_.rejected.fetch_add(1, std::memory_order_relaxed);
+                obs_.hist[0].fetch_add(1, std::memory_order_relaxed);
+            }
             if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
                 compress_fail_count_[page_idx]++;
             rstats::g.ratio_rejects.fetch_add(1, std::memory_order_relaxed);
             cold_count_[page_idx] = 0;
-            states_->set(page_idx, PageState::ACTIVE);
+            states_->set(page_idx, restore_st);
             locks_->unlock(page_idx);
             return false;
         }
@@ -2962,7 +3186,9 @@ private:
         // nothing — the sentinel recorded below carries all the information.
         size_t alloc_size = 0;
         void* stored = nullptr;
-        if (!zero_page) {
+        if (!zero_page && observe) {
+            alloc_size = obsBlobCost(comp_size);  // what store() would charge; blob discarded
+        } else if (!zero_page) {
             stored = store_->store(worker.compress_buf, comp_size, &alloc_size, page_idx);
             if (!stored) {
                 if (!deferred) {
@@ -2971,7 +3197,7 @@ private:
                     }
                     __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
                 }
-                states_->set(page_idx, PageState::ACTIVE);
+                states_->set(page_idx, restore_st);
                 locks_->unlock(page_idx);
                 return false;
             }
@@ -3006,6 +3232,13 @@ private:
                 if (cfg.ucb_warmstart && arena_id < kNumArenas)
                     worker.arena_arm[arena_id].recordReward(chosen_tier, r);
             }
+        }
+
+        if (observe) {
+            obsRecord(page_idx, worker.page_buf, comp_size, alloc_size, zero_page);
+            states_->set(page_idx, restore_st);
+            locks_->unlock(page_idx);
+            return true;
         }
 
         // Record compressed page info (with algo in top 2 bits). Zero pages
@@ -3077,7 +3310,7 @@ private:
                             vm::remapPages(page_addr, kPageSize, true, true);
                         }
                         __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
-                        states_->set(page_idx, PageState::ACTIVE);
+                        states_->set(page_idx, restore_st);
                         locks_->unlock(page_idx);
                         return false;
                     }
@@ -3124,7 +3357,7 @@ private:
                             vm::remapPages(page_addr, kPageSize, true, true);
                         }
                         __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
-                        states_->set(page_idx, PageState::ACTIVE);
+                        states_->set(page_idx, restore_st);
                         locks_->unlock(page_idx);
                         return false;
                     }
@@ -5429,7 +5662,8 @@ private:
 
         // Soft-dirty: bulk-read kernel-tracked write bits into accessed_
         // BEFORE Phase 1 consumes them, then clear for the next tick.
-        bool softdirty = isSoftDirtyEnabled() && ensureSoftDirtyFds();
+        bool softdirty = isSoftDirtyEnabled() && ensureSoftDirtyFds() &&
+                         (!observe_ || obsSoftDirtyWorks());
         softdirty_now_ = softdirty;
         bool scanned = false;
         if (softdirty) {
@@ -5535,6 +5769,8 @@ private:
         // survivors pin all regions, and RSS ends above the no-compression
         // baseline (Redis hot-set run: ~34 MB stranded).
         if (store_) store_->trim();
+
+        if (observe_) observeTickSample();
     }
 
     // Adapt active worker count using Little's Law (see class comment above).
@@ -5992,6 +6228,19 @@ public:
         }
         if (isDeferredReclaimMode())
             shadow_tick_ = bootstrapArray<uint32_t>(max_pages);
+        observe_ = isObserveMode();
+        if (observe_) {
+            obs_stage_ = bootstrapArray<std::atomic<uint8_t>>(max_pages);
+            obs_blob_ = bootstrapArray<uint16_t>(max_pages);
+            obs_hash_ = bootstrapArray<uint32_t>(max_pages);
+            obs_tick_ = bootstrapArray<uint32_t>(max_pages);
+            cfg_observe_report_ = std::getenv("SMASH_OBSERVE_REPORT");
+            if (const char* e = std::getenv("SMASH_OBSERVE_INTERVAL")) {
+                const int v = std::atoi(e);
+                cfg_observe_interval_ = v < 0 ? 0 : v;
+            }
+            obs_pid_ = getpid();
+        }
         page_tier_ = bootstrapArray<uint8_t>(max_pages);
         // Always allocate; sweeper short-circuits on the env knob anyway,
         // and unconditional init keeps pointer-null checks out of fault path.
@@ -6340,6 +6589,11 @@ public:
     }
 
     void start() {
+        if (observe_) {
+            const char msg[] = "[smash observe] dry-run mode: pages are snapshotted and "
+                               "compressed, blobs discarded; nothing is reclaimed\n";
+            (void)!write(2, msg, sizeof(msg) - 1);
+        }
         uffdInit();
         running_.store(true, std::memory_order_release);
         start_steady_time_ = std::chrono::steady_clock::now();
@@ -6939,6 +7193,210 @@ public:
 #endif
     }
 
+    // ── Observe-mode sampling and report ─────────────────────────────────
+    // Soft-dirty is compiled in on every Linux arch but only x86-64 (and a
+    // few others) set PTE bit 55; arm64 6.8 never does, so a "working"
+    // pagemap read reports no writes at all and every page looks cold.
+    // Observe mode must not trust that: probe once with a scratch page and
+    // fall back to Phase 3 PROT_READ write tracking when the bit never sets.
+    bool obsSoftDirtyWorks() {
+        if (obs_softdirty_ok_ >= 0) return obs_softdirty_ok_ == 1;
+        obs_softdirty_ok_ = 0;
+#ifdef __linux__
+        if (clear_refs_fd_ < 0 || pagemap_fd_ < 0) return false;
+        void* p = vm::rawMmap(nullptr, kPageSize, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS);
+        if (!p || p == MAP_FAILED) return false;
+        *static_cast<volatile char*>(p) = 1;
+        if (pwrite(clear_refs_fd_, "4", 1, 0) == 1) {
+            *static_cast<volatile char*>(p) = 2;
+            uint64_t e = 0;
+            const off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(p) / kPageSize * 8);
+            if (pread(pagemap_fd_, &e, sizeof(e), off) == static_cast<ssize_t>(sizeof(e)) &&
+                (e & (1ULL << 55)))
+                obs_softdirty_ok_ = 1;
+        }
+        munmap(p, kPageSize);
+#endif
+        if (obs_softdirty_ok_ != 1) {
+            const char msg[] = "[smash observe] soft-dirty bit unsupported by this kernel/arch; "
+                               "using PROT_READ write monitoring\n";
+            (void)!write(2, msg, sizeof(msg) - 1);
+        }
+        return obs_softdirty_ok_ == 1;
+    }
+
+    static uint64_t obsPeakRssKb() {
+        struct rusage ru{};
+        if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#if defined(__APPLE__)
+        return static_cast<uint64_t>(ru.ru_maxrss) / 1024;  // bytes on macOS
+#else
+        return static_cast<uint64_t>(ru.ru_maxrss);         // KiB on Linux
+#endif
+    }
+
+    int64_t obsSavingBytes() const {
+        // Reclaimed pages give back their frame but keep their blob; shadow
+        // pages hold frame AND blob (a real run's transient overhead).
+        return obs_.recl_pages.load(std::memory_order_relaxed) * static_cast<int64_t>(kPageSize)
+             - obs_.recl_blob.load(std::memory_order_relaxed)
+             - obs_.shadow_blob.load(std::memory_order_relaxed);
+    }
+
+    // Coordinator, end of every tick.
+    // noinline: big stack buffers must not land in tick()'s frame (the
+    // coordinator runs on a 128 KiB stack; sigusr1Handler is deep too).
+    __attribute__((noinline, cold)) void observeTickSample() {
+        auto& o = obs_;
+        const uint64_t rss = residentKb();
+        const int64_t sav_b = obsSavingBytes();
+        const uint64_t sav = sav_b > 0 ? static_cast<uint64_t>(sav_b) / 1024 : 0;
+        const uint64_t proj = rss > sav ? rss - sav : 0;
+        o.rss_kb = rss;
+        o.managed_kb = static_cast<uint64_t>(resident_pages_last_) * kPageSize / 1024;
+        if (rss > o.peak_rss_kb) o.peak_rss_kb = rss;
+        if (sav > o.max_saving_kb) o.max_saving_kb = sav;
+        if (proj < o.min_proj_rss_kb) o.min_proj_rss_kb = proj;
+        o.sum_rss_kb += rss;
+        o.sum_proj_kb += proj;
+        ++o.ticks;
+        const uint64_t el = elapsedSec();
+        if (cfg_observe_interval_ > 0 && el >= o.first_sec + static_cast<uint64_t>(cfg_observe_interval_)) {
+            o.first_sec = el;
+            observeReport(false);
+        }
+    }
+
+    uint64_t elapsedSec() const {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start_steady_time_).count());
+    }
+
+    // pct in tenths of a percent, clamped to [-1000, 1000].
+    static long obsPct10(long double num, long double den) {
+        if (den <= 0) return 0;
+        long double v = num * 1000.0L / den;
+        if (v > 1000) v = 1000;
+        if (v < -1000) v = -1000;
+        return static_cast<long>(v + (v >= 0 ? 0.5L : -0.5L));
+    }
+
+    // One stderr summary line; with SMASH_OBSERVE_REPORT=path also a JSON
+    // file (rewritten on every report, so a killed process leaves the last
+    // periodic one). Allocation-free: safe_snprintf + raw write().
+    // noinline: big stack buffers must not land in tick()'s frame (the
+    // coordinator runs on a 128 KiB stack; sigusr1Handler is deep too).
+    __attribute__((noinline, cold)) void observeReport(bool final) {
+        if (!observe_) return;
+        auto& o = obs_;
+        const uint64_t rss_kb = final ? residentKb() : o.rss_kb;
+        uint64_t peak_kb = obsPeakRssKb();
+        if (o.peak_rss_kb > peak_kb) peak_kb = o.peak_rss_kb;
+        const int64_t sav_b = obsSavingBytes();
+        const uint64_t rss_b = rss_kb * 1024;
+        const int64_t proj_b = static_cast<int64_t>(rss_b) - (sav_b > 0 ? sav_b : 0);
+        const uint64_t n = o.ticks ? o.ticks : 1;
+        const long double avg_rss = o.sum_rss_kb * 1024.0L / n;
+        const long double avg_proj = o.sum_proj_kb * 1024.0L / n;
+        const uint64_t reclaims = o.reclaims.load(std::memory_order_relaxed);
+        const uint64_t rw = o.refault_w.load(std::memory_order_relaxed);
+        const uint64_t rr = o.refault_r.load(std::memory_order_relaxed);
+        const uint64_t minp = o.min_proj_rss_kb == UINT64_MAX ? rss_kb : o.min_proj_rss_kb;
+        const long red = obsPct10(static_cast<long double>(sav_b > 0 ? sav_b : 0), rss_b);
+        const long avg_red = obsPct10(avg_rss - avg_proj, avg_rss);
+        const long peak_red = obsPct10(static_cast<long double>(peak_kb) - minp, peak_kb);
+        const long rf = obsPct10(rw + rr, reclaims);
+        const char* wt = softdirty_now_ ? "soft-dirty" : (cfg_no_monitor_ ? "none" : "prot-read");
+#ifdef __linux__
+        const char* rt = idle_read_ok_ == 1 ? (idled_ ? "smash-idled" : "page_idle") : "none";
+#else
+        const char* rt = "none";
+#endif
+        uint64_t h[kObsHistBins];
+        for (int k = 0; k < kObsHistBins; ++k) h[k] = o.hist[k].load(std::memory_order_relaxed);
+        const auto MiB = [](long double b) { return static_cast<long>(b / (1024.0L * 1024.0L) + 0.5L); };
+        const auto sgn = [](long v) { return v < 0 ? "-" : ""; };
+        const auto ab = [](long v) { return v < 0 ? -v : v; };
+
+        char buf[768];
+        int len = smash::safe_snprintf(buf, sizeof(buf),
+            "[smash observe] %s pid=%d t=%llus mode=%s write_track=%s read_track=%s"
+            " rss=%ldMiB peak_rss=%ldMiB managed=%ldMiB would_compress=%ldMiB blob=%ldMiB"
+            " projected_saving=%ldMiB projected_rss=%ldMiB reduction=%s%ld.%ld%%"
+            " avg_reduction=%s%ld.%ld%% peak_relative=%s%ld.%ld%% refaults=%llu(w=%llu,r=%llu)"
+            " refault_rate=%ld.%ld%% discards=%llu rejected=%llu"
+            " hist[rej,<2,2-4,4-8,8-16,16+,zero]=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            final ? "final" : "interval", static_cast<int>(getpid()),
+            static_cast<unsigned long long>(elapsedSec()),
+            isLargeOnlyMode() ? "large_only" : "full", wt, rt,
+            MiB(rss_b), MiB(peak_kb * 1024.0L), MiB(o.managed_kb * 1024.0L),
+            MiB(o.recl_pages.load(std::memory_order_relaxed) * static_cast<long double>(kPageSize)),
+            MiB(static_cast<long double>(o.recl_blob.load(std::memory_order_relaxed) +
+                                         o.shadow_blob.load(std::memory_order_relaxed))),
+            MiB(static_cast<long double>(sav_b)), MiB(static_cast<long double>(proj_b)),
+            sgn(red), ab(red) / 10, ab(red) % 10, sgn(avg_red), ab(avg_red) / 10, ab(avg_red) % 10,
+            sgn(peak_red), ab(peak_red) / 10, ab(peak_red) % 10,
+            static_cast<unsigned long long>(rw + rr), static_cast<unsigned long long>(rw),
+            static_cast<unsigned long long>(rr), rf / 10, rf % 10,
+            static_cast<unsigned long long>(o.discards.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(o.rejected.load(std::memory_order_relaxed)),
+            (unsigned long long)h[0], (unsigned long long)h[1], (unsigned long long)h[2],
+            (unsigned long long)h[3], (unsigned long long)h[4], (unsigned long long)h[5],
+            (unsigned long long)h[6]);
+        if (len > 0) (void)!write(2, buf, static_cast<size_t>(len) < sizeof(buf) ? static_cast<size_t>(len) : sizeof(buf) - 1);
+
+        if (!cfg_observe_report_ || !cfg_observe_report_[0]) return;
+        char path[512];
+        int pl = (getpid() == obs_pid_)
+            ? smash::safe_snprintf(path, sizeof(path), "%s", cfg_observe_report_)
+            : smash::safe_snprintf(path, sizeof(path), "%s.%d", cfg_observe_report_, static_cast<int>(getpid()));
+        if (pl <= 0 || static_cast<size_t>(pl) >= sizeof(path)) return;
+        char js[2048];
+        int jl = smash::safe_snprintf(js, sizeof(js),
+            "{\"pid\": %d, \"final\": %s, \"elapsed_s\": %llu, \"ticks\": %llu,"
+            " \"mode\": \"%s\", \"write_tracking\": \"%s\", \"read_tracking\": \"%s\",\n"
+            " \"rss_bytes\": %llu, \"peak_rss_bytes\": %llu, \"managed_bytes\": %llu,\n"
+            " \"would_compress_bytes\": %lld, \"shadow_bytes\": %lld, \"blob_bytes\": %lld,\n"
+            " \"projected_saving_bytes\": %lld, \"projected_rss_bytes\": %lld,"
+            " \"projected_reduction_pct\": %s%ld.%ld,\n"
+            " \"avg_rss_bytes\": %llu, \"avg_projected_rss_bytes\": %llu, \"avg_projected_reduction_pct\": %s%ld.%ld,\n"
+            " \"max_projected_saving_bytes\": %llu, \"min_projected_rss_bytes\": %llu,"
+            " \"peak_relative_reduction_pct\": %s%ld.%ld,\n"
+            " \"snapshots\": %llu, \"rejected\": %llu, \"zero_pages\": %llu, \"shadow_discards\": %llu,"
+            " \"reclaims\": %llu, \"refaults_write\": %llu, \"refaults_read\": %llu,"
+            " \"refault_rate_pct\": %ld.%ld, \"freed_while_compressed\": %llu,\n"
+            " \"ratio_hist\": {\"rejected\": %llu, \"lt2x\": %llu, \"2_4x\": %llu, \"4_8x\": %llu,"
+            " \"8_16x\": %llu, \"ge16x\": %llu, \"zero\": %llu}}\n",
+            static_cast<int>(getpid()), final ? "true" : "false",
+            static_cast<unsigned long long>(elapsedSec()), static_cast<unsigned long long>(o.ticks),
+            isLargeOnlyMode() ? "large_only" : "full", wt, rt,
+            (unsigned long long)rss_b, (unsigned long long)(peak_kb * 1024),
+            (unsigned long long)(o.managed_kb * 1024),
+            (long long)(o.recl_pages.load(std::memory_order_relaxed) * static_cast<int64_t>(kPageSize)),
+            (long long)(o.shadow_pages.load(std::memory_order_relaxed) * static_cast<int64_t>(kPageSize)),
+            (long long)(o.recl_blob.load(std::memory_order_relaxed) + o.shadow_blob.load(std::memory_order_relaxed)),
+            (long long)sav_b, (long long)proj_b, sgn(red), ab(red) / 10, ab(red) % 10,
+            (unsigned long long)avg_rss, (unsigned long long)avg_proj,
+            sgn(avg_red), ab(avg_red) / 10, ab(avg_red) % 10,
+            (unsigned long long)(o.max_saving_kb * 1024), (unsigned long long)(minp * 1024),
+            sgn(peak_red), ab(peak_red) / 10, ab(peak_red) % 10,
+            (unsigned long long)o.snapshots.load(std::memory_order_relaxed),
+            (unsigned long long)o.rejected.load(std::memory_order_relaxed),
+            (unsigned long long)o.zero.load(std::memory_order_relaxed),
+            (unsigned long long)o.discards.load(std::memory_order_relaxed),
+            (unsigned long long)reclaims, (unsigned long long)rw, (unsigned long long)rr,
+            rf / 10, rf % 10, (unsigned long long)o.freed.load(std::memory_order_relaxed),
+            (unsigned long long)h[0], (unsigned long long)h[1], (unsigned long long)h[2],
+            (unsigned long long)h[3], (unsigned long long)h[4], (unsigned long long)h[5],
+            (unsigned long long)h[6]);
+        if (jl <= 0 || static_cast<size_t>(jl) >= sizeof(js)) return;
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return;
+        (void)!write(fd, js, static_cast<size_t>(jl));
+        close(fd);
+    }
+
     // Coordinator thread, after each tick (including paused/deferred ones).
     void pressureSample() {
         auto& ps = pressure_;
@@ -7423,6 +7881,8 @@ public:
 
     void stop() {
         pressureDump();
+        if (observe_ && !obs_final_done_.exchange(true, std::memory_order_acq_rel))
+            observeReport(true);
         // Shutdown tracing for debugging (SMASH_SHUTDOWN_TRACE=1)
         static const bool trace = []{
             const char* v = std::getenv("SMASH_SHUTDOWN_TRACE");
@@ -7887,6 +8347,7 @@ public:
             // threadtest's time and its cost swung 2x with ASLR layout.
             if (states_->transition(i, PageState::ACTIVE, PageState::EMPTY)) {
                 if (pstats::g_stamp) [[unlikely]] states_->set(i, PageState::EMPTY);
+                if (obs_stage_) obsClear(i, 1);
                 if (deferred_pending_ && deferred_pending_[i].load(std::memory_order_relaxed))
                     deferred_pending_[i].store(false, std::memory_order_release);
                 if (shadow_tick_ && shadow_tick_[i]) shadow_tick_[i] = 0;
@@ -7913,6 +8374,7 @@ public:
                 compressed_[i] = {};
             }
             if (shadow_tick_) shadow_tick_[i] = 0;
+            if (obs_stage_) obsClear(i, 1);
             states_->set(i, PageState::EMPTY);
             cold_count_[i] = 0;
             recompress_count_[i] = 0;

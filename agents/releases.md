@@ -49,6 +49,14 @@ The lib dir is deliberately fixed so the launcher can find the library relative 
 - **`packaging/linux/build-manylinux.sh`** is the single build entry point for the Linux assets (release.yml calls it inside `quay.io/pypa/manylinux_2_28_<arch>`): it pip-installs cmake/ninja, ensures `rpmbuild`, builds the `smash` target, and runs `cpack -G "DEB;RPM;TGZ"` into `build/pkg/`.
 - **Remaining lint** (intentional): lintian `embedded-library libzstd` (zstd is statically linked on purpose), `no-changelog`, `shared-library-lacks-version` / `package-name-doesnt-match-sonames` (libsmash is a preload library with no SONAME version); rpmlint flags the same no-SONAME-version heuristics, `no-signature` and `no-packager-tag`.
 
+### Install-test coverage
+
+`build-linux` (release.yml) installs each arch's `.deb` on the host runner (Ubuntu 24.04) and on Ubuntu 20.04 + Debian 11 (glibc 2.31, the oldest Debian-family floor), and the `.rpm` in AlmaLinux 8 (glibc 2.28). Each one preloads a probe through `/usr/bin/smash` with `SMASH_LARGE_ONLY=0` and `=1` and requires the `SMASH_STATS` line. CI's `packages-old-glibc` job runs the x86-64 subset on every PR.
+
+**Why glibc 2.31 gets its own check:** glibc < 2.34's `dlsym` callocs its dlerror state, so any `dlsym` reached while smash is initialising re-enters smash. Through v0.0.3-alpha this hung every preloaded process in full mode (`VmRegion::init` called the interposed `::mmap`, which lazily `dlsym`s the real one, and the nested calloc spun in `HeapRedirect::getHeap`) and stack-overflowed it in large-only mode (`SystemAllocFns::resolve` → `dlsym` → calloc → `resolve` → …) on Ubuntu 20.04 and Debian 11. glibc 2.28 (RHEL 8) and ≥ 2.34 did not trigger it, and neither did the ubuntu-latest CI runner. Internal maps must use `vm::rawMmap`, and `resolve()` has a re-entrancy guard.
+
+Development verification, 2026-11-16, of `smash-0.1.0~test` packages built with `packaging/linux/build-manylinux.sh`. Both modes passed on Ubuntu 20.04, Debian 11, Ubuntu 22.04 and 24.04 (deb) and on AL2023, AlmaLinux 8.10 and Rocky 8.9 (rpm), on x86-64 in containers on cloudnew. On aarch64 (Lima VM), the deb passed on Ubuntu 24.04 and the rpm on AlmaLinux 8.
+
 ### Container image
 
 `packaging/docker/Dockerfile` produces a `FROM scratch` image holding only `/smash/lib/libsmash.so` and `/smash/bin/smash`, meant for `COPY --from=ghcr.io/emeryberger/smash:<tag> /smash /opt/smash` (example: `packaging/docker/example/Dockerfile`). Two ways to fill it, selected by `--build-arg SMASH_FROM=`:

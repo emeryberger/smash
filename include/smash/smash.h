@@ -4,31 +4,39 @@
 // This header provides optional application-level hints for advanced usage.
 #pragma once
 
+#ifdef __cplusplus
 #include <cstddef>
+#else
+#include <stddef.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Hint to smash that a region is about to go cold (eligible for compression).
-// No-op in Phase 1.
+// Hint that a region has gone cold: the pages lying wholly inside
+// [ptr, ptr+size) skip the rest of their cold wait, so the next compressor
+// tick (about 1 s) may compress them. The compression-ratio and cost gates
+// still decide; pages smash does not manage are ignored. Not a guarantee.
 void smash_hint_cold(void* ptr, size_t size);
 
-// Hint to smash that a region is about to be heavily accessed (keep decompressed).
-// No-op in Phase 1.
+// Hint that a region is about to be used: every page overlapping it restarts
+// its cold wait, and compressed ones are decompressed now (by touching them)
+// instead of on first access.
 void smash_hint_hot(void* ptr, size_t size);
 
-// Get compression statistics.
+// Process-wide compression statistics. Returns 0, or -1 if smash has no
+// compressor in this process (e.g. not preloaded).
 struct SmashStats {
-    size_t total_allocated;
-    size_t total_freed;
-    size_t compressed_pages;
-    size_t compressed_bytes_saved;
-    size_t active_spans;
-    size_t active_large_allocs;
+    unsigned long long managed_bytes;      // memory in pages smash manages now
+    unsigned long long compressed_pages;   // pages compressed with memory released, now
+    unsigned long long compressed_bytes;   // their uncompressed size
+    unsigned long long stored_bytes;       // blob bytes holding them (+ pending ones)
+    unsigned long long compressions;       // pages compressed and kept, since start
+    unsigned long long decompress_faults;  // accesses that decompressed a page, since start
 };
 
-void smash_get_stats(SmashStats* stats);
+int smash_get_stats(struct SmashStats* stats);
 
 // ── Fail-open kill switch ────────────────────────────────────────────────────
 // smash_disable(): stop compressing and return the process to an inert state.

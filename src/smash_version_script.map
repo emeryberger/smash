@@ -78,6 +78,10 @@ GLIBC_2.2.5 {
     smash_disable;
     smash_enable;
     smash_safety_status;
+    # Hints + statistics (include/smash/smash.h).
+    smash_hint_cold;
+    smash_hint_hot;
+    smash_get_stats;
 
     # Smash syscall wrappers for kernel buffer access
     read;

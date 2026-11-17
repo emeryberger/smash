@@ -2019,6 +2019,18 @@ public:
         *out = compressor_.safetyStatus();
         return true;
     }
+    // smash_hint_cold / smash_hint_hot / smash_get_stats (include/smash/smash.h).
+    void hintRange(const void* ptr, size_t size, bool cold) {
+        if (!compression_inited_ || !ptr || size == 0) return;
+        const uintptr_t lo = reinterpret_cast<uintptr_t>(ptr);
+        if (lo + size < lo) return;
+        compressor_.hintRange(lo, lo + size, cold);
+    }
+    bool apiStats(CompressorThread::ApiStats* out) const {
+        if (!compression_inited_ || !out) return false;
+        *out = compressor_.apiStats();
+        return true;
+    }
 
     int arenaFor(const void* ptr) {
         if (!ptr) return -1;

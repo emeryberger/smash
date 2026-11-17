@@ -6576,10 +6576,15 @@ private:
             // Sleep in 10ms intervals, checking running_ flag each time.
             // This keeps the tick interval at kCompressIntervalMs (1 second)
             // while allowing fast shutdown response (~10ms worst case).
+            // The interval is measured on the monotonic clock, not by
+            // counting sleeps: macOS coalesces short timers for background
+            // threads, and 100 x usleep(10 ms) took ~5 s per tick on a
+            // loaded macOS CI runner (5 ticks in 25.95 s vs 5.04 s on Linux).
             constexpr int kSleepIntervalMs = 10;
-            for (int slept = 0;
-                 slept < kCompressIntervalMs && self->running_.load(std::memory_order_relaxed);
-                 slept += kSleepIntervalMs) {
+            const uint64_t tick_deadline_ns =
+                pstats::monoNs() + static_cast<uint64_t>(kCompressIntervalMs) * 1000000ull;
+            while (self->running_.load(std::memory_order_relaxed) &&
+                   pstats::monoNs() < tick_deadline_ns) {
                 usleep(kSleepIntervalMs * 1000);
                 self->maybePromptTrim();
                 // Kill-switch request: act now, not at the next 1 s boundary.

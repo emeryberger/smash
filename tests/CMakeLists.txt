@@ -619,10 +619,13 @@ foreach(lo 0 1)
           "SMASH_DISABLE_SIGNAL=SIGUSR1" "SMASH_ENABLE_SIGNAL=SIGUSR2"
           "SMASH_CONTROL_FILE=${CMAKE_CURRENT_BINARY_DIR}/kill_switch_${mech}${_sfx}.ctl")
   endforeach()
+  # Rate limit 50/s: the storm refaults every page each cold cycle, which is
+  # ~170-190/s on macOS CI (16 KiB pages, a quarter as many as 4 KiB Linux
+  # pages for the same bytes); 200/s sat just above that and never tripped.
   smash_add_preload_test(test_watchdog_rate${_sfx} storm_test
     ARGS watchdog-rate
     ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
-        "SMASH_RECOMPRESS_BACKOFF=0" "SMASH_WATCHDOG_FAULT_RATE=200" "SMASH_WATCHDOG_WINDOW=2")
+        "SMASH_RECOMPRESS_BACKOFF=0" "SMASH_WATCHDOG_FAULT_RATE=50" "SMASH_WATCHDOG_WINDOW=2")
   smash_add_preload_test(test_watchdog_p99${_sfx} storm_test
     ARGS watchdog-p99
     ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"

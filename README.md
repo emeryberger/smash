@@ -42,6 +42,52 @@ Find out without risk before running it for real:
 Both overestimated the measured reduction on our SQLite benchmark (by 6.6 and 10.8 points); see
 [agents/estimator.md](agents/estimator.md) for what they do and don't capture.
 
+## Install
+
+Every install method gives the same layout: `lib/libsmash.so` (`.dylib` on macOS), a `bin/smash` launcher that preloads it (`smash run -- ./your_server`), and headers in `include/smash/`. The Linux library is built on glibc 2.28, so it runs on Debian 11+, Ubuntu 20.04+, RHEL/Alma/Rocky 8+, Amazon Linux 2023 and Fedora. musl (Alpine) is not supported.
+
+**Debian / Ubuntu, RHEL / Fedora / Amazon Linux.** Each [release](https://github.com/emeryberger/smash/releases) attaches `.deb` and `.rpm` packages for x86-64 and aarch64 (published from the first release cut after packaging landed). They install `/usr/lib/libsmash.so` and `/usr/bin/smash`:
+
+```bash
+tag=vX.Y.Z-alpha    # a release tag from the releases page (all are pre-releases so far,
+                    # which GitHub's releases/latest/download/ URLs skip)
+arch=$(uname -m)    # x86_64 or aarch64
+curl -fLO https://github.com/emeryberger/smash/releases/download/$tag/smash-linux-$arch.deb
+sudo apt install ./smash-linux-$arch.deb         # or: sudo dnf install ./smash-linux-$arch.rpm
+smash run -- ./your_server                       # = LD_PRELOAD=/usr/lib/libsmash.so ./your_server
+```
+
+`smash-linux-$arch.tar.gz` holds the same files for unpacking anywhere without root.
+
+**Docker.** `ghcr.io/emeryberger/smash` is a `FROM scratch` image that holds only `/smash/lib/libsmash.so` and `/smash/bin/smash`. Copy it into your own glibc-based image:
+
+```dockerfile
+FROM python:3.12-slim
+COPY --from=ghcr.io/emeryberger/smash:latest /smash /opt/smash
+ENV LD_PRELOAD=/opt/smash/lib/libsmash.so
+```
+
+Each release pushes `:<tag>` and moves `:latest`. See [packaging/docker/example/Dockerfile](packaging/docker/example/Dockerfile) for a full example (pin a release tag in place of `latest`).
+
+**Homebrew (macOS).** The formula is [packaging/homebrew/smash.rb](packaging/homebrew/smash.rb). Homebrew only installs formulae from a tap, so put it in a local one. `--HEAD` builds from `master`; once a release has filled in the formula's tarball checksum, drop `--HEAD` to build that release:
+
+```bash
+brew tap-new --no-git $USER/local
+curl -fsSL https://raw.githubusercontent.com/emeryberger/smash/master/packaging/homebrew/smash.rb \
+  -o "$(brew --repo $USER/local)/Formula/smash.rb"
+brew install --HEAD $USER/local/smash
+```
+
+On Apple Silicon the formula builds a fat arm64 + arm64e dylib, so it can also be loaded into arm64e processes.
+
+**From source** (any platform; see Quick start for requirements):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSMASH_BUILD_TESTS=OFF
+cmake --build build --target smash -j
+sudo cmake --install build --prefix /usr/local
+```
+
 ## What it does for real servers
 
 Each workload fills its data, sits idle, then serves queries that touch only the newest 5% of the data. Out-of-the-box smash compared with glibc `malloc` and jemalloc, median of 3 runs:

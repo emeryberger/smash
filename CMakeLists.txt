@@ -142,7 +142,7 @@ if(ALLOC8_DIR)
       "Point it at a valid alloc8 checkout, or unset it to fetch from GitHub.")
   endif()
   message(STATUS "Using local alloc8 from ALLOC8_DIR=${ALLOC8_DIR}")
-  add_subdirectory("${ALLOC8_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/alloc8")
+  add_subdirectory("${ALLOC8_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/alloc8" EXCLUDE_FROM_ALL)
 else()
   # Default: self-contained. Clone alloc8 from GitHub.
   message(STATUS "Fetching alloc8 from GitHub (set -DALLOC8_DIR=... to use a local checkout)")
@@ -152,7 +152,15 @@ else()
     GIT_TAG main
     GIT_SHALLOW TRUE
   )
-  FetchContent_MakeAvailable(alloc8)
+  # Populate + add_subdirectory(EXCLUDE_FROM_ALL) rather than
+  # FetchContent_MakeAvailable: EXCLUDE_FROM_ALL keeps alloc8's install() rules
+  # out of `cmake --install` / CPack (see "Install" below). FetchContent_Declare
+  # only accepts EXCLUDE_FROM_ALL from CMake 3.28, above our 3.15 floor.
+  FetchContent_GetProperties(alloc8)
+  if(NOT alloc8_POPULATED)
+    FetchContent_Populate(alloc8)
+    add_subdirectory(${alloc8_SOURCE_DIR} ${alloc8_BINARY_DIR} EXCLUDE_FROM_ALL)
+  endif()
 endif()
 
 # ── emeryberger/printf — allocation-free printf/snprintf ────────────────────
@@ -191,13 +199,18 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/facebook/zstd.git
   GIT_TAG v1.5.6
   GIT_SHALLOW TRUE
-  SOURCE_SUBDIR build/cmake
 )
 set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(zstd)
+# EXCLUDE_FROM_ALL: zstd is statically linked into libsmash; its own install()
+# rules (headers, libzstd.a, cmake/pkg-config files) must not be installed.
+FetchContent_GetProperties(zstd)
+if(NOT zstd_POPULATED)
+  FetchContent_Populate(zstd)
+  add_subdirectory(${zstd_SOURCE_DIR}/build/cmake ${zstd_BINARY_DIR} EXCLUDE_FROM_ALL)
+endif()
 
 # ── LTO ───────────────────────────────────────────────────────────────────────
 include(CheckIPOSupported)
@@ -440,8 +453,65 @@ if(SMASH_BUILD_ESTIMATE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set_target_properties(smash-estimate PROPERTIES CXX_STANDARD 17)
   target_include_directories(smash-estimate PRIVATE ${zstd_SOURCE_DIR}/lib)
   target_link_libraries(smash-estimate PRIVATE libzstd_static)
-  include(GNUInstallDirs)
-  install(TARGETS smash-estimate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  # Same fixed layout and component as libsmash and the launcher (see Install).
+  install(TARGETS smash-estimate RUNTIME DESTINATION bin COMPONENT smash)
+endif()
+
+# ── Launcher ───────────────────────────────────────────────────────
+# bin/smash (POSIX sh) finds libsmash at ../lib (installed) or ../ (build tree:
+# build/bin/smash -> build/libsmash.*). Install layout: ${prefix}/bin/smash and
+# ${prefix}/lib/libsmash.{so,dylib} — packaging depends on these exact paths.
+set(SMASH_VERSION "${PROJECT_VERSION}")
+configure_file(bin/smash.in ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen @ONLY)
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/bin
+     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                      GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+file(RENAME ${CMAKE_CURRENT_BINARY_DIR}/bin/smash-launcher.gen
+     ${CMAKE_CURRENT_BINARY_DIR}/bin/smash)
+# Installed by the SMASH_INSTALL block below (COMPONENT smash).
+
+# ── Install ───────────────────────────────────────────────────────────────────
+# Layout contract (relied on by the bin/smash launcher, the Homebrew formula,
+# the .deb/.rpm/.tar.gz packages and the container image):
+#
+#   ${prefix}/lib/libsmash.so      (Linux)   /  ${prefix}/lib/libsmash.dylib (macOS)
+#   ${prefix}/bin/smash            POSIX sh launcher
+#   ${prefix}/include/smash/       public headers
+#   ${prefix}/share/doc/smash/     LICENSE, README.md (+ copyright on Linux)
+#
+# The library directory is deliberately a fixed `lib`, not GNUInstallDirs'
+# CMAKE_INSTALL_LIBDIR (which becomes lib64 or lib/<multiarch> on some
+# distros): libsmash is a preload library, not a link-time dependency, so a
+# predictable path the launcher can compute from its own location matters
+# more than distro libdir convention. Only libsmash is installed; the ablation
+# variants (smash_noopt, smash_compress_only) and dependency install rules
+# (alloc8, zstd — EXCLUDE_FROM_ALL above) stay out of the install tree.
+# config.h is not installed: it is internal and includes alloc8 headers.
+# (PROJECT_IS_TOP_LEVEL needs CMake 3.21; compare source dirs for 3.15.)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(_smash_top_level ON)
+else()
+  set(_smash_top_level OFF)
+endif()
+option(SMASH_INSTALL "Generate install() rules for libsmash" ${_smash_top_level})
+if(SMASH_INSTALL)
+  # 0644, not 0755: a shared library needs no execute bit to be mapped, and
+  # Debian policy (lintian shared-library-is-executable) rejects it.
+  install(TARGETS smash
+    LIBRARY DESTINATION lib COMPONENT smash
+      PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+    RUNTIME DESTINATION bin COMPONENT smash)
+  install(FILES include/smash/smash.h include/smash/idled_protocol.h
+    DESTINATION include/smash COMPONENT smash)
+  install(FILES LICENSE README.md DESTINATION share/doc/smash COMPONENT smash)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Debian policy wants a machine-readable share/doc/<package>/copyright.
+    install(FILES packaging/debian/copyright DESTINATION share/doc/smash COMPONENT smash)
+  endif()
+  # Launcher generated from bin/smash.in (see "Launcher" above).
+  install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/smash DESTINATION bin COMPONENT smash)
+  include(cmake/SmashCPack.cmake)
 endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -487,20 +557,3 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash-idled PRIVATE Threads::Threads)
 endif()
 
-# ── Launcher + install ───────────────────────────────────────────────────────
-# bin/smash (POSIX sh) finds libsmash at ../lib (installed) or ../ (build tree:
-# build/bin/smash -> build/libsmash.*). Install layout: ${prefix}/bin/smash and
-# ${prefix}/lib/libsmash.{so,dylib} — packaging depends on these exact paths.
-set(SMASH_VERSION "${PROJECT_VERSION}")
-configure_file(bin/smash.in ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen @ONLY)
-file(COPY ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen
-     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/bin
-     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
-                      GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-file(RENAME ${CMAKE_CURRENT_BINARY_DIR}/bin/smash-launcher.gen
-     ${CMAKE_CURRENT_BINARY_DIR}/bin/smash)
-# COMPONENT smash: the fetched dependencies (alloc8, zstd) carry their own
-# install rules for headers and static libraries; `cmake --install build
-# --component smash` installs only these two files.
-install(TARGETS smash LIBRARY DESTINATION lib COMPONENT smash)
-install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/smash DESTINATION bin COMPONENT smash)

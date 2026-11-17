@@ -1,0 +1,8 @@
+# Build context is the repository root (or, for SMASH_FROM=prebuilt, a staging
+# dir holding prebuilt/); keep it to the sources CMake needs. Do NOT ignore
+# *.so here — the prebuilt path ships prebuilt/<arch>/lib/libsmash.so.
+.git
+build*
+tmp
+paper_results_macos
+docs/figures

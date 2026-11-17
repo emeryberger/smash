@@ -205,7 +205,7 @@ python3 ../bench/run_paper_experiments.py --runs 3          # full paper experim
 
 ## Releases
 
-Drop-in `libsmash` binaries are published to GitHub Releases by `.github/workflows/release.yml`. Publishing a Release (not a bare tag, not `workflow_dispatch`) is what triggers the build and attaches the five assets (Linux x86-64/aarch64 `.so`, macOS arm64 `.dylib`, macOS fat `.zip`, `SHA256SUMS.txt`). See [agents/releases.md](agents/releases.md) for the full procedure, the glibc-floor rationale, and the macOS arm64/arm64e split.
+Drop-in `libsmash` binaries are published to GitHub Releases by `.github/workflows/release.yml`. Publishing a Release (not a bare tag, not `workflow_dispatch`) is what triggers the build and attaches the assets (Linux x86-64/aarch64 `.so` plus `.deb`/`.rpm`/`.tar.gz` packages, macOS arm64 `.dylib`, macOS fat `.zip`, `SHA256SUMS.txt`) and pushes the `FROM scratch` image `ghcr.io/<owner>/smash:<tag>`. The CMake `install()` rules define the layout every channel shares (`lib/libsmash.{so,dylib}`, `bin/smash`, `include/smash/`); CPack config is `cmake/SmashCPack.cmake`, the Homebrew formula `packaging/homebrew/smash.rb`, the image `packaging/docker/Dockerfile`. See [agents/releases.md](agents/releases.md) for the full procedure, the glibc-floor rationale, the macOS arm64/arm64e split, and the packaging details.
 
 ```bash
 gh release create vX.Y.Z-alpha --target master --prerelease \

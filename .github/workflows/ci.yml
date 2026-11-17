@@ -105,3 +105,54 @@ jobs:
       - name: Run quick benchmarks
         working-directory: smash
         run: python3 bench/run_quick_ci.py --build-dir build
+
+  # ── Packages + oldest supported glibc ────────────────────────────────────
+  # Builds libsmash and its .deb/.rpm/.tar.gz exactly as release.yml does
+  # (manylinux_2_28, packaging/linux/build-manylinux.sh), then installs the
+  # .deb on glibc 2.31 (Ubuntu 20.04, Debian 11) and the .rpm on glibc 2.28
+  # (AlmaLinux 8) and preloads a probe in both modes. glibc < 2.34's dlsym
+  # callocs its dlerror state, re-entering a half-initialised smash; that once
+  # hung (full mode) or stack-overflowed (large-only) every preloaded process,
+  # and ubuntu-latest's glibc is too new for the main job to notice.
+  packages-old-glibc:
+    name: packages (glibc 2.28/2.31)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout smash
+        uses: actions/checkout@v4
+        with:
+          path: smash
+
+      - name: Checkout alloc8 (sibling dir)
+        uses: actions/checkout@v4
+        with:
+          repository: emeryberger/alloc8
+          path: alloc8
+
+      - name: Build libsmash + packages in manylinux_2_28
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work \
+            quay.io/pypa/manylinux_2_28_x86_64 \
+            bash smash/packaging/linux/build-manylinux.sh /work/smash /work/alloc8
+
+      - name: Install and preload on Ubuntu 20.04, Debian 11, AlmaLinux 8
+        working-directory: smash
+        run: |
+          mkdir -p probe
+          printf '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nint main(void){char*p=malloc(4<<20);if(!p)return 1;memset(p,1,4<<20);free(p);puts("probe ok");return 0;}\n' > probe/probe.c
+          docker run --rm -v "$PWD/probe:/p" quay.io/pypa/manylinux_2_28_x86_64 \
+            gcc -O2 -o /p/probe /p/probe.c
+          for img in ubuntu:20.04 debian:11 quay.io/pypa/manylinux_2_28_x86_64; do
+            docker run --rm -v "$PWD/build/pkg:/pkg:ro" -v "$PWD/probe:/p:ro" "$img" \
+              bash -euo pipefail -c '
+                . /etc/os-release; echo "== $PRETTY_NAME"
+                if command -v dpkg >/dev/null; then dpkg -i /pkg/smash_*_amd64.deb >/dev/null
+                else rpm -i /pkg/smash-*.x86_64.rpm; fi
+                for mode in 0 1; do
+                  out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode timeout 60 /usr/bin/smash run -- /p/probe 2>&1)
+                  echo "SMASH_LARGE_ONLY=$mode: $out"
+                  grep -q "probe ok" <<<"$out"
+                  grep -q "\[smash stats\]" <<<"$out"
+                done
+              '
+          done

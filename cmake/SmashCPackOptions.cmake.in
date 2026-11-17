@@ -1,0 +1,7 @@
+# Generated from cmake/SmashCPackOptions.cmake.in; read by cpack per generator.
+# deb/rpm install under /usr; the tarball is prefix-relative so it can be
+# unpacked anywhere (bin/, lib/, include/ at its top level).
+if(CPACK_GENERATOR STREQUAL "TGZ")
+  set(CPACK_PACKAGING_INSTALL_PREFIX "")
+  set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+endif()

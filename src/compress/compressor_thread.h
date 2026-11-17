@@ -4667,7 +4667,11 @@ private:
         }
 #ifdef __linux__
         if (self_mem_fd_ < 0) {
-            self_mem_fd_ = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+            // Raw openat: this runs in the fault handler, and libsmash's
+            // exported open() wrapper (path-argument EFAULT guard) must not be
+            // entered from signal context.
+            self_mem_fd_ = static_cast<int>(syscall(SYS_openat, AT_FDCWD, "/proc/self/mem",
+                                                    O_RDWR | O_CLOEXEC));
         }
         if (self_mem_fd_ >= 0) {
             // Populate backing while PROT_NONE. pwrite handles partial writes
@@ -4860,7 +4864,7 @@ private:
 #ifdef __linux__
         if (self_mem_fd_ < 0) return false;
         const size_t contig = vm_->contigPages();
-        if (page_idx >= contig) return false;  // external / tracking-mode page
+        if (page_idx >= contig) return restoreWholeVmaExternal(page_idx, data);
         const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->base());
         uintptr_t vlo = 0, vhi = 0;
         if (!findVma(base + page_idx * kPageSize, &vlo, &vhi)) return false;
@@ -4919,6 +4923,107 @@ private:
 #ifdef __linux__
     // Shared body of restoreWholeVma / restoreNearCap: restore [lo, hi),
     // which contains page_idx. See the comment above restoreWholeVma.
+    // restoreWholeVma for an EXTERNAL page (SMASH_TRACK_EXTERNAL). External
+    // indices are not address-ordered, so the VMA is walked by address and
+    // each page mapped back to its index. Without this a compressed external
+    // page at vm.max_map_count could never be restored: the single-page
+    // mprotect fails with ENOMEM, and the fault re-raised forever — a Valkey
+    // BGSAVE child (inherits ~57K VMAs, has no compressor to back off) spun
+    // at 100% CPU. Every page of the restored range must be a tracked
+    // external page (an app's own PROT_NONE region merged into the VMA must
+    // keep its protection); if the VMA is larger than kMaxVmaRunPages, the
+    // piece toward its nearer end is restored instead, which needs no split.
+    bool restoreWholeVmaExternal(size_t page_idx, const void* data) {
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(vm_->pageAddress(page_idx));
+        if (!addr) return false;
+        uintptr_t vlo = 0, vhi = 0;
+        if (!findVma(addr, &vlo, &vhi)) return false;
+        const uintptr_t span = kMaxVmaRunPages * kPageSize;
+        if (vhi - vlo > span) {
+            if (addr - vlo <= vhi - addr) vhi = addr + kPageSize;   // left piece
+            else vlo = addr;                                          // right piece
+            if (vhi - vlo > span) return false;
+        }
+        const size_t contig = vm_->contigPages();
+        auto idxOf = [&](uintptr_t a) -> size_t {
+            const size_t k = vm_->pageIndex(a);
+            return k >= contig ? k : 0;
+        };
+        auto unlockUpTo = [&](uintptr_t end) {
+            for (uintptr_t a = vlo; a < end; a += kPageSize)
+                if (a != addr) locks_->unlock(idxOf(a));
+        };
+        uintptr_t a = vlo;
+        for (; a < vhi; a += kPageSize) {
+            if (a == addr) continue;
+            const size_t k = idxOf(a);
+            if (!k || !locks_->tryLock(k)) break;
+            const PageState sk = states_->get(k);
+            if (sk == PageState::COMPRESSING || sk == PageState::EMPTY ||
+                reinterpret_cast<uintptr_t>(vm_->pageAddress(k)) != a) {
+                locks_->unlock(k);
+                break;
+            }
+        }
+        if (a < vhi) { unlockUpTo(a); return false; }
+
+        auto populate = [&](uintptr_t at, const void* src) -> bool {
+            const char* p = static_cast<const char*>(src);
+            size_t remaining = kPageSize;
+            off_t off = static_cast<off_t>(at);
+            while (remaining > 0) {
+                ssize_t w = syscall(SYS_pwrite64, self_mem_fd_, p, remaining, off);
+                if (w <= 0) return false;
+                p += w; off += w; remaining -= static_cast<size_t>(w);
+            }
+            return true;
+        };
+        bool ok = !data || populate(addr, data);
+        int slot = -1;
+        for (a = vlo; ok && a < vhi; a += kPageSize) {
+            if (a == addr) continue;
+            const size_t k = idxOf(a);
+            if (states_->get(k) != PageState::COMPRESSED) continue;
+            if (slot < 0 && (slot = acquireFaultSlot()) < 0) { ok = false; break; }
+            engine_->decompressWithDCtx(
+                fault_slots_[slot].dctx,
+                compressed_[k].data, fault_slots_[slot].buf,
+                compressed_[k].compressedSize(), kPageSize,
+                compressed_[k].algorithm(), lookupSizeClass(k));
+            ok = populate(a, fault_slots_[slot].buf);
+        }
+        if (slot >= 0) releaseFaultSlot(slot);
+        if (ok) ok = vm::protectPages(reinterpret_cast<void*>(vlo), vhi - vlo, true, true);
+        if (!ok) { unlockUpTo(vhi); return false; }
+        for (a = vlo; a < vhi; a += kPageSize) {
+            if (a == addr) continue;
+            const size_t k = idxOf(a);
+            const PageState st = states_->get(k);
+            if (st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW) {
+                if (deferred_pending_)
+                    deferred_pending_[k].store(false, std::memory_order_release);
+                releaseBlob(k);
+                compressed_[k] = {};
+                if (page_tier_) page_tier_[k] = kTierNone;
+                states_->set(k, PageState::ACTIVE);
+                cold_count_[k] = refaultColdStart();
+            } else if (st == PageState::ACTIVE_MONITORING) {
+                states_->set(k, PageState::ACTIVE);
+            }
+            locks_->unlock(k);
+        }
+        if (vma_cap_run_restores_.fetch_add(1, std::memory_order_relaxed) == 0) {
+            char buf[192];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash WARN] near vm.max_map_count: restored %zu external pages "
+                "around %p instead of splitting a VMA\n",
+                static_cast<size_t>((vhi - vlo) / kPageSize), reinterpret_cast<void*>(addr));
+            if (n > static_cast<int>(sizeof(buf)) - 1) n = static_cast<int>(sizeof(buf)) - 1;
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+        }
+        return true;
+    }
+
     bool restoreRange(size_t page_idx, const void* data, size_t lo, size_t hi,
                       bool whole_vma) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->base());

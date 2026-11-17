@@ -23,6 +23,7 @@
 #include "../util/waker.h"
 #include "../util/spinlock.h"
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
+#include "../util/run_stats.h"    // SMASH_REPORT / SMASH_METRICS_FILE counters
 
 namespace smash {
 // Set true when a loaded profile says external pages were hot, so the mmap/
@@ -1496,6 +1497,8 @@ public:
         }
         helpers_created_ = 0;
         active_workers_ = kCompressorWorkers;
+        // The child's SMASH_REPORT / metrics describe the child only.
+        runStatsResetForFork();
         work_gen_.store(0, std::memory_order_release);
         work_waker_.reinitAfterFork();
         current_phase_ = 0;
@@ -2948,6 +2951,7 @@ private:
             // retries stay capped at one per kMaxEffectiveFloorTicks streak.
             if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
                 compress_fail_count_[page_idx]++;
+            rstats::g.ratio_rejects.fetch_add(1, std::memory_order_relaxed);
             cold_count_[page_idx] = 0;
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
@@ -3012,6 +3016,7 @@ private:
         } else {
             compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
         }
+        rstats::noteCompressed(kPageSize, zero_page ? 0 : alloc_size);
         if (page_tier_) {
             page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
         }
@@ -5781,7 +5786,7 @@ private:
     static void maybeIdleSched() {
 #ifdef __linux__
         static const bool idle = [] {
-            const char* e = std::getenv("SMASH_COMPRESSOR_IDLE");
+            const char* e = envOrProfile("SMASH_COMPRESSOR_IDLE");
             return e && e[0] == '1';
         }();
         if (idle) {
@@ -5842,6 +5847,7 @@ private:
                 self->tick();
                 self->idledFlushArms();
             }
+            self->runStatsTick();
             self->in_tick_.store(false, std::memory_order_release);
         }
         return nullptr;
@@ -5859,7 +5865,7 @@ private:
     // throughput. Same fork fence as a tick (see coordEntry).
     static size_t promptTrimBytes() {
         static const size_t b = [] {
-            const char* e = std::getenv("SMASH_PROMPT_TRIM_MB");
+            const char* e = envOrProfile("SMASH_PROMPT_TRIM_MB");
             const long mb = e ? std::atol(e) : kPromptTrimDefaultMb;
             return mb > 0 ? static_cast<size_t>(mb) << 20 : SIZE_MAX;
         }();
@@ -5905,6 +5911,7 @@ private:
             // so the coordinator's dispatch() doesn't block on parked helpers.
             if (worker_id < self->active_workers_) {
                 self->executePhase(self->current_phase_, worker_id);
+                rstats::publishThreadCpu(worker_id);
             }
             self->helper_done_gen_[helper_id].store(gen, std::memory_order_release);
         }
@@ -6368,6 +6375,18 @@ public:
         if (stats_env && stats_env[0] == '1') {
             std::atexit([]() {
                 if (s_stats_instance_) sigusr1Handler(0);
+            });
+        }
+
+        // SMASH_REPORT: registered before the stop() handler so that, atexit
+        // being LIFO, the report runs after the compressor threads are
+        // joined. Registered once: a fork child inherits the registration.
+        runStatsInit();
+        s_report_instance_ = this;
+        if (cfg_report_ && !s_report_registered_) {
+            s_report_registered_ = true;
+            std::atexit([]() {
+                if (s_report_instance_) s_report_instance_->writeReport();
             });
         }
 
@@ -7044,6 +7063,364 @@ public:
         }
     }
 
+    // ── SMASH_REPORT / SMASH_METRICS_FILE (util/run_stats.h) ──────────────
+    // SMASH_REPORT=1 (stderr) or =path: a human-readable summary at normal
+    // exit. SMASH_METRICS_FILE=path: Prometheus text exposition, rewritten
+    // atomically (temp + rename) every SMASH_METRICS_INTERVAL_SEC (default
+    // 10) by the coordinator thread, for node_exporter's textfile collector.
+    // In both paths "%p" expands to the pid. No network listener on purpose.
+    const char* cfg_report_ = nullptr;        // SMASH_REPORT
+    const char* cfg_metrics_path_ = nullptr;  // SMASH_METRICS_FILE
+    uint64_t cfg_metrics_interval_ns_ = 10ull * 1000000000ull;
+    uint64_t metrics_last_ns_ = 0;
+    char* metrics_buf_ = nullptr;             // BootstrapAlloc, kMetricsBufSize
+    static constexpr size_t kMetricsBufSize = 16384;
+    static inline CompressorThread* s_report_instance_ = nullptr;
+    static inline bool s_report_registered_ = false;
+
+    void runStatsInit() {
+        const char* r = std::getenv("SMASH_REPORT");
+        cfg_report_ = (r && *r && std::strcmp(r, "0") != 0) ? r : nullptr;
+        const char* m = std::getenv("SMASH_METRICS_FILE");
+        cfg_metrics_path_ = (m && *m) ? m : nullptr;
+        if (const char* iv = std::getenv("SMASH_METRICS_INTERVAL_SEC")) {
+            double sec = std::atof(iv);
+            if (sec < 1) sec = 1;
+            cfg_metrics_interval_ns_ = static_cast<uint64_t>(sec * 1e9);
+        }
+        if (cfg_metrics_path_ && !metrics_buf_)
+            metrics_buf_ = static_cast<char*>(
+                BootstrapAlloc::instance().allocate(kMetricsBufSize, 64));
+        if (rstats::g.start_ns.load(std::memory_order_relaxed) == 0)
+            rstats::g.start_ns.store(rstats::monoNs(), std::memory_order_relaxed);
+        const char* prof = std::getenv("SMASH_PROFILE");
+        if (prof && std::strcmp(prof, "balanced") != 0 &&
+            getSmashProfile() == SmashProfile::Balanced) {
+            char b[160];
+            int n = smash::safe_snprintf(b, sizeof(b),
+                "[smash] SMASH_PROFILE=%s is not latency|balanced|memory; using balanced\n", prof);
+            if (n > 0) (void)!write(2, b, (size_t)n);
+        }
+    }
+
+    void runStatsResetForFork() {
+        auto& g = rstats::g;
+        for (auto& h : g.fault_hist) h.store(0, std::memory_order_relaxed);
+        for (auto& c : g.thread_cpu_ns) c.store(0, std::memory_order_relaxed);
+        g.fault_ns_sum.store(0, std::memory_order_relaxed);
+        g.decomp_faults.store(0, std::memory_order_relaxed);
+        g.tracking_faults.store(0, std::memory_order_relaxed);
+        g.compressions.store(0, std::memory_order_relaxed);
+        g.comp_in_bytes.store(0, std::memory_order_relaxed);
+        g.comp_out_bytes.store(0, std::memory_order_relaxed);
+        g.ratio_rejects.store(0, std::memory_order_relaxed);
+        g.rss_peak_kb.store(0, std::memory_order_relaxed);
+        g.rss_drop_kb.store(0, std::memory_order_relaxed);
+        g.rss_drop_peak_kb.store(0, std::memory_order_relaxed);
+        g.rss_last_kb.store(0, std::memory_order_relaxed);
+        g.start_ns.store(rstats::monoNs(), std::memory_order_relaxed);
+        metrics_last_ns_ = 0;
+    }
+
+    // Coordinator thread, once per tick.
+    void runStatsTick() {
+        rstats::publishThreadCpu(0);
+        rstats::sampleRss(residentKb());
+        if (cfg_metrics_path_ && metrics_buf_) {
+            const uint64_t now = rstats::monoNs();
+            if (metrics_last_ns_ == 0 || now - metrics_last_ns_ >= cfg_metrics_interval_ns_) {
+                metrics_last_ns_ = now;
+                writeMetricsFile();
+            }
+        }
+    }
+
+    struct PageSnapshot {
+        size_t committed = 0, managed = 0, compressed = 0, shadow = 0;
+        uint64_t stored_bytes = 0;  // blob bytes for COMPRESSED + SHADOW pages
+    };
+    PageSnapshot snapshotPages() const {
+        PageSnapshot s;
+        if (!states_ || !vm_) return s;
+        s.committed = vm_->committedPages();
+        for (size_t i = 0; i < s.committed; ++i) {
+            const PageState st = states_->get(i);
+            if (st == PageState::EMPTY) continue;
+            ++s.managed;
+            if (st == PageState::COMPRESSED) {
+                ++s.compressed; s.stored_bytes += compressed_[i].alloc_size;
+            } else if (st == PageState::COMPRESSED_SHADOW) {
+                ++s.shadow; s.stored_bytes += compressed_[i].alloc_size;
+            }
+        }
+        return s;
+    }
+
+    static uint64_t peakRssKb() {
+        struct rusage ru{};
+        if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#ifdef __APPLE__
+        uint64_t kb = static_cast<uint64_t>(ru.ru_maxrss) / 1024;  // bytes
+#else
+        uint64_t kb = static_cast<uint64_t>(ru.ru_maxrss);         // KiB
+#endif
+        // Linux updates hiwater_rss lazily, so ru_maxrss can trail both the
+        // tick samples and the current RSS; take the largest.
+        uint64_t best = rstats::g.rss_peak_kb.load(std::memory_order_relaxed);
+        if (kb > best) best = kb;
+        const uint64_t cur = residentKb();
+        return cur > best ? cur : best;
+    }
+
+    const char* modeName() const {
+        if (isCompressOnlyMode()) return "compress_only";
+        return isLargeOnlyMode() ? "large_only" : "full";
+    }
+    const char* trackingName() const {
+        if (uffd_mode_) return wp_scan_ ? "uffd-wp" : "uffd";
+        return "mprotect";
+    }
+    static double coldTimeoutSec() {
+        return static_cast<double>(ROIConfig::instance().cold_ticks_floor) *
+               kCompressIntervalMs / 1000.0;
+    }
+
+    // Expand "%p" to the pid. Returns false if it does not fit.
+    static bool expandPidPath(const char* in, char* out, size_t cap) {
+        size_t o = 0;
+        for (const char* c = in; *c; ++c) {
+            if (c[0] == '%' && c[1] == 'p') {
+                int n = smash::safe_snprintf(out + o, cap - o, "%d", (int)getpid());
+                if (n < 0 || o + static_cast<size_t>(n) >= cap) return false;
+                o += static_cast<size_t>(n);
+                ++c;
+            } else {
+                if (o + 1 >= cap) return false;
+                out[o++] = *c;
+            }
+        }
+        out[o] = 0;
+        return true;
+    }
+
+    static void writeAll(int fd, const char* p, size_t n) {
+        while (n > 0) {
+            ssize_t w = write(fd, p, n);
+            if (w <= 0) { if (w < 0 && errno == EINTR) continue; return; }
+            p += w; n -= static_cast<size_t>(w);
+        }
+    }
+
+    // Prometheus text exposition format 0.0.4. All values are read with
+    // relaxed loads; a scrape may see counters from slightly different
+    // instants, which Prometheus tolerates.
+    size_t formatMetrics(char* buf, size_t cap) const {
+        size_t n = 0;
+        auto put = [&](const char* fmt, auto... args) {
+            if (n >= cap) return;
+            int k = smash::safe_snprintf(buf + n, cap - n, fmt, args...);
+            if (k > 0) n += static_cast<size_t>(k) < cap - n ? static_cast<size_t>(k) : cap - n;
+        };
+        auto metric = [&](const char* name, const char* type, const char* help) {
+            put("# HELP %s %s\n# TYPE %s %s\n", name, help, name, type);
+        };
+        auto& g = rstats::g;
+        auto ld = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
+        const PageSnapshot ps = snapshotPages();
+        const uint64_t now = rstats::monoNs();
+        const uint64_t start = ld(g.start_ns);
+
+        metric("smash_info", "gauge", "smash build and effective configuration (value is always 1).");
+        put("smash_info{version=\"%s\",profile=\"%s\",mode=\"%s\",tracking=\"%s\",pid=\"%d\"} 1\n",
+            SMASH_VERSION_STRING, smashProfileName(getSmashProfile()), modeName(),
+            trackingName(), (int)getpid());
+        metric("smash_config_cold_timeout_seconds", "gauge", "Idle time before a page may be compressed.");
+        put("smash_config_cold_timeout_seconds %.3f\n", coldTimeoutSec());
+        metric("smash_config_roi_threshold", "gauge", "ROI cutoff (byte-seconds saved per us of codec CPU).");
+        put("smash_config_roi_threshold %u\n", (unsigned)ROIConfig::instance().roi_threshold);
+        metric("smash_config_large_only", "gauge", "1 if SMASH_LARGE_ONLY=1.");
+        put("smash_config_large_only %d\n", isLargeOnlyMode() ? 1 : 0);
+        metric("smash_uptime_seconds", "gauge", "Seconds since the compressor started.");
+        put("smash_uptime_seconds %.3f\n", start && now > start ? (now - start) / 1e9 : 0.0);
+
+        metric("smash_resident_bytes", "gauge", "Process resident set size at the last compressor tick.");
+        put("smash_resident_bytes %llu\n", (unsigned long long)(ld(g.rss_last_kb) * 1024));
+        metric("smash_resident_peak_bytes", "gauge", "Peak resident set size of the process.");
+        put("smash_resident_peak_bytes %llu\n", (unsigned long long)(peakRssKb() * 1024));
+        metric("smash_managed_bytes", "gauge", "Bytes of non-empty pages smash tracks.");
+        put("smash_managed_bytes %llu\n", (unsigned long long)(ps.managed * kPageSize));
+        metric("smash_compressed_pages", "gauge", "Pages currently compressed (memory released).");
+        put("smash_compressed_pages %zu\n", ps.compressed);
+        metric("smash_shadow_pages", "gauge", "Pages compressed but not yet released (deferred reclaim).");
+        put("smash_shadow_pages %zu\n", ps.shadow);
+        metric("smash_compressed_bytes", "gauge", "Uncompressed size of the currently compressed pages.");
+        put("smash_compressed_bytes %llu\n", (unsigned long long)(ps.compressed * kPageSize));
+        metric("smash_store_bytes", "gauge", "Bytes of compressed blobs held in the store.");
+        put("smash_store_bytes %llu\n", (unsigned long long)ps.stored_bytes);
+
+        metric("smash_compressions_total", "counter", "Pages compressed and kept.");
+        put("smash_compressions_total %llu\n", (unsigned long long)ld(g.compressions));
+        metric("smash_compress_input_bytes_total", "counter", "Page bytes compressed and kept.");
+        put("smash_compress_input_bytes_total %llu\n", (unsigned long long)ld(g.comp_in_bytes));
+        metric("smash_compress_output_bytes_total", "counter", "Blob bytes produced by kept compressions.");
+        put("smash_compress_output_bytes_total %llu\n", (unsigned long long)ld(g.comp_out_bytes));
+        metric("smash_compress_rejected_total", "counter", "Pages compressed but discarded by the ratio gate.");
+        put("smash_compress_rejected_total %llu\n", (unsigned long long)ld(g.ratio_rejects));
+        metric("smash_tracking_faults_total", "counter", "Faults handled without decompression (tracking, first touch).");
+        put("smash_tracking_faults_total %llu\n", (unsigned long long)ld(g.tracking_faults));
+        metric("smash_compressor_cpu_seconds_total", "counter", "CPU time of the compressor threads.");
+        put("smash_compressor_cpu_seconds_total %.6f\n", rstats::compressorCpuNs() / 1e9);
+
+        metric("smash_fault_service_seconds", "histogram",
+               "Time to service a fault on a compressed page (lock wait, decompress, restore, prefetch).");
+        uint64_t acc = 0;
+        for (int b = 0; b < rstats::kLatBounds; ++b) {
+            acc += ld(g.fault_hist[b]);
+            put("smash_fault_service_seconds_bucket{le=\"%s\"} %llu\n",
+                rstats::kLatBoundsSec[b], (unsigned long long)acc);
+        }
+        acc += ld(g.fault_hist[rstats::kLatBounds]);
+        put("smash_fault_service_seconds_bucket{le=\"+Inf\"} %llu\n", (unsigned long long)acc);
+        put("smash_fault_service_seconds_sum %.9f\n", ld(g.fault_ns_sum) / 1e9);
+        put("smash_fault_service_seconds_count %llu\n", (unsigned long long)acc);
+        return n;
+    }
+
+    void writeMetricsFile() {
+        if (!cfg_metrics_path_ || !metrics_buf_) return;
+        char path[1024], tmp[1100];
+        if (!expandPidPath(cfg_metrics_path_, path, sizeof(path))) return;
+        if (smash::safe_snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid()) >= (int)sizeof(tmp))
+            return;
+        const size_t len = formatMetrics(metrics_buf_, kMetricsBufSize);
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return;
+        writeAll(fd, metrics_buf_, len);
+        close(fd);
+        if (rename(tmp, path) != 0) unlink(tmp);
+    }
+
+    static void fmtBytes(char* out, size_t cap, uint64_t b) {
+        if (b >= (1ull << 30))
+            smash::safe_snprintf(out, cap, "%.2f GiB", b / 1073741824.0);
+        else if (b >= (1ull << 20))
+            smash::safe_snprintf(out, cap, "%.1f MiB", b / 1048576.0);
+        else
+            smash::safe_snprintf(out, cap, "%.1f KiB", b / 1024.0);
+    }
+
+    // Exit report. Runs from atexit on the exiting thread, after stop() has
+    // joined the compressor threads. No malloc: stack buffers + write(2).
+    void writeReport() {
+        if (!cfg_report_) return;
+        int fd = 2;
+        bool close_fd = false;
+        if (std::strcmp(cfg_report_, "1") != 0 && std::strcmp(cfg_report_, "stderr") != 0) {
+            char path[1024];
+            if (!expandPidPath(cfg_report_, path, sizeof(path))) return;
+            fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+            if (fd < 0) return;
+            close_fd = true;
+        }
+        auto& g = rstats::g;
+        auto ld = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
+        const PageSnapshot ps = snapshotPages();
+        const uint64_t now = rstats::monoNs(), start = ld(g.start_ns);
+        const double ran = start && now > start ? (now - start) / 1e9 : 0.0;
+        const double cold = coldTimeoutSec();
+        const uint64_t peak_kb = peakRssKb();
+        const uint64_t drop_kb = ld(g.rss_drop_kb), drop_peak_kb = ld(g.rss_drop_peak_kb);
+        const uint64_t cur_kb = residentKb();
+        const uint64_t ncomp = ld(g.compressions), in_b = ld(g.comp_in_bytes),
+                       out_b = ld(g.comp_out_bytes), rej = ld(g.ratio_rejects);
+        const uint64_t nfault = ld(g.decomp_faults);
+        const int pid = (int)getpid();
+
+        char out[4096];
+        size_t n = 0;
+        auto put = [&](const char* fmt, auto... args) {
+            if (n >= sizeof(out)) return;
+            int k = smash::safe_snprintf(out + n, sizeof(out) - n, fmt, args...);
+            if (k > 0) n += static_cast<size_t>(k) < sizeof(out) - n ? static_cast<size_t>(k) : sizeof(out) - n;
+        };
+        char a[32], b[32], c[32];
+        put("[smash report] pid=%d ran %.1f s  profile=%s mode=%s tracking=%s cold-timeout=%.0f s\n",
+            pid, ran, smashProfileName(getSmashProfile()), modeName(), trackingName(), cold);
+        fmtBytes(a, sizeof(a), peak_kb * 1024);
+        fmtBytes(c, sizeof(c), cur_kb * 1024);
+        put("[smash report]   RSS: peak %s, at exit %s\n", a, c);
+        if (drop_kb && drop_peak_kb) {
+            fmtBytes(a, sizeof(a), drop_peak_kb * 1024);
+            fmtBytes(b, sizeof(b), drop_kb * 1024);
+            put("[smash report]   deepest drop: %s -> %s (%.0f%% below the peak up to then; sampled once a second)\n",
+                a, b, 100.0 * (1.0 - static_cast<double>(drop_kb) / static_cast<double>(drop_peak_kb)));
+        }
+        fmtBytes(a, sizeof(a), ps.managed * kPageSize);
+        put("[smash report]   managed by smash: %s (%zu pages)\n", a, ps.managed);
+        fmtBytes(a, sizeof(a), ps.compressed * kPageSize);
+        fmtBytes(b, sizeof(b), ps.stored_bytes);
+        put("[smash report]   compressed now: %zu pages (%s) released, %zu awaiting release; blobs %s",
+            ps.compressed, a, ps.shadow, b);
+        if (ps.stored_bytes > 0)
+            put(" (%.1fx)", static_cast<double>((ps.compressed + ps.shadow) * kPageSize) /
+                                static_cast<double>(ps.stored_bytes));
+        put("\n");
+        fmtBytes(a, sizeof(a), in_b);
+        fmtBytes(b, sizeof(b), out_b);
+        put("[smash report]   compressed over the run: %llu pages, %s -> %s",
+            (unsigned long long)ncomp, a, b);
+        if (out_b) put(" (%.1fx)", static_cast<double>(in_b) / out_b);
+        put("; %llu pages compressed too poorly to keep\n", (unsigned long long)rej);
+        if (nfault) {
+            const uint32_t p50 = rstats::latQuantileUs(0.50), p99 = rstats::latQuantileUs(0.99);
+            char p50s[24], p99s[24];
+            if (p50 == UINT32_MAX) smash::safe_snprintf(p50s, sizeof(p50s), "> 1 s");
+            else smash::safe_snprintf(p50s, sizeof(p50s), "<= %u us", p50);
+            if (p99 == UINT32_MAX) smash::safe_snprintf(p99s, sizeof(p99s), "> 1 s");
+            else smash::safe_snprintf(p99s, sizeof(p99s), "<= %u us", p99);
+            put("[smash report]   decompression faults: %llu, service time p50 %s, p99 %s, mean %.1f us\n",
+                (unsigned long long)nfault, p50s, p99s,
+                ld(g.fault_ns_sum) / 1000.0 / static_cast<double>(nfault));
+        } else {
+            put("[smash report]   decompression faults: 0\n");
+        }
+        put("[smash report]   tracking faults (no decompression): %llu\n",
+            (unsigned long long)ld(g.tracking_faults));
+        put("[smash report]   compressor CPU: %.2f s\n", rstats::compressorCpuNs() / 1e9);
+
+        // Why nothing was compressed, most specific cause first.
+        if (ncomp == 0) {
+            if (ps.managed == 0 && isLargeOnlyMode()) {
+                put("[smash report]   hint: nothing was compressed because smash managed no pages: with "
+                    "SMASH_LARGE_ONLY=1 only allocations over %zu bytes go through smash, and this "
+                    "program made none that stayed live. Run without SMASH_LARGE_ONLY to manage small objects too.\n",
+                    largeOnlyThreshold());
+            } else if (cfg_defer_phases_ms_ > 0 && ran * 1000.0 < cfg_defer_phases_ms_ + cold * 1000.0) {
+                put("[smash report]   hint: nothing was compressed because SMASH_DEFER_PHASES_MS=%d holds "
+                    "compression off at startup and the process ran only %.1f s.\n",
+                    cfg_defer_phases_ms_, ran);
+            } else if (ran < cold + 2.0) {
+                put("[smash report]   hint: nothing was compressed because the process ran %.1f s and smash "
+                    "compresses a page only after it has been idle for %.0f s (SMASH_COLD_TIMEOUT_SEC). That "
+                    "is intended for long-running services; for a quick test set SMASH_COLD_TIMEOUT_SEC=1 or "
+                    "keep the program running past the timeout.\n", ran, cold);
+            } else if (rej > 0) {
+                put("[smash report]   hint: nothing was kept compressed: %llu idle pages were tried but did "
+                    "not shrink below %.0f%% of their size (incompressible data).\n",
+                    (unsigned long long)rej, ROIConfig::instance().min_compress_ratio * 100.0);
+            } else if (ps.managed * kPageSize < (size_t{1} << 20)) {
+                put("[smash report]   hint: nothing was compressed; smash manages under 1 MiB in this "
+                    "process, so there was little to compress.\n");
+            } else {
+                put("[smash report]   hint: nothing was compressed because no page stayed idle for %.0f s "
+                    "(the working set stayed hot), or the cost model judged idle pages not worth it "
+                    "(SMASH_ROI_THRESHOLD; SMASH_PROFILE=memory compresses sooner).\n", cold);
+            }
+        }
+        writeAll(fd, out, n);
+        if (close_fd) close(fd);
+    }
+
     void stop() {
         pressureDump();
         // Shutdown tracing for debugging (SMASH_SHUTDOWN_TRACE=1)
@@ -7075,6 +7452,7 @@ public:
         for (int i = 0; i < helpers_created_; ++i)
             pthread_join(helper_threads_[i], nullptr);
         trace_msg("all helpers joined");
+        writeMetricsFile();  // final snapshot (threads joined, counters settled)
         // Compressed pages stay compressed at exit. Decompressing them all
         // here grew RSS to the uncompressed heap size plus the not-yet-
         // trimmed store (Redis: 40 -> 208 MB during a SIGTERM shutdown, an
@@ -7192,6 +7570,10 @@ public:
         }
 
         const uint64_t pst_t0 = pstats::enabled() ? pstats::monoNs() : 0;
+        // Fault-service latency for SMASH_REPORT / SMASH_METRICS_FILE: from
+        // here (lock wait included) to the end of prefetch. clock_gettime is
+        // async-signal-safe and a vDSO call on Linux.
+        const uint64_t rs_t0 = rstats::monoNs();
         locks_->lock(page_idx);
 
         PageState st = states_->get(page_idx);
@@ -7392,6 +7774,7 @@ public:
             // Prefetch adjacent compressed pages
             prefetchAdjacent(page_idx);
 
+            rstats::recordDecompressFault(rstats::monoNs() - rs_t0);
             return true;
         }
 
@@ -7429,6 +7812,7 @@ public:
             accessed_[page_idx].store(true, std::memory_order_relaxed);
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
+            rstats::noteTrackingFault();
             return true;
         }
 
@@ -7436,6 +7820,7 @@ public:
             // Race: Phase 3's batched mprotect(PROT_READ) can overwrite a
             // per-page PROT_RW restoration done by a concurrent fault handler.
             void* page_addr = vm_->pageAddress(page_idx);
+            rstats::noteTrackingFault();
             if (uffdFault(page_idx)) {
                 // MISSING page (first touch / decommitted).
                 uffdResolve(page_addr);
@@ -7470,6 +7855,7 @@ public:
             pstats::onExit(page_idx, pstats::kShadowDiscard);
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
+            rstats::noteTrackingFault();
             return true;
         }
 
@@ -7479,6 +7865,7 @@ public:
                 // first touch arrives as a MISSING fault.
                 uffdResolve(vm_->pageAddress(page_idx));
                 locks_->unlock(page_idx);
+                rstats::noteTrackingFault();
                 return true;
             }
             locks_->unlock(page_idx);

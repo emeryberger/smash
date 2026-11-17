@@ -88,6 +88,16 @@ jobs:
         working-directory: smash
         run: ctest --test-dir build --output-on-failure --timeout 120
 
+      # Installed layout: ${prefix}/bin/smash must find ${prefix}/lib/libsmash.*
+      # on its own (the ctest launcher tests cover the build-tree layout).
+      - name: Install and smoke-test the launcher
+        working-directory: smash
+        run: |
+          cmake --install build --component smash --prefix "$RUNNER_TEMP/smash"
+          "$RUNNER_TEMP/smash/bin/smash" version
+          "$RUNNER_TEMP/smash/bin/smash" doctor || true
+          "$RUNNER_TEMP/smash/bin/smash" run --report -- build/tests/launcher_test
+
       # Regression-spotting benchmarks — runs bench_rss (in-process) and
       # bench_sqlite (--quick under preload). Asserts headline RSS-
       # reduction percentages stay above conservative thresholds. See

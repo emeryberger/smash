@@ -4,6 +4,21 @@ smash needs no configuration: the defaults are the tuned settings. Everything he
 
 All runtime behavior is controlled by `SMASH_*` environment variables, read once at process start. Compile-time constants live in [`include/smash/config.h`](../include/smash/config.h).
 
+A classified inventory of every variable (user-facing, expert, debug) is in [agents/env-vars.md](../agents/env-vars.md).
+
+## Profiles
+
+`SMASH_PROFILE=latency|balanced|memory` sets defaults for several of the variables below at once. A variable you set explicitly always wins over the profile. `balanced` is the built-in behaviour; leaving `SMASH_PROFILE` unset is the same.
+
+| Variable | latency | balanced | memory |
+|---|---|---|---|
+| `SMASH_COLD_TIMEOUT_SEC` | 30 | 10 | 2 |
+| `SMASH_COMPRESSOR_IDLE` | 1 | off | off |
+| `SMASH_PROMPT_TRIM_MB` | off | off | 8 |
+| `SMASH_EMPTY_RESIDENT_MB` | RAM/32 | RAM/32 | 64 |
+
+The reasoning behind each value is in [agents/env-vars.md](../agents/env-vars.md#smash_profile). A profile's cold timeout keeps the cost-model gate on, as the built-in default does; an explicit `SMASH_COLD_TIMEOUT_SEC` bypasses it.
+
 ## Modes
 
 Pick at most one; otherwise smash runs in full mode (it is the program's `malloc`).
@@ -49,6 +64,7 @@ Pick at most one; otherwise smash runs in full mode (it is the program's `malloc
 | `SMASH_CPU_PRESSURE_CAP=0` | on | Let the compressor scale up its workers even when the CPU is saturated. |
 | `SMASH_EXIT_DRAIN=1` | unset | Decompress every compressed page when the process exits and uninstall the fault handler (the old behaviour). By default compressed pages stay compressed at exit and the fault handler serves any late access, so exit never grows RSS back to the uncompressed heap size. |
 | `SMASH_PROMPT_TRIM_MB=N` | 0 (off) | Return freed compressed-store pages to the kernel as soon as N MB have accumulated, instead of once a second. Lowers the peak while a program reads back a lot of cold data at once (SQLite's close: about 620 → 520 MB), but on memcached it occasionally cost up to 40% throughput, so it is off by default. |
+| `SMASH_COMPRESSOR_IDLE=1` | unset | Run the compressor threads at `SCHED_IDLE` (Linux), so they only use otherwise-idle CPU. Set by `SMASH_PROFILE=latency`. |
 | `SMASH_NO_COMPRESSOR=1` | unset | Run as a plain allocator with no compression (diagnostic). |
 | `SMASH_EAGER_ZERO=1` | unset | Zero memory on `malloc` instead of in the background after `free`. For programs that wrongly assume `malloc` returns zeroed memory. |
 
@@ -68,9 +84,13 @@ At startup smash measures compression speed on this machine to feed its cost mod
 |----------|---------|--------|
 | `SMASH_BANNER=1` | unset | Print a line when smash loads, to confirm the preload took effect (useful for multi-process programs). |
 | `SMASH_STATS=1` | unset | Print a stats line at normal process exit. Inherited across `fork()`, so each child prints its own. |
+| `SMASH_REPORT=1\|path` | unset | Print a human-readable summary at normal exit: peak RSS and the deepest drop below it, bytes managed and compressed, compression ratio, decompression-fault count and service-time p50/p99, compressor CPU, and a hint when nothing was compressed. `1` writes to stderr; a path is appended to, with `%p` replaced by the pid (each forked child reports for itself). |
+| `SMASH_METRICS_FILE=path` | unset | Write metrics in the Prometheus text format to `path` (`%p` becomes the pid), replacing it atomically through a temp file and `rename`. Point node_exporter's textfile collector at the directory (the file name must end in `.prom`). No network listener. Metrics: `smash_info`, `smash_config_*`, RSS, managed/compressed/store bytes, compressions, ratio-gate rejects, tracking faults, compressor CPU seconds and the `smash_fault_service_seconds` histogram. The file is not removed at exit. |
+| `SMASH_METRICS_INTERVAL_SEC=N` | 10 | How often the metrics file is rewritten (minimum 1). |
+| `SMASH_STATS_SIGNAL=1` | unset | Install a SIGUSR2 handler that prints a stats line. Off by default because some programs use SIGUSR2 themselves (MariaDB's shutdown hangs if it is taken). |
 | `SMASH_DEBUG=1` | unset | Print a stats line periodically while running. |
 | `SMASH_PRESSURE_LOG=path` | unset | Write a per-tick log of compressed pages, compressed bytes, RSS and compressor CPU. |
-| `SIGUSR1` / `SIGUSR2` | — | Signals, not variables: sending either to a smash process prints stats on demand. |
+| `SIGUSR2` | — | With `SMASH_STATS_SIGNAL=1`, sending SIGUSR2 prints a stats line on the process's stderr (`smash stats <pid>` does this). Without it, SIGUSR2 keeps its default action, which terminates the process. |
 
 ## macOS
 

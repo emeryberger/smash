@@ -250,6 +250,16 @@ struct ROIConfig {
         } else if (ct_env) {
             cold_ticks_floor = static_cast<uint32_t>(std::atoi(ct_env));
             cold_ticks_overridden = true;
+        } else if (const char* pt = profileColdTimeout()) {
+            // A profile moves the floor the way the built-in default does:
+            // unlike an explicit timeout it leaves cold_ticks_overridden
+            // false, so the ROI gate stays on.
+            double sec = std::atof(pt);
+            if (sec > 0) {
+                cold_ticks_floor = static_cast<uint32_t>(
+                    sec * 1000.0 / kCompressIntervalMs + 0.5);
+                if (cold_ticks_floor < 1) cold_ticks_floor = 1;
+            }
         }
 
         const char* vct_env = std::getenv("SMASH_VERY_COLD_TICKS");

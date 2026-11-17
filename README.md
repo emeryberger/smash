@@ -13,18 +13,14 @@ Requires a C++20 compiler (GCC 12+ or Clang 14+), CMake 3.15+, and network acces
 ```bash
 git clone https://github.com/emeryberger/smash && cd smash
 cmake -B build && cmake --build build -j
+build/bin/smash run --report -- ./your_server
 ```
 
-Then run any program with it:
+`smash run` preloads the library (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS) and starts your program. `--report` prints a summary when the program exits: peak memory and how far it dropped, how much was compressed and how well, and how long faults on compressed pages took. `cmake --install build --component smash --prefix ~/.local` installs `bin/smash` and `lib/libsmash.*`; `smash doctor` checks the setup. With a library downloaded from a [release](https://github.com/emeryberger/smash/releases), preload it directly (`LD_PRELOAD=/path/to/libsmash.so ./your_server`) or point the launcher at it with `SMASH_LIB`.
 
-```bash
-LD_PRELOAD=$PWD/build/libsmash.so ./your_server                 # Linux
-DYLD_INSERT_LIBRARIES=$PWD/build/libsmash.dylib ./your_server   # macOS
-```
+smash leaves a page alone until it has gone **10 seconds** without being touched, so a short test program that exits right away shows no change; the report then says why. That's intended: smash is built for services that stay up and leave most of their data idle. To see it act sooner, set `SMASH_COLD_TIMEOUT_SEC=2`.
 
-That's the whole setup. smash leaves a page alone until it has gone **10 seconds** without being touched, so a short test program that exits right away shows no change. That's intended: smash is built for services that stay up and leave most of their data idle. To see it act sooner, set `SMASH_COLD_TIMEOUT_SEC=2`.
-
-On macOS, a dylib downloaded from a [release](https://github.com/emeryberger/smash/releases) needs its quarantine flag cleared first (`xattr -d com.apple.quarantine libsmash-macos-arm64.dylib`). macOS also strips `DYLD_*` variables from SIP-protected system binaries, so smash applies to your own programs, not to `/bin` tools.
+On macOS, a downloaded dylib needs its quarantine flag cleared first (`xattr -d com.apple.quarantine libsmash-macos-arm64.dylib`). macOS also strips `DYLD_*` variables from SIP-protected system binaries, so smash applies to your own programs, not to `/bin` tools or `/usr/bin/python3`; `smash run` warns when that happens.
 
 ## What it does for real servers
 
@@ -77,17 +73,16 @@ Under a tight cgroup memory limit the picture is mixed. smash's compressed data 
 
 Everything below is optional; the defaults are what the results above use.
 
-| Variable | What it does |
+| Variable (`smash run` flag) | What it does |
 |---|---|
-| `SMASH_COLD_TIMEOUT_SEC=N` | Seconds a page must sit untouched before it is compressed (default 10). Lower reclaims sooner; higher compresses less often. |
-| `SMASH_LARGE_ONLY=1` | Only manage allocations over 16 KB and pass small ones to the system allocator. For runtimes with their own small-object allocator, such as Python 3.13+. |
+| `SMASH_PROFILE=latency\|balanced\|memory` (`--profile`) | One knob for the tuning variables. `memory` compresses sooner (2 s) and returns memory more eagerly; `latency` waits 30 s and runs the compressor at idle priority. `balanced` is the default. |
+| `SMASH_COLD_TIMEOUT_SEC=N` | Seconds a page must sit untouched before it is compressed (default 10). Overrides the profile. |
+| `SMASH_LARGE_ONLY=1` (`--large-only`) | Only manage allocations over 16 KB and pass small ones to the system allocator. For runtimes with their own small-object allocator, such as Python 3.13+. |
+| `SMASH_REPORT=1\|path` (`--report`) | Print a summary at exit. |
+| `SMASH_METRICS_FILE=path` (`--metrics`) | Keep a Prometheus-format metrics file up to date (every 10 s), for node_exporter's textfile collector. No network port is opened. |
 | `SMASH_MODE=compress_only` | Don't replace `malloc` at all; just compress cold heap pages, whichever allocator owns them. For programs linked against jemalloc or tcmalloc. |
-| `SMASH_TRACK_EXTERNAL=1` | Also compress anonymous memory the program maps itself with `mmap`. Opt-in. |
-| `SMASH_STATS=1` | Print a one-line summary of what smash did when the process exits. |
-| `SMASH_BANNER=1` | Print a line when smash loads, to confirm the preload worked. |
-| `SMASH_UFFD=0` | Turn off `userfaultfd` tracking (on by default on Linux 6.8+). `SMASH_UFFD=1` reports why it is unavailable. |
 
-The full list, including tuning and diagnostic knobs, is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+Every other variable (tuning, compatibility and diagnostics) is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 **Optional: exact read tracking on Linux.** The build also produces `smash-idled`, a small root helper that gives smash processes read tracking through the kernel's idle-page bitmap. smash connects to it automatically when it is running. It serves only the process that started it, plus that process's children:
 

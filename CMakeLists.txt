@@ -236,6 +236,7 @@ add_library(smash SHARED
   ${_SMASH_COMMON_SOURCES}
 )
 target_include_directories(smash PRIVATE ${printf_SOURCE_DIR})
+target_compile_definitions(smash PRIVATE SMASH_VERSION_STRING="${PROJECT_VERSION}")
 
 # macOS arm64: keep hot per-thread state in a reserved pthread TSD slot (one
 # `mrs` + load) instead of thread_locals (a _tlv_get_addr call each on Mach-O).
@@ -467,3 +468,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_package(Threads REQUIRED)
   target_link_libraries(smash-idled PRIVATE Threads::Threads)
 endif()
+
+# ── Launcher + install ───────────────────────────────────────────────────────
+# bin/smash (POSIX sh) finds libsmash at ../lib (installed) or ../ (build tree:
+# build/bin/smash -> build/libsmash.*). Install layout: ${prefix}/bin/smash and
+# ${prefix}/lib/libsmash.{so,dylib} — packaging depends on these exact paths.
+set(SMASH_VERSION "${PROJECT_VERSION}")
+configure_file(bin/smash.in ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen @ONLY)
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/bin
+     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                      GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+file(RENAME ${CMAKE_CURRENT_BINARY_DIR}/bin/smash-launcher.gen
+     ${CMAKE_CURRENT_BINARY_DIR}/bin/smash)
+# COMPONENT smash: the fetched dependencies (alloc8, zstd) carry their own
+# install rules for headers and static libraries; `cmake --install build
+# --component smash` installs only these two files.
+install(TARGETS smash LIBRARY DESTINATION lib COMPONENT smash)
+install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/smash DESTINATION bin COMPONENT smash)

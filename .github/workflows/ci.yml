@@ -149,7 +149,7 @@ jobs:
                 if command -v dpkg >/dev/null; then dpkg -i /pkg/smash_*_amd64.deb >/dev/null
                 else rpm -i /pkg/smash-*.x86_64.rpm; fi
                 for mode in 0 1; do
-                  out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode timeout 60 /usr/bin/smash /p/probe 2>&1)
+                  out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode timeout 60 /usr/bin/smash run -- /p/probe 2>&1)
                   echo "SMASH_LARGE_ONLY=$mode: $out"
                   grep -q "probe ok" <<<"$out"
                   grep -q "\[smash stats\]" <<<"$out"

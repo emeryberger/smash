@@ -151,7 +151,7 @@ jobs:
           printf '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nint main(void){char*p=malloc(4<<20);if(!p)return 1;memset(p,1,4<<20);free(p);puts("probe ok");return 0;}\n' > /tmp/probe.c
           cc -O2 -o /tmp/probe /tmp/probe.c
           for mode in 0 1; do
-            out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode /usr/bin/smash /tmp/probe 2>&1)
+            out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode /usr/bin/smash run -- /tmp/probe 2>&1)
             echo "SMASH_LARGE_ONLY=$mode: $out"
             grep -q 'probe ok' <<<"$out"
             grep -q '\[smash stats\]' <<<"$out"
@@ -170,7 +170,7 @@ jobs:
               printf "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nint main(void){char*p=malloc(4<<20);if(!p)return 1;memset(p,1,4<<20);free(p);puts(\"probe ok\");return 0;}\n" > /tmp/probe.c
               gcc -O2 -o /tmp/probe /tmp/probe.c
               for mode in 0 1; do
-                out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode /usr/bin/smash /tmp/probe 2>&1)
+                out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode /usr/bin/smash run -- /tmp/probe 2>&1)
                 echo "SMASH_LARGE_ONLY=$mode: $out"
                 grep -q "probe ok" <<<"$out"
                 grep -q "\[smash stats\]" <<<"$out"
@@ -197,7 +197,7 @@ jobs:
                 . /etc/os-release; echo "== $PRETTY_NAME"
                 dpkg -i /out/smash-linux-${{ matrix.arch }}.deb >/dev/null
                 for mode in 0 1; do
-                  out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode timeout 60 /usr/bin/smash /p/probe 2>&1)
+                  out=$(SMASH_STATS=1 SMASH_LARGE_ONLY=$mode timeout 60 /usr/bin/smash run -- /p/probe 2>&1)
                   echo "SMASH_LARGE_ONLY=$mode: $out"
                   grep -q "probe ok" <<<"$out"
                   grep -q "\[smash stats\]" <<<"$out"
@@ -386,7 +386,12 @@ jobs:
             mkdir -p "ctx/prebuilt/$d/lib" "ctx/prebuilt/$d/bin"
             cp "dist/libsmash-linux-$a/libsmash-linux-$a.so" "ctx/prebuilt/$d/lib/libsmash.so"
             chmod 0644 "ctx/prebuilt/$d/lib/libsmash.so"
-            install -m 0755 bin/smash "ctx/prebuilt/$d/bin/smash"
+            # The launcher is generated at configure time (bin/smash.in); take the
+            # exact file shipped in this arch's .tar.gz package.
+            tar -xzf "dist/libsmash-linux-$a/smash-linux-$a.tar.gz" --wildcards --no-anchored 'bin/smash' -O \
+              > "ctx/prebuilt/$d/bin/smash"
+            chmod 0755 "ctx/prebuilt/$d/bin/smash"
+            head -1 "ctx/prebuilt/$d/bin/smash" | grep -q "^#!" || { echo "no launcher in tarball" >&2; exit 1; }
           done
           find ctx -type f -exec ls -l {} +
 

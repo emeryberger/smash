@@ -455,6 +455,22 @@ if(SMASH_BUILD_ESTIMATE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash-estimate PRIVATE libzstd_static)
   # Same fixed layout and component as libsmash and the launcher (see Install).
   install(TARGETS smash-estimate RUNTIME DESTINATION bin COMPONENT smash)
+endif()
+
+# ── Launcher ───────────────────────────────────────────────────────
+# bin/smash (POSIX sh) finds libsmash at ../lib (installed) or ../ (build tree:
+# build/bin/smash -> build/libsmash.*). Install layout: ${prefix}/bin/smash and
+# ${prefix}/lib/libsmash.{so,dylib} — packaging depends on these exact paths.
+set(SMASH_VERSION "${PROJECT_VERSION}")
+configure_file(bin/smash.in ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen @ONLY)
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/bin
+     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                      GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+file(RENAME ${CMAKE_CURRENT_BINARY_DIR}/bin/smash-launcher.gen
+     ${CMAKE_CURRENT_BINARY_DIR}/bin/smash)
+# Installed by the SMASH_INSTALL block below (COMPONENT smash).
+
 # ── Install ───────────────────────────────────────────────────────────────────
 # Layout contract (relied on by the bin/smash launcher, the Homebrew formula,
 # the .deb/.rpm/.tar.gz packages and the container image):
@@ -493,11 +509,8 @@ if(SMASH_INSTALL)
     # Debian policy wants a machine-readable share/doc/<package>/copyright.
     install(FILES packaging/debian/copyright DESTINATION share/doc/smash COMPONENT smash)
   endif()
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bin/smash)
-    install(PROGRAMS bin/smash DESTINATION bin COMPONENT smash)
-  else()
-    message(WARNING "bin/smash launcher missing from source tree — not installed")
-  endif()
+  # Launcher generated from bin/smash.in (see "Launcher" above).
+  install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/smash DESTINATION bin COMPONENT smash)
   include(cmake/SmashCPack.cmake)
 endif()
 
@@ -544,20 +557,3 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash-idled PRIVATE Threads::Threads)
 endif()
 
-# ── Launcher + install ───────────────────────────────────────────────────────
-# bin/smash (POSIX sh) finds libsmash at ../lib (installed) or ../ (build tree:
-# build/bin/smash -> build/libsmash.*). Install layout: ${prefix}/bin/smash and
-# ${prefix}/lib/libsmash.{so,dylib} — packaging depends on these exact paths.
-set(SMASH_VERSION "${PROJECT_VERSION}")
-configure_file(bin/smash.in ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen @ONLY)
-file(COPY ${CMAKE_CURRENT_BINARY_DIR}/smash-launcher.gen
-     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/bin
-     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
-                      GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-file(RENAME ${CMAKE_CURRENT_BINARY_DIR}/bin/smash-launcher.gen
-     ${CMAKE_CURRENT_BINARY_DIR}/bin/smash)
-# COMPONENT smash: the fetched dependencies (alloc8, zstd) carry their own
-# install rules for headers and static libraries; `cmake --install build
-# --component smash` installs only these two files.
-install(TARGETS smash LIBRARY DESTINATION lib COMPONENT smash)
-install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/smash DESTINATION bin COMPONENT smash)

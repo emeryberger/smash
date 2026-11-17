@@ -25,6 +25,7 @@
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 #include "../util/run_stats.h"    // SMASH_REPORT / SMASH_METRICS_FILE counters
 #include "safety.h"               // kill switch / watchdog / SLO controller
+#include "../util/cgroup_monitor.h" // SMASH_CGROUP: container memory-limit policy
 
 namespace smash {
 // Set true when a loaded profile says external pages were hot, so the mmap/
@@ -2142,6 +2143,10 @@ private:
         compress_run_end_[worker_id] = SIZE_MAX;
         const ROIConfig& cfg = ROIConfig::instance();
         uint32_t floor = effectiveColdFloor(cfg.cold_ticks_floor);
+        // SMASH_CGROUP: near the container's memory limit, compress sooner
+        // (see cgroupTick). Decided once per tick before phases dispatch.
+        const cgroup::Decision cg_dec = cg_dec_;
+        if (cg_dec.cold_floor && cg_dec.cold_floor < floor) floor = cg_dec.cold_floor;
         bool backoff_enabled = cfg.recompress_backoff;
 
         // No CPU-pressure multiplier and no per-tick compression budget.
@@ -2408,6 +2413,14 @@ private:
                 if (shadow_cap_on_ &&
                     shadow_budget_.load(std::memory_order_relaxed) <= 0)
                     return;
+                // SMASH_CGROUP: the kernel already swapped this page out of
+                // the capped cgroup. Snapshotting it would swap it back in
+                // (charging the cgroup, forcing more reclaim) to build a blob
+                // no smaller than the swap/zswap copy. Leave it to the kernel.
+                if (cg_dec.skip_nonresident && !pageResident(i, worker_id)) {
+                    cg_skipped_nonresident_.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
                 size_t& crun = compress_run_end_[worker_id];
                 if ((st == PageState::ACTIVE_MONITORING || !isDeferredReclaimMode()) &&
                     crun != i && !chargeVmaBudget(2))
@@ -2751,7 +2764,8 @@ private:
                 worker.sc_stats[stats_idx].redirtyDiscountX256(streak_relief);
         }
 
-        if (!CompressionROI::shouldCompress(cold_count_[page_idx],
+        const uint8_t roi_cold = roiColdCount(page_idx);
+        if (!CompressionROI::shouldCompress(roi_cold,
                                              stats_count, stats_sum,
                                              redirty_discount_x256)) {
             states_->set(page_idx, restore_st);
@@ -2787,7 +2801,7 @@ private:
                 pulls[i] = s.arm_pulls[i];
                 mean[i]  = s.arm_mean[i];
                 m2[i]    = s.arm_m2[i];
-                eligible[i] = (cold_count_[page_idx] >= cfg.profiles[i].min_cold_ticks);
+                eligible[i] = (roi_cold >= cfg.profiles[i].min_cold_ticks);
             }
 
             // Force-deep override: every Nth selection in this bucket, if
@@ -2840,7 +2854,7 @@ private:
                 observed_costs_us[1] = worker.sc_stats[stats_idx].observedCostUs(1);
             }
             profile = CompressionROI::selectProfile(
-                cold_count_[page_idx], stats_count, stats_sum,
+                roi_cold, stats_count, stats_sum,
                 observed_costs_us);
             if (profile) {
                 // Map back to a tier index (0=fast, 1=deep) so reward
@@ -3197,10 +3211,22 @@ private:
         // nothing — the sentinel recorded below carries all the information.
         size_t alloc_size = 0;
         void* stored = nullptr;
+        bool cg_spilled = false;
         if (!zero_page && observe) {
             alloc_size = obsBlobCost(comp_size);  // what store() would charge; blob discarded
         } else if (!zero_page) {
-            stored = store_->store(worker.compress_buf, comp_size, &alloc_size, page_idx);
+            // SMASH_CGROUP_SPILL=1 (opt-in): at the critical pressure level,
+            // put new blobs in the file-backed spill store. Once written back
+            // they are clean page cache, which the kernel drops under the
+            // cgroup limit without swap; an anonymous CompressStore page is
+            // swapped instead. Falls back to the anonymous store on any miss.
+            if (cfg_cgroup_spill_ && cg_dec_.level == cgroup::Pressure::kCritical &&
+                page_tier_ && ensureSpillReady()) {
+                stored = spill_.store(worker.compress_buf, comp_size, &alloc_size, page_idx);
+                cg_spilled = stored != nullptr;
+            }
+            if (!stored)
+                stored = store_->store(worker.compress_buf, comp_size, &alloc_size, page_idx);
             if (!stored) {
                 if (!deferred) {
                     if (!vm::protectPages(page_addr, kPageSize, true, true)) {
@@ -3263,6 +3289,10 @@ private:
         rstats::noteCompressed(kPageSize, zero_page ? 0 : alloc_size);
         if (page_tier_) {
             page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
+            if (cg_spilled) {
+                page_tier_[page_idx] = kTierSpilled;
+                spilled_count_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         // v6 profile: track compression count for thrash rate calculation
         if (!zero_page && have_span && sc < kTotalBucketsPerArena) {
@@ -5257,7 +5287,7 @@ private:
         if (spill_.ready()) return true;
         if (spill_init_done_) return false;   // already tried and gave up
         spill_init_done_ = true;
-        if (!cfg_spill_) return false;
+        if (!cfg_spill_ && !cfg_cgroup_spill_) return false;
 
         // Pick a real-disk directory. SMASH_SPILL_DIR wins if it's real disk;
         // else /var/tmp (FHS persistent, real disk by convention — NOT /tmp,
@@ -6112,6 +6142,10 @@ private:
         // populated + read heavily at startup (long before kColdTicks could
         // make it eligible), so it is excluded before it can ever compress.
         refreshEnvironExclusion();
+
+        // SMASH_CGROUP: sample the container's memory limit / PSI and pick
+        // this tick's pressure policy before phase 2 dispatches.
+        cgroupTick();
 
         // SMASH_DEBUG=1: print a stats line every 5 ticks (~5s at the
         // 1000ms compressor cadence — kCompressIntervalMs). Mirrors the
@@ -7047,6 +7081,121 @@ public:
         if (lockfd >= 0) { flock(lockfd, LOCK_UN); close(lockfd); }
     }
 
+    // ── SMASH_CGROUP: container memory-limit awareness ─────────────────────
+    // cgroupInit() (start(), compressor not yet running) locates the cgroup
+    // v2 chain and decides whether the process is capped; cgroupTick() samples
+    // it once per tick (raw syscalls, stack buffers — see cgroup_monitor.h)
+    // and publishes cg_dec_, which phase 2 reads. No-op when not capped.
+    cgroup::Monitor cg_mon_;
+    bool cg_active_ = false;
+    cgroup::Sample cg_last_{};
+    cgroup::Decision cg_dec_{};
+    cgroup::Pressure cg_level_ = cgroup::Pressure::kNone;
+    uint32_t cg_hold_ = 0;
+    std::atomic<uint64_t> cg_skipped_nonresident_{0};
+    std::atomic<uint64_t> cg_pressure_ticks_{0};
+    std::atomic<uint64_t> cg_warm_pages_{0};
+    std::atomic<uint64_t> cg_swapin_pages_{0};
+    // Per-worker mincore cache: residency of one kResChunk-page window.
+    static constexpr size_t kResChunk = 64;
+    size_t res_base_[kMaxCompressorWorkers]{};
+    uint64_t res_tick_[kMaxCompressorWorkers]{};
+    unsigned char res_vec_[kMaxCompressorWorkers][kResChunk]{};
+
+    void cgroupInit() {
+        cg_active_ = false;
+        if (cfg_cgroup_ == 0) return;
+        cg_active_ = cg_mon_.init(cfg_cgroup_root_);
+        if (cfg_cgroup_ == 1 || s_debug_enabled_) {
+            cgroup::Sample s = cg_active_ ? cg_mon_.sample() : cgroup::Sample{};
+            char b[kPathMaxLog];
+            int n = smash::safe_snprintf(b, sizeof(b),
+                "[smash] cgroup: %s dir=%s limit=%lld current=%lld depth=%d\n",
+                cg_active_ ? "capped, pressure policy on" : "no memory limit found, policy off",
+                cg_mon_.leafDir(), (long long)s.limit, (long long)s.current,
+                s.binding_depth);
+            if (n > 0) (void)!write(2, b, (size_t)n);
+        }
+    }
+    static constexpr size_t kPathMaxLog = cgroup::kPathMax + 128;
+
+    void cgroupTick() {
+        if (!cg_active_) return;
+        cg_last_ = cg_mon_.sample();
+        const uint32_t base = ROIConfig::instance().cold_ticks_floor;
+        cgroup::Decision d = cgroup::decide(cg_last_, cg_params_, cg_level_, &cg_hold_,
+                                            base, kAdaptiveMinTicks);
+        if (!cfg_cgroup_skip_swapped_) d.skip_nonresident = false;
+        if (!cfg_cgroup_warm_) d.keep_warm = false;
+        if (!cfg_cgroup_early_) d.cold_floor = 0;
+        cg_level_ = d.level;
+        cg_dec_ = d;
+        if (d.level != cgroup::Pressure::kNone)
+            cg_pressure_ticks_.fetch_add(1, std::memory_order_relaxed);
+        // Keep the blob store out of the kernel's reclaim (see
+        // CompressStore::keepWarm for why a blob page is the worst page to
+        // evict under zswap). Once per tick, resident pages only.
+        if (d.keep_warm && cfg_cgroup_warm_ && store_) {
+            // Spare room above the warm threshold may be spent reading back
+            // store pages the kernel swapped out earlier (half of it, so
+            // the read-back itself cannot push the cgroup into pressure).
+            size_t budget = 0;
+            if (cfg_cgroup_swapin_ && d.level == cgroup::Pressure::kNone) {
+                const int64_t warm_at = cg_last_.limit / 100 *
+                                        static_cast<int64_t>(cg_params_.warm_pct);
+                const int64_t spare = cg_last_.headroom - warm_at / 2;
+                if (spare > 0) budget = static_cast<size_t>(spare / 2) / kPageSize;
+            }
+            size_t issued = 0;
+            cg_warm_pages_.fetch_add(store_->keepWarm(budget, &issued),
+                                     std::memory_order_relaxed);
+            cg_swapin_pages_.fetch_add(issued, std::memory_order_relaxed);
+        }
+    }
+
+    // Cold count presented to the ROI gates (shouldCompress / selectProfile
+    // compare it against the configured cold-tick floor). Under a cgroup
+    // pressure floor the page has been idle long enough relative to the
+    // LOWERED floor, so scale it as if the configured floor had elapsed.
+    uint8_t roiColdCount(size_t page_idx) const {
+        const uint32_t cc = cold_count_[page_idx];
+        const uint32_t pf = cg_dec_.cold_floor;
+        const uint32_t base = ROIConfig::instance().cold_ticks_floor;
+        if (pf == 0 || pf >= base || cc < pf) return static_cast<uint8_t>(cc);
+        const uint32_t scaled = cc * base / pf;
+        return static_cast<uint8_t>(scaled > 255 ? 255 : scaled);
+    }
+
+    // mincore() residency of page i, cached per worker over a kResChunk-page
+    // window of the contiguous arena (one syscall per window per tick).
+    // Non-contiguous (external) pages are queried one by one. A failed
+    // mincore reports "resident" so the policy can only ever skip pages the
+    // kernel positively said are not in RAM.
+    bool pageResident(size_t i, int worker_id) {
+#if defined(__linux__)
+        const size_t contig = vm_->contigPages();
+        if (i >= contig) {
+            unsigned char v = 1;
+            void* a = vm_->pageAddress(i);
+            if (!a || mincore(a, kPageSize, &v) != 0) return true;
+            return (v & 1) != 0;
+        }
+        const size_t base = i - (i % kResChunk);
+        if (res_tick_[worker_id] != tick_counter_ || res_base_[worker_id] != base) {
+            size_t n = contig - base < kResChunk ? contig - base : kResChunk;
+            if (mincore(vm_->pageAddress(base), n * kPageSize, res_vec_[worker_id]) != 0) {
+                for (size_t k = 0; k < kResChunk; ++k) res_vec_[worker_id][k] = 1;
+            }
+            res_base_[worker_id] = base;
+            res_tick_[worker_id] = tick_counter_;
+        }
+        return (res_vec_[worker_id][i - base] & 1) != 0;
+#else
+        (void)i; (void)worker_id;
+        return true;
+#endif
+    }
+
     // Env-var cache: read once at init time, stored as member variables.
     // Avoids function-local statics with getenv() that could first-init
     // inside the signal handler on the compressor thread → crash.
@@ -7060,6 +7209,14 @@ public:
     bool cfg_spill_pageout_ = false; // SMASH_SPILL_PAGEOUT: MADV_PAGEOUT accelerant
     long cfg_spill_max_mb_ = 1024; // SMASH_SPILL_MAX_MB: spill file size cap (default 1 GiB)
     const char* cfg_spill_dir_ = nullptr;  // SMASH_SPILL_DIR (else /var/tmp, cwd)
+    int cfg_cgroup_ = -1;          // SMASH_CGROUP: -1 auto (on when capped), 0 off, 1 on + log
+    const char* cfg_cgroup_root_ = nullptr;  // SMASH_CGROUP_ROOT: own cgroup dir (tests)
+    bool cfg_cgroup_skip_swapped_ = true;    // SMASH_CGROUP_SKIP_SWAPPED=0 ablates
+    bool cfg_cgroup_early_ = false;          // SMASH_CGROUP_EARLY=1 opts in (hurt redis)
+    bool cfg_cgroup_spill_ = false;          // SMASH_CGROUP_SPILL=1: spill new blobs when critical
+    bool cfg_cgroup_warm_ = true;            // SMASH_CGROUP_WARM=0 ablates store keep-warm
+    bool cfg_cgroup_swapin_ = true;          // SMASH_CGROUP_SWAPIN=0 ablates store read-back
+    cgroup::PolicyParams cg_params_{};       // SMASH_CGROUP_HEADROOM_PCT / _PSI_PCT
 
     void warmupClassStatics() {
         const char* v;
@@ -7083,6 +7240,26 @@ public:
         cfg_spill_max_mb_ = v ? std::atol(v) : 1024L;
         cfg_spill_dir_ = std::getenv("SMASH_SPILL_DIR");  // may be null
         readSafetyConfig();
+        v = std::getenv("SMASH_CGROUP");
+        cfg_cgroup_ = !v ? -1 : (v[0] == '0' ? 0 : 1);
+        cfg_cgroup_root_ = std::getenv("SMASH_CGROUP_ROOT");  // may be null
+        v = std::getenv("SMASH_CGROUP_SKIP_SWAPPED");
+        cfg_cgroup_skip_swapped_ = !(v && v[0] == '0');
+        v = std::getenv("SMASH_CGROUP_EARLY");
+        cfg_cgroup_early_ = v && v[0] == '1';
+        v = std::getenv("SMASH_CGROUP_SPILL");
+        cfg_cgroup_spill_ = v && v[0] == '1';
+        v = std::getenv("SMASH_CGROUP_WARM");
+        cfg_cgroup_warm_ = !(v && v[0] == '0');
+        v = std::getenv("SMASH_CGROUP_SWAPIN");
+        cfg_cgroup_swapin_ = !(v && v[0] == '0');
+        v = std::getenv("SMASH_CGROUP_HEADROOM_PCT");
+        if (v && std::atoi(v) > 0 && std::atoi(v) < 100) {
+            cg_params_.elevated_pct = static_cast<uint32_t>(std::atoi(v));
+            cg_params_.critical_pct = cg_params_.elevated_pct * 3 / 10;
+        }
+        v = std::getenv("SMASH_CGROUP_PSI_PCT");
+        if (v && std::atoi(v) > 0) cg_params_.psi_critical_x100 = static_cast<uint32_t>(std::atoi(v)) * 100;
         // Touch remaining statics to force their initialization:
         (void)std::getenv("SMASH_PROTECT_CHUNK_PAGES");
         (void)std::getenv("SMASH_P2_CHUNK");
@@ -7106,6 +7283,7 @@ public:
             ks_disable_ns_ = pstats::monoNs();
         }
         claimKillSwitchSignals();
+        cgroupInit();
         running_.store(true, std::memory_order_release);
         start_steady_time_ = std::chrono::steady_clock::now();
 
@@ -7277,14 +7455,15 @@ public:
         uint64_t tier_success = self->tier_upgrade_success_.load(
             std::memory_order_relaxed);
         size_t spilled = self->spilled_count_.load(std::memory_order_relaxed);
-        char buf[600];
+        char buf[680];
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu"
             "  reheat=%llu  cold_floor=%u  slo_x256=%u  fault_rate=%llu"
             "  fault_p99_us=%llu  faults=%llu  decomp_fail=%llu  disabled=%d"
-            "  inert=%d  trips=%llu\n",
+            "  inert=%d  trips=%llu"
+            "  cg=%d/%lld/%llu/%llu/%llu/%llu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
@@ -7301,7 +7480,16 @@ public:
             (unsigned long long)self->h_decomp_fail_.load(std::memory_order_relaxed),
             self->ks_disabled_.load(std::memory_order_relaxed) ? 1 : 0,
             self->ks_inert_.load(std::memory_order_relaxed) ? 1 : 0,
-            (unsigned long long)self->ks_trips_.load(std::memory_order_relaxed));
+            (unsigned long long)self->ks_trips_.load(std::memory_order_relaxed),
+            // cgroup policy: level / headroom MiB / pressure ticks / skipped
+            // non-resident pages / store pages kept warm / store pages read
+            // back from swap (level -1 = inactive).
+            self->cg_active_ ? static_cast<int>(self->cg_level_) : -1,
+            (long long)(self->cg_last_.headroom >> 20),
+            (unsigned long long)self->cg_pressure_ticks_.load(std::memory_order_relaxed),
+            (unsigned long long)self->cg_skipped_nonresident_.load(std::memory_order_relaxed),
+            (unsigned long long)self->cg_warm_pages_.load(std::memory_order_relaxed),
+            (unsigned long long)self->cg_swapin_pages_.load(std::memory_order_relaxed));
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.

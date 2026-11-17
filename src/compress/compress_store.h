@@ -509,6 +509,86 @@ public:
 
     size_t trimmedPages() const { return trimmed_pages_.load(std::memory_order_relaxed); }
 
+    // Keep resident blob pages young in the kernel's LRU (SMASH_CGROUP,
+    // pressure only): read one byte of every resident, live store page so
+    // its accessed bit is set and reclaim prefers other pages. Rationale: a
+    // blob page is already compressed, so zswap cannot shrink it (measured:
+    // the kernel's reject_compress_fail count tracks smash's disk swap-outs)
+    // and it goes to the disk swap device; one blob page also holds the data
+    // of several heap pages, so evicting it makes several cold accesses each
+    // pay a disk read plus a decompress. A raw cold page evicted instead lands
+    // in zswap and comes back with one in-RAM decompress. Unlike mlock this is
+    // only a hint: under real need the kernel can still evict these pages.
+    //
+    // Non-resident pages are skipped (mincore), so this never swaps anything
+    // in. Region bounds are snapshotted under each shard lock and the pages
+    // touched outside it, so the fault path's release() is never held up by
+    // the walk. Returns the number of pages touched.
+    //
+    // swapin_budget > 0: also ask the kernel to read back (MADV_WILLNEED,
+    // asynchronous swap-in readahead) up to that many live store pages that
+    // were already swapped out, so the next cold access to their blobs hits
+    // RAM instead of the swap device. The caller sizes the budget from the
+    // cgroup's spare headroom. *swapin_issued receives the count requested.
+    size_t keepWarm(size_t swapin_budget = 0, size_t* swapin_issued = nullptr) {
+        if (swapin_issued) *swapin_issued = 0;
+#if defined(__linux__) || defined(__APPLE__)
+        const size_t sh = pageShift();
+        const size_t ps = size_t{1} << sh;
+        struct Span { char* base; size_t end; Region* r; };
+        constexpr int kMaxSpans = 64;
+        size_t touched = 0;
+        for (int s = 0; s < kCompressStoreShards; ++s) {
+            Span spans[kMaxSpans];
+            int n = 0;
+            {
+                LockGuard guard(shards_[s].lock);
+                for (Region* r = shards_[s].current; r && n < kMaxSpans; r = r->next) {
+                    if (r->live_bytes.load(std::memory_order_relaxed) == 0) continue;
+                    spans[n++] = {r->base, r->offset.load(std::memory_order_relaxed), r};
+                }
+            }
+            for (int k = 0; k < n; ++k) {
+                const size_t first = (kDataStart + ps - 1) >> sh;
+                const size_t npages = (spans[k].end + ps - 1) >> sh;
+                if (npages <= first) continue;
+                unsigned char vec[kMaxRegionPages];
+                char* start = spans[k].base + (first << sh);
+#if defined(__APPLE__)
+                char* mvec = reinterpret_cast<char*>(vec);
+#else
+                unsigned char* mvec = vec;
+#endif
+                if (mincore(start, (npages - first) << sh, mvec) != 0) continue;
+                for (size_t p = first; p < npages; ++p) {
+                    if (spans[k].r->page_live[p] == 0) continue;   // racy read: hint only
+                    if (!(vec[p - first] & 1)) {
+                        // Swapped out (or never faulted). Read back a run of
+                        // swapped live pages if the budget allows.
+                        if (swapin_budget == 0) continue;
+                        size_t q = p;
+                        while (q < npages && q - p < swapin_budget && !(vec[q - first] & 1) &&
+                               spans[k].r->page_live[q] != 0)
+                            ++q;
+#if defined(__linux__)
+                        (void)madvise(spans[k].base + (p << sh), (q - p) << sh, MADV_WILLNEED);
+#endif
+                        swapin_budget -= q - p;
+                        if (swapin_issued) *swapin_issued += q - p;
+                        p = q - 1;
+                        continue;
+                    }
+                    (void)*reinterpret_cast<volatile const char*>(spans[k].base + (p << sh));
+                    ++touched;
+                }
+            }
+        }
+        return touched;
+#else
+        return 0;
+#endif
+    }
+
     // Bytes of store pages whose blobs have all been released since the last
     // trim() (approximate: a page reused before the trim still counts).
     size_t deadBytesSinceTrim() const {

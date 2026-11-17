@@ -133,7 +133,9 @@ The defaults are the tuned configuration. Each one targets a way a compressing a
 
 Linux's zswap also compresses memory, but only *reactively*: it compresses pages the kernel has decided to evict, which happens under memory pressure. On a server with spare RAM, zswap does nothing, and idle heap data stays resident. smash compresses idle data *proactively*, with no pressure, no swap device and no system configuration.
 
-Under a tight cgroup memory limit the picture is mixed. smash's compressed data lives in the process and counts against the cgroup, so the kernel can swap it out, and reaching it then costs two faults. Earlier measurements had smash ahead on memcached and zswap ahead on SQLite and Redis inside a tight cap. Those numbers predate the current defaults and are being re-measured; see [docs/ZSWAP.md](docs/ZSWAP.md).
+Under a tight cgroup memory limit the picture is mixed. smash's compressed data lives in the process and counts against the cgroup. zswap cannot compress it again, so when the kernel reclaims it, it goes to the disk swap device and reaching it costs a disk read plus a decompress. Inside a container smash now detects the cgroup limit and keeps its compressed store out of reclaim (`SMASH_CGROUP`, on by default when a limit is present; see [agents/containers.md](agents/containers.md)).
+
+Measured on the EPYC 9R14 host (24-core slice of a shared machine, zswap zstd, five interleaved runs; `bench/run_cgroup_compare.py`), inside the same cap as glibc+zswap smash used 25% less memory on average on SQLite (cap 250M) with the same throughput, but its cold-read p99 was 14% higher (2.6 vs 2.3 ms). On Redis (cap 160M) it used 27% less memory, but GET throughput was 19% lower. Earlier per-workload numbers are in [docs/ZSWAP.md](docs/ZSWAP.md).
 
 ## Deploying safely, and backing out
 

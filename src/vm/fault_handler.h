@@ -114,6 +114,33 @@ inline int& faultDepth() { return g_fault_depth; }
 
 #if defined(__APPLE__) || defined(__linux__)
 
+#if defined(__linux__) && defined(__aarch64__)
+// Walk the arm64 signal frame's context records (struct _aarch64_ctx
+// {u32 magic; u32 size;}, terminated by magic 0) for the ESR record
+// (ESR_MAGIC, followed by the u64 ESR_EL1 value). Constants are spelled out
+// rather than taken from <asm/sigcontext.h>, which clashes with glibc's
+// <signal.h>. Returns 1 write, 0 read, -1 unknown. Async-signal-safe.
+inline int aarch64FaultIsWrite(const unsigned char* p, size_t len) {
+    constexpr uint32_t kEsrMagic = 0x45535201;
+    size_t off = 0;
+    while (off + 8 <= len) {
+        uint32_t magic, size;
+        __builtin_memcpy(&magic, p + off, 4);
+        __builtin_memcpy(&size, p + off + 4, 4);
+        if (magic == 0 || size < 8 || off + size > len) return -1;
+        if (magic == kEsrMagic && size >= 16) {
+            uint64_t esr;
+            __builtin_memcpy(&esr, p + off + 8, 8);
+            const uint64_t ec = esr >> 26;
+            if (ec != 0x24 && ec != 0x25) return -1;
+            return ((esr >> 6) & 1) ? 1 : 0;
+        }
+        off += size;
+    }
+    return -1;
+}
+#endif
+
 // Signal-based fault handler for macOS and Linux.
 // Uses SIGSEGV/SIGBUS to detect accesses to protected pages.
 class FaultHandler {
@@ -238,6 +265,16 @@ class FaultHandler {
                 auto* uc = static_cast<const ucontext_t*>(ucontext);
                 faultWasWrite() =
                     (uc->uc_mcontext.gregs[REG_ERR] & 0x2) ? 1 : 0;
+            }
+#elif defined(__aarch64__)
+            // arm64: the kernel appends an esr_context record to the signal
+            // frame's __reserved area for data aborts. For a data abort
+            // (ESR.EC 0x24 lower EL / 0x25 same EL), ESR.WnR (bit 6) is the
+            // write bit. Without this every arm64 fault read as "write".
+            if (ucontext) {
+                auto* uc = static_cast<const ucontext_t*>(ucontext);
+                faultWasWrite() = aarch64FaultIsWrite(uc->uc_mcontext.__reserved,
+                                                      sizeof(uc->uc_mcontext.__reserved));
             }
 #endif
 #else

@@ -129,6 +129,26 @@ The defaults are the tuned configuration. Each one targets a way a compressing a
 - **Memory that is constantly in use**, where nothing is ever cold, gains nothing.
 - **Workloads that must not exceed a memory cap at their peak.** smash lowers steady-state memory; its peak can be up to about 10% above glibc's.
 
+### What memory does smash manage?
+
+smash can only compress memory it knows about. By default that is everything the program gets from `malloc`; memory the program (or a library it bundles) maps itself needs `SMASH_TRACK_EXTERNAL=1`.
+
+| Memory | Default | `SMASH_TRACK_EXTERNAL=1` | Verified |
+|---|---|---|---|
+| `malloc`'d objects ≤ 16 KB | compressed (full mode); passed to the system allocator with `SMASH_LARGE_ONLY=1` | same | CI tests + the results above |
+| `malloc`'d objects > 16 KB | compressed (both modes) | same | CI tests + the results above |
+| Direct anonymous `mmap` / `sbrk` (private, read-write) | not compressed | compressed; `munmap`, `madvise`, `mprotect`, `mremap`, `MAP_FIXED`, `mlock` on it are handled | `test_external_patterns` (both modes) |
+| A bundled allocator: Redis/Valkey built with jemalloc, mimalloc, gperftools tcmalloc | not compressed (it never calls `malloc`) | compressed, with no allocator-specific hooks: the allocator gets its memory from `mmap`/`sbrk`, which smash interposes | Valkey 9.1 + jemalloc (data checked with `DEBUG DIGEST`, `BGSAVE`, reload), mimalloc and tcmalloc test programs; development measurements in [agents/external-tracking.md](agents/external-tracking.md) |
+| CPython small objects (obmalloc arenas, mapped with `mmap`) | not compressed | compressed | CPython 3.12 dict workload, development measurement in the same doc |
+| Shared, file-backed, read-only, executable, locked, stack or hugetlbfs mappings | never | never (deliberately) | `test_external_patterns`, `test_external_mapping` |
+| Huge pools kept warm by the app (bigger than the 4 GiB tracking budget, e.g. a database buffer pool) | never | skipped with a one-time warning | — |
+| Mappings made with raw syscalls or before smash loads (Go runtime, MariaDB's `MAP_FIXED` buffer pool) | never | never: the interposers can't see them | — |
+| Garbage-collected heaps (JVM, Go, V8/Node) | out of scope | out of scope | — |
+
+Garbage-collected runtimes are out of scope because the collector itself defeats page-level compression: it walks live objects on every cycle, so little stays cold; it installs its own `SIGSEGV` handlers for safepoints and null checks, which collide with smash's fault handler; and the Go runtime maps memory with raw system calls no interposer sees. Compressing under a collector needs the collector's cooperation.
+
+`SMASH_TRACK_EXTERNAL` is still opt-in; [agents/external-tracking.md](agents/external-tracking.md) lists what it changes, what it does not cover yet (the main limit is the kernel's `vm.max_map_count`), and what blocks making it the default.
+
 ### smash and zswap
 
 Linux's zswap also compresses memory, but only *reactively*: it compresses pages the kernel has decided to evict, which happens under memory pressure. On a server with spare RAM, zswap does nothing, and idle heap data stays resident. smash compresses idle data *proactively*, with no pressure, no swap device and no system configuration.
@@ -165,6 +185,7 @@ Everything below is optional; the defaults are what the results above use.
 | `SMASH_MODE=compress_only` | Don't replace `malloc` at all; just compress cold heap pages, whichever allocator owns them. For programs linked against jemalloc or tcmalloc. |
 | `SMASH_DISABLE_SIGNAL=SIG` / `SMASH_CONTROL_FILE=path` | Kill switch: a signal or a file (`disable` / `enable`) that turns compression off and restores every page, or back on. See above. |
 | `SMASH_WATCHDOG_FAULT_RATE=N` / `SMASH_MAX_FAULT_RATE=N` | Disable compression when refaults exceed N/s, or back off the cold threshold to stay under N/s. |
+| `SMASH_TRACK_EXTERNAL=1` | Also compress private anonymous memory the program maps itself (`mmap`, `sbrk`) — this is how smash reaches a bundled jemalloc/mimalloc/tcmalloc or CPython's arenas. Opt-in; see "What memory does smash manage?" above. |
 
 Every other variable (tuning, compatibility and diagnostics) is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 

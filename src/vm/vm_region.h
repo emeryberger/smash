@@ -420,20 +420,26 @@ public:
         // backs only the pages we touch — virtual cost = total_pages_*8B
         // (~32 MiB at kVmMaxPages=1M), resident cost ≈ committed-pages*8B
         // rounded to OS-page granularity.
+        // vm::rawMmap, not ::mmap: this runs inside the SmashHeap constructor,
+        // and on Linux ::mmap is smash's own interposer, which lazily resolves
+        // the real mmap with dlsym(RTLD_NEXT). glibc < 2.34's dlsym allocates
+        // its dlerror state with calloc, which re-enters the half-constructed
+        // heap and spins forever in HeapRedirect::getHeap (state 1) — every
+        // preloaded process hung at startup on Ubuntu 20.04 / Debian 11
+        // (glibc 2.31).
         page_to_span_bytes_ = total_pages_ * sizeof(std::atomic<Span*>);
-        void* m = ::mmap(nullptr, page_to_span_bytes_,
-                         PROT_READ | PROT_WRITE,
-                         MAP_ANON | MAP_PRIVATE | MAP_NORESERVE,
-                         -1, 0);
+        void* m = vm::rawMmap(nullptr, page_to_span_bytes_,
+                              PROT_READ | PROT_WRITE,
+                              MAP_ANON | MAP_PRIVATE | MAP_NORESERVE);
         if (m == MAP_FAILED) {
             page_to_span_ = nullptr;
             page_to_span_bytes_ = 0;
             // Non-fatal: callers fall back to the radix tree via PageMap.
         } else {
             page_to_span_ = static_cast<std::atomic<Span*>*>(m);
-            void* t = ::mmap(nullptr, total_pages_ * sizeof(std::atomic<uint16_t>),
-                             PROT_READ | PROT_WRITE,
-                             MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+            void* t = vm::rawMmap(nullptr, total_pages_ * sizeof(std::atomic<uint16_t>),
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_ANON | MAP_PRIVATE | MAP_NORESERVE);
             page_tag_ = (t == MAP_FAILED) ? nullptr
                                           : static_cast<std::atomic<uint16_t>*>(t);
         }

@@ -492,6 +492,28 @@ struct SystemAllocFns {
             malloc_size = reinterpret_cast<MallocSizeFn>(findOriginal(cur_msize));
         }
 #elif defined(__linux__)
+        // Re-entrancy guard. glibc < 2.34's dlsym allocates its dlerror state
+        // with calloc, which lands back here (large-only calloc → resolve()
+        // → dlsym → calloc → ...) and recursed until the stack overflowed:
+        // SMASH_LARGE_ONLY=1 SIGSEGV'd at startup on Ubuntu 20.04 / Debian 11
+        // (glibc 2.31). A nested call returns with the pointers still null;
+        // every caller already handles that (large-only falls through to the
+        // smash slab; the other paths return nullptr, which glibc's
+        // _dlerror_run tolerates by using its static fallback state).
+        // Only same-thread nesting (dlsym's calloc) bails out. Another thread
+        // that arrives mid-resolution waits for it instead: bailing there
+        // would hand it null pointers, and the passthrough / compressor-thread
+        // paths turn a null system malloc into a spurious nullptr return.
+        static thread_local __attribute__((tls_model("initial-exec"))) bool in_resolve = false;
+        if (in_resolve) return;
+        static std::atomic<bool> resolving{false};
+        while (resolving.exchange(true, std::memory_order_acq_rel)) {
+            sched_yield();
+        }
+        in_resolve = true;
+        struct Clear {
+            ~Clear() { in_resolve = false; resolving.store(false, std::memory_order_release); }
+        } clear;
         malloc = reinterpret_cast<MallocFn>(dlsym(RTLD_NEXT, "malloc"));
         free = reinterpret_cast<FreeFn>(dlsym(RTLD_NEXT, "free"));
         calloc = reinterpret_cast<CallocFn>(dlsym(RTLD_NEXT, "calloc"));

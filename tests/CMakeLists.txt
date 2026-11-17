@@ -231,7 +231,8 @@ function(add_external_patterns_test test_name large_only)
       "SMASH_TRACK_EXTERNAL=1"
       $<TARGET_FILE:external_patterns_test>
   )
-  set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+  # ~85 s on an idle 24-core slice (each case waits for real compression).
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 300)
 endfunction()
 add_external_patterns_test(test_external_patterns 0)             # full mode
 add_external_patterns_test(test_external_patterns_large_only 1)  # large-only

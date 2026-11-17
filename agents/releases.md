@@ -92,7 +92,7 @@ This is the subtle part; it went through several wrong turns before landing. See
 
 `release.yml` has two macOS jobs:
 
-- **`build-macos` (runs-on: `macos-14`)** — compiles the fat dylib, thins it, signs both, zips the fat one. Its checks are **static only**: arm64e slice present (`lipo -archs`) + `codesign -v`. It must **not** try to *execute* an arm64e binary.
+- **`build-macos` (runs-on: `macos-latest`, deployment target 14.0)** — compiles the fat dylib, thins it, signs both, zips the fat one. Its checks are **static only**: arm64e slice present (`lipo -archs`) + `codesign -v`. It must **not** try to *execute* an arm64e binary.
 - **`verify-macos-arm64e` (runs-on: `macos-26`)** — downloads the shipped zip, unzips, and preloads the dylib into a **real arm64e probe process**. This is the end-to-end proof the arm64e slice loads through the same round-trip a user gets. `publish` depends on this job.
 
 The reason for the split — and the trap to remember: **macOS 14 (and 13/15) cannot exec a third-party arm64e binary at all.** Hosted runners on those images lack the `-arm64e_preview_abi` boot-arg, so any third-party arm64e process is **SIGKILLed** (exit 137) regardless of how it is signed. **macOS 26 (Tahoe) runs third-party arm64e** with no boot-arg and no SIP change. So the dynamic load check has to run on a `macos-26` runner; running it on `macos-14` always fails and has nothing to do with the artifact being correct.

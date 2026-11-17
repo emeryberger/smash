@@ -220,7 +220,10 @@ jobs:
   # ── macOS arm64 (Apple Silicon) ──────────────────────────────────────────
   build-macos:
     name: macos-arm64
-    runs-on: macos-14
+    # Static checks only (never execs arm64e), so any macOS runner will do.
+    # macos-14 runners were retired (a 2026-11 dry run got no runner); the
+    # deployment target below keeps the dylib loadable on macOS 14+.
+    runs-on: macos-latest
     steps:
       - name: Checkout smash
         uses: actions/checkout@v4
@@ -247,7 +250,8 @@ jobs:
             -DALLOC8_DIR="$GITHUB_WORKSPACE/alloc8" \
             -DSMASH_BUILD_TESTS=OFF \
             -DSMASH_BUILD_BENCH=OFF \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e"
+            -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
 
       - name: Build libsmash
         working-directory: smash
@@ -283,7 +287,7 @@ jobs:
         # build. The DYNAMIC "does it actually load into an arm64e process"
         # check lives in the separate verify-macos-arm64e job: executing a
         # third-party arm64e binary needs a runner OS that allows it (macOS 26),
-        # and this build job runs on macos-14, which SIGKILLs such a process
+        # and on macOS <= 15 runners such a process is SIGKILLed
         # (no -arm64e_preview_abi boot-arg on hosted runners).
         run: |
           lipo -archs out/libsmash-macos-fat.dylib | tr ' ' '\n' | grep -qx arm64e \
@@ -436,7 +440,10 @@ jobs:
           docker buildx build --load --platform linux/amd64 \
             -f packaging/docker/Dockerfile --build-arg SMASH_FROM=prebuilt \
             -t smash:ci ctx
-          docker buildx build --load --platform linux/amd64 \
+          # --builder default: setup-buildx made an isolated docker-container
+          # builder the default, which cannot see the daemon's smash:ci and
+          # resolved it against Docker Hub ("pull access denied").
+          docker buildx build --builder default --load --platform linux/amd64 \
             --build-arg SMASH_IMAGE=smash:ci -t smash-example:ci packaging/docker/example
           out=$(docker run --rm smash-example:ci 2>&1); echo "$out"
           grep -q 'example ok' <<<"$out"

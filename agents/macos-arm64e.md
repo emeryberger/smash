@@ -52,7 +52,7 @@ Consequences:
 - A fat dylib appearing to work on a dev machine may just mean that machine is on **macOS 26** (or has SIP disabled) — it is **not** evidence the *shipped* artifact loads for stock users. (This bit twice: a local success on macOS 26.5 was first misattributed to SIP being disabled, then a `macos-14` CI probe's SIGKILL was misread as "arm64e injection is fundamentally blocked." Both were the OS-version gate.)
 
 So `release.yml` splits the macOS verification:
-- **`build-macos` (`macos-14`)** — static checks only: arm64e slice present + `codesign -v`. Never execs arm64e.
+- **`build-macos` (`macos-latest`, deployment target 14.0)** — static checks only: arm64e slice present + `codesign -v`. Never execs arm64e.
 - **`verify-macos-arm64e` (`macos-26`)** — downloads the shipped zip, unzips, builds a real arm64e probe, and preloads the dylib into it, asserting `arm64e probe output: [ok]`. It is **capability-gated**: it runs the bare probe first inside an `if`, so a runner that can't exec arm64e *skips* with a `::warning::` instead of false-failing. `publish` depends on this job, so the arm64e slice is proven end-to-end on every release.
 
 The CI probe on macos-26 is the source of truth for "does the shipped arm64e artifact load," precisely because local dev machines give misleading answers.

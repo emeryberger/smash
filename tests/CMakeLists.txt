@@ -437,6 +437,13 @@ add_test(
     -P ${CMAKE_CURRENT_SOURCE_DIR}/debug_stats_test.cmake
 )
 set_tests_properties(test_debug_stats PROPERTIES TIMEOUT 90)
+if(APPLE)
+  # Tick cadence at background QoS (timer coalescing); macOS only.
+  add_test(NAME test_tick_cadence_background
+    COMMAND ${CMAKE_COMMAND} -DLIB=$<TARGET_FILE:smash> -DPROG=$<TARGET_FILE:debug_stats_payload>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tick_cadence_test.cmake)
+  set_tests_properties(test_tick_cadence_background PROPERTIES TIMEOUT 150)
+endif()
 
 # vm.max_map_count regression guard (#94): with the process held 12K VMAs
 # below the cap (the test uses them up itself; no root), a teardown-like

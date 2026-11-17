@@ -8,8 +8,8 @@
 // startup, sample it every tick and run at the CRITICAL pressure level. The
 // test asserts, via the SIGUSR2 stats line:
 //   * cg=2/...   policy active and at the critical level;
-//   * compressed>0 — the pressure policy (skip non-resident, lowered cold
-//     floor) still compresses resident idle pages;
+//   * compressed>0 — the pressure policy (skip non-resident pages, keep the
+//     blob store warm) still compresses resident idle pages;
 // then verifies a byte-exact read-back of large (compressible in both modes)
 // and small (slab in full / passthrough in large-only) chunks.
 #include <cerrno>

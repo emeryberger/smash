@@ -5,18 +5,22 @@
 // kernel memory + the zswap pool, and memory.high / memory.max cap it. Near
 // the cap the kernel reclaims inside the cgroup: it throttles allocating
 // tasks, drops clean page cache and swaps anonymous pages. Two things in that
-// regime are bad for smash specifically:
+// regime are bad for smash specifically (measurements: agents/containers.md):
 //
+//   * smash's CompressStore pages hold already-compressed blobs. zswap cannot
+//     compress them again, rejects them (reject_compress_fail) and they go to
+//     the disk swap device, so a later cold access pays a disk read plus a
+//     decompress. Under glibc+zswap the same data is compressible and stays
+//     in zswap's RAM pool. Response: CompressStore::keepWarm() each tick.
 //   * The compressor snapshots a page to compress it. If the kernel already
 //     swapped that page out, the snapshot swaps it back IN (charging the
-//     cgroup again, pushing the reclaimer to evict something else) only to
-//     produce a blob of about the size zswap already holds. Measured (dev
-//     VM, bench_rss 256 MiB under memory.high=160M, one run each): 93.9K
-//     zswpin under smash vs 135 under glibc; bench_rss only re-touches 10% of
-//     its pages, so the difference is the compressor (agents/containers.md).
-//   * smash waits for the cold timeout (default 10 ticks) before compressing.
-//     A process that fills past the cap inside that window is reclaimed by the
-//     kernel first, so the kernel, not smash, decides what leaves RAM.
+//     cgroup, pushing the reclaimer to evict something else) only to build a
+//     blob about the size of the copy zswap already holds. Response: skip
+//     pages mincore() reports non-resident.
+//
+// A third response, compressing sooner under pressure (Decision::cold_floor),
+// is implemented but opt-in (SMASH_CGROUP_EARLY=1): it lowered SQLite's mean
+// memory.current but cost Redis ~25% GET throughput under a 160M cap.
 //
 // This header is split in two so the logic is unit-testable off Linux:
 //

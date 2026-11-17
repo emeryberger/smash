@@ -207,29 +207,51 @@ def app_cmd(app: str, args) -> list[str]:
     raise ValueError(app)
 
 
+def free_port() -> int:
+    import socket
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
 def run_redis(cg: Cgroup, env: dict, args) -> dict[str, float]:
-    """Start redis-server in the cgroup, fill, idle, then GET-serve."""
-    port = str(args.redis_port)
+    """Start redis-server in the cgroup, fill, idle, then GET-serve.
+
+    The GET phase draws keys uniformly from the whole keyspace after the idle
+    period, so its latency tail is dominated by cold (compressed / swapped)
+    values. The server binds 127.0.0.1 on a fresh port and its PID is checked
+    via INFO so the clients can never talk to some other process's server.
+    """
+    port = str(free_port())
+    cli, bench = args.redis_cli, args.redis_benchmark
+    m: dict[str, float] = {}
     srv = subprocess.Popen(
-        [args.redis_server, "--port", port, "--save", "", "--appendonly", "no",
+        [args.redis_server, "--bind", "127.0.0.1", "--protected-mode", "yes",
+         "--port", port, "--save", "", "--appendonly", "no",
          "--hz", "1", "--activedefrag", "no", "--lazyfree-lazy-user-del", "no"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         preexec_fn=join_cgroup(cg))
-    cli = shutil.which("redis-cli") or "redis-cli"
-    bench = shutil.which("redis-benchmark") or "redis-benchmark"
-    for _ in range(100):
-        if subprocess.run([cli, "-p", port, "ping"], capture_output=True).returncode == 0:
-            break
-        time.sleep(0.1)
-    m: dict[str, float] = {}
     try:
+        ok = False
+        for _ in range(100):
+            info = subprocess.run([cli, "-h", "127.0.0.1", "-p", port, "info", "server"],
+                                  capture_output=True, text=True)
+            if info.returncode == 0 and f"process_id:{srv.pid}" in info.stdout:
+                ok = True
+                break
+            if srv.poll() is not None:
+                break
+            time.sleep(0.1)
+        if not ok:
+            m["exit_code"] = 1.0
+            return m
         n = str(args.redis_keys)
-        subprocess.run([bench, "-p", port, "-t", "set", "-n", n, "-r", n, "-d",
-                        str(args.redis_value), "-q", "-P", "16"], capture_output=True,
+        subprocess.run([bench, "-h", "127.0.0.1", "-p", port, "-t", "set", "-n", n, "-r", n,
+                        "-d", str(args.redis_value), "-q", "-P", "16"], capture_output=True,
                        timeout=600, preexec_fn=demote())
         time.sleep(args.redis_idle)
-        out = subprocess.run([bench, "-p", port, "-t", "get", "-n", n, "-r", n,
-                              "-d", str(args.redis_value), "-c", "8", "--csv"],
+        out = subprocess.run([bench, "-h", "127.0.0.1", "-p", port, "-t", "get", "-n", n,
+                              "-r", n, "-d", str(args.redis_value), "-c", "8", "--csv"],
                              capture_output=True, text=True, timeout=600,
                              preexec_fn=demote()).stdout
         # csv: "test","rps","avg_latency_ms","min","p50","p95","p99","max"
@@ -239,13 +261,14 @@ def run_redis(cg: Cgroup, env: dict, args) -> dict[str, float]:
                 m["ops_per_sec"] = float(cols[1])
                 m["get_p99_us"] = float(cols[6]) * 1000.0
     finally:
-        srv.send_signal(signal.SIGTERM)
-        try:
-            srv.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            srv.kill()
-            srv.wait()
-        m["exit_code"] = float(srv.returncode or 0)
+        if srv.poll() is None:
+            srv.send_signal(signal.SIGTERM)
+            try:
+                srv.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                srv.kill()
+                srv.wait()
+        m.setdefault("exit_code", float(srv.returncode or 0))
     return m
 
 
@@ -394,6 +417,8 @@ def main():
     ap.add_argument("--rss-mb", type=int, default=256)
     ap.add_argument("--rss-wait", type=int, default=40)
     ap.add_argument("--redis-server", default=os.environ.get("REDIS_SERVER", "redis-server"))
+    ap.add_argument("--redis-cli", default=None)
+    ap.add_argument("--redis-benchmark", default=None)
     ap.add_argument("--redis-port", type=int, default=6399)
     ap.add_argument("--redis-keys", type=int, default=300000)
     ap.add_argument("--redis-value", type=int, default=1024)
@@ -401,6 +426,11 @@ def main():
     ap.add_argument("--out", default=None, help="JSON output path")
     args = ap.parse_args()
 
+    # sudo resets PATH (secure_path): also look in /usr/local/bin.
+    search = os.environ.get("PATH", "") + ":/usr/local/bin:/usr/bin"
+    args.redis_cli = args.redis_cli or shutil.which("redis-cli", path=search) or "redis-cli"
+    args.redis_benchmark = (args.redis_benchmark or shutil.which("redis-benchmark", path=search)
+                            or "redis-benchmark")
     if os.geteuid() != 0:
         sys.exit("must run as root (creates cgroups); workloads drop to $SUDO_UID")
     if not (CG_ROOT / "cgroup.controllers").exists():

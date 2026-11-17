@@ -49,6 +49,25 @@ static size_t getCurrentRSSBytes() {
 #endif
 }
 
+// Peak resident set (VmHWM) since exec; 0 where unavailable.
+static size_t getHwmBytes() {
+#if defined(__linux__)
+    int fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[4096];
+    ssize_t n = syscall(SYS_read, fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    const char* p = strstr(buf, "VmHWM:");
+    size_t kb = 0;
+    if (p) sscanf(p, "VmHWM: %zu kB", &kb);
+    return kb * 1024;
+#else
+    return 0;
+#endif
+}
+
 int main(int argc, char* argv[]) {
     // 1 MiB allocations clear kLargeAllocVmThreshold, so they enter smash's
     // compressible VmRegion in both full and large-only mode.
@@ -62,6 +81,10 @@ int main(int argc, char* argv[]) {
     int cold_sec = cold_env ? atoi(cold_env) : 10;
     if (cold_sec <= 0) cold_sec = 10;
     int wait_sec = cold_sec + 5;
+    // --fill-sec S paces the fill over S seconds (one chunk written once,
+    // then left alone), modelling a load phase that is slower than the
+    // compressor's tick. 0 (default) writes everything at once.
+    double fill_sec = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--alloc-size") == 0 && i + 1 < argc)
@@ -70,9 +93,11 @@ int main(int argc, char* argv[]) {
             total_mb = atol(argv[++i]);
         else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc)
             wait_sec = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fill-sec") == 0 && i + 1 < argc)
+            fill_sec = atof(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
-                    "Usage: %s [--alloc-size N] [--total-mb N] [--wait SEC]\n"
+                    "Usage: %s [--alloc-size N] [--total-mb N] [--wait SEC] [--fill-sec SEC]\n"
                     "Run under DYLD_INSERT_LIBRARIES / LD_PRELOAD to exercise smash.\n",
                     argv[0]);
             return 0;
@@ -90,19 +115,31 @@ int main(int argc, char* argv[]) {
     fprintf(stdout, "Initial RSS: %.1f MB\n", initial_rss / (1024.0 * 1024.0));
 
     void** ptrs = static_cast<void**>(malloc(num_allocs * sizeof(void*)));
+    const auto t_fill0 = std::chrono::steady_clock::now();
+    size_t fill_max_rss = 0;
     for (size_t i = 0; i < num_allocs; ++i) {
         ptrs[i] = malloc(alloc_size);
         if (ptrs[i]) {
             // Fill with a compressible pattern.
             memset(ptrs[i], 0x42, alloc_size);
         }
+        if (fill_sec > 0) {
+            const auto due = t_fill0 + std::chrono::duration<double>(fill_sec * (i + 1) / num_allocs);
+            std::this_thread::sleep_until(due);
+            size_t r = getCurrentRSSBytes();
+            if (r > fill_max_rss) fill_max_rss = r;
+        }
     }
 
     size_t peak_rss = getCurrentRSSBytes();
+    if (fill_max_rss > peak_rss) peak_rss = fill_max_rss;
     fprintf(stdout, "After allocation: %.1f MB (+%.1f MB)\n",
             peak_rss / (1024.0 * 1024.0),
             (peak_rss - initial_rss) / (1024.0 * 1024.0));
 
+    fprintf(stdout, "METRIC fill_peak_rss_mb %.1f\n", peak_rss / (1024.0 * 1024.0));
+    fflush(stdout);
+    size_t min_rss = peak_rss;
     fprintf(stdout,
             "\nWaiting for compression (cold threshold %d s; sampling %d s)...\n",
             cold_sec, wait_sec);
@@ -116,6 +153,7 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         size_t rss = getCurrentRSSBytes();
         double reduction = 1.0 - (static_cast<double>(rss) / peak_rss);
+        if (rss < min_rss) min_rss = rss;
         fprintf(stdout, "  t=%2ds: RSS=%.1f MB (%.0f%% reduction from peak)\n",
                 sec, rss / (1024.0 * 1024.0), reduction * 100.0);
     }
@@ -131,6 +169,10 @@ int main(int argc, char* argv[]) {
 
     size_t after_touch = getCurrentRSSBytes();
     fprintf(stdout, "After touching: %.1f MB\n", after_touch / (1024.0 * 1024.0));
+    fprintf(stdout, "METRIC min_rss_mb %.1f\n", min_rss / (1024.0 * 1024.0));
+    fprintf(stdout, "METRIC hwm_rss_mb %.1f\n", getHwmBytes() / (1024.0 * 1024.0));
+    fprintf(stdout, "METRIC workload_done 1\n");
+    fflush(stdout);
 
     for (size_t i = 0; i < num_allocs; ++i) {
         free(ptrs[i]);

@@ -745,3 +745,26 @@ if(NOT APPLE)
       TIMEOUT 300)
   endforeach()
 endif()
+
+# Eager fill compression bounds the peak of a paced write-once fill (1 MiB
+# chunks, so both modes manage them). Default cold timeout on purpose: without
+# SMASH_EAGER_FILL nothing compresses before the fill ends and the test fails.
+add_executable(peak_fill_test peak_fill_test.cpp)
+set_target_properties(peak_fill_test PROPERTIES CXX_STANDARD 20)
+function(add_peak_fill_test test_name large_only)
+  if(APPLE)
+    set(_preload "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_preload "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(
+    NAME ${test_name}
+    COMMAND ${CMAKE_COMMAND} -E env ${_preload}
+      "SMASH_LARGE_ONLY=${large_only}"
+      "SMASH_EAGER_FILL=1"
+      $<TARGET_FILE:peak_fill_test>
+  )
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 90)
+endfunction()
+add_peak_fill_test(test_peak_fill 0)             # full mode
+add_peak_fill_test(test_peak_fill_large_only 1)  # large-only mode

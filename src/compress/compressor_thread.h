@@ -2016,6 +2016,7 @@ private:
                 mig_bits_[w].store(0, std::memory_order_relaxed);
         }
         forEachLivePage(start, end, [&](size_t i) {
+            if (fill_mark_) eagerTrack(i);
             if (restore_mark_ && restore_mark_[i]) --restore_mark_[i];
             if (mig_bits_) {
                 const PageState ms = states_->get(i);
@@ -2156,8 +2157,13 @@ private:
         // it just handed out a chunk on, so a page being filled simply
         // never reaches the floor. Recompression-thrash is handled
         // independently by the per-page rc backoff below.
+        const bool eager_tick = eager_on_;
         forEachLivePage(start, end, [&](size_t i) {
-            if (cold_count_[i] < floor) return;
+            // Eager fill: a page first committed during a fill and quiet for
+            // one full tick is compressed at floor 1 instead of the cold
+            // floor (once per page; see eagerTrack()).
+            const bool eager = eager_tick && fill_mark_[i] == kFillPage;
+            if (cold_count_[i] < (eager ? 1u : floor)) return;
             // Never compress the page(s) backing the C `environ` array. A
             // fork+exec child (Python subprocess.Popen / hlo2penguin) runs
             // getenv() in the child, which walks `environ` — but a raw fork()
@@ -2341,6 +2347,7 @@ private:
             // Looked up via the span so we also pick up the new-page bias
             // from the per-bucket EMA — fresh pages from a known-thrashy
             // call site inherit the wait without needing their own history.
+            if (eager) profile_floor = 0;  // compress at cold_count_ >= 1
             uint32_t eff_floor = profile_floor;
             if (backoff_enabled && !migrated_off) {
                 uint8_t rc = recompress_count_[i];
@@ -2376,7 +2383,8 @@ private:
                     ? compress_fail_count_[i] : 0;
                 uint32_t shift32 = static_cast<uint32_t>(rc) + bucket_bias + fails;
                 if (shift32 > kMaxBackoffShift) shift32 = kMaxBackoffShift;
-                uint64_t wide_floor = static_cast<uint64_t>(profile_floor) << shift32;
+                // Eager pages back off from a 1-tick base like any other.
+                uint64_t wide_floor = static_cast<uint64_t>(eager ? 1u : profile_floor) << shift32;
                 if (wide_floor > kMaxEffectiveFloorTicks)
                     wide_floor = kMaxEffectiveFloorTicks;
                 eff_floor = static_cast<uint32_t>(wide_floor);
@@ -2411,7 +2419,8 @@ private:
                 // pre-compression level. Stop shadowing once this tick's
                 // budget is spent; Phase B frees room as it reclaims.
                 if (shadow_cap_on_ &&
-                    shadow_budget_.load(std::memory_order_relaxed) <= 0)
+                    (shadow_budget_.load(std::memory_order_relaxed) <= 0 ||
+                     (guard_on_ && guard_budget_.load(std::memory_order_relaxed) <= 0)))
                     return;
                 // SMASH_CGROUP: the kernel already swapped this page out of
                 // the capped cgroup. Snapshotting it would swap it back in
@@ -2425,10 +2434,14 @@ private:
                 if ((st == PageState::ACTIVE_MONITORING || !isDeferredReclaimMode()) &&
                     crun != i && !chargeVmaBudget(2))
                     return;  // VMA budget spent this tick
-                const bool compressed_ok = compressPage(i, workers_[worker_id]);
+                const bool compressed_ok = compressPage(i, workers_[worker_id], eager);
                 crun = compressed_ok ? i + 1 : SIZE_MAX;
                 if (compressed_ok) {
                     worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
+                    if (eager) {
+                        fill_mark_[i] = kFillEagerDone;
+                        eager_compressed_.fetch_add(1, std::memory_order_relaxed);
+                    }
                     // Periodic mid-range flush so the pending list
                     // doesn't get too long and so the cap is never hit
                     // inside a hot inner loop.
@@ -2700,7 +2713,8 @@ private:
 
     // ── Compress one page using worker's contexts ─────────────────────────
 
-    __attribute__((cold)) bool compressPage(size_t page_idx, CompressWorker& worker) {
+    __attribute__((cold)) bool compressPage(size_t page_idx, CompressWorker& worker,
+                                            bool eager = false) {
         // Observe mode takes the deferred-mode lock discipline (tryLock) and
         // skips every non-deferred restore path below; its snapshot branch
         // never touches protection.
@@ -2764,7 +2778,11 @@ private:
                 worker.sc_stats[stats_idx].redirtyDiscountX256(streak_relief);
         }
 
-        const uint8_t roi_cold = roiColdCount(page_idx);
+        // An eager fill page is judged as if it had reached the cold floor:
+        // the ratio/ROI gates still apply, only the wait is waived.
+        uint8_t roi_cold = roiColdCount(page_idx);
+        if (eager && roi_cold < ROIConfig::instance().cold_ticks_floor)
+            roi_cold = static_cast<uint8_t>(std::min<uint32_t>(255, ROIConfig::instance().cold_ticks_floor));
         if (!CompressionROI::shouldCompress(roi_cold,
                                              stats_count, stats_sum,
                                              redirty_discount_x256)) {
@@ -3303,6 +3321,9 @@ private:
             if (shadow_cap_on_) {
                 shadow_budget_.fetch_sub(static_cast<int64_t>(compressed_[page_idx].alloc_size),
                                          std::memory_order_relaxed);
+                if (guard_on_)
+                    guard_budget_.fetch_sub(static_cast<int64_t>(compressed_[page_idx].alloc_size),
+                                            std::memory_order_relaxed);
                 shadow_made_.store(true, std::memory_order_relaxed);
             }
             shadow_tick_[page_idx] = tick_counter_;
@@ -3976,6 +3997,96 @@ private:
         return d;
     }
 
+    // ── Eager fill compression (SMASH_EAGER_FILL=1) ───────────────────────
+    // A bulk load writes each page once and moves on, so the whole fill sits
+    // uncompressed until the cold floor (10 ticks by default) elapses after
+    // the last write, and the process peaks at the full uncompressed fill.
+    // While the heap is growing fast (a fill), pages first committed during
+    // the growth are marked fill pages; one that then stays unwritten for a
+    // whole tick is compressed at floor 1. Each page gets this at most once
+    // (a refault or a write during shadow returns it to the normal policy),
+    // the usual rc/bucket backoff still applies, and if more than a quarter
+    // of eager compressions come back the mechanism switches itself off.
+    enum : uint8_t { kFillUnseen = 0, kFillSeen = 1, kFillPage = 2, kFillEagerDone = 3 };
+    bool cfg_eager_fill_ = false;
+    uint32_t cfg_eager_tail_ticks_ = 1;  // SMASH_EAGER_FILL_TAIL: eager ticks after growth stops
+    uint8_t* fill_mark_ = nullptr;
+    bool growth_active_ = false;
+    bool eager_on_ = false;
+    uint32_t growth_quiet_ticks_ = 0;
+    size_t growth_prev_committed_ = 0;
+    std::atomic<uint64_t> eager_compressed_{0};
+    std::atomic<uint64_t> eager_refaulted_{0};
+    static constexpr size_t kGrowthMinPages = 1024;  // 4 MiB per tick
+    static constexpr uint64_t kEagerSelfCheckMin = 256;
+
+    // Phase 1 (per page, range-disjoint across workers).
+    void eagerTrack(size_t i) {
+        const PageState st = states_->get(i);
+        uint8_t& m = fill_mark_[i];
+        if (st == PageState::EMPTY) { m = kFillUnseen; return; }
+        if (m == kFillUnseen) {
+            m = growth_active_ ? kFillPage : kFillSeen;
+        } else if (m == kFillEagerDone &&
+                   (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING)) {
+            // Back to resident after an eager compression: refaulted, or
+            // written while in shadow. Either way it was not write-once.
+            eager_refaulted_.fetch_add(1, std::memory_order_relaxed);
+            m = kFillSeen;
+        } else if (m == kFillPage && !growth_active_ && !eager_on_) {
+            m = kFillSeen;  // the fill is over; normal policy from here
+        }
+    }
+
+    // Coordinator, before Phase 1: is the heap in a fill?
+    void updateGrowth(size_t committed) {
+        const size_t prev = growth_prev_committed_;
+        growth_prev_committed_ = committed;
+        const size_t need = std::max(kGrowthMinPages, prev / 64);
+        growth_active_ = committed > prev && committed - prev >= need;
+        if (!cfg_eager_fill_) return;
+        growth_quiet_ticks_ = growth_active_ ? 0 : growth_quiet_ticks_ + 1;
+        const uint64_t done = eager_compressed_.load(std::memory_order_relaxed);
+        const uint64_t back = eager_refaulted_.load(std::memory_order_relaxed);
+        const bool thrashing = done >= kEagerSelfCheckMin && back * 4 > done;
+        eager_on_ = !thrashing && growth_quiet_ticks_ <= cfg_eager_tail_ticks_;
+    }
+
+    // ── Peak guard (SMASH_PEAK_GUARD=1) ───────────────────────────────────
+    // A cold wave must not lift RSS above the process's own high-water mark:
+    // every compression into shadow additionally draws on a budget of
+    // (VmHWM - RSS) blob bytes per tick, never below kMinShadowCap. Reclaimed
+    // frames raise the headroom, so the wave ramps up geometrically (by about
+    // the compression ratio per tick) instead of overshooting the peak.
+    // Eager fill pages are guarded too: with them exempt (always, or only
+    // while the heap grew) SQLite 1M rows at 1 s peaked at 807 MB vs 762 MB
+    // guard-only; shadow blobs made during a fill are often discarded.
+    bool cfg_peak_guard_ = false;
+    bool guard_on_ = false;
+    std::atomic<int64_t> guard_budget_{0};
+    static uint64_t hwmKb() {
+#if defined(__linux__)
+        int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return 0;
+        char buf[4096];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) return 0;
+        buf[n] = 0;
+        const char* p = std::strstr(buf, "VmHWM:");
+        return p ? std::strtoull(p + 6, nullptr, 10) : 0;
+#elif defined(__APPLE__)
+        mach_task_basic_info_data_t info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+            return 0;
+        return info.resident_size_max / 1024;
+#else
+        return 0;
+#endif
+    }
+
     void armShadowBudget(bool defer_phases) {
         shadow_cap_on_ = false;
         const int div = shadowCapDiv();
@@ -3994,6 +4105,13 @@ private:
         int64_t cap = static_cast<int64_t>(committed * kPageSize) / div;
         if (cap < kMinShadowCap) cap = kMinShadowCap;
         shadow_budget_.store(cap - out, std::memory_order_relaxed);
+        guard_on_ = cfg_peak_guard_;
+        if (guard_on_) {
+            const uint64_t hwm = hwmKb(), rss = residentKb();
+            int64_t head = hwm > rss ? static_cast<int64_t>((hwm - rss) * 1024) : 0;
+            if (head < kMinShadowCap) head = kMinShadowCap;
+            guard_budget_.store(head, std::memory_order_relaxed);
+        }
         shadow_cap_on_ = true;
     }
 
@@ -6213,6 +6331,7 @@ private:
         if (idled_) idledQuery(committed);
 #endif
 
+        if (cfg_eager_fill_) updateGrowth(vm_->committedPages());
         dispatch(1);  // Phase 1: access tracking
         probeMigration();
 
@@ -6782,6 +6901,13 @@ public:
             }
             obs_pid_ = getpid();
         }
+        if (const char* e = std::getenv("SMASH_EAGER_FILL")) cfg_eager_fill_ = std::atoi(e) != 0;
+        if (const char* e = std::getenv("SMASH_EAGER_FILL_TAIL")) {
+            const int v = std::atoi(e);
+            cfg_eager_tail_ticks_ = static_cast<uint32_t>(v < 0 ? 0 : v > 60 ? 60 : v);
+        }
+        if (cfg_eager_fill_) fill_mark_ = bootstrapArray<uint8_t>(max_pages);
+        if (const char* e = std::getenv("SMASH_PEAK_GUARD")) cfg_peak_guard_ = std::atoi(e) != 0;
         page_tier_ = bootstrapArray<uint8_t>(max_pages);
         // Always allocate; sweeper short-circuits on the env knob anyway,
         // and unconditional init keeps pointer-null checks out of fault path.
@@ -8150,14 +8276,14 @@ public:
         uint64_t pcpu = ld(g.phase_cpu_ns), pwall = ld(g.phase_wall_ns);
         uint64_t hcpu = ld(g.helper_cpu_ns), ccpu = ps.coord_cpu_ns;
 
-        char buf[640];
+        char buf[768];
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "tick pid=%d t_ms=%llu dt_ms=%llu L=%zu shadow=%zu blob_kb=%llu"
             " rss_kb=%llu enter=%llu rr=%llu rw=%llu sd=%llu pf=%llu rs=%llu fr=%llu"
             " proc_cpu_us=%llu comp_cpu_us=%llu phase_cpu_us=%llu"
             " phase_wall_us=%llu fault_us=%llu decomp_us=%llu"
             " psi_some_us=%llu psi_full_us=%llu load_x100=%d threads=%d"
-            " cap=%d workers=%d trim_pg=%zu\n",
+            " cap=%d workers=%d trim_pg=%zu eager=%llu eager_back=%llu\n",
             (int)getpid(),
             (unsigned long long)((now - pstats::g_base_ns) / 1000000),
             (unsigned long long)((now - ps.last_ns) / 1000000),
@@ -8179,7 +8305,9 @@ public:
             (unsigned long long)(psi_some - ps.last_psi_some),
             (unsigned long long)(psi_full - ps.last_psi_full),
             load_x100, countOwnThreads(), cpu_pressure_cached_cap_,
-            active_workers_, store_ ? store_->trimmedPages() : size_t{0});
+            active_workers_, store_ ? store_->trimmedPages() : size_t{0},
+            (unsigned long long)eager_compressed_.load(std::memory_order_relaxed),
+            (unsigned long long)eager_refaulted_.load(std::memory_order_relaxed));
         if (n > 0) (void)!write(ps.fd, buf, (size_t)n);
         if (++ps.samples % kOccEvery == 0)
             pressureOccupancy((now - pstats::g_base_ns) / 1000000);
@@ -8991,7 +9119,12 @@ public:
                     uint8_t sc_b = sp->is_large
                         ? largeSizeClass(sp->page_count)
                         : sp->size_class;
-                    if (sc_b < kTotalBucketsPerArena) {
+                    // An eager fill page that refaults says the page was not
+                    // write-once; it must not lengthen the cold wait of the
+                    // whole bucket (that delayed SQLite's normal cold wave by
+                    // ~13 s after its hot rows were eagerly compressed).
+                    const bool eager_page = fill_mark_ && fill_mark_[page_idx] == kFillEagerDone;
+                    if (sc_b < kTotalBucketsPerArena && !eager_page) {
                         size_t bidx = statsIndex(sp->arena_id, sc_b);
                         if (bidx < kBucketTableLen) {
                             // EMA α=1/4, ×256 fixed-point. Relaxed atomics; tearing

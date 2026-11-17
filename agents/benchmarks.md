@@ -96,6 +96,15 @@ python3 bench/verify_paper_claims.py --apps redis,memcached   # external service
 ```
 Measured on the EPYC 9R14 (full datasets): memcached 86%, rocksdb 76%, sqlite 64%, redis 54%, redis-ext 64%, redis-patched 55%, redis-ext-patched 77% — five of seven beat the paper, two match.
 
+## Peak RSS comparison (`bench/run_peak_compare.py`)
+
+glibc vs smash vs `SMASH_EAGER_FILL=1` / `SMASH_PEAK_GUARD=1` / both, randomized and interleaved, full and/or large-only mode. Samples `/proc/<pid>/statm` every 20 ms until the bench's `METRIC workload_done` line (teardown excluded); peak = max(samples, bench-reported `VmHWM`); avgRSS = AUC / duration; smash runs log `SMASH_PRESSURE_LOG` and report compressions / refaults / shadow discards. Benches: `sqlite` (`--sqlite-rows`, `--sqlite-batch` commits every N rows), `rss` (paced write-once fill, `--rss-total-mb`, `--rss-fill-sec`), `rocksdb` (`--rocksdb-args`). Linux only. Results and commands: [docs/PEAK.md](../docs/PEAK.md).
+
+```
+python3 bench/run_peak_compare.py --build-dir build --bench sqlite --sqlite-rows 1000000 --runs 5 \
+    --configs glibc,smash,smash_eager,smash_guard,smash_both --modes full --json tmp/peak.json
+```
+
 ## Application Benchmark Shell Scripts
 
 Individual app benchmarks with detailed output (A/B comparison tables):

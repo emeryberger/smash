@@ -79,6 +79,10 @@
     # Hint for smash-friendly applications (on-access hot-object migration).
     smash_migrate_hint;
     smash_migrate_map;
+    # Kill switch + safety status (include/smash/smash.h).
+    smash_disable;
+    smash_enable;
+    smash_safety_status;
 
     # alloc8 getcwd hooks (function pointers set by Smash constructor)
     xx_getcwd_prepare_hook;

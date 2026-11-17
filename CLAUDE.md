@@ -22,7 +22,7 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All tests must pass (`ctest` lists them; some are macOS-only). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Many of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All tests must pass (`ctest` lists them; some are macOS-only). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` (x86-64), `ubuntu-24.04-arm` (aarch64 — an aarch64-only uffd SIGBUS once slipped past x86-only CI) and `macos-latest` on every push and PR, plus a `stress` job (long `soak_test` in both modes with the kill switch toggling, `fork_stress_test` for issue #61, and a ThreadSanitizer build of the in-process unit tests). The safety tests (`test_safety`, `test_kill_switch_*`, `test_watchdog_*`, `test_slo_controller*`, `test_soak*`, `test_fork_stress*`) are described in [agents/safety.md](agents/safety.md). Many of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -112,6 +112,10 @@ See [agents/syscall-compat.md](agents/syscall-compat.md) for details on EFAULT-d
 ## External-Mapping Tracking (`SMASH_TRACK_EXTERNAL=1`)
 
 See [agents/external-tracking.md](agents/external-tracking.md) for details on the VmRegion tracking hybrid, filter rules, and opt-in rationale.
+
+## Deployment Safety (kill switch, watchdog, SLO controller)
+
+See [agents/safety.md](agents/safety.md). Summary: `smash_disable()` / `SMASH_DISABLE_SIGNAL` / `SMASH_CONTROL_FILE` / the watchdog post a request to `safety::g_request` (`src/compress/safety.h`); the coordinator applies it at the top of `tick()` (`killSwitchTick`). Disabled = no phases; `makeInert()` restores every page one at a time under its page lock (the fault handler's pattern — never several page locks across an mprotect), clears uffd-wp, and sweeps the kernel's map of the arena for leftover non-RW ACTIVE pages. `smash_disable()` returns once inert. Watchdog (`SMASH_WATCHDOG_FAULT_RATE` window-averaged, `SMASH_WATCHDOG_P99_US`, `SMASH_WATCHDOG_DECOMP_FAIL`, all opt-in) trips it with one stderr line; `SMASH_MAX_FAULT_RATE` instead scales `effectiveColdFloor()` (×2 per over-budget tick, −1/8 per tick under half budget, ≤255×). Phases poll `tickAbortRequested()` (fork pause or pending disable) every 16 chunks. Never add a code path that protects or compresses a page outside `tick()` without also gating it on `ks_disabled_`.
 
 ## Production Configuration
 
@@ -230,6 +234,11 @@ Key constants in `include/smash/config.h`:
 Runtime environment variables (full classified list: [agents/env-vars.md](agents/env-vars.md)):
 - `SMASH_PROFILE=latency|balanced|memory`: Defaults for the expert knobs; explicit variables win
 - `SMASH_REPORT=1|path`, `SMASH_METRICS_FILE=path`, `SMASH_METRICS_INTERVAL_SEC=N`: Exit report and Prometheus metrics file (`%p` = pid)
+- `SMASH_DISABLE_SIGNAL=SIG` / `SMASH_ENABLE_SIGNAL=SIG`: opt-in kill-switch signals (no signal is taken by default)
+- `SMASH_CONTROL_FILE=path`: polled each tick; first word `disable`/`enable` (edge-triggered)
+- `SMASH_START_DISABLED=1`: start inert
+- `SMASH_WATCHDOG_FAULT_RATE=N`, `SMASH_WATCHDOG_P99_US=N`, `SMASH_WATCHDOG_DECOMP_FAIL=N` (default off), `SMASH_WATCHDOG_WINDOW=N` (default 5), `SMASH_WATCHDOG_MIN_SAMPLES=N` (default 20): fail-open watchdog
+- `SMASH_MAX_FAULT_RATE=N`: refault budget for the SLO controller (cold-threshold multiplier shown as `cold_floor=`/`slo_x256=` in the stats line)
 - `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc. Production-supported config for concurrent workloads
 - `SMASH_DEFER_MADVISE=1`: Default ON. Defers `madvise(MADV_DONTNEED)` to a per-tick sweeper after `SMASH_DEFER_MADVISE_TICKS` quiescent ticks (default 50). Load-bearing for correctness; do not disable in production
 - `SMASH_DEFER_MADVISE_TICKS=N`: Number of ticks (default 50, ≈500 ms) a page must be quiescent before sweeper madvises it

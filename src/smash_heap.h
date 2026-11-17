@@ -1975,6 +1975,51 @@ public:
         return compressor_.migrateHint(page, cap) ? 1 : 0;
     }
 
+    // ── Kill switch (smash_disable / smash_enable; see compress/safety.h) ──
+    // Returns 0 once compression is off and every page is plain memory, 1 if
+    // the drain is still running at timeout_ms (it continues in the
+    // background), -1 if smash has no compressor in this process.
+    int killSwitchDisable(int reason, int timeout_ms) {
+        if (!compression_inited_) return -1;
+        if (!compressor_.coordinatorRunning()) {
+            compressor_.disableBeforeStart(reason);
+            if (compressor_.killSwitchDisabled() && compressor_.killSwitchInert()) return 0;
+            safety::post(safety::kDisable, reason);  // picked up if it starts
+            return 1;
+        }
+        safety::post(safety::kDisable, reason);
+        if (g_compressor_thread) return 1;  // never block the coordinator
+        for (int waited = 0; waited < timeout_ms; ++waited) {
+            if (compressor_.killSwitchDisabled() && compressor_.killSwitchInert() &&
+                !(safety::g_request.load(std::memory_order_acquire) & 0xf))
+                return 0;
+            usleep(1000);
+        }
+        return 1;
+    }
+    // Returns 0 once compression is back on, 1 on timeout, -1 if no compressor.
+    int killSwitchEnable(int reason, int timeout_ms) {
+        if (!compression_inited_) return -1;
+        if (!compressor_.coordinatorRunning()) {
+            compressor_.enableBeforeStart();
+            return 0;
+        }
+        safety::post(safety::kEnable, reason);
+        if (g_compressor_thread) return 1;
+        for (int waited = 0; waited < timeout_ms; ++waited) {
+            if (!compressor_.killSwitchDisabled() &&
+                !(safety::g_request.load(std::memory_order_acquire) & 0xf))
+                return 0;
+            usleep(1000);
+        }
+        return 1;
+    }
+    bool safetyStatus(CompressorThread::SafetyStatus* out) const {
+        if (!compression_inited_ || !out) return false;
+        *out = compressor_.safetyStatus();
+        return true;
+    }
+
     int arenaFor(const void* ptr) {
         if (!ptr) return -1;
         if (BootstrapAlloc::instance().owns(ptr)) return -1;
@@ -2013,6 +2058,7 @@ public:
     //   slab locks -> large-alloc -> slab leaf locks (magazine, pending pool)
     //   -> VmRegion free shards, commit, decommit pool -> PageMap L2
     //   -> call-site image table -> TSD free list -> thread-cache pool
+    //   -> CompressStore shards (leaf: the fault path's releaseBlob)
     //   -> BootstrapAlloc (innermost: the others allocate from it).
     // The compressor is already paused by smash's own pthread_atfork prepare
     // handler, which runs before this.
@@ -2030,10 +2076,12 @@ public:
         threadStateAtforkPrepare();
 #endif
         ThreadCachePool::instance().lockForFork();
+        if (compression_inited_) compress_store_.lockForFork();
         BootstrapAlloc::instance().atforkPrepare();
     }
     void unlock() SMASH_NO_TS_ANALYSIS {
         BootstrapAlloc::instance().atforkParent();   // same as child: release
+        if (compression_inited_) compress_store_.unlockForFork();
         ThreadCachePool::instance().unlockForFork();
 #if defined(SMASH_USE_TSD)
         threadStateAtforkParent();

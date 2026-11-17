@@ -13,7 +13,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-24.04-arm: aarch64 Linux. An aarch64-only uffd SIGBUS once
+        # slipped past x86-only CI (fixed by mapping the uffd scratch with
+        # rawMmap); run the whole suite on both Linux ISAs.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     steps:
       - name: Checkout smash
         uses: actions/checkout@v4
@@ -156,3 +159,79 @@ jobs:
                 done
               '
           done
+
+  # Concurrency stress: long soak (threads alloc/free/realloc + concurrent
+  # decompress faults + kill switch flipping underneath), fork-under-threads
+  # (issue #61), in BOTH modes, on both Linux ISAs; plus a ThreadSanitizer
+  # build of the in-process unit tests. Seeds are printed (SMASH_SOAK_SEED) so a
+  # failure can be replayed.
+  stress:
+    name: stress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: smash
+      - uses: actions/checkout@v4
+        with:
+          repository: emeryberger/alloc8
+          path: alloc8
+      - name: Build (Release)
+        working-directory: smash
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSMASH_BUILD_TESTS=ON
+          cmake --build build -j
+      - name: Soak, both modes (2 min each, kill switch toggling)
+        working-directory: smash
+        run: |
+          set -e
+          for lo in 0 1; do
+            for toggle in 1 0; do
+              env LD_PRELOAD="$PWD/build/libsmash.so" SMASH_LARGE_ONLY=$lo \
+                SMASH_DEFER_PHASES_MS=0 SMASH_COLD_TIMEOUT_SEC=1 SMASH_SOAK_TOGGLE=$toggle \
+                timeout 300 build/tests/soak_test $((toggle ? 120 : 60)) 8
+            done
+          done
+      - name: fork() under threads, both modes (issue #61)
+        working-directory: smash
+        run: |
+          set -e
+          for lo in 0 1 0 1; do
+            env LD_PRELOAD="$PWD/build/libsmash.so" SMASH_LARGE_ONLY=$lo \
+              SMASH_DEFER_PHASES_MS=0 SMASH_COLD_TIMEOUT_SEC=1 \
+              timeout 600 build/tests/fork_stress_test 300 6
+          done
+      - name: Build unit tests with ThreadSanitizer
+        working-directory: smash
+        # Ubuntu 24.04 kernels default to vm.mmap_rnd_bits=32, which TSan's
+        # fixed shadow layout rejects ("unexpected memory mapping").
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28 || true
+          CC=clang CXX=clang++ cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSMASH_BUILD_TESTS=ON \
+            -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread \
+            -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread
+          cmake --build build-tsan -j
+      # Gating: in-process unit tests that are TSan-clean today (a new race in
+      # any of them fails CI). Preload tests are not run under TSan (its
+      # runtime and an interposed malloc do not mix).
+      - name: ThreadSanitizer (gating set)
+        working-directory: smash
+        env:
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+        run: >
+          ctest --test-dir build-tsan --output-on-failure --timeout 600
+          -R '^(test_size_classes|test_bootstrap|test_span|test_slab|test_vm_region|test_spill_store|test_safety|test_integration|test_compression|test_dictionary|test_prefetch|test_compression_ratio|test_profile_dict_persistence)$'
+      # Report-only: these two exercise the live compressor threads and report
+      # known races (agents/safety.md, "ThreadSanitizer findings"). Kept visible
+      # in the log until they are fixed or annotated.
+      - name: ThreadSanitizer (report-only)
+        working-directory: smash
+        continue-on-error: true
+        env:
+          TSAN_OPTIONS: halt_on_error=0
+        run: ctest --test-dir build-tsan --output-on-failure --timeout 600 -R '^(test_contention|test_stop_no_drain)$'

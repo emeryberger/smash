@@ -1,6 +1,7 @@
 // smash/src/smash_heap.cpp - SmashHeap alloc8 integration + thread cache methods
 #include <new>
 #include "smash_heap.h"
+#include "smash/smash.h"
 #include "vm/syscall_compat.h"
 #include <alloc8/alloc8.h>
 #include <cstdio>
@@ -1681,6 +1682,42 @@ extern "C" __attribute__((visibility("default")))
 int smash_arena_for(const void* ptr) {
     auto* heap = SmashRedirect::getHeap();
     return heap ? heap->arenaFor(ptr) : -1;
+}
+
+// ── Kill switch / safety status (include/smash/smash.h) ─────────────────────
+// Default visibility + version-script entries so a program running under
+// LD_PRELOAD / DYLD_INSERT_LIBRARIES can dlsym them (or link against them).
+extern "C" __attribute__((visibility("default")))
+int smash_disable(void) {
+    auto* heap = SmashRedirect::getHeap();
+    return heap ? heap->killSwitchDisable(smash::safety::kReasonApi, 30000) : -1;
+}
+extern "C" __attribute__((visibility("default")))
+int smash_enable(void) {
+    auto* heap = SmashRedirect::getHeap();
+    return heap ? heap->killSwitchEnable(smash::safety::kReasonApi, 30000) : -1;
+}
+extern "C" __attribute__((visibility("default")))
+int smash_safety_status(SmashSafetyStatus* st) {
+    auto* heap = SmashRedirect::getHeap();
+    smash::CompressorThread::SafetyStatus s;
+    if (!st || !heap || !heap->safetyStatus(&s)) return -1;
+    st->disabled = s.disabled ? 1 : 0;
+    st->inert = s.inert ? 1 : 0;
+    st->compressed_pages = s.compressed;
+    st->reclaimed_pages = s.reclaimed;
+    st->faults = s.faults;
+    st->decompress_faults = s.decomp_faults;
+    st->decompress_failures = s.decomp_failures;
+    st->watchdog_trips = s.trips;
+    st->cold_floor_ticks = s.cold_floor;
+    st->slo_multiplier_x256 = s.slo_mult_x256;
+    st->fault_rate = s.fault_rate;
+    st->fault_p99_us = s.p99_us;
+    size_t k = 0;
+    for (; s.reason && s.reason[k] && k + 1 < sizeof(st->reason); ++k) st->reason[k] = s.reason[k];
+    st->reason[k] = 0;
+    return 0;
 }
 
 __attribute__((constructor(202)))  // After smash_start_main_thread (201)

@@ -24,6 +24,7 @@
 #include "../util/spinlock.h"
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 #include "../util/run_stats.h"    // SMASH_REPORT / SMASH_METRICS_FILE counters
+#include "safety.h"               // kill switch / watchdog / SLO controller
 
 namespace smash {
 // Set true when a loaded profile says external pages were hot, so the mmap/
@@ -102,6 +103,7 @@ struct uffdio_move { __u64 dst; __u64 src; __u64 len; __u64 mode; __s64 move; };
 #endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <mach/mach_vm.h>  // mach_vm_region (kill-switch protection sweep)
 #endif
 
 #include <cstdio>
@@ -784,7 +786,13 @@ class CompressorThread {
         probe_skip_[i] = static_cast<uint8_t>((1u << probe_level_[i]) - 1);
     }
     size_t adaptive_ref_pages_ = 0;  // 0 = off; set in init()
+    // SMASH_MAX_FAULT_RATE (safety.h HealthMonitor) then scales the result:
+    // while refaults exceed the budget the multiplier doubles each tick, and
+    // decays by 1/8 per tick once they are under half the budget.
     uint32_t effectiveColdFloor(uint32_t base) const {
+        return safety::HealthMonitor::scaleFloor(adaptiveColdFloor(base), health_.multX256());
+    }
+    uint32_t adaptiveColdFloor(uint32_t base) const {
         const size_t ref_pages = adaptive_ref_pages_;
         if (ref_pages == 0 || base <= kAdaptiveMinTicks) return base;
         const size_t res = resident_pages_last_;
@@ -1975,6 +1983,9 @@ private:
         for (size_t c = start_chunk; c < end_chunk; ++c) {
             uint64_t mask = live_chunks_[c];
             if (mask == 0) continue;
+            // Fork prepare / kill-switch request: stop at a page boundary;
+            // every phase is resumable on the next tick.
+            if ((c & 15) == 0 && tickAbortRequested()) [[unlikely]] return;
             size_t base = c * kChunkSize;
             while (mask) {
                 int bit = __builtin_ctzll(mask);
@@ -3658,11 +3669,12 @@ private:
                     continue;
                 }
 
-                engine_->decompressWithDCtx(
-                    fault_slots_[slot].dctx,
-                    compressed_[adj].data, fault_slots_[slot].buf,
-                    compressed_[adj].compressedSize(), kPageSize,
-                    algo, sc);
+                if (engine_->decompressWithDCtx(
+                        fault_slots_[slot].dctx,
+                        compressed_[adj].data, fault_slots_[slot].buf,
+                        compressed_[adj].compressedSize(), kPageSize,
+                        algo, sc) != kPageSize) [[unlikely]]
+                    h_decomp_fail_.fetch_add(1, std::memory_order_relaxed);
                 // Populate backing before the page becomes readable so a
                 // concurrent app load never sees a readable-but-empty page.
                 const bool restored = restorePageContents(adj_addr, fault_slots_[slot].buf);
@@ -4769,11 +4781,12 @@ private:
         for (size_t k = lo; ok && k < hi; ++k) {
             if (k == page_idx || states_->get(k) != PageState::COMPRESSED) continue;
             if (slot < 0 && (slot = acquireFaultSlot()) < 0) { ok = false; break; }
-            engine_->decompressWithDCtx(
-                fault_slots_[slot].dctx,
-                compressed_[k].data, fault_slots_[slot].buf,
-                compressed_[k].compressedSize(), kPageSize,
-                compressed_[k].algorithm(), lookupSizeClass(k));
+            if (engine_->decompressWithDCtx(
+                    fault_slots_[slot].dctx,
+                    compressed_[k].data, fault_slots_[slot].buf,
+                    compressed_[k].compressedSize(), kPageSize,
+                    compressed_[k].algorithm(), lookupSizeClass(k)) != kPageSize) [[unlikely]]
+                h_decomp_fail_.fetch_add(1, std::memory_order_relaxed);
             ok = populate(k, fault_slots_[slot].buf);
         }
         if (slot >= 0) releaseFaultSlot(slot);
@@ -5498,6 +5511,485 @@ private:
         }
     }
 
+    // ── Fail-open kill switch, watchdog, SLO controller (safety.h) ───────
+    // Disabled = no Phase 1/2/3/B, no deferred-madvise sweep, no uffd-wp
+    // scan; the first disabled ticks restore every compressed page and undo
+    // every protection smash applied (makeInert), after which smash induces no
+    // faults. The allocator keeps running (it owns the live objects). All of
+    // this runs on the coordinator between phases, under the same in_tick_ /
+    // paused_ fork handshake as a normal tick, and touches each page only
+    // under its per-page lock, one page at a time (the fault handler's own
+    // restore pattern; no multi-page lock is ever held across an mprotect).
+public:
+    struct SafetyStatus {
+        bool disabled = false, inert = false;
+        uint64_t compressed = 0;      // COMPRESSED + COMPRESSED_SHADOW pages now
+        uint64_t reclaimed = 0;       // of which COMPRESSED (frame dropped)
+        uint64_t faults = 0;          // smash fault-handler invocations served
+        uint64_t decomp_faults = 0;   // of which decompressed a page
+        uint64_t decomp_failures = 0; // decompressions that returned a short page
+        uint64_t trips = 0;           // watchdog trips
+        uint32_t cold_floor = 0;      // effective cold threshold (ticks) now
+        uint32_t slo_mult_x256 = 256; // SLO controller multiplier
+        uint64_t fault_rate = 0;      // decompress faults/s, last tick
+        uint64_t p99_us = 0;          // fault-service p99 (us), last tick (0 = untimed)
+        const char* reason = "";      // last disable reason
+    };
+    SafetyStatus safetyStatus() const {
+        SafetyStatus s;
+        s.disabled = ks_disabled_.load(std::memory_order_acquire);
+        s.inert = ks_inert_.load(std::memory_order_acquire);
+        if (states_ && vm_) {
+            const size_t n = vm_->committedPages();
+            for (size_t i = 0; i < n; ++i) {
+                const PageState st = states_->get(i);
+                if (st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW) ++s.compressed;
+                if (st == PageState::COMPRESSED) ++s.reclaimed;
+            }
+        }
+        s.faults = h_faults_.load(std::memory_order_relaxed);
+        s.decomp_faults = h_decomp_faults_.load(std::memory_order_relaxed);
+        s.decomp_failures = h_decomp_fail_.load(std::memory_order_relaxed);
+        s.trips = ks_trips_.load(std::memory_order_relaxed);
+        s.cold_floor = effectiveColdFloor(ROIConfig::instance().cold_ticks_floor);
+        s.slo_mult_x256 = health_.multX256();
+        s.fault_rate = h_last_rate_.load(std::memory_order_relaxed);
+        s.p99_us = h_last_p99_.load(std::memory_order_relaxed);
+        s.reason = ks_reason_;
+        return s;
+    }
+    bool killSwitchDisabled() const { return ks_disabled_.load(std::memory_order_acquire); }
+    bool killSwitchInert() const { return ks_inert_.load(std::memory_order_acquire); }
+    bool coordinatorRunning() const { return running_.load(std::memory_order_acquire); }
+    // Before start() (or with no compressor at all) nothing can be compressed:
+    // mark the switch so a later start() begins disabled, and report inert.
+    void disableBeforeStart(int reason) {
+        if (running_.load(std::memory_order_acquire)) return;
+        if (g_any_page_compressed.load(std::memory_order_relaxed)) return;
+        if (!ks_disabled_.exchange(true)) setReason(reason, nullptr);
+        ks_inert_.store(true, std::memory_order_release);
+    }
+    void enableBeforeStart() {
+        if (running_.load(std::memory_order_acquire)) return;
+        ks_disabled_.store(false, std::memory_order_release);
+        ks_inert_.store(false, std::memory_order_release);
+    }
+
+private:
+    std::atomic<bool> ks_disabled_{false};
+    std::atomic<bool> ks_inert_{false};
+    std::atomic<uint64_t> ks_trips_{0};
+    char ks_reason_[128] = "";
+    uint64_t ks_disable_ns_ = 0;     // when the current disable began (drain timing)
+    uint64_t ks_drained_ = 0;        // pages restored by the current disable
+    bool ks_logged_inert_ = false;
+    // Health counters (fault path: relaxed atomics only).
+    std::atomic<uint64_t> h_faults_{0}, h_decomp_faults_{0}, h_decomp_fail_{0};
+    std::atomic<uint64_t> h_last_rate_{0}, h_last_p99_{0};
+    uint64_t h_prev_decomp_ = 0, h_prev_ns_ = 0;
+    safety::LatencyHist h_lat_;
+    safety::HealthMonitor health_;
+    bool cfg_fault_timing_ = false;   // time faults (SMASH_WATCHDOG_P99_US set)
+    bool cfg_health_on_ = false;      // watchdog or controller configured
+    int cfg_disable_signal_ = 0;      // SMASH_DISABLE_SIGNAL
+    int cfg_enable_signal_ = 0;       // SMASH_ENABLE_SIGNAL
+    bool cfg_start_disabled_ = false; // SMASH_START_DISABLED
+    const char* cfg_control_file_ = nullptr;  // SMASH_CONTROL_FILE
+    char ctl_last_[16] = "";          // last control-file command acted on
+    bool ctl_seen_ = false;
+
+    void readSafetyConfig() {
+        const char* v;
+        safety::HealthConfig hc;
+        if ((v = std::getenv("SMASH_WATCHDOG_FAULT_RATE"))) hc.wd_fault_rate = std::strtoull(v, nullptr, 10);
+        if ((v = std::getenv("SMASH_WATCHDOG_P99_US"))) hc.wd_p99_us = std::strtoull(v, nullptr, 10);
+        if ((v = std::getenv("SMASH_WATCHDOG_DECOMP_FAIL"))) hc.wd_decomp_fail = std::strtoull(v, nullptr, 10);
+        if ((v = std::getenv("SMASH_WATCHDOG_WINDOW"))) {
+            const long w = std::atol(v);
+            hc.wd_window = static_cast<uint32_t>(w < 1 ? 1 : w > 120 ? 120 : w);
+        }
+        if ((v = std::getenv("SMASH_WATCHDOG_MIN_SAMPLES"))) hc.wd_min_samples = std::strtoull(v, nullptr, 10);
+        if ((v = std::getenv("SMASH_MAX_FAULT_RATE"))) hc.max_fault_rate = std::strtoull(v, nullptr, 10);
+        health_.configure(hc);
+        cfg_fault_timing_ = hc.timingOn();
+        cfg_health_on_ = hc.watchdogOn() || hc.max_fault_rate != 0;
+        cfg_disable_signal_ = safety::parseSignal(std::getenv("SMASH_DISABLE_SIGNAL"));
+        cfg_enable_signal_ = safety::parseSignal(std::getenv("SMASH_ENABLE_SIGNAL"));
+        // Never share the stats signal (or each other): that would make one
+        // signal do two things.
+        if (statsSignalEnabled()) {
+            if (cfg_disable_signal_ == SIGUSR2) cfg_disable_signal_ = 0;
+            if (cfg_enable_signal_ == SIGUSR2) cfg_enable_signal_ = 0;
+        }
+        if (cfg_enable_signal_ == cfg_disable_signal_) cfg_enable_signal_ = 0;
+        v = std::getenv("SMASH_START_DISABLED");
+        cfg_start_disabled_ = v && v[0] == '1';
+        v = std::getenv("SMASH_CONTROL_FILE");
+        cfg_control_file_ = (v && *v) ? v : nullptr;
+    }
+
+    static void ksDisableSignalHandler(int) { safety::post(safety::kDisable, safety::kReasonSignal); }
+    static void ksEnableSignalHandler(int) { safety::post(safety::kEnable, safety::kReasonSignal); }
+    // Install (and, each tick, re-claim like the stats signal) the opt-in
+    // kill-switch signals. Off unless SMASH_DISABLE_SIGNAL/ENABLE_SIGNAL set.
+    void claimKillSwitchSignals() {
+        auto claim = [](int sig, void (*h)(int)) {
+            if (!sig) return;
+            struct sigaction cur{};
+            sigaction(sig, nullptr, &cur);
+            if (cur.sa_handler == h) return;
+            struct sigaction sa{};
+            sa.sa_handler = h;
+            sa.sa_flags = SA_RESTART;
+            sigemptyset(&sa.sa_mask);
+            sigaction(sig, &sa, nullptr);
+        };
+        claim(cfg_disable_signal_, &CompressorThread::ksDisableSignalHandler);
+        claim(cfg_enable_signal_, &CompressorThread::ksEnableSignalHandler);
+    }
+
+    void setReason(int reason, const char* detail) {
+        int n = smash::safe_snprintf(ks_reason_, sizeof(ks_reason_), "%s%s%s",
+                                     safety::reasonName(reason), detail ? ": " : "",
+                                     detail ? detail : "");
+        if (n < 0) ks_reason_[0] = 0;
+    }
+    static void safetyLog(const char* line) {
+        char ts[32] = {};
+        vm::formatTimestamp(ts, sizeof(ts));
+        char buf[256];
+        int n = smash::safe_snprintf(buf, sizeof(buf), "[smash] [%s] pid=%d %s\n", ts,
+                                     (int)getpid(), line);
+        if (n > 0) (void)!write(2, buf, (size_t)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1));
+    }
+
+    // SMASH_CONTROL_FILE: edge-triggered on the file's first word. Acting only
+    // on a change means a file left saying "enable" cannot undo a watchdog
+    // trip; write the word again (after something else) to re-assert it.
+    void pollControlFile() {
+        if (!cfg_control_file_) return;
+        int fd = open(cfg_control_file_, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;
+        char buf[32];
+        ssize_t r = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (r < 0) return;
+        buf[r] = 0;
+        char word[16];
+        size_t k = 0;
+        const char* p = buf;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && k + 1 < sizeof(word))
+            word[k++] = *p++;
+        word[k] = 0;
+        if (ctl_seen_ && std::strcmp(word, ctl_last_) == 0) return;
+        ctl_seen_ = true;
+        std::memcpy(ctl_last_, word, k + 1);
+        if (!std::strcmp(word, "disable") || !std::strcmp(word, "off") || !std::strcmp(word, "0"))
+            safety::post(safety::kDisable, safety::kReasonFile);
+        else if (!std::strcmp(word, "enable") || !std::strcmp(word, "on") || !std::strcmp(word, "1"))
+            safety::post(safety::kEnable, safety::kReasonFile);
+    }
+
+    // Once per tick: fold the fault counters into a HealthSample, run the
+    // controller and (while enabled) the watchdog.
+    void healthTick() {
+        const uint64_t now = pstats::monoNs();
+        if (h_prev_ns_ == 0) {  // first tick: baseline only
+            h_prev_ns_ = now;
+            h_prev_decomp_ = h_decomp_faults_.load(std::memory_order_relaxed);
+            uint64_t p; (void)h_lat_.drain(&p);
+            health_.resetWatchdog(h_decomp_fail_.load(std::memory_order_relaxed));
+            return;
+        }
+        safety::HealthSample s;
+        s.dt_ns = now - h_prev_ns_;
+        const uint64_t d = h_decomp_faults_.load(std::memory_order_relaxed);
+        s.decomp_faults = d - h_prev_decomp_;
+        s.latency_samples = h_lat_.drain(&s.p99_us);
+        s.decomp_fail_total = h_decomp_fail_.load(std::memory_order_relaxed);
+        h_prev_ns_ = now;
+        h_prev_decomp_ = d;
+        char why[96] = "";
+        const bool armed = !ks_disabled_.load(std::memory_order_relaxed);
+        if (health_.update(s, armed, why, sizeof(why))) {
+            ks_trips_.fetch_add(1, std::memory_order_relaxed);
+            char line[200];
+            smash::safe_snprintf(line, sizeof(line),
+                                 "watchdog tripped: %s; disabling compression (fail-open)", why);
+            safetyLog(line);
+            setReason(safety::kReasonWatchdog, why);
+            // Applied below in this same tick (no mailbox race with a user
+            // request: the explicit reason was recorded already).
+            beginDisable(safety::kReasonWatchdog, /*reason_set=*/true);
+        }
+        h_last_rate_.store(health_.lastRate(), std::memory_order_relaxed);
+        h_last_p99_.store(health_.lastP99Us(), std::memory_order_relaxed);
+    }
+
+    void beginDisable(int reason, bool reason_set) {
+        if (ks_disabled_.load(std::memory_order_relaxed)) return;
+        if (!reason_set) setReason(reason, nullptr);
+        ks_inert_.store(false, std::memory_order_release);
+        ks_disabled_.store(true, std::memory_order_release);
+        ks_disable_ns_ = pstats::monoNs();
+        ks_drained_ = 0;
+        ks_logged_inert_ = false;
+        if (reason != safety::kReasonWatchdog) {
+            char line[200];
+            smash::safe_snprintf(line, sizeof(line),
+                                 "kill switch: compression disabled (%s); restoring compressed pages",
+                                 ks_reason_);
+            safetyLog(line);
+        }
+    }
+
+    void beginEnable(int reason) {
+        if (!ks_disabled_.load(std::memory_order_relaxed)) return;
+        // Pages kept their cold streaks while the switch was off; start every
+        // page fresh so re-enabling is not an instant whole-heap compression.
+        if (cold_count_ && vm_) {
+            const size_t n = vm_->committedPages();
+            for (size_t i = 0; i < n; ++i) cold_count_[i] = 0;
+        }
+        health_.resetWatchdog(h_decomp_fail_.load(std::memory_order_relaxed));
+        ks_inert_.store(false, std::memory_order_release);
+        ks_disabled_.store(false, std::memory_order_release);
+        char line[160];
+        smash::safe_snprintf(line, sizeof(line), "kill switch: compression re-enabled (%s)",
+                             safety::reasonName(reason));
+        safetyLog(line);
+    }
+
+    // Returns true if the rest of tick() must be skipped (switch is off).
+    bool killSwitchTick() {
+        claimKillSwitchSignals();
+        pollControlFile();
+        if (cfg_health_on_) healthTick();
+        const int req = safety::takeRequest();
+        if ((req & 0xf) == safety::kDisable) beginDisable(req >> 4, false);
+        else if ((req & 0xf) == safety::kEnable) beginEnable(req >> 4);
+        if (!ks_disabled_.load(std::memory_order_relaxed)) return false;
+        if (!ks_inert_.load(std::memory_order_relaxed)) {
+            const size_t left = makeInert();
+            if (left == 0) {
+                ks_inert_.store(true, std::memory_order_release);
+                if (!ks_logged_inert_) {
+                    ks_logged_inert_ = true;
+                    char line[160];
+                    smash::safe_snprintf(line, sizeof(line),
+                                         "kill switch: inert (%llu pages restored in %llu ms)",
+                                         (unsigned long long)ks_drained_,
+                                         (unsigned long long)((pstats::monoNs() - ks_disable_ns_) / 1000000));
+                    safetyLog(line);
+                }
+            }
+        }
+        return true;
+    }
+
+    // Decompress one COMPRESSED page in place (lock held). False: could not
+    // make it accessible (VMA cap / busy neighbor); it stays COMPRESSED.
+    bool restoreCompressedLocked(size_t i, void* page_addr) {
+        CompressAlgo algo = compressed_[i].algorithm();
+        uint8_t sc = lookupSizeClass(i);
+        int slot;
+        while ((slot = acquireFaultSlot()) < 0) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield");
+#endif
+        }
+        const size_t got = engine_->decompressWithDCtx(
+            fault_slots_[slot].dctx, compressed_[i].data, fault_slots_[slot].buf,
+            compressed_[i].compressedSize(), kPageSize, algo, sc);
+        if (got != kPageSize) h_decomp_fail_.fetch_add(1, std::memory_order_relaxed);
+        bool restored = restorePageContents(page_addr, fault_slots_[slot].buf) ||
+                        restoreWholeVma(i, fault_slots_[slot].buf);
+        releaseFaultSlot(slot);
+        if (!restored) return false;
+        if (deferred_pending_) deferred_pending_[i].store(false, std::memory_order_release);
+        releaseBlob(i);
+        compressed_[i] = {};
+        if (page_tier_) page_tier_[i] = kTierNone;
+        cold_count_[i] = 0;
+        states_->set(i, PageState::ACTIVE);
+        return true;
+    }
+
+    // Drive every page to plain RW memory. Returns the number of pages that
+    // still need work (busy lock, VMA cap); the caller retries next tick.
+    size_t makeInert() {
+        if (!vm_ || !states_ || !locks_ || !engine_ || !store_) return 0;
+        size_t left = 0;
+        const size_t committed = vm_->committedPages();
+        for (size_t i = 0; i < committed; ++i) {
+            const PageState st0 = states_->get(i);
+            if (st0 == PageState::ACTIVE || st0 == PageState::EMPTY) continue;
+            if (paused_.load(std::memory_order_relaxed)) return left + 1;  // fork: finish later
+            if (!locks_->tryLock(i)) { ++left; continue; }
+            const PageState st = states_->get(i);
+            void* page_addr = vm_->pageAddress(i);
+            if (st == PageState::COMPRESSED_SHADOW) {
+                // The page itself is still mapped and authoritative (writes
+                // may postdate the blob): drop the blob, never restore it.
+                bool ok = uffdPage(i) || makeResidentPageWritable(i, page_addr);
+                if (ok) {
+                    if (deferred_pending_) deferred_pending_[i].store(false, std::memory_order_release);
+                    releaseBlob(i);
+                    compressed_[i] = {};
+                    if (shadow_tick_) shadow_tick_[i] = 0;
+                    if (page_tier_) page_tier_[i] = kTierNone;
+                    cold_count_[i] = 0;
+                    states_->set(i, PageState::ACTIVE);
+                    ++ks_drained_;
+                } else {
+                    ++left;
+                }
+            } else if (st == PageState::COMPRESSED) {
+                if (restoreCompressedLocked(i, page_addr)) ++ks_drained_;
+                else ++left;
+            } else if (st == PageState::ACTIVE_MONITORING) {
+                if (uffdPage(i) || makeResidentPageWritable(i, page_addr))
+                    states_->set(i, PageState::ACTIVE);
+                else
+                    ++left;
+            } else if (st == PageState::COMPRESSING) {
+                ++left;  // a worker owns it (cannot happen between ticks)
+            }
+            locks_->unlock(i);
+        }
+#ifdef __linux__
+        // uffd-wp: clear write protection on the whole registered range (the
+        // per-tick PAGEMAP_SCAN that re-arms it is not run while disabled).
+        if (uffd_mode_ && wp_scan_) {
+            const size_t n = committed < vm_->contigPages() ? committed : vm_->contigPages();
+            if (n) (void)uffdWp(vm_->base(), false, n * kPageSize);
+        }
+#endif
+        left += sweepProtectedActive(committed);
+        return left;
+    }
+
+    // A batched Phase 3 mprotect(PROT_READ) can land on a page a concurrent
+    // fault just restored, leaving it ACTIVE but read-only (handleFault's
+    // ACTIVE case repairs that on the next write — a fault the inert state
+    // must not induce). Find such pages from the kernel's view of the arena
+    // and make them writable. EMPTY pages are left alone: the decommit
+    // thread restores PROT_RW on freed ranges before they are reused.
+    size_t sweepProtectedActive(size_t committed) {
+        const size_t contig = committed < vm_->contigPages() ? committed : vm_->contigPages();
+        if (contig == 0) return 0;
+        const uintptr_t lo = reinterpret_cast<uintptr_t>(vm_->base());
+        const uintptr_t hi = lo + contig * kPageSize;
+        size_t left = 0;
+        forEachNonRwRange(lo, hi, [&](uintptr_t a, uintptr_t b) {
+            for (uintptr_t p = a; p < b; p += kPageSize) {
+                const size_t i = (p - lo) / kPageSize;
+                const PageState st0 = states_->get(i);
+                if (st0 == PageState::EMPTY) continue;
+                if (!locks_->tryLock(i)) { ++left; continue; }
+                const PageState st = states_->get(i);
+                if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+                    if (makeResidentPageWritable(i, reinterpret_cast<void*>(p)))
+                        states_->set(i, PageState::ACTIVE);
+                    else
+                        ++left;
+                } else if (st != PageState::EMPTY) {
+                    ++left;  // compressed again? (cannot happen while disabled)
+                }
+                locks_->unlock(i);
+            }
+        });
+        return left;
+    }
+
+    // Calls fn(a, b) for each maximal [a, b) within [lo, hi) the kernel maps
+    // with less than PROT_READ|PROT_WRITE. Allocation-free.
+    template <class Fn>
+    static void forEachNonRwRange(uintptr_t lo, uintptr_t hi, Fn&& fn) {
+#if defined(__linux__)
+        int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, "/proc/self/maps",
+                                          O_RDONLY | O_CLOEXEC));
+        if (fd < 0) return;
+        // Collect first, act after closing: acting changes the maps file
+        // under the reader (mprotect merges VMAs).
+        constexpr int kMax = 256;
+        uintptr_t ra[kMax], rb[kMax];
+        int nr = 0;
+        char buf[4096];
+        uintptr_t s = 0, e = 0;
+        int field = 0, pk = 0;
+        bool rw = true, done = false;
+        auto hexval = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            return -1;
+        };
+        ssize_t r;
+        while (!done && (r = syscall(SYS_read, fd, buf, sizeof(buf))) > 0) {
+            for (ssize_t k = 0; k < r && !done; ++k) {
+                const char ch = buf[k];
+                if (field == 0) {
+                    if (ch == '-') field = 1;
+                    else if (hexval(ch) >= 0) s = s * 16 + static_cast<uintptr_t>(hexval(ch));
+                } else if (field == 1) {
+                    if (ch == ' ') { field = 2; pk = 0; rw = true; }
+                    else if (hexval(ch) >= 0) e = e * 16 + static_cast<uintptr_t>(hexval(ch));
+                } else if (field == 2) {
+                    if (pk == 0 && ch != 'r') rw = false;
+                    if (pk == 1 && ch != 'w') rw = false;
+                    if (++pk == 2) {
+                        if (s >= hi) { done = true; break; }
+                        if (!rw && e > lo && nr < kMax) {
+                            ra[nr] = s < lo ? lo : s;
+                            rb[nr] = e > hi ? hi : e;
+                            ++nr;
+                        }
+                        field = 3;
+                    }
+                } else if (ch == '\n') {
+                    field = 0;
+                    s = e = 0;
+                }
+            }
+        }
+        syscall(SYS_close, fd);
+        for (int k = 0; k < nr; ++k) fn(ra[k], rb[k]);
+#elif defined(__APPLE__)
+        mach_vm_address_t addr = lo;
+        while (addr < hi) {
+            mach_vm_size_t size = 0;
+            vm_region_basic_info_data_64_t info{};
+            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj = MACH_PORT_NULL;
+            if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                               reinterpret_cast<vm_region_info_t>(&info), &cnt, &obj) != KERN_SUCCESS)
+                break;
+            if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+            if (addr >= hi) break;
+            const mach_vm_address_t end = addr + size;
+            if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE))
+                fn(static_cast<uintptr_t>(addr < lo ? lo : addr),
+                   static_cast<uintptr_t>(end > hi ? hi : end));
+            addr = end;
+        }
+#else
+        (void)lo; (void)hi; (void)fn;
+#endif
+    }
+
+    // Phases poll this at chunk granularity so a fork() prepare or a disable
+    // request is not held up by a long Phase 2.
+    bool tickAbortRequested() const {
+        return paused_.load(std::memory_order_relaxed) || safety::disablePending();
+    }
+
+    void recordFaultLatency(uint64_t t0) {
+        if (t0) h_lat_.record(pstats::monoNs() - t0);
+    }
+
     // ── Tick ──────────────────────────────────────────────────────────────
 
     __attribute__((cold)) void tick() {
@@ -5505,6 +5997,14 @@ private:
         resident_pages_last_ = p1_resident_acc_.exchange(0, std::memory_order_relaxed);
         if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
+        // Kill switch / watchdog / SLO controller. While the switch is off
+        // nothing below runs: no access tracking, no compression, no
+        // monitoring, no deferred madvise — only the store trim, so blobs
+        // released by the drain go back to the OS.
+        if (killSwitchTick()) {
+            if (store_) store_->trim();
+            return;
+        }
         // Time-budget recompute is cheap (~144-4600 buckets sorted) and only
         // runs every kBudgetRecomputeEveryTicks ticks. When the budget knob
         // is unset this still runs but the inner loop short-circuits to the
@@ -6048,6 +6548,8 @@ private:
                  slept += kSleepIntervalMs) {
                 usleep(kSleepIntervalMs * 1000);
                 self->maybePromptTrim();
+                // Kill-switch request: act now, not at the next 1 s boundary.
+                if (safety::g_request.load(std::memory_order_relaxed)) [[unlikely]] break;
             }
             if (!self->running_.load(std::memory_order_relaxed)) break;
             // Skip the tick if a fork is in progress. The atfork prepare
@@ -6580,6 +7082,7 @@ public:
         v = std::getenv("SMASH_SPILL_MAX_MB");
         cfg_spill_max_mb_ = v ? std::atol(v) : 1024L;
         cfg_spill_dir_ = std::getenv("SMASH_SPILL_DIR");  // may be null
+        readSafetyConfig();
         // Touch remaining statics to force their initialization:
         (void)std::getenv("SMASH_PROTECT_CHUNK_PAGES");
         (void)std::getenv("SMASH_P2_CHUNK");
@@ -6595,6 +7098,14 @@ public:
             (void)!write(2, msg, sizeof(msg) - 1);
         }
         uffdInit();
+        if (cfg_start_disabled_ && !ks_disabled_.load(std::memory_order_relaxed)) {
+            setReason(safety::kReasonStartup, nullptr);
+            ks_disabled_.store(true, std::memory_order_release);
+            ks_inert_.store(!g_any_page_compressed.load(std::memory_order_relaxed),
+                            std::memory_order_release);
+            ks_disable_ns_ = pstats::monoNs();
+        }
+        claimKillSwitchSignals();
         running_.store(true, std::memory_order_release);
         start_steady_time_ = std::chrono::steady_clock::now();
 
@@ -6766,12 +7277,14 @@ public:
         uint64_t tier_success = self->tier_upgrade_success_.load(
             std::memory_order_relaxed);
         size_t spilled = self->spilled_count_.load(std::memory_order_relaxed);
-        char buf[416];
+        char buf[600];
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu"
-            "  reheat=%llu\n",
+            "  reheat=%llu  cold_floor=%u  slo_x256=%u  fault_rate=%llu"
+            "  fault_p99_us=%llu  faults=%llu  decomp_fail=%llu  disabled=%d"
+            "  inert=%d  trips=%llu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
@@ -6779,7 +7292,16 @@ public:
             spilled,
             (unsigned long long)self->zero_pages_.load(std::memory_order_relaxed),
             raw_bump,
-            (unsigned long long)g_reheat_events.load(std::memory_order_relaxed));
+            (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
+            self->effectiveColdFloor(ROIConfig::instance().cold_ticks_floor),
+            self->health_.multX256(),
+            (unsigned long long)self->h_last_rate_.load(std::memory_order_relaxed),
+            (unsigned long long)self->h_last_p99_.load(std::memory_order_relaxed),
+            (unsigned long long)self->h_faults_.load(std::memory_order_relaxed),
+            (unsigned long long)self->h_decomp_fail_.load(std::memory_order_relaxed),
+            self->ks_disabled_.load(std::memory_order_relaxed) ? 1 : 0,
+            self->ks_inert_.load(std::memory_order_relaxed) ? 1 : 0,
+            (unsigned long long)self->ks_trips_.load(std::memory_order_relaxed));
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
@@ -8014,6 +8536,19 @@ public:
     }
 
     bool handleFault(uintptr_t addr) {
+        // Health accounting for the watchdog / SLO controller / kill-switch
+        // status: relaxed counters, plus clock_gettime (async-signal-safe)
+        // around the fault only when SMASH_WATCHDOG_P99_US asks for it.
+        const uint64_t t0 = cfg_fault_timing_ ? pstats::monoNs() : 0;
+        const bool handled = handleFaultImpl(addr);
+        if (handled) {
+            h_faults_.fetch_add(1, std::memory_order_relaxed);
+            recordFaultLatency(t0);
+        }
+        return handled;
+    }
+
+    bool handleFaultImpl(uintptr_t addr) {
         if (!vm_->contains(addr)) return false;
 
         size_t page_idx = vm_->pageIndex(addr);
@@ -8075,11 +8610,16 @@ public:
             // the budget machinery — refault cost is part of the bucket's
             // amortized time per compressed page.
             auto dec_t0 = std::chrono::steady_clock::now();
-            engine_->decompressWithDCtx(
+            const size_t dec_got = engine_->decompressWithDCtx(
                 fault_slots_[slot].dctx,
                 compressed_[page_idx].data, fault_slots_[slot].buf,
                 compressed_[page_idx].compressedSize(), kPageSize,
                 algo, sc);
+            // A short decompression is data loss; the watchdog fails open on
+            // it when SMASH_WATCHDOG_DECOMP_FAIL=N is set (opt-in).
+            if (dec_got != kPageSize) [[unlikely]]
+                h_decomp_fail_.fetch_add(1, std::memory_order_relaxed);
+            h_decomp_faults_.fetch_add(1, std::memory_order_relaxed);
             auto dec_t1 = std::chrono::steady_clock::now();
             uint32_t dec_us = static_cast<uint32_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(

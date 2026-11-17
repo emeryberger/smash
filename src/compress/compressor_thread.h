@@ -605,19 +605,23 @@ class CompressorThread {
         };
         // Scratch: one page per fault slot plus one for the self-test.
         const size_t scratch_len = static_cast<size_t>(kFaultSlotCount + 1 + kReclaimBatch) * kPageSize;
-        void* sc = mmap(nullptr, scratch_len, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        // rawMmap, not mmap: under SMASH_TRACK_EXTERNAL=1 libsmash's own PLT
+        // mmap re-enters its interposer and would register the scratch as an
+        // external app page; Phase 2 then reads its unpopulated uffd-MISSING
+        // pages and takes a fatal SIGBUS (UFFD_FEATURE_SIGBUS). See #84.
+        void* sc = vm::rawMmap(nullptr, scratch_len, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS);
         if (sc == MAP_FAILED) return fail("scratch mmap");
         struct uffdio_register sreg{};
         sreg.range.start = reinterpret_cast<uintptr_t>(sc);
         sreg.range.len = scratch_len;
         sreg.mode = UFFDIO_REGISTER_MODE_MISSING;
-        if (ioctl(fd, UFFDIO_REGISTER, &sreg) != 0) { munmap(sc, scratch_len); return fail("scratch REGISTER"); }
+        if (ioctl(fd, UFFDIO_REGISTER, &sreg) != 0) { vm::rawMunmap(sc, scratch_len); return fail("scratch REGISTER"); }
         struct uffdio_register reg{};
         reg.range.start = reinterpret_cast<uintptr_t>(vm_->base());
         reg.range.len = vm_->contigPages() * kPageSize;
         reg.mode = UFFDIO_REGISTER_MODE_MISSING | (wp ? UFFDIO_REGISTER_MODE_WP : 0);
-        if (ioctl(fd, UFFDIO_REGISTER, &reg) != 0) { munmap(sc, scratch_len); return fail("arena REGISTER"); }
+        if (ioctl(fd, UFFDIO_REGISTER, &reg) != 0) { vm::rawMunmap(sc, scratch_len); return fail("arena REGISTER"); }
         wp_scan_ = wp;
         vm::g_uffd_wp = wp;
         uffd_ = fd;
@@ -635,7 +639,7 @@ class CompressorThread {
             uffdDrop(B);
             if (!ok) {
                 uffd_ = -1; uffd_scratch_ = nullptr; uffd_rbatch_ = nullptr;
-                munmap(sc, scratch_len);
+                vm::rawMunmap(sc, scratch_len);
                 return fail("UFFDIO_MOVE self-test");
             }
         }

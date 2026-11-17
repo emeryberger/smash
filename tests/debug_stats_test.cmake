@@ -3,7 +3,7 @@
 #   cmake -DPRELOAD_VAR=.. -DLIB=.. -DPROG=.. -P debug_stats_test.cmake
 execute_process(
   COMMAND ${CMAKE_COMMAND} -E env "${PRELOAD_VAR}=${LIB}" "MallocNanoZone=0"
-          "SMASH_DEBUG=1" "SMASH_BUCKET_STATS=1" "${PROG}"
+          "SMASH_DEBUG=1" "SMASH_BUCKET_STATS=1" "SMASH_CALIBRATE=never" "${PROG}"
   RESULT_VARIABLE rc TIMEOUT 40 OUTPUT_QUIET ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "SMASH_DEBUG run failed (rc=${rc}):\n${err}")

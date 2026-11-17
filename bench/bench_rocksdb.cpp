@@ -328,6 +328,24 @@ int main(int argc, char* argv[]) {
     printf("METRIC cold_p99_us %.2f\n", cold_p99);
     printf("METRIC cold_rss_mb %.1f\n", cold_rss);
     recordRss();
+#if defined(__linux__)
+    {
+        // Kernel high-water mark over the workload (bench/run_peak_compare.py).
+        int fd = open("/proc/self/status", O_RDONLY);
+        char buf[4096];
+        ssize_t n = fd >= 0 ? syscall(SYS_read, fd, buf, sizeof(buf) - 1) : -1;
+        if (fd >= 0) close(fd);
+        size_t kb = 0;
+        if (n > 0) {
+            buf[n] = '\0';
+            if (const char* p = strstr(buf, "VmHWM:")) sscanf(p, "VmHWM: %zu kB", &kb);
+        }
+        printf("METRIC hwm_rss_mb %.1f\n", kb / 1024.0);
+    }
+#endif
+    // Everything after this is teardown (external samplers stop here).
+    printf("METRIC workload_done 1\n");
+    fflush(stdout);
 
     if (const char* rss_dir = std::getenv("SMASH_RSS_DIR")) {
         dumpRssTimeline((std::string(rss_dir) + "/rocksdb_rss.csv").c_str());

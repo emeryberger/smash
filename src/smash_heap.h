@@ -65,6 +65,13 @@ extern std::atomic<int> g_thread_init_count;
 // Set after SmashHeap construction when compression is enabled.
 extern VmRegion* g_smash_vm_region;
 
+// True while the SmashHeap constructor runs. The syscall wrappers' lazy
+// dlsym() must not run then: on glibc < 2.34 dlsym callocs its dlerror state,
+// which re-enters the heap being constructed and spins in getHeap() (every
+// preloaded process hung on Ubuntu 20.04 / Debian 11 once init called the
+// interposed open()). They use their raw-syscall fallback instead.
+inline std::atomic<bool> g_heap_constructing{false};
+
 // Global pointer to the PageStateTable, used by the mmap / Mach VM
 // interposers to mark newly-tracked external pages as ACTIVE (or EMPTY
 // on unmap). Set when compression is initialized; nullptr otherwise.
@@ -1293,6 +1300,10 @@ private:
 
 public:
     SmashHeap() {
+        g_heap_constructing.store(true, std::memory_order_relaxed);
+        struct ConstructingGuard {
+            ~ConstructingGuard() { g_heap_constructing.store(false, std::memory_order_relaxed); }
+        } constructing_guard;
         // Debug timing
         static const bool time_init = [] {
             const char* v = std::getenv("SMASH_TIME_INIT");

@@ -68,7 +68,8 @@ static const bool g_syscall_wrap_disabled = [] {
 #define SMASH_LAZY_RESOLVE(fn_type, name) \
     static fn_type real_##name = nullptr; \
     if (__builtin_expect(!real_##name, 0)) { \
-        if (!g_resolving_syscalls.load(std::memory_order_relaxed)) { \
+        if (!g_resolving_syscalls.load(std::memory_order_relaxed) && \
+            !smash::g_heap_constructing.load(std::memory_order_relaxed)) { \
             g_resolving_syscalls.store(true, std::memory_order_relaxed); \
             real_##name = reinterpret_cast<fn_type>(dlsym(RTLD_NEXT, #name)); \
             g_resolving_syscalls.store(false, std::memory_order_relaxed); \

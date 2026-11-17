@@ -177,8 +177,9 @@ LD_PRELOAD=$PWD/build/libsmash.so ./your_server
 
 ```c
 #include <smash/smash.h>
-smash_hint_cold(ptr, size);   // compress this region now
-smash_hint_hot(ptr, size);    // keep this region uncompressed
+smash_hint_cold(ptr, size);   // done with it: may compress at the next tick (~1 s)
+smash_hint_hot(ptr, size);    // about to use it: decompress now, restart its cold wait
+struct SmashStats s; smash_get_stats(&s);   // s.compressed_bytes, s.stored_bytes, ...
 smash_disable();              // stop compressing, restore every page
 smash_enable();               // resume
 struct SmashSafetyStatus st; smash_safety_status(&st);

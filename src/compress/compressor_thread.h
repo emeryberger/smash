@@ -8121,6 +8121,52 @@ public:
         }
     }
 
+    // ── Public hint / stats API (include/smash/smash.h) ─────────────────────
+    // smash_hint_cold: pages lying wholly inside [lo, hi) jump to the cold
+    // floor, so the next Phase 2 may compress them. The ratio/ROI gates and
+    // the read check still apply (never 255, which would skip the read check).
+    // smash_hint_hot: every page overlapping [lo, hi) is marked written, so
+    // Phase 1 resets its cold streak; compressed ones are faulted back now by
+    // a read. Plain relaxed stores, like the app-side writers of these arrays.
+    void hintRange(uintptr_t lo, uintptr_t hi, bool cold) {
+        if (!vm_ || !states_ || !cold_count_ || !accessed_ || hi <= lo) return;
+        const uintptr_t first = cold ? (lo + kPageSize - 1) & ~(uintptr_t)(kPageSize - 1)
+                                     : lo & ~(uintptr_t)(kPageSize - 1);
+        const uintptr_t floor = static_cast<uintptr_t>(ROIConfig::instance().cold_ticks_floor);
+        const uint8_t to = static_cast<uint8_t>(floor < 1 ? 1 : floor > 254 ? 254 : floor);
+        const size_t committed = vm_->committedPages();
+        for (uintptr_t a = first; cold ? a + kPageSize <= hi : a < hi; a += kPageSize) {
+            if (!vm_->contains(a)) continue;
+            const size_t i = vm_->pageIndex(a);
+            if (i >= committed || states_->get(i) == PageState::EMPTY) continue;
+            if (cold) {
+                if (__atomic_load_n(&cold_count_[i], __ATOMIC_RELAXED) < to)
+                    __atomic_store_n(&cold_count_[i], to, __ATOMIC_RELAXED);
+            } else {
+                accessed_[i].store(true, std::memory_order_relaxed);
+                const PageState st = states_->get(i);
+                if (st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW)
+                    (void)*reinterpret_cast<volatile const char*>(a);
+            }
+        }
+    }
+
+    struct ApiStats {
+        uint64_t managed_bytes = 0, compressed_pages = 0, compressed_bytes = 0,
+                 stored_bytes = 0, compressions = 0, decompress_faults = 0;
+    };
+    ApiStats apiStats() const {
+        ApiStats a;
+        const PageSnapshot ps = snapshotPages();
+        a.managed_bytes = static_cast<uint64_t>(ps.managed) * kPageSize;
+        a.compressed_pages = ps.compressed;
+        a.compressed_bytes = static_cast<uint64_t>(ps.compressed) * kPageSize;
+        a.stored_bytes = ps.stored_bytes;
+        a.compressions = rstats::g.compressions.load(std::memory_order_relaxed);
+        a.decompress_faults = rstats::g.decomp_faults.load(std::memory_order_relaxed);
+        return a;
+    }
+
     struct PageSnapshot {
         size_t committed = 0, managed = 0, compressed = 0, shadow = 0;
         uint64_t stored_bytes = 0;  // blob bytes for COMPRESSED + SHADOW pages

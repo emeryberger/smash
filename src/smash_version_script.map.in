@@ -83,6 +83,10 @@
     smash_disable;
     smash_enable;
     smash_safety_status;
+    # Hints + statistics (include/smash/smash.h).
+    smash_hint_cold;
+    smash_hint_hot;
+    smash_get_stats;
 
     # alloc8 getcwd hooks (function pointers set by Smash constructor)
     xx_getcwd_prepare_hook;

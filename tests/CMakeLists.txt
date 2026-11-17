@@ -344,6 +344,28 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# smash_hint_cold / smash_hint_hot / smash_get_stats, both modes. A 30 s cold
+# timeout means only the hint can make pages compress within the test.
+add_executable(public_api_test public_api_test.cpp)
+set_target_properties(public_api_test PROPERTIES CXX_STANDARD 20)
+target_include_directories(public_api_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(public_api_test PRIVATE ${CMAKE_DL_LIBS})
+foreach(lo 0 1)
+  set(_name test_public_api)
+  if(lo)
+    set(_name test_public_api_large_only)
+  endif()
+  if(APPLE)
+    set(_pa_pre "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_pa_pre "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(NAME ${_name}
+    COMMAND ${CMAKE_COMMAND} -E env ${_pa_pre} "SMASH_LARGE_ONLY=${lo}"
+      "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=30" $<TARGET_FILE:public_api_test>)
+  set_tests_properties(${_name} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+endforeach()
+
 # SMASH_CALIBRATION_FILE save + load under interposition (no stdio during
 # heap construction). Reuses the arena-routing program as a payload.
 if(APPLE)

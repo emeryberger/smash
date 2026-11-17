@@ -1720,6 +1720,29 @@ int smash_safety_status(SmashSafetyStatus* st) {
     return 0;
 }
 
+// ── Hints and statistics (include/smash/smash.h) ────────────────────────────
+extern "C" __attribute__((visibility("default")))
+void smash_hint_cold(void* ptr, size_t size) {
+    if (auto* heap = SmashRedirect::getHeap()) heap->hintRange(ptr, size, true);
+}
+extern "C" __attribute__((visibility("default")))
+void smash_hint_hot(void* ptr, size_t size) {
+    if (auto* heap = SmashRedirect::getHeap()) heap->hintRange(ptr, size, false);
+}
+extern "C" __attribute__((visibility("default")))
+int smash_get_stats(SmashStats* st) {
+    auto* heap = SmashRedirect::getHeap();
+    smash::CompressorThread::ApiStats a;
+    if (!st || !heap || !heap->apiStats(&a)) return -1;
+    st->managed_bytes = a.managed_bytes;
+    st->compressed_pages = a.compressed_pages;
+    st->compressed_bytes = a.compressed_bytes;
+    st->stored_bytes = a.stored_bytes;
+    st->compressions = a.compressions;
+    st->decompress_faults = a.decompress_faults;
+    return 0;
+}
+
 __attribute__((constructor(202)))  // After smash_start_main_thread (201)
 static void smash_register_atfork() {
     pthread_atfork(smash_atfork_prepare,

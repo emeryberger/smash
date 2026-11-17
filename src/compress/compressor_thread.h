@@ -2420,8 +2420,7 @@ private:
                 // budget is spent; Phase B frees room as it reclaims.
                 if (shadow_cap_on_ &&
                     (shadow_budget_.load(std::memory_order_relaxed) <= 0 ||
-                     (guard_on_ && !(eager && growth_active_) &&
-                      guard_budget_.load(std::memory_order_relaxed) <= 0)))
+                     (guard_on_ && guard_budget_.load(std::memory_order_relaxed) <= 0)))
                     return;
                 // SMASH_CGROUP: the kernel already swapped this page out of
                 // the capped cgroup. Snapshotting it would swap it back in
@@ -4055,14 +4054,13 @@ private:
 
     // ── Peak guard (SMASH_PEAK_GUARD=1) ───────────────────────────────────
     // A cold wave must not lift RSS above the process's own high-water mark:
-    // pages compressed at the normal floor additionally draw on a budget of
+    // every compression into shadow additionally draws on a budget of
     // (VmHWM - RSS) blob bytes per tick, never below kMinShadowCap. Reclaimed
     // frames raise the headroom, so the wave ramps up geometrically (by about
     // the compression ratio per tick) instead of overshooting the peak.
-    // Eager fill pages are exempt while the heap is still growing: RSS then
-    // sits at its HWM, and compressing the fill lowers the trajectory rather
-    // than raising it. In the tail after growth stops they are guarded too
-    // (exempting them there let SQLite's tail overshoot the HWM at 1 s).
+    // Eager fill pages are guarded too: with them exempt (always, or only
+    // while the heap grew) SQLite 1M rows at 1 s peaked at 807 MB vs 762 MB
+    // guard-only; shadow blobs made during a fill are often discarded.
     bool cfg_peak_guard_ = false;
     bool guard_on_ = false;
     std::atomic<int64_t> guard_budget_{0};

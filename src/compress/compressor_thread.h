@@ -7632,6 +7632,7 @@ public:
 
     const char* modeName() const {
         if (isCompressOnlyMode()) return "compress_only";
+        if (observe_) return isLargeOnlyMode() ? "observe+large_only" : "observe";
         return isLargeOnlyMode() ? "large_only" : "full";
     }
     const char* trackingName() const {
@@ -7847,7 +7848,12 @@ public:
         put("[smash report]   compressor CPU: %.2f s\n", rstats::compressorCpuNs() / 1e9);
 
         // Why nothing was compressed, most specific cause first.
-        if (ncomp == 0) {
+        if (observe_) {
+            // Observe mode never keeps a blob, by design: the projection is in
+            // the [smash observe] line / SMASH_OBSERVE_REPORT, not here.
+            put("[smash report]   note: SMASH_MODE=observe compresses nothing by design; "
+                "projected savings are in the [smash observe] report.\n");
+        } else if (ncomp == 0) {
             if (ps.managed == 0 && isLargeOnlyMode()) {
                 put("[smash report]   hint: nothing was compressed because smash managed no pages: with "
                     "SMASH_LARGE_ONLY=1 only allocations over %zu bytes go through smash, and this "

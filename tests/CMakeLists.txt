@@ -533,6 +533,16 @@ foreach(lo 0 1)
       ${CMAKE_CURRENT_BINARY_DIR}/${_name}.d)
   set_tests_properties(${_name} PROPERTIES TIMEOUT 90)
 endforeach()
+if(APPLE)
+  set(_ro_preload DYLD_INSERT_LIBRARIES)
+else()
+  set(_ro_preload LD_PRELOAD)
+endif()
+add_test(NAME test_report_observe
+  COMMAND ${CMAKE_COMMAND} -DPRELOAD_VAR=${_ro_preload} -DLIB=$<TARGET_FILE:smash>
+    -DPROG=$<TARGET_FILE:report_test> -DOUT=${CMAKE_CURRENT_BINARY_DIR}/test_report_observe.d
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/report_observe_test.cmake)
+set_tests_properties(test_report_observe PROPERTIES TIMEOUT 90)
 
 # bin/smash launcher, both modes: library discovery relative to the script,
 # preload, --report/--large-only/--profile, `smash stats` refusal and

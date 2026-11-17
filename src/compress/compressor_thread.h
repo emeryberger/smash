@@ -7913,10 +7913,16 @@ public:
             (unsigned long long)h[3], (unsigned long long)h[4], (unsigned long long)h[5],
             (unsigned long long)h[6]);
         if (jl <= 0 || static_cast<size_t>(jl) >= sizeof(js)) return;
-        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        // Temp file + rename, so a reader polling the report (it is rewritten
+        // every SMASH_OBSERVE_INTERVAL) never sees it truncated or half written.
+        char tmp[540];
+        int tl = smash::safe_snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, static_cast<int>(getpid()));
+        if (tl <= 0 || static_cast<size_t>(tl) >= sizeof(tmp)) return;
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd < 0) return;
-        (void)!write(fd, js, static_cast<size_t>(jl));
+        const bool ok = write(fd, js, static_cast<size_t>(jl)) == jl;
         close(fd);
+        if (!ok || rename(tmp, path) != 0) unlink(tmp);
     }
 
     // Coordinator thread, after each tick (including paused/deferred ones).

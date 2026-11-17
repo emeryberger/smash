@@ -171,7 +171,12 @@ static void testWatchdogP99() {
 }
 
 static void testWatchdogDecompFail() {
-    HealthConfig c;  // default: trip on the first decompression failure
+    HealthConfig d;  // default: off (opt-in)
+    HealthMonitor dm(d);
+    char why0[96] = "";
+    CHECK(!dm.update(tickWith(0, 0, 0, 99), true, why0, sizeof(why0)), "off by default");
+    HealthConfig c;
+    c.wd_decomp_fail = 1;  // SMASH_WATCHDOG_DECOMP_FAIL=1: trip on the first failure
     HealthMonitor m(c);
     char why[96] = "";
     CHECK(!m.update(tickWith(0, 0, 0, 0), true, why, sizeof(why)), "no failures");

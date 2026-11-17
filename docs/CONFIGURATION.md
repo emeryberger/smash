@@ -90,7 +90,7 @@ See [agents/safety.md](../agents/safety.md) for the mechanism and its guarantees
 | `SMASH_START_DISABLED=1` | unset | Start with compression off (enable later via API, signal or control file). |
 | `SMASH_WATCHDOG_FAULT_RATE=N` | off | Disable compression when decompress faults/s, averaged over the window, exceed N. |
 | `SMASH_WATCHDOG_P99_US=N` | off | Disable compression when the fault-service p99 exceeds N µs for the whole window (ticks with < `SMASH_WATCHDOG_MIN_SAMPLES`=20 faults are ignored). Turns on fault timing. |
-| `SMASH_WATCHDOG_DECOMP_FAIL=N` | 1 | Disable compression after N decompression failures. `0` turns this off. |
+| `SMASH_WATCHDOG_DECOMP_FAIL=N` | off | Disable compression after N decompression failures. Opt-in. |
 | `SMASH_WATCHDOG_WINDOW=N` | 5 | Watchdog window in ticks (seconds), 1..120. |
 | `SMASH_MAX_FAULT_RATE=N` | off | Refault budget: while decompress faults/s exceed N the cold threshold doubles each tick (up to 255×); below N/2 it decays by 1/8 per tick. |
 

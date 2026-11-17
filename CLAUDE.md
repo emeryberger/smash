@@ -115,7 +115,7 @@ See [agents/external-tracking.md](agents/external-tracking.md) for details on th
 
 ## Deployment Safety (kill switch, watchdog, SLO controller)
 
-See [agents/safety.md](agents/safety.md). Summary: `smash_disable()` / `SMASH_DISABLE_SIGNAL` / `SMASH_CONTROL_FILE` / the watchdog post a request to `safety::g_request` (`src/compress/safety.h`); the coordinator applies it at the top of `tick()` (`killSwitchTick`). Disabled = no phases; `makeInert()` restores every page one at a time under its page lock (the fault handler's pattern — never several page locks across an mprotect), clears uffd-wp, and sweeps the kernel's map of the arena for leftover non-RW ACTIVE pages. `smash_disable()` returns once inert. Watchdog (`SMASH_WATCHDOG_FAULT_RATE` window-averaged, `SMASH_WATCHDOG_P99_US`, `SMASH_WATCHDOG_DECOMP_FAIL` default 1) trips it with one stderr line; `SMASH_MAX_FAULT_RATE` instead scales `effectiveColdFloor()` (×2 per over-budget tick, −1/8 per tick under half budget, ≤255×). Phases poll `tickAbortRequested()` (fork pause or pending disable) every 16 chunks. Never add a code path that protects or compresses a page outside `tick()` without also gating it on `ks_disabled_`.
+See [agents/safety.md](agents/safety.md). Summary: `smash_disable()` / `SMASH_DISABLE_SIGNAL` / `SMASH_CONTROL_FILE` / the watchdog post a request to `safety::g_request` (`src/compress/safety.h`); the coordinator applies it at the top of `tick()` (`killSwitchTick`). Disabled = no phases; `makeInert()` restores every page one at a time under its page lock (the fault handler's pattern — never several page locks across an mprotect), clears uffd-wp, and sweeps the kernel's map of the arena for leftover non-RW ACTIVE pages. `smash_disable()` returns once inert. Watchdog (`SMASH_WATCHDOG_FAULT_RATE` window-averaged, `SMASH_WATCHDOG_P99_US`, `SMASH_WATCHDOG_DECOMP_FAIL`, all opt-in) trips it with one stderr line; `SMASH_MAX_FAULT_RATE` instead scales `effectiveColdFloor()` (×2 per over-budget tick, −1/8 per tick under half budget, ≤255×). Phases poll `tickAbortRequested()` (fork pause or pending disable) every 16 chunks. Never add a code path that protects or compresses a page outside `tick()` without also gating it on `ks_disabled_`.
 
 ## Production Configuration
 
@@ -237,7 +237,7 @@ Runtime environment variables (full classified list: [agents/env-vars.md](agents
 - `SMASH_DISABLE_SIGNAL=SIG` / `SMASH_ENABLE_SIGNAL=SIG`: opt-in kill-switch signals (no signal is taken by default)
 - `SMASH_CONTROL_FILE=path`: polled each tick; first word `disable`/`enable` (edge-triggered)
 - `SMASH_START_DISABLED=1`: start inert
-- `SMASH_WATCHDOG_FAULT_RATE=N`, `SMASH_WATCHDOG_P99_US=N`, `SMASH_WATCHDOG_DECOMP_FAIL=N` (default 1), `SMASH_WATCHDOG_WINDOW=N` (default 5), `SMASH_WATCHDOG_MIN_SAMPLES=N` (default 20): fail-open watchdog
+- `SMASH_WATCHDOG_FAULT_RATE=N`, `SMASH_WATCHDOG_P99_US=N`, `SMASH_WATCHDOG_DECOMP_FAIL=N` (default off), `SMASH_WATCHDOG_WINDOW=N` (default 5), `SMASH_WATCHDOG_MIN_SAMPLES=N` (default 20): fail-open watchdog
 - `SMASH_MAX_FAULT_RATE=N`: refault budget for the SLO controller (cold-threshold multiplier shown as `cold_floor=`/`slo_x256=` in the stats line)
 - `SMASH_LARGE_ONLY=1`: Large-only mode — small allocations (≤16KB) pass through to system malloc. Production-supported config for concurrent workloads
 - `SMASH_DEFER_MADVISE=1`: Default ON. Defers `madvise(MADV_DONTNEED)` to a per-tick sweeper after `SMASH_DEFER_MADVISE_TICKS` quiescent ticks (default 50). Load-bearing for correctness; do not disable in production

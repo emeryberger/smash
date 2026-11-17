@@ -79,7 +79,7 @@ logs one line with the reason and disables compression as above.
 |---|---|---|
 | `SMASH_WATCHDOG_FAULT_RATE=N` | off | decompress faults/s, averaged over the last `SMASH_WATCHDOG_WINDOW` ticks, exceed N |
 | `SMASH_WATCHDOG_P99_US=N` | off | the fault-service p99 exceeds N µs on `WINDOW` consecutive ticks that had ≥ `SMASH_WATCHDOG_MIN_SAMPLES` (20) faults; ticks with fewer faults are neutral |
-| `SMASH_WATCHDOG_DECOMP_FAIL=N` | **1** | N decompressions returned a short page (data loss). `0` disables |
+| `SMASH_WATCHDOG_DECOMP_FAIL=N` | off | N decompressions returned a short page (data loss). Opt-in |
 | `SMASH_WATCHDOG_WINDOW=N` | 5 | window, ticks (1..120) |
 
 The rate limit uses a window average, not consecutive ticks, because refaults

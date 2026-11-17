@@ -146,7 +146,7 @@ struct LatencyHist {
 struct HealthConfig {
     uint64_t wd_fault_rate = 0;   // SMASH_WATCHDOG_FAULT_RATE: decompress faults/s (0 = off)
     uint64_t wd_p99_us = 0;       // SMASH_WATCHDOG_P99_US: fault-service p99 (0 = off)
-    uint64_t wd_decomp_fail = 1;  // SMASH_WATCHDOG_DECOMP_FAIL: failures to trip (0 = off)
+    uint64_t wd_decomp_fail = 0;  // SMASH_WATCHDOG_DECOMP_FAIL: failures to trip (0 = off, the default)
     uint32_t wd_window = 5;       // SMASH_WATCHDOG_WINDOW: ticks (1..kMaxWindow) a limit must hold
     uint64_t wd_min_samples = 20; // p99 needs at least this many faults in a tick
     uint64_t max_fault_rate = 0;  // SMASH_MAX_FAULT_RATE: controller budget (0 = off)

@@ -8616,7 +8616,7 @@ public:
                 compressed_[page_idx].compressedSize(), kPageSize,
                 algo, sc);
             // A short decompression is data loss; the watchdog fails open on
-            // it (SMASH_WATCHDOG_DECOMP_FAIL, default 1).
+            // it when SMASH_WATCHDOG_DECOMP_FAIL=N is set (opt-in).
             if (dec_got != kPageSize) [[unlikely]]
                 h_decomp_fail_.fetch_add(1, std::memory_order_relaxed);
             h_decomp_faults_.fetch_add(1, std::memory_order_relaxed);

@@ -11,13 +11,17 @@
 #include "smash/config.h"
 #include "compress_engine.h"
 #include "../core/bootstrap_alloc.h"
+#include "../util/safe_printf.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <cstdio>
 #include <cmath>
+#include <fcntl.h>
+#include <unistd.h>
 #include <algorithm>
 
 #include <lz4.h>
@@ -554,13 +558,22 @@ private:
         }
     }
 
+    // Calibration file I/O uses open/read/write and safe_snprintf, never
+    // stdio: this runs during heap construction, and glibc's fopen/fprintf
+    // malloc (FILE buffers), which re-enters getHeap() and recurses forever.
     bool loadCalibrationFile(const char* path) {
-        FILE* f = std::fopen(path, "r");
-        if (!f) return false;
+        int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
 
         char buf[4096];
-        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
-        std::fclose(f);
+        size_t n = 0;
+        while (n < sizeof(buf) - 1) {
+            ssize_t r = ::read(fd, buf + n, sizeof(buf) - 1 - n);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            n += static_cast<size_t>(r);
+        }
+        ::close(fd);
         if (n == 0) return false;
         buf[n] = '\0';
 
@@ -616,26 +629,42 @@ private:
     }
 
     void saveCalibrationFile(const char* path) {
-        FILE* f = std::fopen(path, "w");
-        if (!f) return;
+        char buf[1024];
+        int len = smash::safe_snprintf(buf, sizeof(buf),
+            "{\n"
+            "  \"page_size\": %zu,\n"
+            "  \"fast_comp_mbs_hi\": %u,\n"
+            "  \"fast_comp_mbs_lo\": %u,\n"
+            "  \"fast_decomp_mbs_hi\": %u,\n"
+            "  \"fast_decomp_mbs_lo\": %u,\n"
+            "  \"fast_ratio_zeros\": %.6f,\n"
+            "  \"fast_ratio_random\": %.6f,\n"
+            "  \"deep_comp_mbs_hi\": %u,\n"
+            "  \"deep_comp_mbs_lo\": %u,\n"
+            "  \"deep_decomp_mbs_hi\": %u,\n"
+            "  \"deep_decomp_mbs_lo\": %u,\n"
+            "  \"deep_ratio_zeros\": %.6f,\n"
+            "  \"deep_ratio_random\": %.6f\n"
+            "}\n",
+            static_cast<size_t>(kPageSize),
+            unsigned{cal_.fast_comp_hi}, unsigned{cal_.fast_comp_lo},
+            unsigned{cal_.fast_decomp_hi}, unsigned{cal_.fast_decomp_lo},
+            cal_.fast_ratio_zeros, cal_.fast_ratio_random,
+            unsigned{cal_.deep_comp_hi}, unsigned{cal_.deep_comp_lo},
+            unsigned{cal_.deep_decomp_hi}, unsigned{cal_.deep_decomp_lo},
+            cal_.deep_ratio_zeros, cal_.deep_ratio_random);
+        if (len <= 0 || static_cast<size_t>(len) >= sizeof(buf)) return;
 
-        std::fprintf(f, "{\n");
-        std::fprintf(f, "  \"page_size\": %zu,\n",
-                     static_cast<size_t>(kPageSize));
-        std::fprintf(f, "  \"fast_comp_mbs_hi\": %u,\n", cal_.fast_comp_hi);
-        std::fprintf(f, "  \"fast_comp_mbs_lo\": %u,\n", cal_.fast_comp_lo);
-        std::fprintf(f, "  \"fast_decomp_mbs_hi\": %u,\n", cal_.fast_decomp_hi);
-        std::fprintf(f, "  \"fast_decomp_mbs_lo\": %u,\n", cal_.fast_decomp_lo);
-        std::fprintf(f, "  \"fast_ratio_zeros\": %.6f,\n", cal_.fast_ratio_zeros);
-        std::fprintf(f, "  \"fast_ratio_random\": %.6f,\n",cal_.fast_ratio_random);
-        std::fprintf(f, "  \"deep_comp_mbs_hi\": %u,\n", cal_.deep_comp_hi);
-        std::fprintf(f, "  \"deep_comp_mbs_lo\": %u,\n", cal_.deep_comp_lo);
-        std::fprintf(f, "  \"deep_decomp_mbs_hi\": %u,\n",cal_.deep_decomp_hi);
-        std::fprintf(f, "  \"deep_decomp_mbs_lo\": %u,\n",cal_.deep_decomp_lo);
-        std::fprintf(f, "  \"deep_ratio_zeros\": %.6f,\n",cal_.deep_ratio_zeros);
-        std::fprintf(f, "  \"deep_ratio_random\": %.6f\n",cal_.deep_ratio_random);
-        std::fprintf(f, "}\n");
-        std::fclose(f);
+        int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return;
+        size_t off = 0;
+        while (off < static_cast<size_t>(len)) {
+            ssize_t w = ::write(fd, buf + off, static_cast<size_t>(len) - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            off += static_cast<size_t>(w);
+        }
+        ::close(fd);
     }
 };
 

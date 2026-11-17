@@ -312,6 +312,24 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# SMASH_CALIBRATION_FILE save + load under interposition (no stdio during
+# heap construction). Reuses the arena-routing program as a payload.
+if(APPLE)
+  set(_cal_preload DYLD_INSERT_LIBRARIES)
+else()
+  set(_cal_preload LD_PRELOAD)
+endif()
+add_test(
+  NAME test_calibration_file
+  COMMAND ${CMAKE_COMMAND}
+    -DPRELOAD_VAR=${_cal_preload}
+    -DLIB=$<TARGET_FILE:smash>
+    -DPROG=$<TARGET_FILE:arena_routing_test>
+    -DCAL=${CMAKE_CURRENT_BINARY_DIR}/calibration_test.json
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/calibration_file_test.cmake
+)
+set_tests_properties(test_calibration_file PROPERTIES TIMEOUT 60)
+
 # vm.max_map_count regression guard (#94): with the process held 12K VMAs
 # below the cap (the test uses them up itself; no root), a teardown-like
 # stride walk over 128 MiB of compressed large blocks must neither hang nor

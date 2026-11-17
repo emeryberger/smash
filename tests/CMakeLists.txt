@@ -630,10 +630,12 @@ foreach(lo 0 1)
     ARGS watchdog-p99
     ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
         "SMASH_RECOMPRESS_BACKOFF=0" "SMASH_WATCHDOG_P99_US=1" "SMASH_WATCHDOG_WINDOW=2")
+  # Budget 50/s, under the storm on every platform (macOS CI: 182-196/s with
+  # 16 KiB pages; 200/s sat just above it and the floor never rose).
   smash_add_preload_test(test_slo_controller${_sfx} storm_test
     ARGS controller
     ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
-        "SMASH_RECOMPRESS_BACKOFF=0" "SMASH_MAX_FAULT_RATE=200")
+        "SMASH_RECOMPRESS_BACKOFF=0" "SMASH_MAX_FAULT_RATE=50")
 endforeach()
 
 # Concurrency soak: threads alloc/free/realloc across size classes with

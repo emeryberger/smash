@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <cstdarg>
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/attr.h>
@@ -805,6 +807,7 @@ using fstatat_fn = int(*)(int, const char*, struct stat*, int);
 extern "C" int smash_stat(const char* path, struct stat* st);
 SMASH_INTERPOSE(smash_stat, stat);
 extern "C" int smash_stat(const char* path, struct stat* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return smash::vm::retryWith1Buf(
         [&] { return reinterpret_cast<stat_fn>(smash_interpose_smash_stat.original)(path, st); },
         st, sizeof(struct stat));
@@ -1046,6 +1049,19 @@ static inline void warmFileBuffer(FILE* stream, smash::VmRegion* vm) {
 using fread_fn = size_t(*)(void*, size_t, size_t, FILE*);
 using fgets_fn = char*(*)(char*, int, FILE*);
 
+// The stdio buffer is malloc'd lazily on a stream's first read, inside
+// libSystem and after the warm above; a recycled chunk on a compressed page
+// makes the internal read() fail with EFAULT (test_stdio_first_fill). If the
+// stream had no buffer before the call and the call failed with EFAULT,
+// nothing was delivered or consumed: clear the error, retry once (the warm
+// then covers the new buffer). Same as the Linux wrappers.
+static inline bool firstFillFaulted(FILE* stream, bool had_buf) {
+    if (!stream || had_buf || !stream->_bf._base) return false;
+    if (!ferror(stream) || errno != EFAULT) return false;
+    clearerr(stream);
+    return true;
+}
+
 extern "C" size_t smash_fread(void* ptr, size_t size, size_t nitems, FILE* stream);
 SMASH_INTERPOSE(smash_fread, fread);
 extern "C" size_t smash_fread(void* ptr, size_t size, size_t nitems, FILE* stream) {
@@ -1055,8 +1071,11 @@ extern "C" size_t smash_fread(void* ptr, size_t size, size_t nitems, FILE* strea
         if (ptr && total) smash::vm::warmPages(ptr, total, vm);
         warmFileBuffer(stream, vm);
     }
+    const bool had_buf = stream && stream->_bf._base;
     size_t ret = reinterpret_cast<fread_fn>(smash_interpose_smash_fread.original)(ptr, size, nitems, stream);
-    if (vm) {
+    if (vm && ret < nitems && firstFillFaulted(stream, had_buf)) {
+        warmFileBuffer(stream, vm);
+        ret = reinterpret_cast<fread_fn>(smash_interpose_smash_fread.original)(ptr, size, nitems, stream);
     }
     return ret;
 }
@@ -1069,8 +1088,11 @@ extern "C" char* smash_fgets(char* str, int size, FILE* stream) {
         if (str && size > 0) smash::vm::warmPages(str, size, vm);
         warmFileBuffer(stream, vm);
     }
+    const bool had_buf = stream && stream->_bf._base;
     char* ret = reinterpret_cast<fgets_fn>(smash_interpose_smash_fgets.original)(str, size, stream);
-    if (vm) {
+    if (vm && !ret && firstFillFaulted(stream, had_buf)) {
+        warmFileBuffer(stream, vm);
+        ret = reinterpret_cast<fgets_fn>(smash_interpose_smash_fgets.original)(str, size, stream);
     }
     return ret;
 }
@@ -1089,7 +1111,12 @@ SMASH_INTERPOSE(smash_fgetc, fgetc);
 extern "C" int smash_fgetc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
+    const bool had_buf = stream && stream->_bf._base;
     int ret = reinterpret_cast<fgetc_fn>(smash_interpose_smash_fgetc.original)(stream);
+    if (vm && ret == EOF && firstFillFaulted(stream, had_buf)) {
+        warmFileBuffer(stream, vm);
+        ret = reinterpret_cast<fgetc_fn>(smash_interpose_smash_fgetc.original)(stream);
+    }
     return ret;
 }
 
@@ -1098,7 +1125,12 @@ SMASH_INTERPOSE(smash_getc, getc);
 extern "C" int smash_getc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
+    const bool had_buf = stream && stream->_bf._base;
     int ret = reinterpret_cast<getc_fn>(smash_interpose_smash_getc.original)(stream);
+    if (vm && ret == EOF && firstFillFaulted(stream, had_buf)) {
+        warmFileBuffer(stream, vm);
+        ret = reinterpret_cast<getc_fn>(smash_interpose_smash_getc.original)(stream);
+    }
     return ret;
 }
 
@@ -1274,6 +1306,72 @@ extern "C" int smash_mlockall(int flags) {
     smash::ext::detachAll(smash::g_smash_vm_region);
     return reinterpret_cast<mlockall_fn>(smash_interpose_smash_mlockall.original)(flags);
 }
+
+// ── Path-argument syscalls ──────────────────────────────────────────────────
+// A path on a compressed page makes the kernel's copyinstr fail with EFAULT
+// (no signal). Warm the string first; see warmString in syscall_compat.h.
+#define SMASH_WARM(p) smash::vm::warmString((p), smash::g_smash_vm_region)
+using open_fn = int(*)(const char*, int, ...);
+using openat_fn = int(*)(int, const char*, int, ...);
+using path2_fn = int(*)(const char*, const char*);
+using path1_fn = int(*)(const char*);
+using pathmode_fn = int(*)(const char*, mode_t);
+using pathint_fn = int(*)(const char*, int);
+
+extern "C" int smash_open(const char* path, int flags, ...);
+SMASH_INTERPOSE(smash_open, open);
+extern "C" int smash_open(const char* path, int flags, ...) {
+    int mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap); }
+    SMASH_WARM(path);
+    return reinterpret_cast<open_fn>(smash_interpose_smash_open.original)(path, flags, mode);
+}
+extern "C" int smash_openat(int fd, const char* path, int flags, ...);
+SMASH_INTERPOSE(smash_openat, openat);
+extern "C" int smash_openat(int fd, const char* path, int flags, ...) {
+    int mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap); }
+    SMASH_WARM(path);
+    return reinterpret_cast<openat_fn>(smash_interpose_smash_openat.original)(fd, path, flags, mode);
+}
+extern "C" int smash_rename(const char* a, const char* b);
+SMASH_INTERPOSE(smash_rename, rename);
+extern "C" int smash_rename(const char* a, const char* b) {
+    SMASH_WARM(a); SMASH_WARM(b);
+    return reinterpret_cast<path2_fn>(smash_interpose_smash_rename.original)(a, b);
+}
+extern "C" int smash_unlink(const char* p);
+SMASH_INTERPOSE(smash_unlink, unlink);
+extern "C" int smash_unlink(const char* p) {
+    SMASH_WARM(p);
+    return reinterpret_cast<path1_fn>(smash_interpose_smash_unlink.original)(p);
+}
+extern "C" int smash_rmdir(const char* p);
+SMASH_INTERPOSE(smash_rmdir, rmdir);
+extern "C" int smash_rmdir(const char* p) {
+    SMASH_WARM(p);
+    return reinterpret_cast<path1_fn>(smash_interpose_smash_rmdir.original)(p);
+}
+extern "C" int smash_mkdir(const char* p, mode_t m);
+SMASH_INTERPOSE(smash_mkdir, mkdir);
+extern "C" int smash_mkdir(const char* p, mode_t m) {
+    SMASH_WARM(p);
+    return reinterpret_cast<pathmode_fn>(smash_interpose_smash_mkdir.original)(p, m);
+}
+extern "C" int smash_access(const char* p, int m);
+SMASH_INTERPOSE(smash_access, access);
+extern "C" int smash_access(const char* p, int m) {
+    SMASH_WARM(p);
+    return reinterpret_cast<pathint_fn>(smash_interpose_smash_access.original)(p, m);
+}
+using fopen_fn = FILE*(*)(const char*, const char*);
+extern "C" FILE* smash_fopen(const char* p, const char* m);
+SMASH_INTERPOSE(smash_fopen, fopen);
+extern "C" FILE* smash_fopen(const char* p, const char* m) {
+    SMASH_WARM(p);
+    return reinterpret_cast<fopen_fn>(smash_interpose_smash_fopen.original)(p, m);
+}
+#undef SMASH_WARM
 
 // ── mach_vm_allocate / mach_vm_deallocate ────────────────────────────────────
 //

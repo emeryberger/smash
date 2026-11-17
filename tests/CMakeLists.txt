@@ -236,6 +236,28 @@ endfunction()
 add_external_patterns_test(test_external_patterns 0)             # full mode
 add_external_patterns_test(test_external_patterns_large_only 1)  # large-only
 
+# stdio first-fill EFAULT: the lazily malloc'd stdio buffer can land on a
+# compressed page; libc's internal read() into it must not fail the stream.
+add_executable(stdio_first_fill_test stdio_first_fill_test.cpp)
+set_target_properties(stdio_first_fill_test PROPERTIES CXX_STANDARD 20)
+foreach(_lo 0 1)
+  if(_lo STREQUAL "0")
+    set(_name test_stdio_first_fill)
+  else()
+    set(_name test_stdio_first_fill_large_only)
+  endif()
+  if(APPLE)
+    set(_preload "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_preload "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(NAME ${_name}
+    COMMAND ${CMAKE_COMMAND} -E env ${_preload}
+      "SMASH_LARGE_ONLY=${_lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+      $<TARGET_FILE:stdio_first_fill_test>)
+  set_tests_properties(${_name} PROPERTIES TIMEOUT 120)
+endforeach()
+
 # Mode compression test: ONE executable (mode_compression_test.cpp), run twice
 # with SMASH_LARGE_ONLY={0,1}, so FULL mode (test_malloc_compression) and
 # LARGE-ONLY mode (test_large_only_compression) execute byte-identical

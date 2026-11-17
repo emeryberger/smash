@@ -33,6 +33,8 @@
 //              compressed; resuming it must not kill the process (Linux).
 //   mlock      mlock() of a compressed range restores it; it is never
 //              compressed again.
+//   path       open / rename / stat / fopen / unlink with path strings on compressed
+//              pages.
 //   noreserve  untouched pages of a MAP_NORESERVE reservation are never made
 //              inaccessible; the touched part compresses.
 //   thp        a MADV_HUGEPAGE region compresses, round-trips, and a partial
@@ -55,6 +57,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -562,6 +565,42 @@ bool testMlock() {
     return true;
 }
 
+// Path arguments on compressed pages: the kernel's string copy returns
+// EFAULT without raising a signal (a Valkey BGSAVE child's rename() of its
+// RDB file failed this way — the target path is a heap string). open,
+// rename, stat, unlink with paths living in compressed memory must work.
+bool testPathArgs() {
+    char* p = static_cast<char*>(mapAnon(kLen));
+    fill(p, kLen, 18);
+    char* a = p + 10 * g_page + 100;   // two paths in the middle of the region
+    char* b = p + 20 * g_page + 100;
+    snprintf(a, 64, "/tmp/smash-extpat-path-%d-a", static_cast<int>(getpid()));
+    snprintf(b, 64, "/tmp/smash-extpat-path-%d-b", static_cast<int>(getpid()));
+    Region r{p, kLen, "path"};
+    // The pages holding the paths were rewritten after the fill; wait for
+    // those exact pages to be compressed.
+    Region ra{p + 10 * g_page, g_page, "path-a"}, rb{p + 20 * g_page, g_page, "path-b"};
+    Region rs[] = {r, ra, rb};
+    if (!waitCompressed(rs, 3)) FAIL("[path]: never compressed");
+    int fd = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) FAIL("[path]: open(compressed path) errno=%d", errno);
+    close(fd);
+    while (inaccessiblePages(p + 10 * g_page, g_page) == 0 ||
+           inaccessiblePages(p + 20 * g_page, g_page) == 0)
+        usleep(100 * 1000);  // let both recompress, so rename sees compressed paths
+    if (rename(a, b) != 0) FAIL("[path]: rename(compressed paths) errno=%d", errno);
+    struct stat st;
+    if (stat(b, &st) != 0) FAIL("[path]: stat errno=%d", errno);
+    while (inaccessiblePages(p + 20 * g_page, g_page) == 0) usleep(100 * 1000);
+    FILE* f = fopen(b, "r");  // glibc/libSystem open internally: no syscall wrapper sees it
+    if (!f) FAIL("[path]: fopen(compressed path) errno=%d", errno);
+    fclose(f);
+    if (unlink(b) != 0) FAIL("[path]: unlink errno=%d", errno);
+    munmap(p, kLen);
+    fprintf(stderr, "external_patterns_test: path PASSED\n");
+    return true;
+}
+
 // MAP_SHARED|MAP_ANON memory is shared with forked children (PostgreSQL
 // shared buffers, multiprocessing). It must never be compressed: a blob in
 // the parent is stale as soon as the child writes, and decompressing it would
@@ -619,6 +658,7 @@ int main(int argc, char** argv) {
     if (want("shared") && !testSharedAnon()) return 1;
     if (want("sigmask") && !testSigmask()) return 1;
     if (want("mlock") && !testMlock()) return 1;
+    if (want("path") && !testPathArgs()) return 1;
     if (want("noreserve") && !testNoreserve()) return 1;
 #ifdef MADV_HUGEPAGE
     if (want("thp") && !testThp()) return 1;

@@ -56,9 +56,12 @@ int main() {
     const long want = static_cast<long>(kNumLarge * kLarge / 2);
     const time_t deadline = time(nullptr) + 60;
     long got = -1;
-    while (time(nullptr) < deadline && (got = compressedBytesFromMetrics()) < want)
+    // Observe mode keeps no blobs, so there is nothing to wait for.
+    const char* mode = getenv("SMASH_MODE");
+    const bool observe = mode && strcmp(mode, "observe") == 0;
+    while (!observe && time(nullptr) < deadline && (got = compressedBytesFromMetrics()) < want)
         usleep(200 * 1000);
-    if (got < want) fprintf(stderr, "report_test: only %ld compressed bytes after 60 s\n", got);
+    if (!observe && got < want) fprintf(stderr, "report_test: only %ld compressed bytes after 60 s\n", got);
     for (size_t i = 0; i < kNumLarge; ++i)
         for (size_t j = 0; j < kLarge; j += 4096)
             if (large[i][j] != static_cast<unsigned char>(i + 1)) {

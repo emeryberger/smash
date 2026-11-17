@@ -720,7 +720,8 @@ inline size_t getVmRegionSize() {
 }
 
 // ── Runtime mode detection ───────────────────────────────────────────────────
-// Set SMASH_MODE=compress_only to enable compress-only mode at runtime.
+// Set SMASH_MODE=compress_only to enable compress-only mode at runtime
+// (SMASH_MODE=observe is the dry-run mode, see isObserveMode() below).
 // In compress-only mode, malloc is forwarded to the system allocator and
 // pages are tracked for compression. This works with any allocator (jemalloc,
 // tcmalloc, etc.) but doesn't benefit from Smash's allocation optimizations.
@@ -745,6 +746,25 @@ inline SmashMode getSmashMode() {
         cached.store(v, std::memory_order_relaxed);
     }
     return static_cast<SmashMode>(v);
+}
+
+// ── Observe (dry-run) mode ──────────────────────────────────────────────────
+// SMASH_MODE=observe: run the allocator and cold-page detection exactly as in
+// full (or SMASH_LARGE_ONLY=1) mode, but when a page would be compressed,
+// compress a snapshot into the worker scratch buffer and DISCARD the blob.
+// The page is never made PROT_NONE, never madvised, never modified; the
+// compressor only accumulates projected savings / ratio / refault estimates
+// (see agents/estimator.md). getSmashMode() reports Full for "observe" — the
+// allocator side is identical to a normal smash run.
+inline bool isObserveMode() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* env = getenv("SMASH_MODE");
+        v = (env && strcmp(env, "observe") == 0) ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
 }
 
 [[gnu::always_inline, gnu::hot]]

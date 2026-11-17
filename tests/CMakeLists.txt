@@ -252,6 +252,38 @@ endfunction()
 add_mode_compression_test(test_malloc_compression 0)      # full mode
 add_mode_compression_test(test_large_only_compression 1)  # large-only mode
 
+# Observe (dry-run) mode: SMASH_MODE=observe, ONE executable run in both full
+# and large-only mode. Asserts cold regions are projected, a hot region is not,
+# rewriting a projected region counts refaults, nothing is really compressed
+# (SIGUSR2 stats compressed=0 shadow=0), RSS keeps every page, and all data
+# reads back byte-exact. Reads the JSON report SMASH_OBSERVE_REPORT rewrites
+# every SMASH_OBSERVE_INTERVAL=1 s.
+add_executable(observe_mode_test observe_mode_test.cpp)
+set_target_properties(observe_mode_test PROPERTIES CXX_STANDARD 20)
+function(add_observe_mode_test test_name large_only)
+  if(APPLE)
+    set(_preload "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_preload "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(
+    NAME ${test_name}
+    COMMAND ${CMAKE_COMMAND} -E env
+      ${_preload}
+      "SMASH_MODE=observe"
+      "SMASH_LARGE_ONLY=${large_only}"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_STATS_SIGNAL=1"
+      "SMASH_OBSERVE_INTERVAL=1"
+      "SMASH_OBSERVE_REPORT=${CMAKE_CURRENT_BINARY_DIR}/${test_name}.json"
+      $<TARGET_FILE:observe_mode_test>
+  )
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+endfunction()
+add_observe_mode_test(test_observe_full 0)
+add_observe_mode_test(test_observe_large_only 1)
+
 # Shadow-reclaim regression guard: slab pages that hold freed slots must
 # finish shadow reclaim. compressPage() zeroes free slots in the image it
 # compresses, so the shadow content check has to mask the live page the same
@@ -501,6 +533,16 @@ foreach(lo 0 1)
       ${CMAKE_CURRENT_BINARY_DIR}/${_name}.d)
   set_tests_properties(${_name} PROPERTIES TIMEOUT 90)
 endforeach()
+if(APPLE)
+  set(_ro_preload DYLD_INSERT_LIBRARIES)
+else()
+  set(_ro_preload LD_PRELOAD)
+endif()
+add_test(NAME test_report_observe
+  COMMAND ${CMAKE_COMMAND} -DPRELOAD_VAR=${_ro_preload} -DLIB=$<TARGET_FILE:smash>
+    -DPROG=$<TARGET_FILE:report_test> -DOUT=${CMAKE_CURRENT_BINARY_DIR}/test_report_observe.d
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/report_observe_test.cmake)
+set_tests_properties(test_report_observe PROPERTIES TIMEOUT 90)
 
 # bin/smash launcher, both modes: library discovery relative to the script,
 # preload, --report/--large-only/--profile, `smash stats` refusal and
@@ -519,3 +561,16 @@ foreach(lo 0 1)
       ${CMAKE_CURRENT_BINARY_DIR}/${_name}.d)
   set_tests_properties(${_name} PROPERTIES TIMEOUT 60)
 endforeach()
+# smash-estimate (Linux): launch mode against a target with known idle/hot
+# regions; runs unprivileged (soft-dirty or the referenced fallback; idle-page
+# tracking when run as root). The _referenced variant forces the per-mapping
+# fallback, the only method on kernels without soft-dirty or page_idle access.
+if(TARGET smash-estimate)
+  add_executable(estimate_target estimate_target.cpp)
+  add_executable(estimate_test estimate_test.cpp)
+  add_test(NAME test_smash_estimate
+           COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target>)
+  add_test(NAME test_smash_estimate_referenced
+           COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> referenced)
+  set_tests_properties(test_smash_estimate test_smash_estimate_referenced PROPERTIES TIMEOUT 60)
+endif()

@@ -426,6 +426,24 @@ if(APPLE)
   set_target_properties(smash_compress_only PROPERTIES SUFFIX ".dylib")
 endif()
 
+# ── smash-estimate (Linux) ────────────────────────────────────────────────────
+# Standalone "how much would smash save?" tool for a running process: no
+# preload, no restart (tools/smash-estimate/, agents/estimator.md). Defined
+# before tests/ so the test can check `if(TARGET smash-estimate)`.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  option(SMASH_BUILD_ESTIMATE "Build the smash-estimate tool" ON)
+else()
+  option(SMASH_BUILD_ESTIMATE "Build the smash-estimate tool (Linux only)" OFF)
+endif()
+if(SMASH_BUILD_ESTIMATE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(smash-estimate tools/smash-estimate/smash_estimate.cpp)
+  set_target_properties(smash-estimate PROPERTIES CXX_STANDARD 17)
+  target_include_directories(smash-estimate PRIVATE ${zstd_SOURCE_DIR}/lib)
+  target_link_libraries(smash-estimate PRIVATE libzstd_static)
+  include(GNUInstallDirs)
+  install(TARGETS smash-estimate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 option(SMASH_BUILD_TESTS "Build smash tests" ON)
 if(SMASH_BUILD_TESTS)

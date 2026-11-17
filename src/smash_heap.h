@@ -500,11 +500,20 @@ struct SystemAllocFns {
         // every caller already handles that (large-only falls through to the
         // smash slab; the other paths return nullptr, which glibc's
         // _dlerror_run tolerates by using its static fallback state).
-        // Global, not thread-local: a second thread racing the first
-        // resolution sees the same null-pointer fallback, which is safe.
+        // Only same-thread nesting (dlsym's calloc) bails out. Another thread
+        // that arrives mid-resolution waits for it instead: bailing there
+        // would hand it null pointers, and the passthrough / compressor-thread
+        // paths turn a null system malloc into a spurious nullptr return.
+        static thread_local __attribute__((tls_model("initial-exec"))) bool in_resolve = false;
+        if (in_resolve) return;
         static std::atomic<bool> resolving{false};
-        if (resolving.exchange(true, std::memory_order_acq_rel)) return;
-        struct Clear { ~Clear() { resolving.store(false, std::memory_order_release); } } clear;
+        while (resolving.exchange(true, std::memory_order_acq_rel)) {
+            sched_yield();
+        }
+        in_resolve = true;
+        struct Clear {
+            ~Clear() { in_resolve = false; resolving.store(false, std::memory_order_release); }
+        } clear;
         malloc = reinterpret_cast<MallocFn>(dlsym(RTLD_NEXT, "malloc"));
         free = reinterpret_cast<FreeFn>(dlsym(RTLD_NEXT, "free"));
         calloc = reinterpret_cast<CallocFn>(dlsym(RTLD_NEXT, "calloc"));

@@ -191,7 +191,7 @@ jobs:
           set -e
           for lo in 0 1; do
             for toggle in 1 0; do
-              env LD_PRELOAD=$PWD/build/libsmash.so SMASH_LARGE_ONLY=$lo \
+              env LD_PRELOAD="$PWD/build/libsmash.so" SMASH_LARGE_ONLY=$lo \
                 SMASH_DEFER_PHASES_MS=0 SMASH_COLD_TIMEOUT_SEC=1 SMASH_SOAK_TOGGLE=$toggle \
                 timeout 300 build/tests/soak_test $((toggle ? 120 : 60)) 8
             done
@@ -201,7 +201,7 @@ jobs:
         run: |
           set -e
           for lo in 0 1 0 1; do
-            env LD_PRELOAD=$PWD/build/libsmash.so SMASH_LARGE_ONLY=$lo \
+            env LD_PRELOAD="$PWD/build/libsmash.so" SMASH_LARGE_ONLY=$lo \
               SMASH_DEFER_PHASES_MS=0 SMASH_COLD_TIMEOUT_SEC=1 \
               timeout 600 build/tests/fork_stress_test 300 6
           done

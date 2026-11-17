@@ -3,7 +3,7 @@
 //
 //   soak_test [seconds] [threads]      (defaults: $SMASH_SOAK_SEC or 15, 8)
 //   SMASH_SOAK_TOGGLE=1                a thread flips smash_disable()/smash_enable()
-//                                      every 0.5-2.5 s while the workers run
+//                                      (enabled 3.5-7 s, disabled 0.3-1.5 s)
 //   SMASH_SOAK_SEED=N                  reproduce a run (printed at start)
 //
 // Every live object carries a pattern derived from (seed, size); it is checked
@@ -41,7 +41,7 @@ toggle_fn g_disable, g_enable;
 
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_fail{0};
-std::atomic<uint64_t> g_ops{0}, g_toggles{0};
+std::atomic<uint64_t> g_ops{0}, g_toggles{0}, g_drained_from{0};
 
 constexpr size_t kColdBytes = 32u << 20;
 unsigned char* g_cold;
@@ -135,8 +135,15 @@ void* worker(void* arg) {
 void* toggler(void* arg) {
     uint64_t r = reinterpret_cast<uint64_t>(arg) | 1;
     while (!g_stop.load(std::memory_order_relaxed)) {
-        usleep(static_cast<useconds_t>(500000 + xorshift(r) % 2000000));
+        // Enabled long enough (3.5-7 s at SMASH_COLD_TIMEOUT_SEC=1) for pages
+        // to be compressed AND reclaimed, so each disable drains real
+        // compressed pages while the workers fault on them; re-enable resets
+        // every cold streak, so shorter windows would never compress.
+        usleep(static_cast<useconds_t>(3500000 + xorshift(r) % 3500000));
         if (g_stop.load()) break;
+        Status pre{};
+        g_status(&pre);
+        g_drained_from.fetch_add(pre.compressed_pages, std::memory_order_relaxed);
         const int rc = g_disable();
         if (rc == 0) {
             Status s{};
@@ -150,7 +157,7 @@ void* toggler(void* arg) {
             fprintf(stderr, "FAIL: smash_disable() = %d\n", rc);
             g_fail.fetch_add(1);
         }
-        usleep(static_cast<useconds_t>(200000 + xorshift(r) % 1500000));
+        usleep(static_cast<useconds_t>(300000 + xorshift(r) % 1200000));
         if (g_enable() != 0) { fprintf(stderr, "FAIL: smash_enable()\n"); g_fail.fetch_add(1); }
         g_toggles.fetch_add(1);
     }
@@ -212,8 +219,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "FAIL: %llu decompression failures\n", s.decompress_failures);
         g_fail.fetch_add(1);
     }
-    fprintf(stderr, "soak_test: ops=%llu faults=%llu decompress_faults=%llu toggles=%llu -> %s\n",
+    fprintf(stderr,
+            "soak_test: ops=%llu faults=%llu decompress_faults=%llu toggles=%llu "
+            "compressed_at_disable=%llu -> %s\n",
             (unsigned long long)g_ops.load(), s.faults, s.decompress_faults,
-            (unsigned long long)g_toggles.load(), g_fail.load() ? "FAIL" : "PASS");
+            (unsigned long long)g_toggles.load(), (unsigned long long)g_drained_from.load(),
+            g_fail.load() ? "FAIL" : "PASS");
     return g_fail.load() ? 1 : 0;
 }

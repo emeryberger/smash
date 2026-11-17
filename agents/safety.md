@@ -129,8 +129,15 @@ disabled= inert= trips=`.
 | `test_kill_switch_{api,signal,file}[_large_only]` | waits for ≥ 1024 *reclaimed* pages, triggers the disable without touching the data, then: 0 compressed pages, every page of every test chunk is RW in the kernel's map, data byte-exact, a full read+write pass plus 3 ticks cause 0 smash faults and 0 recompressions; re-enable → pages reclaimed again, read-back byte-exact and takes decompress faults |
 | `test_watchdog_rate[_large_only]`, `test_watchdog_p99[_large_only]` | synthetic refault storm (16 MiB read every 150 ms, `SMASH_RECOMPRESS_BACKOFF=0`) trips the watchdog with the right reason; process then inert, data exact, no faults |
 | `test_slo_controller[_large_only]` | same storm with `SMASH_MAX_FAULT_RATE`: the effective cold floor rises (≥ 2× base) without a trip, then the multiplier decays once the storm stops |
-| `test_soak[_large_only]` | 8 threads alloc/free/realloc (16 B – 3 MiB) with random idle gaps, random reads of a reclaimed cold set (concurrent decompress faults), while a thread flips `smash_disable()`/`smash_enable()` every 0.5–2.5 s; every object is pattern-checked; `smash_disable()==0` must imply 0 compressed pages. CI's stress job runs it for minutes |
+| `test_soak[_large_only]` | 8 threads alloc/free/realloc (16 B – 3 MiB) with random idle gaps, random reads of a reclaimed cold set (concurrent decompress faults), while a thread flips `smash_disable()`/`smash_enable()` (enabled 3.5–7 s, so pages are reclaimed before each drain; disabled 0.3–1.5 s); every object is pattern-checked; `smash_disable()==0` must imply 0 compressed pages. CI's stress job runs it for minutes |
 | `test_fork_stress[_large_only]` (Linux) | issue #61 regression: threads churn + fault while the main thread forks 120 times; each child allocates across size classes and reads the whole reclaimed cold set; a child that does not finish in 20 s fails the test |
+
+Soak runs on cloudnew (x86-64, 24-core taskset, development check, not a
+benchmark), `LD_PRELOAD=build-linux/libsmash.so SMASH_DEFER_PHASES_MS=0
+SMASH_COLD_TIMEOUT_SEC=1 SMASH_SOAK_TOGGLE={0,1} SMASH_LARGE_ONLY={0,1}
+build-linux/tests/soak_test 120 8`: all four PASS. With toggling, 19 disables
+per run drained 525,486 (full) / 325,954 (large-only) compressed pages in
+total while the workers took 211,378 / 178,784 decompress faults.
 
 ## Fork safety (issue #61)
 

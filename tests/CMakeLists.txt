@@ -647,7 +647,7 @@ foreach(lo 0 1)
     set(_sfx "")
   endif()
   smash_add_preload_test(test_soak${_sfx} soak_test
-    ARGS 15 8
+    ARGS 20 8
     ENV "SMASH_LARGE_ONLY=${lo}" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
         "SMASH_SOAK_TOGGLE=1"
     TIMEOUT 180)

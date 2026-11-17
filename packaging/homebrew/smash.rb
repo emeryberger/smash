@@ -43,7 +43,7 @@ class Smash < Formula
   def caveats
     <<~EOS
       Run a program under smash with:
-        smash ./your_program
+        smash run -- ./your_program
       macOS strips DYLD_* variables for SIP-protected system binaries
       (/bin, /usr/bin), so smash applies to your own programs.
       Small, short-lived programs show no effect: pages are compressed only
@@ -67,7 +67,7 @@ class Smash < Formula
     C
     system ENV.cc, "probe.c", "-o", "probe"
     assert_path_exists lib/shared_library("libsmash")
-    output = shell_output("SMASH_STATS=1 #{bin}/smash ./probe 2>&1")
+    output = shell_output("SMASH_STATS=1 #{bin}/smash run -- ./probe 2>&1")
     assert_match "probe ok", output
     assert_match "[smash stats]", output
   end

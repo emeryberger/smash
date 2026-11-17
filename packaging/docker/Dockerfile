@@ -57,6 +57,7 @@ RUN set -eu; \
       -DCMAKE_BUILD_TYPE=Release \
       -DSMASH_BUILD_TESTS=OFF \
       -DSMASH_BUILD_BENCH=OFF \
+      -DSMASH_BUILD_ESTIMATE=OFF \
       -DCMAKE_INSTALL_PREFIX=/stage \
       $a8; \
     cmake --build /build --target smash -j"${JOBS:-$(nproc)}"; \

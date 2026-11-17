@@ -13,7 +13,7 @@ COPY --from=smash /smash /opt/smash
 
 # Preload for every process in the container. Alternatively leave LD_PRELOAD
 # unset and start the app through the launcher:
-#   ENTRYPOINT ["/opt/smash/bin/smash"]
+#   ENTRYPOINT ["/opt/smash/bin/smash", "run", "--"]
 # PYTHONMALLOC=malloc: CPython's own small-object allocator otherwise hides
 # allocations from malloc. SMASH_LARGE_ONLY=1 is the production-supported mode
 # for runtimes with their own small-object allocator. SMASH_STATS=1 prints a

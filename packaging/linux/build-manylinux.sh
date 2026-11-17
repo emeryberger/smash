@@ -35,7 +35,8 @@ cmake -S "$SRC" -B "$B" -G Ninja \
   -DSMASH_BUILD_TESTS=OFF \
   -DSMASH_BUILD_BENCH=OFF \
   ${VERSION:+-DSMASH_PACKAGE_VERSION="$VERSION"}
-cmake --build "$B" --target smash -j
+# libsmash plus the tools the packages install (smash-estimate on Linux).
+cmake --build "$B" --target smash smash-estimate -j
 
 (cd "$B" && cpack -G "DEB;RPM;TGZ" -B "$B/pkg")
 rm -rf "$B/pkg/_CPack_Packages"

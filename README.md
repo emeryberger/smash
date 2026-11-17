@@ -44,7 +44,7 @@ Both overestimated the measured reduction on our SQLite benchmark (by 6.6 and 10
 
 ## Install
 
-Every install method gives the same layout: `lib/libsmash.so` (`.dylib` on macOS), a `bin/smash` launcher that preloads it (`smash ./your_server`), and headers in `include/smash/`. The Linux library is built on glibc 2.28, so it runs on Debian 11+, Ubuntu 20.04+, RHEL/Alma/Rocky 8+, Amazon Linux 2023 and Fedora. musl (Alpine) is not supported.
+Every install method gives the same layout: `lib/libsmash.so` (`.dylib` on macOS), a `bin/smash` launcher that preloads it (`smash run -- ./your_server`), and headers in `include/smash/`. The Linux library is built on glibc 2.28, so it runs on Debian 11+, Ubuntu 20.04+, RHEL/Alma/Rocky 8+, Amazon Linux 2023 and Fedora. musl (Alpine) is not supported.
 
 **Debian / Ubuntu, RHEL / Fedora / Amazon Linux.** Each [release](https://github.com/emeryberger/smash/releases) attaches `.deb` and `.rpm` packages for x86-64 and aarch64 (published from the first release cut after packaging landed). They install `/usr/lib/libsmash.so` and `/usr/bin/smash`:
 
@@ -54,7 +54,7 @@ tag=vX.Y.Z-alpha    # a release tag from the releases page (all are pre-releases
 arch=$(uname -m)    # x86_64 or aarch64
 curl -fLO https://github.com/emeryberger/smash/releases/download/$tag/smash-linux-$arch.deb
 sudo apt install ./smash-linux-$arch.deb         # or: sudo dnf install ./smash-linux-$arch.rpm
-smash ./your_server                              # = LD_PRELOAD=/usr/lib/libsmash.so ./your_server
+smash run -- ./your_server                       # = LD_PRELOAD=/usr/lib/libsmash.so ./your_server
 ```
 
 `smash-linux-$arch.tar.gz` holds the same files for unpacking anywhere without root.

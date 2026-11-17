@@ -1,5 +1,6 @@
 // Payload for test_debug_stats: allocate slab objects, then stay alive past
-// SMASH_DEBUG's first periodic stats line (every 5 compressor ticks, ~5 s).
+// SMASH_DEBUG's first periodic stats line (every 5 compressor ticks, ~5 s,
+// later on a slow or loaded CI runner — hence 13 s).
 // Before the fix, printing that line from the 128 KiB coordinator stack
 // overflowed it (an inlined ~240 KB bucket-summary array) and SIGBUSed.
 #include <cstdlib>
@@ -11,6 +12,6 @@ int main() {
         void* p = std::malloc(256);
         std::memset(p, i, 256);
     }
-    sleep(7);
+    sleep(13);
     return 0;
 }

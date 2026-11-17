@@ -1,0 +1,78 @@
+# Run an existing container image under smash in Kubernetes, without
+# rebuilding the image.
+#
+# An initContainer downloads a published libsmash release asset, checks it
+# against the release's SHA256SUMS.txt, and installs it as lib/libsmash.so in
+# an emptyDir volume. The app container mounts that volume read-only and
+# preloads the library with LD_PRELOAD.
+#
+# Requirements and caveats:
+#   * The app must allocate with the C library's malloc. LD_PRELOAD has no
+#     effect on binaries that link their own allocator statically (for
+#     example the official redis images, which bundle jemalloc).
+#   * A glibc-based image (Debian, Ubuntu, RHEL, Amazon Linux). Alpine/musl is
+#     not supported by the published binaries.
+#   * Inside a memory-limited cgroup (resources.limits.memory below), smash
+#     finds the limit at startup and adjusts its compression to it
+#     (SMASH_CGROUP, on by default). See agents/containers.md.
+#
+# Change SMASH_VERSION and ARCH (x86_64 | aarch64), and replace the app
+# container's image and command with your own.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-smash
+spec:
+  volumes:
+    - name: smash
+      emptyDir:
+        sizeLimit: 16Mi
+  initContainers:
+    - name: install-smash
+      image: curlimages/curl:8.10.1
+      env:
+        - name: SMASH_VERSION
+          value: "vX.Y.Z-alpha"
+        - name: ARCH
+          value: "x86_64"
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          base="https://github.com/emeryberger/smash/releases/download/${SMASH_VERSION}"
+          asset="libsmash-linux-${ARCH}.so"
+          cd /tmp
+          curl -fsSLO "${base}/${asset}"
+          curl -fsSLO "${base}/SHA256SUMS.txt"
+          grep " ${asset}\$" SHA256SUMS.txt | sha256sum -c -
+          mkdir -p /smash/lib
+          cp "${asset}" /smash/lib/libsmash.so
+          chmod 0444 /smash/lib/libsmash.so
+      volumeMounts:
+        - name: smash
+          mountPath: /smash
+      resources:
+        limits:
+          memory: 64Mi
+          cpu: 250m
+  containers:
+    - name: app
+      image: your-registry/your-app:latest      # replace
+      env:
+        - name: LD_PRELOAD
+          value: /smash/lib/libsmash.so
+        # Production-supported mode for multi-threaded apps: smash manages
+        # allocations > 16 KiB and passes smaller ones to the system malloc.
+        - name: SMASH_LARGE_ONLY
+          value: "1"
+        # Python apps: route PyMem through malloc so smash sees the heap.
+        # - name: PYTHONMALLOC
+        #   value: malloc
+      volumeMounts:
+        - name: smash
+          mountPath: /smash
+          readOnly: true
+      resources:
+        requests:
+          memory: 512Mi
+        limits:
+          memory: 768Mi        # cgroup memory.max seen by smash

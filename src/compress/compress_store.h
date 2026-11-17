@@ -524,7 +524,14 @@ public:
     // in. Region bounds are snapshotted under each shard lock and the pages
     // touched outside it, so the fault path's release() is never held up by
     // the walk. Returns the number of pages touched.
-    size_t keepWarm() {
+    //
+    // swapin_budget > 0: also ask the kernel to read back (MADV_WILLNEED,
+    // asynchronous swap-in readahead) up to that many live store pages that
+    // were already swapped out, so the next cold access to their blobs hits
+    // RAM instead of the swap device. The caller sizes the budget from the
+    // cgroup's spare headroom. *swapin_issued receives the count requested.
+    size_t keepWarm(size_t swapin_budget = 0, size_t* swapin_issued = nullptr) {
+        if (swapin_issued) *swapin_issued = 0;
 #if defined(__linux__) || defined(__APPLE__)
         const size_t sh = pageShift();
         const size_t ps = size_t{1} << sh;
@@ -554,8 +561,23 @@ public:
 #endif
                 if (mincore(start, (npages - first) << sh, mvec) != 0) continue;
                 for (size_t p = first; p < npages; ++p) {
-                    if (!(vec[p - first] & 1)) continue;
                     if (spans[k].r->page_live[p] == 0) continue;   // racy read: hint only
+                    if (!(vec[p - first] & 1)) {
+                        // Swapped out (or never faulted). Read back a run of
+                        // swapped live pages if the budget allows.
+                        if (swapin_budget == 0) continue;
+                        size_t q = p;
+                        while (q < npages && q - p < swapin_budget && !(vec[q - first] & 1) &&
+                               spans[k].r->page_live[q] != 0)
+                            ++q;
+#if defined(__linux__)
+                        (void)madvise(spans[k].base + (p << sh), (q - p) << sh, MADV_WILLNEED);
+#endif
+                        swapin_budget -= q - p;
+                        if (swapin_issued) *swapin_issued += q - p;
+                        p = q - 1;
+                        continue;
+                    }
                     (void)*reinterpret_cast<volatile const char*>(spans[k].base + (p << sh));
                     ++touched;
                 }

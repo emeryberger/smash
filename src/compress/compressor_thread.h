@@ -7095,6 +7095,7 @@ public:
     std::atomic<uint64_t> cg_skipped_nonresident_{0};
     std::atomic<uint64_t> cg_pressure_ticks_{0};
     std::atomic<uint64_t> cg_warm_pages_{0};
+    std::atomic<uint64_t> cg_swapin_pages_{0};
     // Per-worker mincore cache: residency of one kResChunk-page window.
     static constexpr size_t kResChunk = 64;
     size_t res_base_[kMaxCompressorWorkers]{};
@@ -7125,16 +7126,30 @@ public:
         cgroup::Decision d = cgroup::decide(cg_last_, cg_params_, cg_level_, &cg_hold_,
                                             base, kAdaptiveMinTicks);
         if (!cfg_cgroup_skip_swapped_) d.skip_nonresident = false;
+        if (!cfg_cgroup_warm_) d.keep_warm = false;
         if (!cfg_cgroup_early_) d.cold_floor = 0;
         cg_level_ = d.level;
         cg_dec_ = d;
-        if (d.level != cgroup::Pressure::kNone) {
+        if (d.level != cgroup::Pressure::kNone)
             cg_pressure_ticks_.fetch_add(1, std::memory_order_relaxed);
-            // Keep the blob store out of the kernel's reclaim (see
-            // CompressStore::keepWarm for why a blob page is the worst page
-            // to evict under zswap). Once per tick, resident pages only.
-            if (cfg_cgroup_warm_ && store_)
-                cg_warm_pages_.fetch_add(store_->keepWarm(), std::memory_order_relaxed);
+        // Keep the blob store out of the kernel's reclaim (see
+        // CompressStore::keepWarm for why a blob page is the worst page to
+        // evict under zswap). Once per tick, resident pages only.
+        if (d.keep_warm && cfg_cgroup_warm_ && store_) {
+            // Spare room above the warm threshold may be spent reading back
+            // store pages the kernel swapped out earlier (half of it, so
+            // the read-back itself cannot push the cgroup into pressure).
+            size_t budget = 0;
+            if (cfg_cgroup_swapin_ && d.level == cgroup::Pressure::kNone) {
+                const int64_t warm_at = cg_last_.limit / 100 *
+                                        static_cast<int64_t>(cg_params_.warm_pct);
+                const int64_t spare = cg_last_.headroom - warm_at / 2;
+                if (spare > 0) budget = static_cast<size_t>(spare / 2) / kPageSize;
+            }
+            size_t issued = 0;
+            cg_warm_pages_.fetch_add(store_->keepWarm(budget, &issued),
+                                     std::memory_order_relaxed);
+            cg_swapin_pages_.fetch_add(issued, std::memory_order_relaxed);
         }
     }
 
@@ -7200,6 +7215,7 @@ public:
     bool cfg_cgroup_early_ = false;          // SMASH_CGROUP_EARLY=1 opts in (hurt redis)
     bool cfg_cgroup_spill_ = false;          // SMASH_CGROUP_SPILL=1: spill new blobs when critical
     bool cfg_cgroup_warm_ = true;            // SMASH_CGROUP_WARM=0 ablates store keep-warm
+    bool cfg_cgroup_swapin_ = true;          // SMASH_CGROUP_SWAPIN=0 ablates store read-back
     cgroup::PolicyParams cg_params_{};       // SMASH_CGROUP_HEADROOM_PCT / _PSI_PCT
 
     void warmupClassStatics() {
@@ -7235,6 +7251,8 @@ public:
         cfg_cgroup_spill_ = v && v[0] == '1';
         v = std::getenv("SMASH_CGROUP_WARM");
         cfg_cgroup_warm_ = !(v && v[0] == '0');
+        v = std::getenv("SMASH_CGROUP_SWAPIN");
+        cfg_cgroup_swapin_ = !(v && v[0] == '0');
         v = std::getenv("SMASH_CGROUP_HEADROOM_PCT");
         if (v && std::atoi(v) > 0 && std::atoi(v) < 100) {
             cg_params_.elevated_pct = static_cast<uint32_t>(std::atoi(v));
@@ -7445,7 +7463,7 @@ public:
             "  reheat=%llu  cold_floor=%u  slo_x256=%u  fault_rate=%llu"
             "  fault_p99_us=%llu  faults=%llu  decomp_fail=%llu  disabled=%d"
             "  inert=%d  trips=%llu"
-            "  cg=%d/%lld/%llu/%llu/%llu\n",
+            "  cg=%d/%lld/%llu/%llu/%llu/%llu\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
@@ -7464,12 +7482,14 @@ public:
             self->ks_inert_.load(std::memory_order_relaxed) ? 1 : 0,
             (unsigned long long)self->ks_trips_.load(std::memory_order_relaxed),
             // cgroup policy: level / headroom MiB / pressure ticks / skipped
-            // non-resident pages / store pages kept warm (level -1 = inactive).
+            // non-resident pages / store pages kept warm / store pages read
+            // back from swap (level -1 = inactive).
             self->cg_active_ ? static_cast<int>(self->cg_level_) : -1,
             (long long)(self->cg_last_.headroom >> 20),
             (unsigned long long)self->cg_pressure_ticks_.load(std::memory_order_relaxed),
             (unsigned long long)self->cg_skipped_nonresident_.load(std::memory_order_relaxed),
-            (unsigned long long)self->cg_warm_pages_.load(std::memory_order_relaxed));
+            (unsigned long long)self->cg_warm_pages_.load(std::memory_order_relaxed),
+            (unsigned long long)self->cg_swapin_pages_.load(std::memory_order_relaxed));
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.

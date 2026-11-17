@@ -180,6 +180,11 @@ struct PolicyParams {
     // Pressure is sticky for this many samples after the last trigger, so
     // the policy does not flap while the kernel oscillates around high.
     uint32_t hold_samples = 10;
+    // Keep the blob store warm whenever headroom is below this share of the
+    // limit, not only once pressure is detected: the policy reacts once per
+    // tick, and a growing process can cross from ~20% headroom to the limit
+    // inside one tick, long enough for reclaim to push store pages out.
+    uint32_t warm_pct = 25;
 };
 
 struct Decision {
@@ -191,6 +196,8 @@ struct Decision {
     // compressor compresses sooner so that idle data is compressed by smash
     // while it is still resident instead of being swapped by the kernel.
     uint32_t cold_floor = 0;
+    // Touch resident CompressStore pages this tick (CompressStore::keepWarm).
+    bool keep_warm = false;
 };
 
 // Pure policy. `prev_level` + `*hold` implement the sticky window; the caller
@@ -214,7 +221,11 @@ inline Decision decide(const Sample& s, const PolicyParams& p, Pressure prev_lev
         now = prev_level;   // sticky: keep the previous level while held
     }
     d.level = now;
+    if (s.valid && s.limit > 0 &&
+        s.headroom < s.limit / 100 * static_cast<int64_t>(p.warm_pct))
+        d.keep_warm = true;
     if (now == Pressure::kNone) return d;
+    d.keep_warm = true;
     d.skip_nonresident = true;
     if (now == Pressure::kCritical) {
         d.cold_floor = min_floor < base_floor ? min_floor : base_floor;

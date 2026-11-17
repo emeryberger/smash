@@ -83,7 +83,13 @@ static void testPolicy() {
 
     // Plenty of headroom: no action.
     Decision d = decide(mk(L, L / 2), p, Pressure::kNone, &hold, base, minf);
-    CHECK(d.level == Pressure::kNone && !d.skip_nonresident && d.cold_floor == 0, "idle");
+    CHECK(d.level == Pressure::kNone && !d.skip_nonresident && d.cold_floor == 0 &&
+          !d.keep_warm, "idle");
+
+    // 20% headroom: no pressure yet, but the store is kept warm (warm_pct 25).
+    d = decide(mk(L, L - L / 5), p, Pressure::kNone, &hold, base, minf);
+    CHECK(d.level == Pressure::kNone && d.keep_warm && !d.skip_nonresident, "pre-pressure warm");
+    CHECK(hold == 0, "warm alone does not arm the hold");
 
     // Invalid / uncapped samples never trigger.
     Sample inv;
@@ -93,7 +99,7 @@ static void testPolicy() {
     // 5% headroom → elevated: skip swapped pages, halve the floor.
     hold = 0;
     d = decide(mk(L, L - L / 20), p, Pressure::kNone, &hold, base, minf);
-    CHECK(d.level == Pressure::kElevated && d.skip_nonresident && d.cold_floor == 5,
+    CHECK(d.level == Pressure::kElevated && d.skip_nonresident && d.keep_warm && d.cold_floor == 5,
           "elevated level=%d floor=%u", (int)d.level, d.cold_floor);
     CHECK(hold == p.hold_samples, "hold armed");
 

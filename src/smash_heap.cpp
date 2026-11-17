@@ -3,6 +3,7 @@
 #include "smash_heap.h"
 #include "smash/smash.h"
 #include "vm/syscall_compat.h"
+#include "external_track.h"
 #include <alloc8/alloc8.h>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,8 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <cstdarg>
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/attr.h>
@@ -253,6 +256,7 @@ smash::PageStateTable* smash::g_smash_page_states_for_external = nullptr;
 // munmap / Mach VM deallocate interposers can take the per-page lock while
 // untracking an external page, serializing against compressPage's snapshot.
 smash::PageLockTable* smash::g_smash_page_locks_for_external = nullptr;
+std::atomic<smash::ExternalDetachFn> smash::g_smash_external_detach{nullptr};
 
 // g_smash_skip_external_tracking is now an inline variable defined in
 // compress/compressor_thread.h (single definition across libsmash and the
@@ -803,6 +807,7 @@ using fstatat_fn = int(*)(int, const char*, struct stat*, int);
 extern "C" int smash_stat(const char* path, struct stat* st);
 SMASH_INTERPOSE(smash_stat, stat);
 extern "C" int smash_stat(const char* path, struct stat* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return smash::vm::retryWith1Buf(
         [&] { return reinterpret_cast<stat_fn>(smash_interpose_smash_stat.original)(path, st); },
         st, sizeof(struct stat));
@@ -1044,6 +1049,19 @@ static inline void warmFileBuffer(FILE* stream, smash::VmRegion* vm) {
 using fread_fn = size_t(*)(void*, size_t, size_t, FILE*);
 using fgets_fn = char*(*)(char*, int, FILE*);
 
+// The stdio buffer is malloc'd lazily on a stream's first read, inside
+// libSystem and after the warm above; a recycled chunk on a compressed page
+// makes the internal read() fail with EFAULT (test_stdio_first_fill). If the
+// stream had no buffer before the call and the call failed with EFAULT,
+// nothing was delivered or consumed: clear the error, retry once (the warm
+// then covers the new buffer). Same as the Linux wrappers.
+static inline bool firstFillFaulted(FILE* stream, bool had_buf) {
+    if (!stream || had_buf || !stream->_bf._base) return false;
+    if (!ferror(stream) || errno != EFAULT) return false;
+    clearerr(stream);
+    return true;
+}
+
 extern "C" size_t smash_fread(void* ptr, size_t size, size_t nitems, FILE* stream);
 SMASH_INTERPOSE(smash_fread, fread);
 extern "C" size_t smash_fread(void* ptr, size_t size, size_t nitems, FILE* stream) {
@@ -1053,8 +1071,11 @@ extern "C" size_t smash_fread(void* ptr, size_t size, size_t nitems, FILE* strea
         if (ptr && total) smash::vm::warmPages(ptr, total, vm);
         warmFileBuffer(stream, vm);
     }
+    const bool had_buf = stream && stream->_bf._base;
     size_t ret = reinterpret_cast<fread_fn>(smash_interpose_smash_fread.original)(ptr, size, nitems, stream);
-    if (vm) {
+    if (vm && ret < nitems && firstFillFaulted(stream, had_buf)) {
+        warmFileBuffer(stream, vm);
+        ret = reinterpret_cast<fread_fn>(smash_interpose_smash_fread.original)(ptr, size, nitems, stream);
     }
     return ret;
 }
@@ -1067,8 +1088,11 @@ extern "C" char* smash_fgets(char* str, int size, FILE* stream) {
         if (str && size > 0) smash::vm::warmPages(str, size, vm);
         warmFileBuffer(stream, vm);
     }
+    const bool had_buf = stream && stream->_bf._base;
     char* ret = reinterpret_cast<fgets_fn>(smash_interpose_smash_fgets.original)(str, size, stream);
-    if (vm) {
+    if (vm && !ret && firstFillFaulted(stream, had_buf)) {
+        warmFileBuffer(stream, vm);
+        ret = reinterpret_cast<fgets_fn>(smash_interpose_smash_fgets.original)(str, size, stream);
     }
     return ret;
 }
@@ -1087,7 +1111,12 @@ SMASH_INTERPOSE(smash_fgetc, fgetc);
 extern "C" int smash_fgetc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
+    const bool had_buf = stream && stream->_bf._base;
     int ret = reinterpret_cast<fgetc_fn>(smash_interpose_smash_fgetc.original)(stream);
+    if (vm && ret == EOF && firstFillFaulted(stream, had_buf)) {
+        warmFileBuffer(stream, vm);
+        ret = reinterpret_cast<fgetc_fn>(smash_interpose_smash_fgetc.original)(stream);
+    }
     return ret;
 }
 
@@ -1096,7 +1125,12 @@ SMASH_INTERPOSE(smash_getc, getc);
 extern "C" int smash_getc(FILE* stream) {
     auto* vm = smash::g_smash_vm_region;
     if (vm) warmFileBuffer(stream, vm);
+    const bool had_buf = stream && stream->_bf._base;
     int ret = reinterpret_cast<getc_fn>(smash_interpose_smash_getc.original)(stream);
+    if (vm && ret == EOF && firstFillFaulted(stream, had_buf)) {
+        warmFileBuffer(stream, vm);
+        ret = reinterpret_cast<getc_fn>(smash_interpose_smash_getc.original)(stream);
+    }
     return ret;
 }
 
@@ -1133,101 +1167,48 @@ extern "C" int smash_fflush(FILE* stream) {
 
 // ── External-mapping interposers ────────────────────────────────────────────
 //
-// Standard smash's main allocator hands out memory from a single big
-// MAP_ANON reservation that smash itself owns; the compressor compresses
-// pages within that reservation. Application code that calls mmap() /
-// vm_allocate() *directly* (SpiderMonkey JS GC arenas, Skia surfaces via
-// mozalloc_aligned, etc.) bypasses the malloc path entirely and so escapes
-// the compressor.
+// Application code that calls mmap() / vm_allocate() directly (bundled
+// allocators, SpiderMonkey GC arenas, Skia surfaces) bypasses the malloc path
+// and so escapes the compressor. With SMASH_TRACK_EXTERNAL=1 these
+// interposers register such mappings via VmRegion's external-page hash, and
+// munmap / madvise / mprotect / vm_deallocate first settle smash's state for
+// tracked pages (free the blob, restore contents, untrack). Policy and the
+// shared helpers live in external_track.h (same code as the Linux wrappers).
 //
-// The interposers below register such mappings via VmRegion's external-
-// page hash so the compressor's tick can see them. Strict filters apply:
-//
-//   • mmap     — only MAP_ANON | PROT_WRITE. File-backed mappings would
-//                break msync semantics under compression and the OS
-//                already evicts them; non-writable mappings won't dirty.
-//   • mach_vm_allocate — anonymous by design; tracked when caller-
-//                requested protection includes VM_PROT_WRITE.
-//
-// munmap / vm_deallocate counterparts mark the pages EMPTY so the
-// compressor stops scanning them. Compressed-page leakage on unmap is
-// possible (we don't free associated compressed buffers) but bounded
-// by the workload's churn rate.
-//
-// External tracking is OFF by default. Set SMASH_TRACK_EXTERNAL=1 to
-// enable. Firefox 5-tab Wikipedia at 90 s crashes ~25 s earlier with
-// tracking on (35 s vs 60 s pre-port baseline) — the cause hasn't been
-// root-caused yet. Targets that don't have Firefox's allocation patterns
-// (e.g., a one-shot redb workload) are safe to opt in. The interposers
-// themselves still install (cost: one branch per mmap / mach_vm call);
-// only the page registration path is gated.
+//   • mmap     — private anonymous, exactly PROT_READ|PROT_WRITE.
+//   • mach_vm_allocate — anonymous by design; tracked in our own task.
 
 namespace {
 
-inline bool externalTrackingEnabled() {
-    static const bool enabled = []{
-        const char* v = std::getenv("SMASH_TRACK_EXTERNAL");
-        return v && v[0] == '1';
-    }();
-    return enabled;
-}
-
-// Register every page in [base, base+len) with the VmRegion's external
-// tracker and set its initial PageState to ACTIVE.
 inline void registerExternalRange(smash::VmRegion* vm, void* base, size_t len) {
-    if (!vm || !base || !len) return;
-    if (!externalTrackingEnabled()) return;
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
-    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
-               & ~(uintptr_t{smash::kPageSize} - 1);
-    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        size_t idx = vm->trackExternalPage(p);
-        if (idx == 0) continue;  // table full or page in contiguous arena
-        smash::g_smash_page_states_for_external
-            ? smash::g_smash_page_states_for_external->set(idx, smash::PageState::ACTIVE)
-            : (void)0;
-    }
+    smash::ext::registerRange(vm, base, len);
 }
 
 inline void deregisterExternalRange(smash::VmRegion* vm, void* base, size_t len) {
-    if (!vm || !base || !len) return;
-    if (!externalTrackingEnabled()) return;
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
-    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
-               & ~(uintptr_t{smash::kPageSize} - 1);
-    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        // Untrack UNDER the per-page lock: serializes against a compressor
-        // worker that may be mid-snapshot on this external page, so the real
-        // munmap (in the caller, AFTER this returns) can't pull the mapping out
-        // from under the worker's memcpy. Proven necessary + deadlock-free by
-        // model/SmashExternalRace.{lean,tla}. No mprotect/munmap is done while
-        // the lock is held here.
-        vm->untrackExternalPageLocked(p,
-            smash::g_smash_page_locks_for_external,
-            smash::g_smash_page_states_for_external);
-    }
+    smash::ext::detachRange(vm, base, len, smash::ext::kUnmap);
 }
 
 }  // namespace
 
-// ── mmap / munmap ───────────────────────────────────────────────────────────
+// ── mmap / munmap / madvise / mprotect ──────────────────────────────────────
 
 using mmap_fn = void*(*)(void*, size_t, int, int, int, off_t);
 using munmap_fn = int(*)(void*, size_t);
+using madvise_fn = int(*)(void*, size_t, int);
+using mprotect_fn = int(*)(void*, size_t, int);
 
 extern "C" void* smash_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset);
 SMASH_INTERPOSE(smash_mmap, mmap);
 extern "C" void* smash_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    auto* vm = smash::g_smash_vm_region;
+    // MAP_FIXED replaces the old mapping; restore tracked pages first (if the
+    // call fails the old mapping survives and must keep its data).
+    if (vm && (flags & MAP_FIXED) && addr && len)
+        smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
     void* ret = reinterpret_cast<mmap_fn>(smash_interpose_smash_mmap.original)(
         addr, len, prot, flags, fd, offset);
-    if (ret == MAP_FAILED) return ret;
-    // Filter to anonymous, writable, non-zero-length mappings. File-backed
-    // (fd != -1 or !MAP_ANON) and read-only mappings are ineligible.
-    bool anon = (flags & MAP_ANON) != 0;
-    bool writable = (prot & PROT_WRITE) != 0;
-    if (!anon || !writable || len == 0) return ret;
-    auto* vm = smash::g_smash_vm_region;
-    if (vm) registerExternalRange(vm, ret, len);
+    if (ret == MAP_FAILED || len == 0) return ret;
+    if (vm && smash::ext::eligibleMapping(prot, flags)) registerExternalRange(vm, ret, len);
     return ret;
 }
 
@@ -1238,6 +1219,159 @@ extern "C" int smash_munmap(void* addr, size_t len) {
     if (vm && addr && len) deregisterExternalRange(vm, addr, len);
     return reinterpret_cast<munmap_fn>(smash_interpose_smash_munmap.original)(addr, len);
 }
+
+extern "C" int smash_madvise(void* addr, size_t len, int advice);
+SMASH_INTERPOSE(smash_madvise, madvise);
+extern "C" int smash_madvise(void* addr, size_t len, int advice) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len && smash::ext::discardAdvice(advice))
+        smash::ext::detachRange(vm, addr, len, smash::ext::kPurge);
+    return reinterpret_cast<madvise_fn>(smash_interpose_smash_madvise.original)(addr, len, advice);
+}
+
+extern "C" int smash_mprotect(void* addr, size_t len, int prot);
+SMASH_INTERPOSE(smash_mprotect, mprotect);
+extern "C" int smash_mprotect(void* addr, size_t len, int prot) {
+    auto* vm = smash::g_smash_vm_region;
+    size_t tracked = 0;
+    if (vm && addr && len)
+        tracked = smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    int rc = reinterpret_cast<mprotect_fn>(smash_interpose_smash_mprotect.original)(addr, len, prot);
+    if (rc == 0 && tracked && prot == (PROT_READ | PROT_WRITE) &&
+        tracked == (smash::ext::pageUp(addr, len) - smash::ext::pageDown(addr)) / smash::kPageSize)
+        registerExternalRange(vm, addr, len);
+    return rc;
+}
+
+// ── pthread_sigmask / sigprocmask ───────────────────────────────────────────
+// Never let a thread block SIGSEGV/SIGBUS: a synchronous fault on a thread
+// that blocks them is not delivered to smash's decompression handler, the
+// process dies instead (jemalloc's background thread blocks every signal).
+// See the Linux wrappers in linux_syscall_wrappers.cpp.
+using sigmask_fn = int(*)(int, const sigset_t*, sigset_t*);
+namespace {
+inline const sigset_t* keepFaultSignals(int how, const sigset_t* set, sigset_t* copy) {
+    if (!set || how == SIG_UNBLOCK) return set;
+    if (!sigismember(set, SIGSEGV) && !sigismember(set, SIGBUS)) return set;
+    *copy = *set;
+    sigdelset(copy, SIGSEGV);
+    sigdelset(copy, SIGBUS);
+    return copy;
+}
+}  // namespace
+
+extern "C" int smash_pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
+SMASH_INTERPOSE(smash_pthread_sigmask, pthread_sigmask);
+extern "C" int smash_pthread_sigmask(int how, const sigset_t* set, sigset_t* old) {
+    sigset_t copy;
+    return reinterpret_cast<sigmask_fn>(smash_interpose_smash_pthread_sigmask.original)(
+        how, keepFaultSignals(how, set, &copy), old);
+}
+
+extern "C" int smash_sigprocmask(int how, const sigset_t* set, sigset_t* old);
+SMASH_INTERPOSE(smash_sigprocmask, sigprocmask);
+extern "C" int smash_sigprocmask(int how, const sigset_t* set, sigset_t* old) {
+    sigset_t copy;
+    return reinterpret_cast<sigmask_fn>(smash_interpose_smash_sigprocmask.original)(
+        how, keepFaultSignals(how, set, &copy), old);
+}
+
+// sigaltstack: never compress an alternate signal stack (handlers, smash's
+// SA_ONSTACK one included, run on it). Same as the Linux wrapper.
+using sigaltstack_fn = int(*)(const stack_t*, stack_t*);
+extern "C" int smash_sigaltstack(const stack_t* ss, stack_t* old);
+SMASH_INTERPOSE(smash_sigaltstack, sigaltstack);
+extern "C" int smash_sigaltstack(const stack_t* ss, stack_t* old) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && ss && !(ss->ss_flags & SS_DISABLE) && ss->ss_sp && ss->ss_size)
+        smash::ext::detachRange(vm, ss->ss_sp, ss->ss_size, smash::ext::kRestore);
+    return reinterpret_cast<sigaltstack_fn>(smash_interpose_smash_sigaltstack.original)(ss, old);
+}
+
+// mlock / mlockall: never compress locked memory (see the Linux wrappers).
+using mlock_fn = int(*)(const void*, size_t);
+using mlockall_fn = int(*)(int);
+extern "C" int smash_mlock(const void* addr, size_t len);
+SMASH_INTERPOSE(smash_mlock, mlock);
+extern "C" int smash_mlock(const void* addr, size_t len) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len)
+        smash::ext::detachRange(vm, const_cast<void*>(addr), len, smash::ext::kRestore);
+    return reinterpret_cast<mlock_fn>(smash_interpose_smash_mlock.original)(addr, len);
+}
+extern "C" int smash_mlockall(int flags);
+SMASH_INTERPOSE(smash_mlockall, mlockall);
+extern "C" int smash_mlockall(int flags) {
+    if (flags & MCL_FUTURE) smash::ext::g_no_new_tracking.store(true, std::memory_order_relaxed);
+    smash::ext::detachAll(smash::g_smash_vm_region);
+    return reinterpret_cast<mlockall_fn>(smash_interpose_smash_mlockall.original)(flags);
+}
+
+// ── Path-argument syscalls ──────────────────────────────────────────────────
+// A path on a compressed page makes the kernel's copyinstr fail with EFAULT
+// (no signal). Warm the string first; see warmString in syscall_compat.h.
+#define SMASH_WARM(p) smash::vm::warmString((p), smash::g_smash_vm_region)
+using open_fn = int(*)(const char*, int, ...);
+using openat_fn = int(*)(int, const char*, int, ...);
+using path2_fn = int(*)(const char*, const char*);
+using path1_fn = int(*)(const char*);
+using pathmode_fn = int(*)(const char*, mode_t);
+using pathint_fn = int(*)(const char*, int);
+
+extern "C" int smash_open(const char* path, int flags, ...);
+SMASH_INTERPOSE(smash_open, open);
+extern "C" int smash_open(const char* path, int flags, ...) {
+    int mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap); }
+    SMASH_WARM(path);
+    return reinterpret_cast<open_fn>(smash_interpose_smash_open.original)(path, flags, mode);
+}
+extern "C" int smash_openat(int fd, const char* path, int flags, ...);
+SMASH_INTERPOSE(smash_openat, openat);
+extern "C" int smash_openat(int fd, const char* path, int flags, ...) {
+    int mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap); }
+    SMASH_WARM(path);
+    return reinterpret_cast<openat_fn>(smash_interpose_smash_openat.original)(fd, path, flags, mode);
+}
+extern "C" int smash_rename(const char* a, const char* b);
+SMASH_INTERPOSE(smash_rename, rename);
+extern "C" int smash_rename(const char* a, const char* b) {
+    SMASH_WARM(a); SMASH_WARM(b);
+    return reinterpret_cast<path2_fn>(smash_interpose_smash_rename.original)(a, b);
+}
+extern "C" int smash_unlink(const char* p);
+SMASH_INTERPOSE(smash_unlink, unlink);
+extern "C" int smash_unlink(const char* p) {
+    SMASH_WARM(p);
+    return reinterpret_cast<path1_fn>(smash_interpose_smash_unlink.original)(p);
+}
+extern "C" int smash_rmdir(const char* p);
+SMASH_INTERPOSE(smash_rmdir, rmdir);
+extern "C" int smash_rmdir(const char* p) {
+    SMASH_WARM(p);
+    return reinterpret_cast<path1_fn>(smash_interpose_smash_rmdir.original)(p);
+}
+extern "C" int smash_mkdir(const char* p, mode_t m);
+SMASH_INTERPOSE(smash_mkdir, mkdir);
+extern "C" int smash_mkdir(const char* p, mode_t m) {
+    SMASH_WARM(p);
+    return reinterpret_cast<pathmode_fn>(smash_interpose_smash_mkdir.original)(p, m);
+}
+extern "C" int smash_access(const char* p, int m);
+SMASH_INTERPOSE(smash_access, access);
+extern "C" int smash_access(const char* p, int m) {
+    SMASH_WARM(p);
+    return reinterpret_cast<pathint_fn>(smash_interpose_smash_access.original)(p, m);
+}
+using fopen_fn = FILE*(*)(const char*, const char*);
+extern "C" FILE* smash_fopen(const char* p, const char* m);
+SMASH_INTERPOSE(smash_fopen, fopen);
+extern "C" FILE* smash_fopen(const char* p, const char* m) {
+    SMASH_WARM(p);
+    return reinterpret_cast<fopen_fn>(smash_interpose_smash_fopen.original)(p, m);
+}
+#undef SMASH_WARM
 
 // ── mach_vm_allocate / mach_vm_deallocate ────────────────────────────────────
 //

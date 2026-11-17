@@ -71,6 +71,18 @@ inline void walkPagesForFault(const void* buf, size_t len, VmRegion* vm) {
     warmPages(buf, len, vm);
 }
 
+// Path / string arguments (open, rename, unlink, ...): the kernel copies a
+// NUL-terminated string with strncpy_from_user, which fails with EFAULT when
+// it sits on a compressed page — e.g. a Valkey BGSAVE child's rename() of its
+// RDB file, whose target path is a heap sds. Read the string once from user
+// context (faults decompress it) when its first byte is smash-managed.
+// The hot path for any other string is one VmRegion::contains().
+inline void warmString(const char* s, VmRegion* vm) {
+    if (!s || !vm || !vm->contains(reinterpret_cast<uintptr_t>(s))) return;
+    const volatile char* p = s;
+    while (*p) ++p;
+}
+
 inline void walkIovecForFault(const struct iovec* iov, int iovcnt, VmRegion* vm) {
     for (int i = 0; i < iovcnt; ++i) {
         if (iov[i].iov_base && iov[i].iov_len)

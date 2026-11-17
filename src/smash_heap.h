@@ -65,6 +65,13 @@ extern std::atomic<int> g_thread_init_count;
 // Set after SmashHeap construction when compression is enabled.
 extern VmRegion* g_smash_vm_region;
 
+// True while the SmashHeap constructor runs. The syscall wrappers' lazy
+// dlsym() must not run then: on glibc < 2.34 dlsym callocs its dlerror state,
+// which re-enters the heap being constructed and spins in getHeap() (every
+// preloaded process hung on Ubuntu 20.04 / Debian 11 once init called the
+// interposed open()). They use their raw-syscall fallback instead.
+inline std::atomic<bool> g_heap_constructing{false};
+
 // Global pointer to the PageStateTable, used by the mmap / Mach VM
 // interposers to mark newly-tracked external pages as ACTIVE (or EMPTY
 // on unmap). Set when compression is initialized; nullptr otherwise.
@@ -78,6 +85,12 @@ extern PageStateTable* g_smash_page_states_for_external;
 // munmap that tears down the mapping → SIGSEGV (full-mode external-page race;
 // see model/SmashExternalRace.{lean,tla}). Same lifetime as the above.
 extern PageLockTable* g_smash_page_locks_for_external;
+
+// Detach hook into the compressor (CompressorThread::detachExternalRange) for
+// the external-mapping interposers (src/external_track.h); mode is a
+// CompressorThread::ExtDetach. Published with the globals above.
+using ExternalDetachFn = size_t (*)(uintptr_t start, uintptr_t end, int mode);
+extern std::atomic<ExternalDetachFn> g_smash_external_detach;
 
 // Profile-driven skip flag for external page tracking. Set by the
 // compressor when loading a profile that marks external pages as hot.
@@ -1159,6 +1172,8 @@ private:
     std::atomic<bool> compression_started_{false};
     std::atomic<int> warmup_count_{0};
 
+    static inline SmashHeap* s_external_self_ = nullptr;
+
     // Fault callback: decompress on access to compressed/monitored pages
     static bool faultCallback(uintptr_t fault_addr, void* ctx) {
         auto* self = static_cast<SmashHeap*>(ctx);
@@ -1285,6 +1300,10 @@ private:
 
 public:
     SmashHeap() {
+        g_heap_constructing.store(true, std::memory_order_relaxed);
+        struct ConstructingGuard {
+            ~ConstructingGuard() { g_heap_constructing.store(false, std::memory_order_relaxed); }
+        } constructing_guard;
         // Debug timing
         static const bool time_init = [] {
             const char* v = std::getenv("SMASH_TIME_INIT");
@@ -1402,6 +1421,15 @@ public:
             // interposers can serialize external-page untracking against a
             // compressor worker's snapshot read (full-mode external-page race).
             g_smash_page_locks_for_external = &page_locks_;
+            s_external_self_ = this;
+            g_smash_external_detach.store(
+                +[](uintptr_t start, uintptr_t end, int mode) -> size_t {
+                    auto& c = s_external_self_->compressor_;
+                    if (mode == 3) return c.detachAllExternal();  // ext::kRestoreAll
+                    return c.detachExternalRange(
+                        start, end, static_cast<CompressorThread::ExtDetach>(mode));
+                },
+                std::memory_order_release);
 
             // When external mmap tracking is active (SMASH_TRACK_EXTERNAL=1),
             // tracked pages live at addresses OUTSIDE the contiguous arena, so
@@ -2118,6 +2146,7 @@ public:
     }
 
     void threadInit() {
+        vm::installThreadAltStack();
         if (noThreadHooks()) return;
         if (!isCompressOnlyMode()) {
             getOrCreateThreadCache();
@@ -2138,6 +2167,7 @@ public:
         }
     }
     void threadCleanup() {
+        vm::releaseThreadAltStack();
         if (noThreadHooks()) return;
         if (isCompressOnlyMode()) return;
         ThreadCache*& tc = currentThreadCache();

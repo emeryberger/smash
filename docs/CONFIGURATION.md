@@ -28,7 +28,8 @@ Pick at most one; otherwise smash runs in full mode (it is the program's `malloc
 | `SMASH_MODE=compress_only` | unset | Track and compress heap pages without replacing `malloc`, for programs with their own allocator (jemalloc, tcmalloc, …). Pages are found through `/proc/self/maps` (Linux) or `vm_region` (macOS). |
 | `SMASH_LARGE_ONLY=1` | unset | Pass allocations of 16 KB or less to the system allocator; only larger ones go through smash. For runtimes with an optimized small-object allocator (Python 3.13+ uses mimalloc). |
 | `SMASH_LARGE_ONLY_THRESHOLD=N` | 16384 | The small/large cutoff in bytes when `SMASH_LARGE_ONLY=1`. |
-| `SMASH_TRACK_EXTERNAL=1` | unset | Also track anonymous, writable memory the program maps itself (`mmap` with `MAP_ANON \| PROT_WRITE`; `mach_vm_allocate`/`vm_allocate` on macOS), so the compressor sees it. File-backed and read-only mappings are never tracked. Opt-in because it has not been validated on Firefox-class workloads, where JS GC arenas and graphics surfaces bypass `malloc`. |
+| `SMASH_TRACK_EXTERNAL=1` | unset | Also track private anonymous `PROT_READ\|PROT_WRITE` memory the program maps itself (`mmap`, `sbrk`; `mach_vm_allocate`/`vm_allocate` on macOS), so the compressor sees it. This is how smash reaches a bundled allocator (jemalloc, mimalloc, tcmalloc) or CPython's obmalloc arenas. Shared, file-backed, read-only, executable, locked, stack and hugetlb mappings are never tracked; `munmap`/`madvise`/`mprotect`/`mremap`/`mlock` on tracked memory are handled. Opt-in; see [agents/external-tracking.md](../agents/external-tracking.md) for what blocks default-on. |
+| `SMASH_ALTSTACK=0\|1` | on iff `SMASH_TRACK_EXTERNAL=1` | Give each thread a 64 KiB alternate signal stack and run the fault handler on it (`SA_ONSTACK`), so a compressed coroutine/fiber stack can be decompressed on resume. |
 
 ## When pages are compressed
 

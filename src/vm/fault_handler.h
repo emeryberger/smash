@@ -141,6 +141,71 @@ inline int aarch64FaultIsWrite(const unsigned char* p, size_t len) {
 }
 #endif
 
+// ── Per-thread alternate signal stacks (SMASH_TRACK_EXTERNAL) ───────────────
+// With external tracking, a plain RW mmap can be a coroutine / fiber stack
+// (makecontext, boost.context, folly fibers: no MAP_STACK). While the
+// coroutine is suspended its stack is cold and gets compressed; on resume the
+// first touch faults with the stack pointer INSIDE the inaccessible range, so
+// the kernel cannot push a signal frame there and kills the process
+// (external_patterns_test "ucstack"). Running the handler on an alternate
+// stack fixes that: smash gives every thread it sees (threadInit) a 64 KiB
+// sigaltstack mapped with rawMmap (never tracked) and installs its handler
+// with SA_ONSTACK. Threads without an alternate stack are unaffected by
+// SA_ONSTACK; a thread whose app installs its own keeps the app's (see the
+// sigaltstack interposers, which also untrack it).
+// SMASH_ALTSTACK=0 disables; default on iff SMASH_TRACK_EXTERNAL=1.
+inline bool altStackWanted() {
+    static const bool on = [] {
+        const char* te = std::getenv("SMASH_TRACK_EXTERNAL");
+        const char* as = std::getenv("SMASH_ALTSTACK");
+        if (as) return as[0] == '1';
+        return te && te[0] == '1';
+    }();
+    return on;
+}
+inline constexpr size_t kAltStackSize = 64 * 1024;
+#if defined(__linux__)
+inline __thread __attribute__((tls_model("initial-exec"))) char* g_altstack_mem = nullptr;
+inline int rawSigaltstack(const stack_t* ss, stack_t* old) {
+    return static_cast<int>(syscall(SYS_sigaltstack, ss, old));
+}
+#else
+inline thread_local char* g_altstack_mem = nullptr;
+inline int rawSigaltstack(const stack_t* ss, stack_t* old) { return sigaltstack(ss, old); }
+#endif
+// Give the calling thread an alternate signal stack unless it has one.
+inline void installThreadAltStack() {
+    if (!altStackWanted() || g_altstack_mem) return;
+    stack_t cur{};
+    if (rawSigaltstack(nullptr, &cur) == 0 && !(cur.ss_flags & SS_DISABLE)) return;
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t total = kAltStackSize + page;  // + low guard page
+    void* m = rawMmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON);
+    if (m == MAP_FAILED) return;
+    (void)rawMprotect(m, page, PROT_NONE);
+    stack_t ss{};
+    ss.ss_sp = static_cast<char*>(m) + page;
+    ss.ss_size = kAltStackSize;
+    ss.ss_flags = 0;
+    if (rawSigaltstack(&ss, nullptr) != 0) { rawMunmap(m, total); return; }
+    g_altstack_mem = static_cast<char*>(m);
+}
+// Thread exit: disable the alternate stack if it is still ours, unmap it.
+inline void releaseThreadAltStack() {
+    char* m = g_altstack_mem;
+    if (!m) return;
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    stack_t cur{};
+    if (rawSigaltstack(nullptr, &cur) == 0 && cur.ss_sp == m + page) {
+        if (cur.ss_flags & SS_ONSTACK) return;  // running on it (can't happen at exit)
+        stack_t off{};
+        off.ss_flags = SS_DISABLE;
+        (void)rawSigaltstack(&off, nullptr);
+    }
+    g_altstack_mem = nullptr;
+    rawMunmap(m, kAltStackSize + page);
+}
+
 // Signal-based fault handler for macOS and Linux.
 // Uses SIGSEGV/SIGBUS to detect accesses to protected pages.
 class FaultHandler {
@@ -535,7 +600,7 @@ public:
 
         struct sigaction sa{};
         sa.sa_sigaction = signalHandler;
-        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER | (altStackWanted() ? SA_ONSTACK : 0);
         sigemptyset(&sa.sa_mask);
 
         sigaction(SIGSEGV, &sa, &old_sigsegv_);
@@ -611,7 +676,7 @@ public:
 
         struct sigaction sa{};
         sa.sa_sigaction = signalHandler;
-        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER | (altStackWanted() ? SA_ONSTACK : 0);
         sigemptyset(&sa.sa_mask);
         if (need_reinstall) sigaction(SIGSEGV, &sa, &old_sigsegv_);
         if (bus_reinstall) sigaction(SIGBUS, &sa, &old_sigbus_);

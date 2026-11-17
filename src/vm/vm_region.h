@@ -311,9 +311,21 @@ class VmRegion {
     //       them too. External pages get indices in
     //       [kVmMaxPages, kVmMaxPages + kTrackMaxPages); contiguous pages
     //       keep their existing low indices.
-    static constexpr size_t kTrackMaxPages = 128 * 1024;  // 128K pages (~2GB on 16K pages)
-    static constexpr size_t kTrackHashCap  = 256 * 1024;  // 2x headroom
+    // External slot budget: 4 GiB of tracked memory (1M pages at 4 KiB, 256K
+    // at 16 KiB). Every per-page table is demand-zero, so unused capacity costs
+    // address space, not RSS. Slots are recycled when pages are untracked
+    // (munmap / mremap / mprotect), so the budget bounds LIVE tracked memory,
+    // not cumulative mmap traffic (CPython arena churn used to exhaust a
+    // non-recycled budget and silently end tracking for the rest of the run).
+    static constexpr size_t kTrackMaxPages = (size_t{4} << 30) / kPageSize;
+    static constexpr size_t kTrackHashCap  = 2 * kTrackMaxPages;  // 2x headroom
     static constexpr size_t kTrackHashMask = kTrackHashCap - 1;
+    static constexpr int kTrackHashBits = __builtin_ctzll(kTrackHashCap);
+    static_assert((kTrackHashCap & kTrackHashMask) == 0, "hash cap must be a power of 2");
+    static constexpr uintptr_t kTombstone = ~uintptr_t{0};
+    static size_t trackHashSlot(uintptr_t key) {
+        return static_cast<size_t>(key * 0x9E3779B97F4A7C15ULL) >> (64 - kTrackHashBits);
+    }
 
     struct TrackEntry {
         std::atomic<uintptr_t> key{0};  // page addr >> kPageShift; 0 = empty/freed
@@ -332,6 +344,16 @@ class VmRegion {
     //                  the compressor won't iterate to slots-in-progress.
     std::atomic<size_t> external_slot_next_{0};
     std::atomic<size_t> external_count_{0};
+    // Live external pages (tracked minus untracked) — stats only.
+    std::atomic<size_t> external_live_{0};
+    // Serializes external-hash MUTATIONS (track / untrack / slot recycling) so
+    // tombstone reuse and tombstone-to-empty cleanup stay correct; lookups
+    // (fault handler, compressor) remain lock-free. Taken only on the mmap /
+    // munmap / madvise / mprotect interposer paths, never in a signal handler.
+    Spinlock track_lock_;
+    // Recycled external slot indices (local, i.e. idx - contig_pages_).
+    uint32_t* ext_free_slots_ = nullptr;
+    size_t ext_free_top_ = 0;
 
     // Flat direct page-index → Span* table. Sized to total_pages_ entries
     // (8 B each) and mmap'd with MAP_NORESERVE so we only pay RSS for the
@@ -353,10 +375,12 @@ class VmRegion {
         if (!track_hash_) return 0;
         uintptr_t key = addr >> kPageShift;
         if (key == 0) return 0;
-        size_t slot = static_cast<size_t>(key * 0x9E3779B97F4A7C15ULL) >> (64 - 18);
+        size_t slot = trackHashSlot(key);
         for (size_t i = 0; i < kTrackHashCap; ++i) {
             size_t s = (slot + i) & kTrackHashMask;
-            uintptr_t existing = track_hash_[s].key.load(std::memory_order_relaxed);
+            // acquire: pairs with trackExternalPage's key release-store, which
+            // follows the idx store (a reused tombstone slot changes idx).
+            uintptr_t existing = track_hash_[s].key.load(std::memory_order_acquire);
             if (existing == key)
                 return track_hash_[s].idx.load(std::memory_order_acquire);
             if (existing == 0)
@@ -373,8 +397,10 @@ public:
         for (size_t i = 0; i < kNumFreeShards; ++i) shards_[i].lock.lock();
         commit_lock_.lock();
         decommit_pool_lock_.lock();
+        track_lock_.lock();
     }
     void unlockForFork() SMASH_NO_TS_ANALYSIS {
+        track_lock_.unlock();
         decommit_pool_lock_.unlock();
         commit_lock_.unlock();
         for (size_t i = kNumFreeShards; i-- > 0;) shards_[i].lock.unlock();
@@ -398,6 +424,12 @@ public:
             BootstrapAlloc::instance().allocateZeroed(
                 kTrackMaxPages * sizeof(uintptr_t), 8));
         if (!track_hash_ || !track_reverse_) return false;
+        if (!tracking_mode_) {
+            ext_free_slots_ = static_cast<uint32_t*>(
+                BootstrapAlloc::instance().allocateZeroed(
+                    kTrackMaxPages * sizeof(uint32_t), 8));
+            if (!ext_free_slots_) return false;
+        }
 
         if (!tracking_mode_) {
             // Full mode: reserve contiguous VM region. total_pages_ covers
@@ -634,7 +666,7 @@ public:
             return v && v[0] == '1';
         }();
         if (landmines) {
-            (void)::mprotect(addr, num_pages * kPageSize, PROT_NONE);
+            (void)vm::rawMprotect(addr, num_pages * kPageSize, PROT_NONE);
             char buf[96];
             int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash landmine] free addr=%p npages=%zu range=[%p,%p)\n",
@@ -681,7 +713,7 @@ public:
 
         uintptr_t key = page_addr >> kPageShift;
         if (key == 0) return 0;
-        size_t slot = static_cast<size_t>(key * 0x9E3779B97F4A7C15ULL) >> (64 - 18);
+        size_t slot = trackHashSlot(key);
         for (size_t i = 0; i < kTrackHashCap; ++i) {
             size_t s = (slot + i) & kTrackHashMask;
             uintptr_t existing = track_hash_[s].key.load(std::memory_order_relaxed);
@@ -715,80 +747,111 @@ public:
     // logic processes external pages without modification.
     size_t trackExternalPage(uintptr_t page_addr) {
         if (tracking_mode_ || !track_hash_) return 0;
-        // Slot budget exhausted? Bail BEFORE touching the hash. Without this
-        // early-out, a mapping larger than the slot budget (e.g. a multi-GiB
-        // InnoDB buffer pool) keeps CAS-inserting keys — which succeed (line
-        // below) and only THEN discover local >= kTrackMaxPages — permanently
-        // polluting the table. Once the table fills, every further page probes
-        // the full kTrackHashCap before failing, turning registration into
-        // O(pages × cap): a single 6 GiB mmap wedged mariadbd startup for
-        // minutes. Reading external_slot_next_ up front caps total tracking
-        // work at O(kTrackMaxPages) regardless of how many pages arrive.
-        if (external_slot_next_.load(std::memory_order_relaxed) >= kTrackMaxPages)
-            return 0;
         // Page already covered by smash's own contiguous arena? Skip.
         auto b = reinterpret_cast<uintptr_t>(base_);
         if (page_addr >= b && page_addr < b + contig_pages_ * kPageSize)
             return 0;
-
         uintptr_t key = page_addr >> kPageShift;
-        if (key == 0) return 0;
-        size_t slot = static_cast<size_t>(key * 0x9E3779B97F4A7C15ULL) >> (64 - 18);
+        if (key == 0 || key == kTombstone) return 0;
+
+        LockGuard g(track_lock_);
+        // Slot budget exhausted (no fresh and no recycled slot)? Bail BEFORE
+        // touching the hash: a mapping larger than the budget (a multi-GiB
+        // InnoDB buffer pool) must not turn registration into O(pages × cap)
+        // probing — that wedged mariadbd startup for minutes.
+        if (ext_free_top_ == 0 &&
+            external_slot_next_.load(std::memory_order_relaxed) >= kTrackMaxPages)
+            return 0;
+
+        // Probe for the key; remember the first tombstone so a re-insert
+        // reuses it (otherwise mmap/munmap churn fills the table with
+        // tombstones and every miss probes the whole table).
+        size_t slot = trackHashSlot(key);
+        size_t reuse = SIZE_MAX;
+        size_t s = 0;
+        bool found_empty = false;
         for (size_t i = 0; i < kTrackHashCap; ++i) {
-            size_t s = (slot + i) & kTrackHashMask;
+            s = (slot + i) & kTrackHashMask;
             uintptr_t existing = track_hash_[s].key.load(std::memory_order_relaxed);
             if (existing == key)
                 return track_hash_[s].idx.load(std::memory_order_acquire);
-            if (existing == 0) {
-                uintptr_t expected = 0;
-                if (track_hash_[s].key.compare_exchange_strong(
-                        expected, key, std::memory_order_acq_rel)) {
-                    // Reserve a slot first (use relaxed since we control visibility)
-                    size_t local = external_slot_next_.fetch_add(1, std::memory_order_relaxed);
-                    if (local >= kTrackMaxPages) {
-                        // No more slots available
-                        return 0;
-                    }
-                    size_t idx = contig_pages_ + local;
-                    // Write address before publishing.
-                    track_reverse_[local] = page_addr;
-                    track_hash_[s].idx.store(idx, std::memory_order_release);
-                    // Only increment external_count_ AFTER everything is set.
-                    // This is what committedPages() reads, so the compressor
-                    // won't iterate to this index until the address is valid.
-                    // Use release so the address write is visible before the
-                    // count increment.
-                    external_count_.fetch_add(1, std::memory_order_release);
-                    return idx;
-                }
-                if (track_hash_[s].key.load(std::memory_order_relaxed) == key)
-                    return track_hash_[s].idx.load(std::memory_order_acquire);
+            if (existing == kTombstone) {
+                if (reuse == SIZE_MAX) reuse = s;
+                continue;
             }
+            if (existing == 0) { found_empty = true; break; }
         }
-        return 0;
+        if (reuse == SIZE_MAX) {
+            if (!found_empty) return 0;  // table full
+            reuse = s;
+        }
+
+        size_t local;
+        bool fresh = false;
+        if (ext_free_top_ > 0) {
+            local = ext_free_slots_[--ext_free_top_];
+        } else {
+            local = external_slot_next_.fetch_add(1, std::memory_order_relaxed);
+            fresh = true;
+        }
+        size_t idx = contig_pages_ + local;
+        // Publish order: reverse map, then index, then key — a lock-free
+        // lookup that matches the key always sees a valid index.
+        track_reverse_[local] = page_addr;
+        track_hash_[reuse].idx.store(idx, std::memory_order_release);
+        track_hash_[reuse].key.store(key, std::memory_order_release);
+        // external_count_ is the slot HIGH-WATER the compressor iterates to
+        // (committedPages()); bump it only for a fresh slot, after the address
+        // is written, so the compressor never walks a half-published slot.
+        if (fresh) external_count_.fetch_add(1, std::memory_order_release);
+        external_live_.fetch_add(1, std::memory_order_relaxed);
+        return idx;
     }
 
-    // Untrack a previously-registered external page (e.g. on munmap /
-    // vm_deallocate). Marks the hash slot as freed (key = ~0ULL — a
-    // tombstone — so the open-addressing probe skips past it but treats it
-    // as occupied for collision purposes). The PageStateTable entry must be
-    // cleared by the caller (set to EMPTY) so the compressor stops scanning
-    // that index.
-    void untrackExternalPage(uintptr_t page_addr) {
-        if (tracking_mode_ || !track_hash_) return;
+    // Untrack a previously-registered external page: drop its hash entry and
+    // clear its reverse-map slot. Returns the external index it had (0 if it
+    // was not tracked). If recycle, the slot goes back on the free list — the
+    // caller must already have reset every per-page table for idx (the
+    // compressor's detachExternalRange does), because the next registration
+    // hands the same idx to an unrelated page. Caller holds the page lock.
+    size_t untrackExternalPage(uintptr_t page_addr, bool recycle = false) {
+        if (tracking_mode_ || !track_hash_) return 0;
         uintptr_t key = page_addr >> kPageShift;
-        if (key == 0) return;
-        size_t slot = static_cast<size_t>(key * 0x9E3779B97F4A7C15ULL) >> (64 - 18);
+        if (key == 0 || key == kTombstone) return 0;
+        LockGuard g(track_lock_);
+        size_t slot = trackHashSlot(key);
         for (size_t i = 0; i < kTrackHashCap; ++i) {
             size_t s = (slot + i) & kTrackHashMask;
             uintptr_t existing = track_hash_[s].key.load(std::memory_order_relaxed);
-            if (existing == 0) return;  // not present
-            if (existing == key) {
-                // Mark with a tombstone so probe doesn't terminate early.
-                track_hash_[s].key.store(~uintptr_t{0}, std::memory_order_release);
-                return;
+            if (existing == 0) return 0;  // not present
+            if (existing != key) continue;
+            size_t idx = track_hash_[s].idx.load(std::memory_order_relaxed);
+            // Tombstone, then — if the probe chain ends right after this slot
+            // — turn this and any tombstones immediately before it back into
+            // empty slots. Safe under track_lock_: no live key can sit past an
+            // empty slot in its probe chain, and inserts are serialized.
+            track_hash_[s].key.store(kTombstone, std::memory_order_release);
+            size_t next = (s + 1) & kTrackHashMask;
+            if (track_hash_[next].key.load(std::memory_order_relaxed) == 0) {
+                size_t c = s;
+                while (track_hash_[c].key.load(std::memory_order_relaxed) == kTombstone) {
+                    track_hash_[c].key.store(0, std::memory_order_release);
+                    c = (c - 1) & kTrackHashMask;
+                    if (c == s) break;
+                }
             }
+            if (idx >= contig_pages_) {
+                size_t local = idx - contig_pages_;
+                if (local < kTrackMaxPages) {
+                    track_reverse_[local] = 0;
+                    if (recycle && ext_free_top_ < kTrackMaxPages)
+                        ext_free_slots_[ext_free_top_++] = static_cast<uint32_t>(local);
+                }
+            }
+            external_live_.fetch_sub(1, std::memory_order_relaxed);
+            return idx;
         }
+        return 0;
     }
 
     // Untrack an external page UNDER ITS PER-PAGE LOCK, the serialization the
@@ -808,6 +871,10 @@ public:
     // real_munmap AFTER this returns. So it cannot reintroduce the
     // TLB-shootdown-vs-page-lock deadlock documented in compressor_thread.h.
     // (locks/states are passed in to avoid a header dependency cycle.)
+    //
+    // Does not free a compressed blob or recycle the slot; the full-mode
+    // interposers use CompressorThread::detachExternalRange, which does both.
+    // This remains for callers without a compressor.
     void untrackExternalPageLocked(uintptr_t page_addr,
                                    PageLockTable* locks,
                                    PageStateTable* states) {
@@ -816,16 +883,11 @@ public:
         if (idx == 0) return;                       // not tracked
         if (locks) locks->lock(idx);
         if (states) states->set(idx, PageState::EMPTY);
-        untrackExternalPage(page_addr);             // tombstone the hash slot
-        // Clear the reverse map so pageAddress(idx) returns nullptr — a worker
-        // that observes the page post-untrack gets null and skips it instead of
-        // dereferencing a stale (soon-to-be-unmapped) address.
-        if (idx >= contig_pages_) {
-            size_t local = idx - contig_pages_;
-            if (local < kTrackMaxPages) track_reverse_[local] = 0;
-        }
+        untrackExternalPage(page_addr);             // tombstone + clear reverse map
         if (locks) locks->unlock(idx);
     }
+
+    size_t externalLivePages() const { return external_live_.load(std::memory_order_relaxed); }
 
     bool contains(uintptr_t addr) const {
         if (tracking_mode_) {
@@ -974,7 +1036,7 @@ public:
     // tracking but only used as a fast pre-filter, never for correctness).
     size_t externalSlotsRemaining() const {
         size_t used = external_slot_next_.load(std::memory_order_relaxed);
-        return used >= kTrackMaxPages ? 0 : kTrackMaxPages - used;
+        return (used >= kTrackMaxPages ? 0 : kTrackMaxPages - used) + ext_free_top_;
     }
     size_t rawNextPage() const { return next_page_.load(std::memory_order_acquire); }
 

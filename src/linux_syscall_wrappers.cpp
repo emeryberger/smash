@@ -22,6 +22,7 @@
 
 #include "smash_heap.h"
 #include "vm/syscall_compat.h"
+#include "external_track.h"
 
 #include <atomic>
 #include <dlfcn.h>
@@ -67,7 +68,8 @@ static const bool g_syscall_wrap_disabled = [] {
 #define SMASH_LAZY_RESOLVE(fn_type, name) \
     static fn_type real_##name = nullptr; \
     if (__builtin_expect(!real_##name, 0)) { \
-        if (!g_resolving_syscalls.load(std::memory_order_relaxed)) { \
+        if (!g_resolving_syscalls.load(std::memory_order_relaxed) && \
+            !smash::g_heap_constructing.load(std::memory_order_relaxed)) { \
             g_resolving_syscalls.store(true, std::memory_order_relaxed); \
             real_##name = reinterpret_cast<fn_type>(dlsym(RTLD_NEXT, #name)); \
             g_resolving_syscalls.store(false, std::memory_order_relaxed); \
@@ -503,6 +505,7 @@ SMASH_VISIBLE int fstatfs(int fd, struct statfs* st) {
 // Fall back via SYS_newfstatat (works on every modern arch including
 // arm64/riscv where SYS_stat doesn't exist).
 SMASH_VISIBLE int stat(const char* path, struct stat* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(const char*, struct stat*);
     SMASH_LAZY_RESOLVE(fn_t, stat);
     if (!real_stat) return syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
@@ -512,6 +515,7 @@ SMASH_VISIBLE int stat(const char* path, struct stat* st) {
 }
 
 SMASH_VISIBLE int lstat(const char* path, struct stat* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(const char*, struct stat*);
     SMASH_LAZY_RESOLVE(fn_t, lstat);
     if (!real_lstat) return syscall(SYS_newfstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
@@ -521,6 +525,7 @@ SMASH_VISIBLE int lstat(const char* path, struct stat* st) {
 }
 
 SMASH_VISIBLE int fstatat(int dirfd, const char* path, struct stat* st, int flags) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, const char*, struct stat*, int);
     SMASH_LAZY_RESOLVE(fn_t, fstatat);
     if (!real_fstatat) return syscall(SYS_newfstatat, dirfd, path, st, flags);
@@ -530,6 +535,7 @@ SMASH_VISIBLE int fstatat(int dirfd, const char* path, struct stat* st, int flag
 }
 
 SMASH_VISIBLE int stat64(const char* path, struct stat64* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(const char*, struct stat64*);
     SMASH_LAZY_RESOLVE(fn_t, stat64);
     if (!real_stat64) return syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
@@ -539,6 +545,7 @@ SMASH_VISIBLE int stat64(const char* path, struct stat64* st) {
 }
 
 SMASH_VISIBLE int lstat64(const char* path, struct stat64* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(const char*, struct stat64*);
     SMASH_LAZY_RESOLVE(fn_t, lstat64);
     if (!real_lstat64) return syscall(SYS_newfstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
@@ -548,6 +555,7 @@ SMASH_VISIBLE int lstat64(const char* path, struct stat64* st) {
 }
 
 SMASH_VISIBLE int fstatat64(int dirfd, const char* path, struct stat64* st, int flags) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, const char*, struct stat64*, int);
     SMASH_LAZY_RESOLVE(fn_t, fstatat64);
     if (!real_fstatat64) return syscall(SYS_newfstatat, dirfd, path, st, flags);
@@ -559,6 +567,7 @@ SMASH_VISIBLE int fstatat64(int dirfd, const char* path, struct stat64* st, int 
 // __xstat / __lxstat / __fxstatat (and _64 variants): glibc < 2.33 internal
 // symbols that the old stat / lstat / fstatat inlines forwarded to.
 SMASH_VISIBLE int __xstat(int ver, const char* path, struct stat* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, const char*, struct stat*);
     SMASH_LAZY_RESOLVE(fn_t, __xstat);
     if (!real___xstat) return syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
@@ -568,6 +577,7 @@ SMASH_VISIBLE int __xstat(int ver, const char* path, struct stat* st) {
 }
 
 SMASH_VISIBLE int __lxstat(int ver, const char* path, struct stat* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, const char*, struct stat*);
     SMASH_LAZY_RESOLVE(fn_t, __lxstat);
     if (!real___lxstat) return syscall(SYS_newfstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
@@ -577,6 +587,7 @@ SMASH_VISIBLE int __lxstat(int ver, const char* path, struct stat* st) {
 }
 
 SMASH_VISIBLE int __fxstatat(int ver, int dirfd, const char* path, struct stat* st, int flags) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, int, const char*, struct stat*, int);
     SMASH_LAZY_RESOLVE(fn_t, __fxstatat);
     if (!real___fxstatat) return syscall(SYS_newfstatat, dirfd, path, st, flags);
@@ -586,6 +597,7 @@ SMASH_VISIBLE int __fxstatat(int ver, int dirfd, const char* path, struct stat* 
 }
 
 SMASH_VISIBLE int __xstat64(int ver, const char* path, struct stat64* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, const char*, struct stat64*);
     SMASH_LAZY_RESOLVE(fn_t, __xstat64);
     if (!real___xstat64) return syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
@@ -595,6 +607,7 @@ SMASH_VISIBLE int __xstat64(int ver, const char* path, struct stat64* st) {
 }
 
 SMASH_VISIBLE int __lxstat64(int ver, const char* path, struct stat64* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, const char*, struct stat64*);
     SMASH_LAZY_RESOLVE(fn_t, __lxstat64);
     if (!real___lxstat64) return syscall(SYS_newfstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
@@ -604,6 +617,7 @@ SMASH_VISIBLE int __lxstat64(int ver, const char* path, struct stat64* st) {
 }
 
 SMASH_VISIBLE int __fxstatat64(int ver, int dirfd, const char* path, struct stat64* st, int flags) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, int, const char*, struct stat64*, int);
     SMASH_LAZY_RESOLVE(fn_t, __fxstatat64);
     if (!real___fxstatat64) return syscall(SYS_newfstatat, dirfd, path, st, flags);
@@ -616,6 +630,7 @@ SMASH_VISIBLE int __fxstatat64(int ver, int dirfd, const char* path, struct stat
 // no GLIBC_2.33 aliasing dance needed.
 SMASH_VISIBLE int statx(int dirfd, const char* path, int flags,
                          unsigned int mask, struct statx* buf) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(int, const char*, int, unsigned int, struct statx*);
     SMASH_LAZY_RESOLVE(fn_t, statx);
     if (!real_statx) return syscall(SYS_statx, dirfd, path, flags, mask, buf);
@@ -642,6 +657,7 @@ SMASH_VISIBLE ssize_t getdents64(int fd, void* dirp, size_t count) {
 }
 
 SMASH_VISIBLE ssize_t readlink(const char* path, char* buf, size_t bufsize) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = ssize_t(*)(const char*, char*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, readlink);
     if (!real_readlink) return syscall(SYS_readlinkat, AT_FDCWD, path, buf, bufsize);
@@ -652,6 +668,7 @@ SMASH_VISIBLE ssize_t readlink(const char* path, char* buf, size_t bufsize) {
 
 SMASH_VISIBLE ssize_t readlinkat(int dirfd, const char* path,
                                   char* buf, size_t bufsize) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = ssize_t(*)(int, const char*, char*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, readlinkat);
     if (!real_readlinkat) return syscall(SYS_readlinkat, dirfd, path, buf, bufsize);
@@ -737,6 +754,7 @@ SMASH_VISIBLE pid_t wait4(pid_t pid, int* wstatus, int options, struct rusage* r
 // POSIX path-form statfs. struct statvfs is similar in size to statfs (~112B);
 // heap-allocated when callers track multiple filesystems.
 SMASH_VISIBLE int statvfs(const char* path, struct statvfs* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = int(*)(const char*, struct statvfs*);
     SMASH_LAZY_RESOLVE(fn_t, statvfs);
     if (!real_statvfs) {
@@ -766,6 +784,7 @@ SMASH_VISIBLE int fstatvfs(int fd, struct statvfs* st) {
 // Used by SELinux/AppArmor labels, cap_net_raw, mac sandbox metadata, etc.
 SMASH_VISIBLE ssize_t getxattr(const char* path, const char* name,
                                 void* value, size_t size) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = ssize_t(*)(const char*, const char*, void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, getxattr);
     if (!real_getxattr) return syscall(SYS_getxattr, path, name, value, size);
@@ -776,6 +795,7 @@ SMASH_VISIBLE ssize_t getxattr(const char* path, const char* name,
 
 SMASH_VISIBLE ssize_t lgetxattr(const char* path, const char* name,
                                  void* value, size_t size) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = ssize_t(*)(const char*, const char*, void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, lgetxattr);
     if (!real_lgetxattr) return syscall(SYS_lgetxattr, path, name, value, size);
@@ -795,6 +815,7 @@ SMASH_VISIBLE ssize_t fgetxattr(int fd, const char* name,
 }
 
 SMASH_VISIBLE ssize_t listxattr(const char* path, char* list, size_t size) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = ssize_t(*)(const char*, char*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, listxattr);
     if (!real_listxattr) return syscall(SYS_listxattr, path, list, size);
@@ -804,6 +825,7 @@ SMASH_VISIBLE ssize_t listxattr(const char* path, char* list, size_t size) {
 }
 
 SMASH_VISIBLE ssize_t llistxattr(const char* path, char* list, size_t size) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     using fn_t = ssize_t(*)(const char*, char*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, llistxattr);
     if (!real_llistxattr) return syscall(SYS_llistxattr, path, list, size);
@@ -953,6 +975,21 @@ static inline void warmGlibcFileBuffer(FILE* stream, smash::VmRegion* vm) {
     }
 }
 
+// The stdio buffer is malloc'd lazily on a stream's first read — INSIDE
+// glibc, after the warm above — and in full mode it can land on a smash page
+// that is compressed, so glibc's internal read() into it fails with EFAULT
+// and the stream reports an error (Valkey: "Short read or OOM loading DB" on
+// every DEBUG RELOAD in full mode, with or without SMASH_TRACK_EXTERNAL).
+// When the stream had no buffer before the call and the call failed with
+// EFAULT, nothing was delivered or consumed (the first fill failed): warm the
+// new buffer, clear the error and retry once.
+static inline bool firstFillFaulted(FILE* stream, bool had_buf) {
+    if (!stream || had_buf || !stream->_IO_buf_base) return false;
+    if (!ferror(stream) || errno != EFAULT) return false;
+    clearerr(stream);
+    return true;
+}
+
 SMASH_VISIBLE size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     using fn_t = size_t(*)(void*, size_t, size_t, FILE*);
     SMASH_LAZY_RESOLVE(fn_t, fread);
@@ -962,7 +999,13 @@ SMASH_VISIBLE size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     bool pin_buf = total && bufferInHeap(ptr, total, vm);
     if (pin_buf) smash::vm::warmPages(ptr, total, vm);
     warmGlibcFileBuffer(stream, vm);
+    const bool had_buf = stream && stream->_IO_buf_base;
     size_t ret = real_fread(ptr, size, nmemb, stream);
+    if (ret < nmemb && firstFillFaulted(stream, had_buf)) {
+        warmGlibcFileBuffer(stream, vm);
+        if (pin_buf) smash::vm::warmPages(ptr, total, vm);
+        ret = real_fread(ptr, size, nmemb, stream);
+    }
     return ret;
 }
 
@@ -974,7 +1017,12 @@ SMASH_VISIBLE char* fgets(char* s, int size, FILE* stream) {
     bool pin_s = (s && size > 0) && bufferInHeap(s, static_cast<size_t>(size), vm);
     if (pin_s) smash::vm::warmPages(s, size, vm);
     warmGlibcFileBuffer(stream, vm);
+    const bool had_buf = stream && stream->_IO_buf_base;
     char* ret = real_fgets(s, size, stream);
+    if (!ret && firstFillFaulted(stream, had_buf)) {
+        warmGlibcFileBuffer(stream, vm);
+        ret = real_fgets(s, size, stream);
+    }
     return ret;
 }
 
@@ -984,7 +1032,12 @@ SMASH_VISIBLE int fgetc(FILE* stream) {
     if (!real_fgetc) return EOF;
     auto* vm = smash::g_smash_vm_region;
     warmGlibcFileBuffer(stream, vm);
+    const bool had_buf = stream && stream->_IO_buf_base;
     int ret = real_fgetc(stream);
+    if (ret == EOF && firstFillFaulted(stream, had_buf)) {
+        warmGlibcFileBuffer(stream, vm);
+        ret = real_fgetc(stream);
+    }
     return ret;
 }
 
@@ -1084,26 +1137,33 @@ SMASH_VISIBLE int fstat64_233(int fd, struct stat64* st) {
     return fstat64(fd, st);
 }
 SMASH_VISIBLE int stat_233(const char* path, struct stat* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return stat(path, st);
 }
 SMASH_VISIBLE int stat64_233(const char* path, struct stat64* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return stat64(path, st);
 }
 SMASH_VISIBLE int lstat_233(const char* path, struct stat* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return lstat(path, st);
 }
 SMASH_VISIBLE int lstat64_233(const char* path, struct stat64* st) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return lstat64(path, st);
 }
 SMASH_VISIBLE int fstatat_233(int dirfd, const char* path, struct stat* st, int flags) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return fstatat(dirfd, path, st, flags);
 }
 SMASH_VISIBLE int fstatat64_233(int dirfd, const char* path, struct stat64* st, int flags) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return fstatat64(dirfd, path, st, flags);
 }
 // statx was introduced in glibc 2.28 — binaries reference statx@GLIBC_2.28.
 SMASH_VISIBLE int statx_228(int dirfd, const char* path, int flags,
                              unsigned int mask, struct statx* buf) {
+    smash::vm::warmString(path, smash::g_smash_vm_region);
     return statx(dirfd, path, flags, mask, buf);
 }
 // getdents64 userspace function added in glibc 2.30 — binaries built
@@ -1126,109 +1186,196 @@ SMASH_VISIBLE ssize_t pwritev2_226(int fd, const struct iovec* iov, int iovcnt, 
     return pwritev2(fd, iov, iovcnt, offset, flags);
 }
 
-// ── External-mapping interposers (mmap / munmap) ────────────────────────────
+// ── Path-argument syscalls ──────────────────────────────────────────────────
 //
-// Application-direct mmap calls (e.g., SpiderMonkey GC arenas, jemalloc
-// internal slabs in projects that bundle it) bypass smash's malloc and so
-// escape compression. Track MAP_ANONYMOUS + PROT_WRITE mappings via
-// VmRegion's external-page hash so the compressor's tick can see them.
-// File-backed and read-only mappings are explicitly skipped (the former
-// would break msync semantics under compression; the latter never need it).
+// A path that lives on a compressed page makes the kernel's
+// strncpy_from_user fail with EFAULT; no signal is raised, so the fault
+// handler never gets a chance. Warm the string first (syscall_compat.h
+// warmString). These are thin wrappers over the raw syscalls (the *at forms,
+// which exist on every arch), so they never need dlsym — they can be reached
+// before the lazy resolver is usable. open/openat keep glibc's function (a
+// pthread cancellation point), resolved via dlsym.
+#define SMASH_WARM(path) smash::vm::warmString((path), smash::g_smash_vm_region)
+
+SMASH_VISIBLE int open(const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    SMASH_WARM(path);
+    using fn_t = int(*)(const char*, int, ...);
+    SMASH_LAZY_RESOLVE(fn_t, open);
+    if (!real_open) return static_cast<int>(syscall(SYS_openat, AT_FDCWD, path, flags, mode));
+    return real_open(path, flags, mode);
+}
+SMASH_VISIBLE int open64(const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    SMASH_WARM(path);
+    using fn_t = int(*)(const char*, int, ...);
+    SMASH_LAZY_RESOLVE(fn_t, open64);
+    if (!real_open64) return static_cast<int>(syscall(SYS_openat, AT_FDCWD, path, flags | O_LARGEFILE, mode));
+    return real_open64(path, flags, mode);
+}
+SMASH_VISIBLE int openat(int dirfd, const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    SMASH_WARM(path);
+    using fn_t = int(*)(int, const char*, int, ...);
+    SMASH_LAZY_RESOLVE(fn_t, openat);
+    if (!real_openat) return static_cast<int>(syscall(SYS_openat, dirfd, path, flags, mode));
+    return real_openat(dirfd, path, flags, mode);
+}
+SMASH_VISIBLE int openat64(int dirfd, const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    SMASH_WARM(path);
+    using fn_t = int(*)(int, const char*, int, ...);
+    SMASH_LAZY_RESOLVE(fn_t, openat64);
+    if (!real_openat64) return static_cast<int>(syscall(SYS_openat, dirfd, path, flags | O_LARGEFILE, mode));
+    return real_openat64(dirfd, path, flags, mode);
+}
+SMASH_VISIBLE int creat(const char* path, mode_t mode) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_openat, AT_FDCWD, path, O_CREAT | O_WRONLY | O_TRUNC, mode));
+}
+// arm64 has no renameat syscall, only renameat2.
+#ifdef SYS_renameat
+#define SMASH_SYS_RENAMEAT(f1, a, f2, b) syscall(SYS_renameat, f1, a, f2, b)
+#else
+#define SMASH_SYS_RENAMEAT(f1, a, f2, b) syscall(SYS_renameat2, f1, a, f2, b, 0)
+#endif
+SMASH_VISIBLE int rename(const char* from, const char* to) {
+    SMASH_WARM(from); SMASH_WARM(to);
+    return static_cast<int>(SMASH_SYS_RENAMEAT(AT_FDCWD, from, AT_FDCWD, to));
+}
+SMASH_VISIBLE int renameat(int fd1, const char* from, int fd2, const char* to) {
+    SMASH_WARM(from); SMASH_WARM(to);
+    return static_cast<int>(SMASH_SYS_RENAMEAT(fd1, from, fd2, to));
+}
+#ifdef SYS_renameat2
+SMASH_VISIBLE int renameat2(int fd1, const char* from, int fd2, const char* to, unsigned int flags) {
+    SMASH_WARM(from); SMASH_WARM(to);
+    return static_cast<int>(syscall(SYS_renameat2, fd1, from, fd2, to, flags));
+}
+#endif
+SMASH_VISIBLE int unlink(const char* path) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_unlinkat, AT_FDCWD, path, 0));
+}
+SMASH_VISIBLE int unlinkat(int dirfd, const char* path, int flags) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_unlinkat, dirfd, path, flags));
+}
+SMASH_VISIBLE int rmdir(const char* path) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_unlinkat, AT_FDCWD, path, AT_REMOVEDIR));
+}
+SMASH_VISIBLE int mkdir(const char* path, mode_t mode) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_mkdirat, AT_FDCWD, path, mode));
+}
+SMASH_VISIBLE int mkdirat(int dirfd, const char* path, mode_t mode) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_mkdirat, dirfd, path, mode));
+}
+SMASH_VISIBLE int access(const char* path, int mode) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_faccessat, AT_FDCWD, path, mode));
+}
+SMASH_VISIBLE int chdir(const char* path) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_chdir, path));
+}
+SMASH_VISIBLE int truncate(const char* path, off_t len) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_truncate, path, len));
+}
+SMASH_VISIBLE int link(const char* from, const char* to) {
+    SMASH_WARM(from); SMASH_WARM(to);
+    return static_cast<int>(syscall(SYS_linkat, AT_FDCWD, from, AT_FDCWD, to, 0));
+}
+SMASH_VISIBLE int symlink(const char* target, const char* path) {
+    SMASH_WARM(target); SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_symlinkat, target, AT_FDCWD, path));
+}
+SMASH_VISIBLE int chmod(const char* path, mode_t mode) {
+    SMASH_WARM(path);
+    return static_cast<int>(syscall(SYS_fchmodat, AT_FDCWD, path, mode));
+}
+// fopen opens through glibc's internal __open, which no wrapper sees: warm
+// the path here (Valkey's DEBUG RELOAD fopen()s its heap-held RDB path).
+SMASH_VISIBLE FILE* fopen(const char* path, const char* mode) {
+    SMASH_WARM(path);
+    using fn_t = FILE*(*)(const char*, const char*);
+    SMASH_LAZY_RESOLVE(fn_t, fopen);
+    if (!real_fopen) { errno = ENOSYS; return nullptr; }
+    return real_fopen(path, mode);
+}
+SMASH_VISIBLE FILE* fopen64(const char* path, const char* mode) {
+    SMASH_WARM(path);
+    using fn_t = FILE*(*)(const char*, const char*);
+    SMASH_LAZY_RESOLVE(fn_t, fopen64);
+    if (!real_fopen64) { errno = ENOSYS; return nullptr; }
+    return real_fopen64(path, mode);
+}
+SMASH_VISIBLE FILE* freopen(const char* path, const char* mode, FILE* f) {
+    SMASH_WARM(path);
+    using fn_t = FILE*(*)(const char*, const char*, FILE*);
+    SMASH_LAZY_RESOLVE(fn_t, freopen);
+    if (!real_freopen) { errno = ENOSYS; return nullptr; }
+    return real_freopen(path, mode, f);
+}
+#undef SMASH_WARM
+
+// ── External-mapping interposers (mmap / munmap / madvise / mprotect / mremap)
 //
-// External tracking is OFF by default; set SMASH_TRACK_EXTERNAL=1 to
-// enable. Same opt-in polarity as the macOS path — see smash_heap.cpp
-// for the rationale (Firefox-on-macOS regression with the registration
-// path active).
-
-namespace {
-
-inline bool externalTrackingEnabledLinux() {
-    static const bool enabled = []{
-        const char* v = std::getenv("SMASH_TRACK_EXTERNAL");
-        return v && v[0] == '1';
-    }();
-    return enabled;
-}
-
-inline void registerLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {
-    if (!vm || !base || !len) return;
-    if (!externalTrackingEnabledLinux()) return;
-    // Profile-driven skip: if we already know external pages are hot from a
-    // prior run, skip the O(pages) registration loop entirely.
-    if (smash::g_smash_skip_external_tracking.load(std::memory_order_acquire)) return;
-    // Safety check: page_states must be initialized
-    if (!smash::g_smash_page_states_for_external) return;
-
-    size_t npages = (len + smash::kPageSize - 1) / smash::kPageSize;
-
-    // Oversized single mapping guard. A mapping larger than the entire
-    // external-page slot budget can never be fully tracked, and such mappings
-    // are invariably app-managed arenas (a DB buffer pool, a JVM/GC heap) that
-    // the application keeps warm — so compressing them is counterproductive
-    // AND the registration loop would burn O(slot-budget) work inside the
-    // caller's mmap() (observed wedging mariadbd startup for minutes on a
-    // 6 GiB InnoDB buffer pool). Skip the whole mapping rather than tracking a
-    // useless prefix. Logged once so the coverage gap is never silent.
-    if (npages > vm->externalSlotCapacity()) {
-        static std::atomic<bool> warned{false};
-        bool expected = false;
-        if (warned.compare_exchange_strong(expected, true,
-                                           std::memory_order_relaxed)) {
-            char buf[192];
-            int n = smash::safe_snprintf(buf, sizeof(buf),
-                "[smash] SMASH_TRACK_EXTERNAL: skipping mmap of %zu pages "
-                "(> %zu slot budget) at %p — likely an app-managed arena kept "
-                "warm; not compressible. Further such skips are silent.\n",
-                npages, vm->externalSlotCapacity(), base);
-            if (n > 0) (void)!::write(2, buf, (size_t)n);
-        }
-        return;
-    }
-
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
-    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
-               & ~(uintptr_t{smash::kPageSize} - 1);
-    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        size_t idx = vm->trackExternalPage(p);
-        if (idx == 0) continue;
-        smash::g_smash_page_states_for_external->set(idx, smash::PageState::ACTIVE);
-    }
-}
-
-inline void deregisterLinuxExternalRange(smash::VmRegion* vm, void* base, size_t len) {
-    if (!vm || !base || !len) return;
-    if (!externalTrackingEnabledLinux()) return;
-    // Safety check: page_states must be initialized
-    if (!smash::g_smash_page_states_for_external) return;
-
-    auto start = reinterpret_cast<uintptr_t>(base) & ~(uintptr_t{smash::kPageSize} - 1);
-    auto end = (reinterpret_cast<uintptr_t>(base) + len + smash::kPageSize - 1)
-               & ~(uintptr_t{smash::kPageSize} - 1);
-    for (uintptr_t p = start; p < end; p += smash::kPageSize) {
-        // Untrack UNDER the per-page lock so a compressor worker mid-snapshot on
-        // this external page can't race the real munmap (in the caller, AFTER
-        // this returns) and read an unmapped page. Proven necessary +
-        // deadlock-free by model/SmashExternalRace.{lean,tla}: no
-        // mprotect/munmap is performed while the per-page lock is held.
-        vm->untrackExternalPageLocked(p,
-            smash::g_smash_page_locks_for_external,
-            smash::g_smash_page_states_for_external);
-    }
-}
-
-}  // namespace
+// Application-direct mmap calls (bundled jemalloc / mimalloc arenas, CPython
+// obmalloc arenas, FFmpeg frame pools) bypass smash's malloc and so escape
+// compression. With SMASH_TRACK_EXTERNAL=1, private anonymous RW mappings are
+// registered with VmRegion's external-page hash so the compressor's tick sees
+// them (policy: ext::eligibleMapping in external_track.h), and every later
+// call that changes such memory first settles smash's state for it
+// (ext::detachRange → CompressorThread::detachExternalRange).
+//
+// smash's own mmap/madvise/mprotect go through raw syscalls (platform_mem.h),
+// so none of these wrappers ever sees smash-internal memory.
 
 SMASH_VISIBLE void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     using fn_t = void*(*)(void*, size_t, int, int, int, off_t);
     SMASH_LAZY_RESOLVE(fn_t, mmap);
     if (!real_mmap) return MAP_FAILED;
-    void* ret = real_mmap(addr, len, prot, flags, fd, offset);
-    if (ret == MAP_FAILED) return ret;
-    bool anon = (flags & MAP_ANONYMOUS) != 0;
-    bool writable = (prot & PROT_WRITE) != 0;
-    if (!anon || !writable || len == 0) return ret;
     auto* vm = smash::g_smash_vm_region;
-    if (vm) registerLinuxExternalRange(vm, ret, len);
+    // MAP_FIXED replaces whatever was mapped there: settle tracked pages
+    // first. Restore (not discard): if the mmap fails, the old mapping may
+    // survive and must still hold its data.
+    if (vm && (flags & MAP_FIXED) && addr && len)
+        smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    void* ret = real_mmap(addr, len, prot, flags, fd, offset);
+    if (ret == MAP_FAILED || len == 0) return ret;
+    if (vm && smash::ext::eligibleMapping(prot, flags))
+        smash::ext::registerRange(vm, ret, len);
+    return ret;
+}
+
+// mmap64 is the LFS (Large File Support) version used internally by glibc
+SMASH_VISIBLE void* mmap64(void* addr, size_t len, int prot, int flags, int fd, off64_t offset) {
+    using fn_t = void*(*)(void*, size_t, int, int, int, off64_t);
+    SMASH_LAZY_RESOLVE(fn_t, mmap64);
+    if (!real_mmap64) return MAP_FAILED;
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && (flags & MAP_FIXED) && addr && len)
+        smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    void* ret = real_mmap64(addr, len, prot, flags, fd, offset);
+    if (ret == MAP_FAILED || len == 0) return ret;
+    if (vm && smash::ext::eligibleMapping(prot, flags))
+        smash::ext::registerRange(vm, ret, len);
     return ret;
 }
 
@@ -1237,26 +1384,175 @@ SMASH_VISIBLE int munmap(void* addr, size_t len) {
     SMASH_LAZY_RESOLVE(fn_t, munmap);
     if (!real_munmap) return -1;
     auto* vm = smash::g_smash_vm_region;
-    if (vm && addr && len) deregisterLinuxExternalRange(vm, addr, len);
+    // Untrack + free blobs under the per-page lock BEFORE the real munmap, so
+    // a compressor worker mid-snapshot can't read an unmapped page
+    // (model/SmashExternalRace.{lean,tla}); no syscall runs under the lock.
+    if (vm && addr && len) smash::ext::detachRange(vm, addr, len, smash::ext::kUnmap);
     return real_munmap(addr, len);
 }
 
-// mmap64 is the LFS (Large File Support) version used internally by glibc
-SMASH_VISIBLE void* mmap64(void* addr, size_t len, int prot, int flags, int fd, off64_t offset) {
-    using fn_t = void*(*)(void*, size_t, int, int, int, off64_t);
-    SMASH_LAZY_RESOLVE(fn_t, mmap64);
-    if (!real_mmap64) return MAP_FAILED;
-    void* ret = real_mmap64(addr, len, prot, flags, fd, offset);
-    if (ret == MAP_FAILED) return ret;
-    bool anon = (flags & MAP_ANONYMOUS) != 0;
-    bool writable = (prot & PROT_WRITE) != 0;
-    if (!anon || !writable || len == 0) return ret;
+// sbrk / __sbrk: bundled allocators that grow the program break themselves
+// (gperftools tcmalloc's SbrkSysAllocator calls __sbrk) get private anonymous
+// RW heap. glibc malloc's own break growth is an internal call and never
+// reaches these wrappers.
+namespace {
+using sbrk_fn = void* (*)(intptr_t);
+void* trackedSbrk(sbrk_fn real, intptr_t inc) {
     auto* vm = smash::g_smash_vm_region;
-    if (vm) registerLinuxExternalRange(vm, ret, len);
-    return ret;
+    if (vm && inc < 0) {
+        // Shrink: [brk+inc, brk) goes away. Drop smash's state first (same
+        // ordering as munmap, so no worker is mid-snapshot on it).
+        char* cur = static_cast<char*>(real(0));
+        if (cur != reinterpret_cast<char*>(-1))
+            smash::ext::detachRange(vm, cur + inc, static_cast<size_t>(-inc), smash::ext::kUnmap);
+    }
+    void* old = real(inc);
+    if (vm && inc > 0 && old != reinterpret_cast<void*>(-1))
+        smash::ext::registerRange(vm, old, static_cast<size_t>(inc));
+    return old;
+}
+}  // namespace
+
+SMASH_VISIBLE void* sbrk(intptr_t inc) {
+    using fn_t = void*(*)(intptr_t);
+    SMASH_LAZY_RESOLVE(fn_t, sbrk);
+    if (!real_sbrk) { errno = ENOMEM; return reinterpret_cast<void*>(-1); }
+    return trackedSbrk(real_sbrk, inc);
 }
 
-// mremap can grow/move mappings — track new range, untrack old if moved
+SMASH_VISIBLE void* __sbrk(intptr_t inc) {
+    using fn_t = void*(*)(intptr_t);
+    SMASH_LAZY_RESOLVE(fn_t, __sbrk);
+    if (!real___sbrk) { errno = ENOMEM; return reinterpret_cast<void*>(-1); }
+    return trackedSbrk(real___sbrk, inc);
+}
+
+// pthread_sigmask / sigprocmask: never let a thread block SIGSEGV / SIGBUS.
+// smash decompresses on the fault; a synchronous fault on a thread that has
+// them blocked is not delivered — the kernel resets the action to SIG_DFL and
+// kills the process. jemalloc's background purge thread is created with
+// every signal blocked (background_thread_create_signals_masked) and then
+// walks extent metadata smash may have compressed: under
+// SMASH_TRACK_EXTERNAL=1 bundled-jemalloc Valkey died this way within
+// seconds. Blocking a synchronous fault signal has no useful effect anyway
+// (it can't be postponed), so the only observable change is that an
+// asynchronous kill(SIGSEGV/SIGBUS) is no longer held pending.
+namespace {
+inline const sigset_t* keepFaultSignals(int how, const sigset_t* set, sigset_t* copy) {
+    if (!set || how == SIG_UNBLOCK) return set;
+    if (sigismember(set, SIGSEGV) != 1 && sigismember(set, SIGBUS) != 1) return set;
+    *copy = *set;
+    sigdelset(copy, SIGSEGV);
+    sigdelset(copy, SIGBUS);
+    return copy;
+}
+
+// Fallback before dlsym resolves: raw rt_sigprocmask, also stripping glibc's
+// internal SIGCANCEL / SIGSETXID (32, 33) as glibc itself does — blocking
+// SIGSETXID would hang setuid() in multithreaded processes.
+inline int rawSigmask(int how, const sigset_t* set, sigset_t* old) {
+    sigset_t copy;
+    if (set && how != SIG_UNBLOCK) {
+        copy = *set;
+        sigdelset(&copy, 32);
+        sigdelset(&copy, 33);
+        set = &copy;
+    }
+    return static_cast<int>(syscall(SYS_rt_sigprocmask, how, set, old, _NSIG / 8));
+}
+}  // namespace
+
+SMASH_VISIBLE int pthread_sigmask(int how, const sigset_t* set, sigset_t* old) {
+    using fn_t = int(*)(int, const sigset_t*, sigset_t*);
+    SMASH_LAZY_RESOLVE(fn_t, pthread_sigmask);
+    sigset_t copy;
+    set = keepFaultSignals(how, set, &copy);
+    if (!real_pthread_sigmask) return rawSigmask(how, set, old) == 0 ? 0 : errno;
+    return real_pthread_sigmask(how, set, old);
+}
+SMASH_VISIBLE int pthread_sigmask_232(int how, const sigset_t* set, sigset_t* old) {
+    return pthread_sigmask(how, set, old);
+}
+
+SMASH_VISIBLE int sigprocmask(int how, const sigset_t* set, sigset_t* old) {
+    using fn_t = int(*)(int, const sigset_t*, sigset_t*);
+    SMASH_LAZY_RESOLVE(fn_t, sigprocmask);
+    sigset_t copy;
+    set = keepFaultSignals(how, set, &copy);
+    if (!real_sigprocmask) return rawSigmask(how, set, old);
+    return real_sigprocmask(how, set, old);
+}
+
+// sigaltstack: signal handlers (smash's included, SA_ONSTACK) run on the
+// alternate stack, so it must never be compressed: untrack it (restoring
+// any compressed page) before the kernel starts using it.
+SMASH_VISIBLE int sigaltstack(const stack_t* ss, stack_t* old) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && ss && !(ss->ss_flags & SS_DISABLE) && ss->ss_sp && ss->ss_size)
+        smash::ext::detachRange(vm, ss->ss_sp, ss->ss_size, smash::ext::kRestore);
+    return smash::vm::rawSigaltstack(ss, old);
+}
+
+// mlock / mlock2 / mlockall: locked memory must stay resident (and may hold
+// secrets kept out of swap), so it must not be compressed. Untrack the range,
+// restoring any compressed page, before locking it. mlockall untracks every
+// external page; with MCL_FUTURE no later mapping is tracked either.
+SMASH_VISIBLE int mlock(const void* addr, size_t len) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len)
+        smash::ext::detachRange(vm, const_cast<void*>(addr), len, smash::ext::kRestore);
+    return static_cast<int>(syscall(SYS_mlock, addr, len));
+}
+SMASH_VISIBLE int mlock2(const void* addr, size_t len, unsigned int flags) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len)
+        smash::ext::detachRange(vm, const_cast<void*>(addr), len, smash::ext::kRestore);
+#ifdef SYS_mlock2
+    return static_cast<int>(syscall(SYS_mlock2, addr, len, flags));
+#else
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+SMASH_VISIBLE int mlockall(int flags) {
+    if (flags & MCL_FUTURE) smash::ext::g_no_new_tracking.store(true, std::memory_order_relaxed);
+    smash::ext::detachAll(smash::g_smash_vm_region);
+    return static_cast<int>(syscall(SYS_mlockall, flags));
+}
+
+// madvise: allocators purge freed extents with DONTNEED / FREE. Drop smash's
+// blob for those pages first, or a later access would decompress stale data
+// over memory the allocator believes is zero (jemalloc's calloc fast path).
+SMASH_VISIBLE int madvise(void* addr, size_t len, int advice) {
+    // Direct syscall (glibc's madvise is a bare syscall wrapper): no dlsym
+    // resolution window in which the call could fail.
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len && smash::ext::discardAdvice(advice))
+        smash::ext::detachRange(vm, addr, len, smash::ext::kPurge);
+    return static_cast<int>(syscall(SYS_madvise, addr, len, advice));
+}
+
+// mprotect: the app takes over the protection of these pages (guard pages,
+// read-only freezing, W^X). Put compressed contents back and untrack them,
+// then re-register if the range ends up plain RW again.
+SMASH_VISIBLE int mprotect(void* addr, size_t len, int prot) {
+    auto* vm = smash::g_smash_vm_region;
+    size_t tracked = 0;
+    if (vm && addr && len)
+        tracked = smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    int rc = static_cast<int>(syscall(SYS_mprotect, addr, len, prot));
+    // Only re-track a range that was wholly tracked before (so it is known
+    // private anonymous memory).
+    if (rc == 0 && tracked && prot == (PROT_READ | PROT_WRITE) &&
+        tracked == (smash::ext::pageUp(addr, len) - smash::ext::pageDown(addr)) / smash::kPageSize)
+        smash::ext::registerRange(vm, addr, len);
+    return rc;
+}
+
+// mremap can grow / shrink / move a mapping, carrying its (possibly PROT_NONE
+// compressed) pages along. Restore + untrack the old range first, re-register
+// the result.
 SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int flags, ...) {
     using fn_t = void*(*)(void*, size_t, size_t, int, ...);
     SMASH_LAZY_RESOLVE(fn_t, mremap);
@@ -1270,32 +1566,19 @@ SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int
         va_end(ap);
     }
 
-    void* ret;
-    if (flags & MREMAP_FIXED) {
-        ret = real_mremap(old_addr, old_size, new_size, flags, new_addr);
-    } else {
-        ret = real_mremap(old_addr, old_size, new_size, flags);
-    }
-
-    if (ret == MAP_FAILED) return ret;
-
     auto* vm = smash::g_smash_vm_region;
-    if (vm && externalTrackingEnabledLinux()) {
-        // If mapping moved (ret != old_addr), untrack old and track new
-        if (ret != old_addr) {
-            deregisterLinuxExternalRange(vm, old_addr, old_size);
-            registerLinuxExternalRange(vm, ret, new_size);
-        } else if (new_size > old_size) {
-            // Grew in place — track additional pages
-            registerLinuxExternalRange(vm,
-                reinterpret_cast<char*>(ret) + old_size,
-                new_size - old_size);
-        } else if (new_size < old_size) {
-            // Shrunk — untrack removed pages
-            deregisterLinuxExternalRange(vm,
-                reinterpret_cast<char*>(ret) + new_size,
-                old_size - new_size);
-        }
+    size_t tracked = 0;
+    if (vm && old_addr && old_size)
+        tracked = smash::ext::detachRange(vm, old_addr, old_size, smash::ext::kRestore);
+    if (vm && (flags & MREMAP_FIXED) && new_addr && new_size)
+        smash::ext::detachRange(vm, new_addr, new_size, smash::ext::kRestore);
+
+    void* ret = (flags & MREMAP_FIXED)
+        ? real_mremap(old_addr, old_size, new_size, flags, new_addr)
+        : real_mremap(old_addr, old_size, new_size, flags);
+    if (vm && tracked) {
+        if (ret != MAP_FAILED) smash::ext::registerRange(vm, ret, new_size);
+        else smash::ext::registerRange(vm, old_addr, old_size);  // unchanged
     }
     return ret;
 }
@@ -1306,6 +1589,7 @@ SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int
 __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 __asm__(".symver epoll_pwait_232,epoll_pwait@GLIBC_2.3.2");
 __asm__(".symver fstat_233,fstat@GLIBC_2.33");
+__asm__(".symver pthread_sigmask_232,pthread_sigmask@GLIBC_2.32");
 __asm__(".symver fstat64_233,fstat64@GLIBC_2.33");
 __asm__(".symver stat_233,stat@GLIBC_2.33");
 __asm__(".symver stat64_233,stat64@GLIBC_2.33");

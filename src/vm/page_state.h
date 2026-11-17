@@ -147,6 +147,21 @@ public:
         locks_[page_idx].clear(std::memory_order_release);
     }
 
+    // fork() child only: release every lock in [lo, hi) not held by the
+    // calling (= only surviving) thread. A lock another parent thread held
+    // at the instant of fork (a fault handler mid-restore, an interposer
+    // detaching an external page) has no owner left in the child and would
+    // deadlock the child's first access to that page.
+    void releaseForeignForFork(size_t lo, size_t hi) {
+        if (hi > num_pages_) hi = num_pages_;
+        const pthread_t self = pthread_self();
+        for (size_t i = lo; i < hi; ++i) {
+            if (owners_[i] == pthread_t{} || pthread_equal(owners_[i], self)) continue;
+            owners_[i] = pthread_t{};
+            locks_[i].clear(std::memory_order_release);
+        }
+    }
+
     // Used by the fault handler to detect self-recursion. compressPage
     // holds the lock while doing memcpy after PROT_READ; if the memcpy
     // SIGSEGVs (TLB inconsistency or smash state-machine bug), the

@@ -1533,6 +1533,11 @@ public:
         // release/acquire does NOT forbid the store-load reordering this
         // handshake relies on.
         paused_.store(true, std::memory_order_seq_cst);
+        // No external-page detach (munmap/madvise/mprotect interposer on
+        // another thread) may be mid-flight across fork: it holds per-page
+        // locks, and the child would inherit them locked.
+        ext_fork_pending_.store(true, std::memory_order_seq_cst);
+        while (ext_detach_inflight_.load(std::memory_order_seq_cst) != 0) sched_yield();
         // Coordinator wakes on its 10 ms tick boundary. Give it a few of
         // those (~50 ms total) to drain in_tick_ before we let fork proceed.
         for (int i = 0; i < 50 && in_tick_.load(std::memory_order_seq_cst); ++i)
@@ -1542,6 +1547,7 @@ public:
 
     // Resume after fork() in the parent.
     void resumeAfterFork() {
+        ext_fork_pending_.store(false, std::memory_order_release);
         paused_.store(false, std::memory_order_release);
     }
 
@@ -1552,6 +1558,18 @@ public:
     // Without this, the singleton's startCompression() CAS fails (because
     // compression_started_ is true) and the child runs with no compressor.
     void resetForFork() {
+        ext_fork_pending_.store(false, std::memory_order_release);
+        ext_detach_inflight_.store(0, std::memory_order_release);
+        // Page locks held by parent threads that don't exist here (a fault
+        // mid-restore): release them, or the child's first touch of that page
+        // spins forever. Observed: Valkey BGSAVE child at 100% CPU in
+        // PageLockTable::lock under SMASH_TRACK_EXTERNAL=1 (2 of ~30 runs).
+        if (locks_ && vm_) {
+            const size_t bump = vm_->rawNextPage(), contig = vm_->contigPages();
+            locks_->releaseForeignForFork(0, bump < contig ? bump : contig);
+            if (vm_->committedPages() > contig)
+                locks_->releaseForeignForFork(contig, vm_->committedPages());
+        }
         // Child: the inherited uffd refers to the PARENT's mm; never use it.
         if (uffd_ >= 0) { close(uffd_); uffd_ = -1; }
         vm::g_uffd_fd = -1;
@@ -9560,8 +9578,26 @@ public:
     // VmRegion's leaf track_lock_), so lock order matches handleFault.
     enum class ExtDetach : uint8_t { kUnmap, kPurge, kRestore };
 
+    // fork gate (see pauseForFork): detaches don't start while a fork is
+    // pending, and fork waits for in-flight ones.
+    std::atomic<int> ext_detach_inflight_{0};
+    std::atomic<bool> ext_fork_pending_{false};
+    struct DetachGate {
+        CompressorThread* t;
+        explicit DetachGate(CompressorThread* c) : t(c) {
+            for (;;) {
+                while (t->ext_fork_pending_.load(std::memory_order_seq_cst)) sched_yield();
+                t->ext_detach_inflight_.fetch_add(1, std::memory_order_seq_cst);
+                if (!t->ext_fork_pending_.load(std::memory_order_seq_cst)) break;
+                t->ext_detach_inflight_.fetch_sub(1, std::memory_order_seq_cst);
+            }
+        }
+        ~DetachGate() { t->ext_detach_inflight_.fetch_sub(1, std::memory_order_seq_cst); }
+    };
+
     size_t detachExternalRange(uintptr_t start, uintptr_t end, ExtDetach mode) {
         if (!vm_ || !states_ || !locks_) return 0;
+        DetachGate gate(this);
         const size_t contig = vm_->contigPages();
         size_t n = 0;
         for (uintptr_t p = start; p < end; p += kPageSize) {
@@ -9575,6 +9611,7 @@ public:
     // mlockall: restore and untrack every external page.
     size_t detachAllExternal() {
         if (!vm_ || !states_ || !locks_) return 0;
+        DetachGate gate(this);
         size_t n = 0;
         const size_t end = vm_->committedPages();
         for (size_t idx = vm_->contigPages(); idx < end; ++idx) {

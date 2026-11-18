@@ -457,6 +457,26 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# Linux uffd mode: pages UFFDIO_MOVE refuses (here: shared copy-on-write with
+# a fork child) must still be reclaimed, via the classic path. Both modes.
+if(NOT APPLE)
+  add_executable(move_refused_test move_refused_test.cpp)
+  set_target_properties(move_refused_test PROPERTIES CXX_STANDARD 20)
+  target_include_directories(move_refused_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(move_refused_test PRIVATE ${CMAKE_DL_LIBS})
+  foreach(lo 0 1)
+    set(_name test_move_refused)
+    if(lo)
+      set(_name test_move_refused_large_only)
+    endif()
+    add_test(NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=${lo}"
+        "SMASH_UFFD=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+        $<TARGET_FILE:move_refused_test>)
+    set_tests_properties(${_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endforeach()
+endif()
+
 # smash_hint_cold / smash_hint_hot / smash_get_stats, both modes. A 30 s cold
 # timeout means only the hint can make pages compress within the test.
 add_executable(public_api_test public_api_test.cpp)

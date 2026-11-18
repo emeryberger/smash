@@ -494,6 +494,34 @@ class CompressorThread {
     void notePageProtNone(size_t i) {
         if (uffdPage(i)) prot_none_[i] = 1;
     }
+    // UFFDIO_MOVE refused this page (EBUSY: not exclusively owned, e.g. still
+    // shared copy-on-write with a fork child, or pinned). Retrying MOVE every
+    // tick left it in COMPRESSED_SHADOW indefinitely: the blob AND the page
+    // resident, so compressing it cost memory instead of saving it. Reclaiming
+    // it some other way would not help either: the child still maps the frame,
+    // so dropping the parent's mapping frees nothing. (Routing it to the
+    // classic drop path instead was tried and made fork children read wrong
+    // data, 6-17/20 fork_stress runs on 2 cores.) Discard the shadow copy and
+    // back off; the page compresses again once it is cold and unshared.
+    // Page lock held; the caller unlocks.
+    // True from pauseForFork() until the fork completes. pauseForFork caps
+    // its wait for an in-flight tick (so a stuck tick can't deadlock fork()),
+    // so a tick that outlives the cap could MOVE a page out (making it
+    // MISSING) after uffdPrepareFork() passed it; the child, which has no
+    // uffd, would then read that page as zeros. Checked under the page lock
+    // (which uffdPrepareFork also takes) after paused_ is set.
+    bool forkPending() const { return paused_.load(std::memory_order_seq_cst); }
+    void noteMoveRefused(size_t i) {
+        releaseBlob(i);
+        compressed_[i] = {};
+        shadow_tick_[i] = 0;
+        if (page_tier_) page_tier_[i] = kTierNone;
+        cold_count_[i] = 0;
+        if (compress_fail_count_ && compress_fail_count_[i] < 255)
+            compress_fail_count_[i] = compress_fail_count_[i] + 1;
+        pstats::onExit(i, pstats::kShadowDiscard);
+        states_->set(i, PageState::ACTIVE);
+    }
     // In handleFault: this fault is a uffd MISSING fault (SIGBUS); a SIGSEGV
     // is a protection fault and takes the classic path.
     bool uffdFault(size_t i) const { return uffdPage(i) && vm::faultSignal() == SIGBUS; }
@@ -683,9 +711,20 @@ class CompressorThread {
         const size_t n = vm_->contigPages() < vm_->committedPages() ? vm_->contigPages()
                                                                     : vm_->committedPages();
         for (size_t i = 0; i < n; ++i) {
-            if (states_->get(i) != PageState::COMPRESSED || prot_none_[i]) continue;
+            // COMPRESSED_SHADOW too, decided under the page lock: the uffd
+            // reclaim MOVEs a page out (MISSING) before it marks it
+            // COMPRESSED, and the verify-mismatch path MOVEs one out and
+            // back, both while holding the lock. An unlocked "not COMPRESSED
+            // yet" skip let such a page reach the child MISSING and RW, which
+            // reads it as zeros (fork_stress: whole zero pages, prot rw-p).
+            // Every COMPRESSED page is protected whatever prot_none_ says:
+            // prot_none_ can be stale (set while the page is RW and MISSING),
+            // and trusting it let such a page reach the child unprotected.
+            // mprotect(PROT_NONE) on a PROT_NONE page is a no-op.
+            const PageState pre = states_->get(i);
+            if (pre != PageState::COMPRESSED && pre != PageState::COMPRESSED_SHADOW) continue;
             locks_->lock(i);
-            if (states_->get(i) == PageState::COMPRESSED && !prot_none_[i]) {
+            if (states_->get(i) == PageState::COMPRESSED) {
                 vm::protectPages(vm_->pageAddress(i), kPageSize, false, false);
                 prot_none_[i] = 1;
             }
@@ -1524,12 +1563,17 @@ class CompressorThread {
     // proceed, so the child never inherits a half-done tick.
     std::atomic<bool> paused_{false};
     std::atomic<bool> in_tick_{false};
+    std::atomic<bool> fork_prepared_{false};  // pauseForFork done for this fork
 
 public:
     // Pause the coordinator (called from a pthread_atfork prepare handler in
     // the parent before fork()). Wait briefly for any in-flight tick to
     // finish. We cap the wait so a stuck tick can never deadlock fork().
     void pauseForFork() {
+        // Idempotent per fork: on Linux alloc8's pthread_atfork prepare (which
+        // calls SmashHeap::lock()) runs BEFORE smash's own, so lock() calls
+        // this first and smash's handler then finds it done.
+        if (fork_prepared_.exchange(true, std::memory_order_acq_rel)) return;
         // seq_cst store + seq_cst load: the Dekker pairing with coordEntry's
         // in_tick_-then-paused_ sequence (see the comment there). Plain
         // release/acquire does NOT forbid the store-load reordering this
@@ -1549,6 +1593,7 @@ public:
 
     // Resume after fork() in the parent.
     void resumeAfterFork() {
+        fork_prepared_.store(false, std::memory_order_release);
         ext_fork_pending_.store(false, std::memory_order_release);
         paused_.store(false, std::memory_order_release);
     }
@@ -1560,6 +1605,7 @@ public:
     // Without this, the singleton's startCompression() CAS fails (because
     // compression_started_ is true) and the child runs with no compressor.
     void resetForFork() {
+        fork_prepared_.store(false, std::memory_order_release);
         ext_fork_pending_.store(false, std::memory_order_release);
         ext_detach_inflight_.store(0, std::memory_order_release);
         // Page locks held by parent threads that don't exist here (a fault
@@ -3916,6 +3962,9 @@ private:
     // the page lock held, releases it. Returns false (lock still held, page
     // untouched) if the MOVE is refused, so the caller can fall back.
     bool uffdReclaim(size_t i, void* page_addr) {
+        // A fork is pending: don't create a MISSING page uffdPrepareFork may
+        // already have passed (see forkPending()). Retry next tick.
+        if (forkPending()) { locks_->unlock(i); return true; }
         int slot = acquireFaultSlot();
         if (slot < 0) { locks_->unlock(i); return true; }  // busy: retry next tick
         void* scratch = scratchPage(slot);
@@ -3924,9 +3973,10 @@ private:
         if (!uffdMove(scratch, page_addr)) {
             if (uffd_move_fail_.fetch_add(1, std::memory_order_relaxed) == 0) {
                 char b[96];
-                int n = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); classic reclaim\n", errno);
+                int n = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); shadow discarded\n", errno);
                 if (n > 0) (void)!write(2, b, (size_t)n);
             }
+            noteMoveRefused(i);
             releaseFaultSlot(slot);
             return false;
         }
@@ -3993,13 +4043,19 @@ private:
             const size_t i = rb[k];
             void* page_addr = vm_->pageAddress(i);
             void* scratch = uffd_rbatch_ + static_cast<size_t>(k) * kPageSize;
+            if (forkPending()) {  // see forkPending(): stays SHADOW for now
+                if (wp_scan_) uffdWp(page_addr, true);
+                locks_->unlock(i);
+                continue;
+            }
             if (!uffdMove(scratch, page_addr)) {
                 if (uffd_move_fail_.fetch_add(1, std::memory_order_relaxed) == 0) {
                     char b[96];
-                    int m = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); retry\n", errno);
+                    int m = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); shadow discarded\n", errno);
                     if (m > 0) (void)!write(2, b, (size_t)m);
                 }
-                if (wp_scan_) uffdWp(page_addr, true);  // stays SHADOW, keep tracking writes
+                noteMoveRefused(i);  // now ACTIVE again
+                if (wp_scan_) uffdWp(page_addr, true);  // keep tracking writes
                 locks_->unlock(i);
                 continue;
             }

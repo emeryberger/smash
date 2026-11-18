@@ -358,6 +358,35 @@ function(add_observe_mode_test test_name large_only)
 endfunction()
 add_observe_mode_test(test_observe_full 0)
 add_observe_mode_test(test_observe_large_only 1)
+# Observe mode READ tracking through the idle-page bitmap (Linux; root via
+# `sudo -n`, CONFIG_IDLE_PAGE_TRACKING; skipped with 77 otherwise): a read-hot
+# region must not be projected and reads of a projected region must count as
+# refaults_read. _root: smash opens the bitmap itself; _idled: unprivileged,
+# through a smash-idled daemon the test starts for itself.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(observe_read_track_test observe_read_track_test.cpp)
+  foreach(_lo 0 1)
+    if(_lo)
+      set(_sfx large_only)
+      set(_arg large_only)
+    else()
+      set(_sfx full)
+      set(_arg "")
+    endif()
+    add_test(NAME test_observe_read_root_${_sfx}
+             COMMAND observe_read_track_test $<TARGET_FILE:smash> root ${_arg})
+    add_test(NAME test_observe_read_idled_${_sfx}
+             COMMAND observe_read_track_test $<TARGET_FILE:smash> idled $<TARGET_FILE:smash-idled> ${_arg})
+    # _thp: run only with THP "always" (else 77): pages in 2 MiB folios.
+    add_test(NAME test_observe_read_root_${_sfx}_thp
+             COMMAND observe_read_track_test $<TARGET_FILE:smash> root ${_arg} thp)
+    add_test(NAME test_observe_read_idled_${_sfx}_thp
+             COMMAND observe_read_track_test $<TARGET_FILE:smash> idled $<TARGET_FILE:smash-idled> ${_arg} thp)
+    set_tests_properties(test_observe_read_root_${_sfx} test_observe_read_idled_${_sfx}
+                         test_observe_read_root_${_sfx}_thp test_observe_read_idled_${_sfx}_thp
+                         PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endforeach()
+endif()
 
 # SMASH_CGROUP (container memory-limit policy). Unit test: parsers, the pure
 # policy decision, and the Monitor walking a fake pod/container cgroup tree.
@@ -727,6 +756,9 @@ endforeach()
 # regions; runs unprivileged (soft-dirty or the referenced fallback; idle-page
 # tracking when run as root). The _referenced variant forces the per-mapping
 # fallback, the only method on kernels without soft-dirty or page_idle access.
+# The _idle variants force the page_idle bitmap method (root via `sudo -n`,
+# CONFIG_IDLE_PAGE_TRACKING; skipped with 77 otherwise); _idle_thp backs the
+# target with transparent huge pages, whose tail PFNs the bitmap never tracks.
 if(TARGET smash-estimate)
   add_executable(estimate_target estimate_target.cpp)
   add_executable(estimate_test estimate_test.cpp)
@@ -734,7 +766,13 @@ if(TARGET smash-estimate)
            COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target>)
   add_test(NAME test_smash_estimate_referenced
            COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> referenced)
-  set_tests_properties(test_smash_estimate test_smash_estimate_referenced PROPERTIES TIMEOUT 60)
+  add_test(NAME test_smash_estimate_idle
+           COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> idle)
+  add_test(NAME test_smash_estimate_idle_thp
+           COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> idle thp)
+  set_tests_properties(test_smash_estimate test_smash_estimate_referenced
+                       test_smash_estimate_idle test_smash_estimate_idle_thp PROPERTIES TIMEOUT 60)
+  set_tests_properties(test_smash_estimate_idle test_smash_estimate_idle_thp PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # ── Deployment safety: kill switch, watchdog, SLO controller (agents/safety.md) ──

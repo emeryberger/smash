@@ -46,6 +46,7 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 #include <sys/socket.h>
 #include <sys/un.h>
 #include "smash/idled_protocol.h"
+#include "../vm/page_idle.h"
 #endif
 #include "../vm/syscall_compat.h"
 
@@ -775,12 +776,7 @@ class CompressorThread {
     size_t compress_run_end_[kMaxCompressorWorkers]{};
     void armReadCheck(size_t i, int worker_id) {
 #ifdef __linux__
-        if (idle_read_ok_ == 1 && idled_) {
-            if (i < idled_npages_) { read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; idledArm(i); return; }
-        } else if (idle_read_ok_ == 1) {
-            uint64_t pfn = pfnForPage(i);
-            if (pfn) { markPageIdle(pfn); read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; return; }
-        }
+        if (armIdleRead(i)) { read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; return; }
 #endif
         if (observe_) return;  // never PROT_NONE in observe mode
         // Charge 2 VMAs per contiguous run, not per page: page i-1 armed
@@ -1031,7 +1027,11 @@ class CompressorThread {
     // ensureIdleReadFds() probes both conditions; on failure idle_read_ok_ stays
     // false and we fall back to the existing PROT_NONE read-arm, byte-identical.
     [[maybe_unused]] int page_idle_fd_ = -1;     // /sys/kernel/mm/page_idle/bitmap
+    [[maybe_unused]] int kpageflags_fd_ = -1;    // /proc/kpageflags: THP head PFN (vm/page_idle.h)
     [[maybe_unused]] int idle_read_ok_ = -1;     // -1 unprobed, 0 unavailable, 1 active
+    // Per page: idle bit set by armIdleRead() since the last access seen; only
+    // these pages' bits mean anything (an unarmed page reads "accessed").
+    [[maybe_unused]] uint8_t* idle_armed_ = nullptr;
     // smash-idled client (see include/smash/idled_protocol.h). Unprivileged
     // processes get the idle-bitmap read signal from a root daemon: arms are
     // queued and sent in batches as Phase 2 makes them; the read check is one
@@ -1655,6 +1655,7 @@ public:
         // page_idle bitmap fd is process-global (not /proc/self), but re-probe
         // in the child since PFNs and privilege may differ; reset the cache.
         if (page_idle_fd_ >= 0)  { close(page_idle_fd_);  page_idle_fd_ = -1; }
+        if (kpageflags_fd_ >= 0) { close(kpageflags_fd_); kpageflags_fd_ = -1; }
         idle_read_ok_ = -1;
         // The smash-idled socket is the parent's connection (registered for
         // the parent's pid): drop our copy and let the child connect afresh.
@@ -2034,13 +2035,7 @@ private:
         // A real run's reclaimed page faults on ANY access. Reads are only
         // visible through the idle bitmap; arm it so phase1's existing
         // idle-bit check reports a read as an access (fault-free).
-        if (idle_read_ok_ == 1 && read_armed_) {
-            if (idled_) {
-                if (i < idled_npages_) { read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; idledArm(i); }
-            } else if (uint64_t pfn = pfnForPage(i)) {
-                markPageIdle(pfn); read_armed_[i] = 1; arm_cc_[i] = cold_count_[i];
-            }
-        }
+        if (armIdleRead(i) && read_armed_) { read_armed_[i] = 1; arm_cc_[i] = cold_count_[i]; }
 #endif
     }
 
@@ -2150,12 +2145,17 @@ private:
 
                 bool accessed = written;
 #ifdef __linux__
-                // Read detection via idle-page tracking: a page armed idle (in
-                // escalateToDeepMonitoring) whose idle bit was CLEARED has been
-                // read since — count that as an access, fault-free. soft-dirty
+                // Read detection via idle-page tracking: a page armed idle
+                // (armIdleRead) whose idle bit was CLEARED has been read since
+                // — count that as an access, fault-free. soft-dirty
                 // (accessed_) only covers writes; this adds the read signal.
-                if (!accessed && idle_read_ok_ == 1 &&
-                    (st == PageState::ACTIVE_MONITORING || (read_armed_ && read_armed_[i]))) {
+                // Only ARMED pages: an ACTIVE_MONITORING page is armed at the
+                // base floor (escalateToDeepMonitoring); before that its bit
+                // was never set and always read "accessed", which reset its
+                // cold count every tick so it never reached the floor — with
+                // PROT_READ write tracking (no soft-dirty: arm64) nothing was
+                // ever compressed once idle tracking was on.
+                if (!accessed && idle_read_ok_ == 1 && idle_armed_ && idle_armed_[i]) {
                     if (idled_) {
                         if (i < idled_npages_ && idle_hit_[i]) accessed = true;
                     } else {
@@ -2172,6 +2172,7 @@ private:
                     // the page's holes with hot objects (see v58 note).
                     cold_count_[i] = (restore_mark_ && restore_mark_[i]) ? refaultColdStart() : 0;
                     if (read_armed_) read_armed_[i] = 0;
+                    if (idle_armed_) idle_armed_[i] = 0;
                     // Access can change contents — the incompressibility
                     // verdict behind the ratio-gate backoff is stale.
                     compress_fail_count_[i] = 0;
@@ -2186,6 +2187,7 @@ private:
                 }
             } else if (st == PageState::COMPRESSED) {
                 if (read_armed_) read_armed_[i] = 0;  // a restore re-arms from scratch
+                if (idle_armed_) idle_armed_[i] = 0;
                 // Keep counting for compressed pages so zstd upgrade can trigger
                 if (cold_count_[i] < 255) cold_count_[i]++;
                 decayRecompressCount(i);
@@ -2631,13 +2633,8 @@ private:
         // avoids both the mprotect arm here and the per-read SIGSEGV. Only taken
         // when the privileged probe passed — otherwise falls through to the
         // legacy PROT_NONE path below, byte-identical to before.
-        if (idle_read_ok_ == 1 && idled_) {
-            if (page_idx < idled_npages_) { idledArm(page_idx); return; }
-        } else if (idle_read_ok_ == 1) {
-            uint64_t pfn = pfnForPage(page_idx);
-            if (pfn) { markPageIdle(pfn); return; }
-            // PFN vanished (page swapped/migrated) → fall through to PROT_NONE.
-        }
+        // A page whose PFN vanished (swapped/migrated) falls through to PROT_NONE.
+        if (armIdleRead(page_idx)) return;
 #endif
         // Observe mode: deep monitoring is a PROT_NONE arm — never applied.
         // Read-hot pages stay invisible unless the idle bitmap is usable.
@@ -4559,7 +4556,8 @@ private:
         if (np > idled_npages_ || !idle_hit_) idle_hit_ = bootstrapArray<uint8_t>(np);
         if (!idled_buf_) idled_buf_ = bootstrapArray<uint32_t>(kMaxBatch);
         if (!idled_out_) idled_out_ = bootstrapArray<uint8_t>(kMaxBatch);
-        if (!idle_hit_ || !idled_buf_ || !idled_out_) { close(fd); idled_fd_ = -1; return; }
+        if (!idle_armed_) idle_armed_ = bootstrapArray<uint8_t>(vm_->totalPages());
+        if (!idle_hit_ || !idled_buf_ || !idled_out_ || !idle_armed_) { close(fd); idled_fd_ = -1; return; }
         idled_npages_ = np;
         idled_pid_ = getpid();
         idled_ = true;
@@ -4605,7 +4603,7 @@ private:
         uint32_t n = 0;
         for (size_t i = 0; i < end; ++i) {
             idle_hit_[i] = 1;
-            if (states_->get(i) != PageState::ACTIVE_MONITORING && !(read_armed_ && read_armed_[i])) continue;
+            if (!idle_armed_ || !idle_armed_[i]) continue;
             idled_buf_[n++] = static_cast<uint32_t>(i);
             if (n == smash::idled::kMaxBatch) { if (!idledQueryBatch(n)) return; n = 0; }
         }
@@ -4659,6 +4657,12 @@ private:
             }
             return false;
         }
+        // Readable whenever PFNs are (same privilege). Without it a page of a
+        // transparent huge page is armed by its tail PFN, which the bitmap
+        // ignores, and always reads as accessed (never read-cold).
+        kpageflags_fd_ = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
+        if (!idle_armed_) idle_armed_ = bootstrapArray<uint8_t>(vm_->totalPages());
+        if (!idle_armed_) { close(page_idle_fd_); page_idle_fd_ = -1; return false; }
         idle_read_ok_ = 1;
         return true;
 #else
@@ -4667,7 +4671,8 @@ private:
     }
 
 #ifdef __linux__
-    // Read the PFN for a smash page index from pagemap (0 if absent/redacted).
+    // The idle-bitmap PFN for a smash page index (0 if absent/redacted): the
+    // page's own PFN, or its folio's head PFN if it is part of a THP.
     uint64_t pfnForPage(size_t page_idx) {
         if (pagemap_fd_ < 0 || !vm_) return 0;
         void* pa = vm_->pageAddress(page_idx);
@@ -4676,7 +4681,7 @@ private:
         uint64_t e = 0;
         if (pread(pagemap_fd_, &e, sizeof(e), off) != (ssize_t)sizeof(e)) return 0;
         if (!((e >> 63) & 1)) return 0;  // not present
-        return e & ((1ULL << 55) - 1);
+        return vm::folioHeadPfn(kpageflags_fd_, e & ((1ULL << 55) - 1));
     }
 
     // Set the idle bit for a PFN (the bitmap is u64-per-64-PFN; bit = pfn%64).
@@ -4700,6 +4705,22 @@ private:
         if (pread(page_idle_fd_, &word, sizeof(word), word_off) != (ssize_t)sizeof(word))
             return false;
         return (word >> (pfn % 64)) & 1;
+    }
+
+    // Arm page i's idle-bit read check (in-process bitmap or smash-idled).
+    // False if idle tracking is off or the page has no PFN (not present).
+    bool armIdleRead(size_t i) {
+        if (idle_read_ok_ != 1 || !idle_armed_ || i >= vm_->totalPages()) return false;
+        if (idled_) {
+            if (i >= idled_npages_) return false;
+            idledArm(i);
+        } else {
+            const uint64_t pfn = pfnForPage(i);
+            if (!pfn) return false;
+            markPageIdle(pfn);
+        }
+        idle_armed_[i] = 1;
+        return true;
     }
 #endif
 

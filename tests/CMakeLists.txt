@@ -514,6 +514,37 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# io_uring fixed buffers (pinned pages) under SMASH_TRACK_EXTERNAL=1: a
+# pinned page must never be reclaimed out from under the kernel (uffd MOVE
+# refuses it), and liburing's io_uring_register_buffers of a compressed
+# buffer must succeed (libsmash untracks it first). Linux, both modes.
+if(NOT APPLE)
+  add_executable(iouring_pin_test iouring_pin_test.cpp)
+  set_target_properties(iouring_pin_test PROPERTIES CXX_STANDARD 20)
+  find_library(SMASH_LIBURING uring)
+  find_path(SMASH_LIBURING_INC liburing.h)
+  set(_iouring_cases pin)
+  if(SMASH_LIBURING AND SMASH_LIBURING_INC)
+    target_compile_definitions(iouring_pin_test PRIVATE SMASH_TEST_LIBURING=1)
+    target_include_directories(iouring_pin_test PRIVATE ${SMASH_LIBURING_INC})
+    target_link_libraries(iouring_pin_test PRIVATE ${SMASH_LIBURING})
+    list(APPEND _iouring_cases liburing)
+  endif()
+  foreach(lo 0 1)
+    foreach(c ${_iouring_cases})
+      set(_name test_iouring_${c})
+      if(lo)
+        set(_name ${_name}_large_only)
+      endif()
+      add_test(NAME ${_name}
+        COMMAND ${CMAKE_COMMAND} -E env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=${lo}"
+          "SMASH_TRACK_EXTERNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+          $<TARGET_FILE:iouring_pin_test> ${c})
+      set_tests_properties(${_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+  endforeach()
+endif()
+
 # Linux uffd mode: pages UFFDIO_MOVE refuses (here: shared copy-on-write with
 # a fork child) must still be reclaimed, via the classic path. Both modes.
 if(NOT APPLE)

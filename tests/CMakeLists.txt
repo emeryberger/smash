@@ -358,6 +358,35 @@ function(add_observe_mode_test test_name large_only)
 endfunction()
 add_observe_mode_test(test_observe_full 0)
 add_observe_mode_test(test_observe_large_only 1)
+# Observe mode READ tracking through the idle-page bitmap (Linux; root via
+# `sudo -n`, CONFIG_IDLE_PAGE_TRACKING; skipped with 77 otherwise): a read-hot
+# region must not be projected and reads of a projected region must count as
+# refaults_read. _root: smash opens the bitmap itself; _idled: unprivileged,
+# through a smash-idled daemon the test starts for itself.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(observe_read_track_test observe_read_track_test.cpp)
+  foreach(_lo 0 1)
+    if(_lo)
+      set(_sfx large_only)
+      set(_arg large_only)
+    else()
+      set(_sfx full)
+      set(_arg "")
+    endif()
+    add_test(NAME test_observe_read_root_${_sfx}
+             COMMAND observe_read_track_test $<TARGET_FILE:smash> root ${_arg})
+    add_test(NAME test_observe_read_idled_${_sfx}
+             COMMAND observe_read_track_test $<TARGET_FILE:smash> idled $<TARGET_FILE:smash-idled> ${_arg})
+    # _thp: run only with THP "always" (else 77): pages in 2 MiB folios.
+    add_test(NAME test_observe_read_root_${_sfx}_thp
+             COMMAND observe_read_track_test $<TARGET_FILE:smash> root ${_arg} thp)
+    add_test(NAME test_observe_read_idled_${_sfx}_thp
+             COMMAND observe_read_track_test $<TARGET_FILE:smash> idled $<TARGET_FILE:smash-idled> ${_arg} thp)
+    set_tests_properties(test_observe_read_root_${_sfx} test_observe_read_idled_${_sfx}
+                         test_observe_read_root_${_sfx}_thp test_observe_read_idled_${_sfx}_thp
+                         PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endforeach()
+endif()
 
 # SMASH_CGROUP (container memory-limit policy). Unit test: parsers, the pure
 # policy decision, and the Monitor walking a fake pod/container cgroup tree.

@@ -16,6 +16,7 @@
 // client's registered range, and only present + anonymous + exclusively
 // mapped ones.
 #include "smash/idled_protocol.h"
+#include "vm/page_idle.h"
 
 #include <algorithm>
 #include <atomic>
@@ -52,6 +53,7 @@ namespace {
 constexpr int kMaxClients = 256;
 std::atomic<int> g_clients{0};
 int g_bitmap = -1;
+int g_kpageflags = -1;  // THP: arm/query the folio head PFN (vm/page_idle.h)
 bool g_verbose = false;
 
 // The launcher: pid plus its start time (clock ticks since boot), so a
@@ -179,7 +181,8 @@ struct Client {
             }
             const uint64_t e = pm[i - w0];
             if (!(e & kPresent)) { absent[k] = 1; continue; }
-            if ((e & kPresent) && (e & kExclusive) && !(e & kFile)) pfn[k] = e & kPfnMask;
+            if ((e & kPresent) && (e & kExclusive) && !(e & kFile))
+                pfn[k] = smash::vm::folioHeadPfn(g_kpageflags, e & kPfnMask);
         }
     }
 
@@ -345,6 +348,7 @@ int main(int argc, char** argv) {
     }
     g_bitmap = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
     if (g_bitmap < 0) { std::perror("smash-idled: page_idle/bitmap (need root + CONFIG_IDLE_PAGE_TRACKING)"); return 1; }
+    g_kpageflags = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
     std::signal(SIGPIPE, SIG_IGN);
     int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un sa{};

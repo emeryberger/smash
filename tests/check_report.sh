@@ -15,7 +15,7 @@ else
 fi
 "$@" SMASH_LARGE_ONLY="$lo" SMASH_DEFER_PHASES_MS=0 SMASH_COLD_TIMEOUT_SEC=1 \
     SMASH_REPORT="$dir/report.%p" SMASH_METRICS_FILE="$dir/metrics.%p.prom" \
-    SMASH_METRICS_INTERVAL_SEC=1 "$prog" || fail "workload exited $?"
+    SMASH_METRICS_INTERVAL_SEC=1 SMASH_METRICS_RSS_PARTS=1 "$prog" || fail "workload exited $?"
 
 report=$(ls "$dir"/report.* 2>/dev/null | head -n 1)
 metrics=$(ls "$dir"/metrics.*.prom 2>/dev/null | head -n 1)
@@ -44,5 +44,20 @@ val() { sed -n "s/^$1 \([0-9.]*\)$/\1/p" "$metrics"; }
 inf=$(sed -n 's/^smash_fault_service_seconds_bucket{le="+Inf"} \([0-9]*\)$/\1/p' "$metrics")
 [ "$inf" = "$(val smash_fault_service_seconds_count)" ] || fail "+Inf bucket != _count"
 grep -q "^smash_config_large_only $lo\$" "$metrics" || fail "smash_config_large_only"
+# RSS by owner (SMASH_METRICS_RSS_PARTS=1): every part present, smash's own
+# metadata and store resident, and the accounted parts below RSS. On Linux
+# "other" (program image, libraries, stacks) must stay positive: counting with
+# mincore, the shared zero page that reads of never-written metadata map was
+# counted as resident and the parts summed to more than the RSS.
+part() { sed -n "s/^smash_rss_part_bytes{part=\"$1\"} \([0-9]*\)$/\1/p" "$metrics"; }
+for p in data_live data_shadow data_pending_madvise data_compressed_resident data_empty \
+         store_header store_data metadata other; do
+    [ -n "$(part $p)" ] || fail "smash_rss_part_bytes{part=$p} missing"
+done
+[ "$(part metadata)" -gt 0 ] || fail "metadata part is 0"
+[ "$(part store_header)" -gt 0 ] || fail "store_header part is 0"
+if [ "$(uname -s)" = Linux ]; then
+    [ "$(part other)" -gt 0 ] || fail "accounted RSS parts exceed the RSS (other = 0)"
+fi
 ls "$dir"/*.tmp.* >/dev/null 2>&1 && fail "temp file left behind (rename not atomic?)"
 echo "PASS: report + metrics (SMASH_LARGE_ONLY=$lo)"

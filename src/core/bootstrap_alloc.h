@@ -43,6 +43,20 @@ class BootstrapAlloc {
     std::atomic<uintptr_t> bounds_lo_{UINTPTR_MAX};
     std::atomic<uintptr_t> bounds_hi_{0};
 
+    // Direct mmaps from allocateZeroed() (>= 64 KiB: the per-page state
+    // arrays), recorded only so resident() can account them. Never unmapped.
+    static constexpr size_t kMaxDirect = 256;
+    struct Direct { std::atomic<char*> base{nullptr}; size_t len = 0; };
+    Direct direct_[kMaxDirect];
+    std::atomic<size_t> num_direct_{0};
+
+    void noteDirect(void* p, size_t len) {
+        size_t i = num_direct_.fetch_add(1, std::memory_order_relaxed);
+        if (i >= kMaxDirect) return;
+        direct_[i].len = len;
+        direct_[i].base.store(static_cast<char*>(p), std::memory_order_release);
+    }
+
     static size_t pageSize() {
         static const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
         return ps;
@@ -210,16 +224,34 @@ public:
             void* p = reinterpret_cast<void*>(
                 syscall(SYS_mmap, nullptr, rounded, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0));
-            return (p == MAP_FAILED) ? nullptr : p;
+            if (p == MAP_FAILED) return nullptr;
 #else
             // macOS: use vm::mapPages which doesn't go through our interposer
-            return vm::mapPages(rounded);
+            void* p = vm::mapPages(rounded);
+            if (!p) return nullptr;
 #endif
+            noteDirect(p, rounded);
+            return p;
         }
         // Small allocation: bump-allocate and memset
         void* p = allocate(size, align);
         if (p) __builtin_memset(p, 0, size);
         return p;
+    }
+
+    // Resident bytes of all bootstrap memory (bump regions + direct maps).
+    // Diagnostics only (rssBreakdown); no allocation.
+    size_t resident() const {
+        vm::ResidentScan rs;
+        size_t total = 0;
+        size_t n = num_regions_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i)
+            total += rs.residentBytes(regions_[i].base, regions_[i].committed.load(std::memory_order_acquire));
+        size_t d = num_direct_.load(std::memory_order_relaxed);
+        if (d > kMaxDirect) d = kMaxDirect;
+        for (size_t i = 0; i < d; ++i)
+            if (char* b = direct_[i].base.load(std::memory_order_acquire)) total += rs.residentBytes(b, direct_[i].len);
+        return total;
     }
 
     [[gnu::always_inline, gnu::hot]]

@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sys/syscall.h>
 // MADV_COLD / MADV_PAGEOUT are stable kernel ABI constants (Linux 5.4+) but
 // only appear in <sys/mman.h> from glibc 2.31. We build release artifacts on
@@ -398,5 +399,75 @@ inline void willNeedPages(void* addr, size_t size) {
     rawMadvise(addr, size, MADV_WILLNEED);
 #endif
 }
+
+// Resident-page scan for diagnostics (rssBreakdown and friends): calls
+// fn(k) for every page k of [addr, addr + npages * OS page) that holds a
+// private frame. Linux reads /proc/self/pagemap (present AND exclusively
+// mapped): mincore also reports the shared zero page that a read of a
+// never-written anonymous page maps, which RSS does not count (measured:
+// smash's metadata read as larger than the whole RSS). Falls back to mincore
+// when pagemap is unreadable and on other platforms. No allocation; raw
+// syscalls on Linux. Not for hot paths.
+class ResidentScan {
+#if defined(__linux__)
+    int fd_ = -1;
+#endif
+    size_t ps_ = 0;
+public:
+    ResidentScan() {
+        ps_ = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#if defined(__linux__)
+        fd_ = static_cast<int>(syscall(SYS_openat, AT_FDCWD, "/proc/self/pagemap", O_RDONLY | O_CLOEXEC));
+#endif
+    }
+    ~ResidentScan() {
+#if defined(__linux__)
+        if (fd_ >= 0) syscall(SYS_close, fd_);
+#endif
+    }
+    ResidentScan(const ResidentScan&) = delete;
+    ResidentScan& operator=(const ResidentScan&) = delete;
+    size_t pageSize() const { return ps_; }
+
+    template <class Fn>
+    void scan(const void* addr, size_t npages, Fn fn) const {
+#if defined(_WIN32)
+        (void)addr; (void)npages; (void)fn;
+#else
+        const uintptr_t base = reinterpret_cast<uintptr_t>(addr);
+        constexpr size_t kChunk = 512;
+#if defined(__linux__)
+        if (fd_ >= 0) {
+            uint64_t ent[kChunk];
+            for (size_t i = 0; i < npages; i += kChunk) {
+                const size_t n = npages - i < kChunk ? npages - i : kChunk;
+                const long got = syscall(SYS_pread64, fd_, ent, n * 8,
+                                         static_cast<long>((base / ps_ + i) * 8));
+                if (got <= 0) return;
+                const size_t k_end = static_cast<size_t>(got) / 8;
+                for (size_t k = 0; k < k_end; ++k)
+                    if ((ent[k] >> 63 & 1) && (ent[k] >> 56 & 1)) fn(i + k);
+            }
+            return;
+        }
+#endif
+        unsigned char vec[kChunk];
+        for (size_t i = 0; i < npages; i += kChunk) {
+            const size_t n = npages - i < kChunk ? npages - i : kChunk;
+#if defined(__APPLE__)
+            if (mincore(reinterpret_cast<void*>(base + i * ps_), n * ps_, reinterpret_cast<char*>(vec)) != 0) continue;
+#else
+            if (mincore(reinterpret_cast<void*>(base + i * ps_), n * ps_, vec) != 0) continue;
+#endif
+            for (size_t k = 0; k < n; ++k) if (vec[k] & 1) fn(i + k);
+        }
+#endif
+    }
+    size_t residentBytes(const void* addr, size_t len) const {
+        size_t n = 0;
+        scan(addr, (len + ps_ - 1) / ps_, [&](size_t) { ++n; });
+        return n * ps_;
+    }
+};
 
 } // namespace smash::vm

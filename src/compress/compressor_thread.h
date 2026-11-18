@@ -8770,6 +8770,9 @@ public:
     const char* cfg_report_ = nullptr;        // SMASH_REPORT
     const char* cfg_metrics_path_ = nullptr;  // SMASH_METRICS_FILE
     uint64_t cfg_metrics_interval_ns_ = 10ull * 1000000000ull;
+    // SMASH_METRICS_RSS_PARTS=1: also export smash_rss_part_bytes (a pagemap
+    // read per resident page per interval; off by default for big heaps).
+    bool cfg_metrics_rss_parts_ = false;
     uint64_t metrics_last_ns_ = 0;
     char* metrics_buf_ = nullptr;             // BootstrapAlloc, kMetricsBufSize
     static constexpr size_t kMetricsBufSize = 16384;
@@ -8781,6 +8784,7 @@ public:
         cfg_report_ = (r && *r && std::strcmp(r, "0") != 0) ? r : nullptr;
         const char* m = std::getenv("SMASH_METRICS_FILE");
         cfg_metrics_path_ = (m && *m) ? m : nullptr;
+        if (const char* rp = std::getenv("SMASH_METRICS_RSS_PARTS")) cfg_metrics_rss_parts_ = std::atoi(rp) != 0;
         if (const char* iv = std::getenv("SMASH_METRICS_INTERVAL_SEC")) {
             double sec = std::atof(iv);
             if (sec < 1) sec = 1;
@@ -8900,6 +8904,69 @@ public:
         return s;
     }
 
+    // Where the process's resident memory is, by smash's own accounting
+    // (mincore): data pages of the VmRegion split by page state, the
+    // CompressStore (header pages, blob pages, live blob bytes) and the
+    // bootstrap metadata. `other` = RSS minus all of these (program image,
+    // libraries, stacks, system-malloc memory, smash's other mappings).
+    // Used to decompose estimator error (bench/validate_estimator.py); cost
+    // is one mincore per 4096 data pages plus one per store region, so it
+    // is computed only for the metrics file and the observe JSON.
+    struct RssBreakdown {
+        uint64_t rss = 0;
+        uint64_t data_live = 0;      // ACTIVE / ACTIVE_MONITORING / COMPRESSING
+        uint64_t data_shadow = 0;    // COMPRESSED_SHADOW: frame + blob held
+        uint64_t data_pending = 0;   // COMPRESSED, deferred madvise not yet run
+        uint64_t data_compressed_resident = 0;  // COMPRESSED, not pending, still resident
+        uint64_t data_empty = 0;     // EMPTY (freed) pages still holding a frame
+        uint64_t store_header = 0, store_data = 0, store_live = 0, store_regions = 0;
+        uint64_t metadata = 0;       // BootstrapAlloc regions + direct maps
+        uint64_t other = 0;
+    };
+    __attribute__((noinline, cold)) RssBreakdown rssBreakdown() const {
+        RssBreakdown b;
+        b.rss = residentKb() * 1024;
+#if defined(__linux__) || defined(__APPLE__)
+        if (states_ && vm_) {
+            const size_t total = vm_->committedPages();
+            const size_t gap_lo = vm_->rawNextPage(), gap_hi = vm_->contigPages();
+            auto bucket = [&](size_t i) {
+                const PageState st = states_->get(i);
+                uint64_t* slot = &b.data_live;
+                if (st == PageState::EMPTY) slot = &b.data_empty;
+                else if (st == PageState::COMPRESSED_SHADOW) slot = &b.data_shadow;
+                else if (st == PageState::COMPRESSED)
+                    slot = (deferred_pending_ && deferred_pending_[i].load(std::memory_order_relaxed))
+                        ? &b.data_pending : &b.data_compressed_resident;
+                *slot += kPageSize;
+            };
+            vm::ResidentScan rs;
+            // Contiguous arena [0, min(bump, contig)). In tracking mode
+            // (compress_only) contig is 0 and every page is external.
+            size_t contig_end = gap_lo < total ? gap_lo : total;
+            if (contig_end > gap_hi) contig_end = gap_hi;
+            if (contig_end && kPageSize == rs.pageSize())
+                rs.scan(vm_->pageAddress(0), contig_end, bucket);
+            // External pages (SMASH_TRACK_EXTERNAL): arbitrary addresses.
+            for (size_t i = gap_hi > contig_end ? gap_hi : contig_end; i < total; ++i) {
+                if (states_->get(i) == PageState::EMPTY) continue;
+                void* a = vm_->pageAddress(i);
+                if (a && rs.residentBytes(a, kPageSize)) bucket(i);
+            }
+        }
+        if (store_) {
+            const auto r = store_->resident();
+            b.store_header = r.header; b.store_data = r.data;
+            b.store_live = r.live; b.store_regions = r.regions;
+        }
+        b.metadata = BootstrapAlloc::instance().resident();
+#endif
+        const uint64_t acc = b.data_live + b.data_shadow + b.data_pending + b.data_compressed_resident +
+                             b.data_empty + b.store_header + b.store_data + b.metadata;
+        b.other = b.rss > acc ? b.rss - acc : 0;
+        return b;
+    }
+
     static uint64_t peakRssKb() {
         struct rusage ru{};
         if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
@@ -9002,6 +9069,24 @@ public:
         put("smash_compressed_bytes %llu\n", (unsigned long long)(ps.compressed * kPageSize));
         metric("smash_store_bytes", "gauge", "Bytes of compressed blobs held in the store.");
         put("smash_store_bytes %llu\n", (unsigned long long)ps.stored_bytes);
+        if (cfg_metrics_rss_parts_) {
+            const RssBreakdown rb = rssBreakdown();
+            metric("smash_rss_part_bytes", "gauge",
+                   "Resident bytes by owner (mincore): data_* = smash data pages by state, store_* = "
+                   "compressed-blob store, metadata = smash bookkeeping, other = the rest of RSS.");
+            const struct { const char* k; uint64_t v; } parts[] = {
+                {"data_live", rb.data_live}, {"data_shadow", rb.data_shadow},
+                {"data_pending_madvise", rb.data_pending},
+                {"data_compressed_resident", rb.data_compressed_resident},
+                {"data_empty", rb.data_empty}, {"store_header", rb.store_header},
+                {"store_data", rb.store_data}, {"metadata", rb.metadata}, {"other", rb.other}};
+            for (const auto& p : parts)
+                put("smash_rss_part_bytes{part=\"%s\"} %llu\n", p.k, (unsigned long long)p.v);
+            metric("smash_store_live_bytes", "gauge", "Live blob bytes in the store (region accounting).");
+            put("smash_store_live_bytes %llu\n", (unsigned long long)rb.store_live);
+            metric("smash_store_regions", "gauge", "CompressStore regions mapped.");
+            put("smash_store_regions %llu\n", (unsigned long long)rb.store_regions);
+        }
 
         metric("smash_compressions_total", "counter", "Pages compressed and kept.");
         put("smash_compressions_total %llu\n", (unsigned long long)ld(g.compressions));

@@ -86,6 +86,8 @@ Dev measurements of the profiles (cloudnew, not for results tables) are in [the 
 | `SMASH_CALIBRATE` / `SMASH_CALIBRATION_FILE` | calibration | Force/skip startup calibration; cache it in a file. |
 | `SMASH_FAST_{COMP,DECOMP}_MBS_{HI,LO}` | calibration | Override the calibrated fast-tier speeds. |
 | `SMASH_PRESSURE_LOG` | diagnostics | Per-tick time/space log (`scripts/pressure_report.py`). |
+| `SMASH_METRICS_RSS_PARTS` | diagnostics | `1`: add `smash_rss_part_bytes` (RSS by owner) to the metrics file (agents/estimator.md). |
+| `SMASH_OBSERVE_REFERENCED` | observe | `0`: no referenced-bits read signal (`clear_refs 1`) in `SMASH_MODE=observe`. |
 | `SMASH_DEBUG` | diagnostics | Periodic stats lines while running. |
 | `SMASH_BUCKET_STATS` | diagnostics | Per-(arena, size class) dump with the stats line. |
 | `SMASH_PROFILE_FILE` / `SMASH_PROFILE_FILE_SAVE` / `SMASH_PROFILE_FILE_RW` | persistence | Persist per-bucket statistics across runs. |

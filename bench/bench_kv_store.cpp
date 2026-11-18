@@ -160,6 +160,12 @@ int main(int argc, char* argv[]) {
             g_cool_duration_sec = 5;
             g_serve_duration_sec = 10;
             g_num_entries = 500000;
+        } else if (strcmp(argv[i], "--entries") == 0 && i + 1 < argc) {
+            g_num_entries = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cool") == 0 && i + 1 < argc) {
+            g_cool_duration_sec = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) {
+            g_serve_duration_sec = atoi(argv[++i]);
         }
     }
 

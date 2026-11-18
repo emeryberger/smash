@@ -42,6 +42,7 @@
 
 #include <zstd.h>
 
+#include "core/size_classes.h"  // smash's slab size classes (allocator-layout model)
 #include "vm/page_idle.h"
 
 #include <algorithm>
@@ -85,6 +86,7 @@ struct Options {
     bool json = false;
     bool kill_child = false;
     unsigned seed = 1;
+    double cold = 10.0;        // smash's cold timeout (SMASH_COLD_TIMEOUT_SEC default)
 };
 
 [[noreturn]] void usage(int rc) {
@@ -97,6 +99,9 @@ struct Options {
         "  --samples N      cold pages to read and compress (default 4096)\n"
         "  --method M       auto | idle | soft-dirty | referenced (default auto)\n"
         "  --seed N         sampling seed (default 1)\n"
+        "  --cold-timeout S smash's cold timeout the projection assumes (default 10); a\n"
+        "                   window with points at S+2 and 2S+1 s also models refault backoff:\n"
+        "                   --window 21 --points 7 for the default (see agents/estimator.md)\n"
         "  --kill           launch mode: kill the command after the estimate\n"
         "  --json           JSON on stdout instead of the text report\n");
     exit(rc);
@@ -116,6 +121,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--samples") o.samples = static_cast<size_t>(atol(val()));
         else if (a == "--method") o.method = val();
         else if (a == "--seed") o.seed = static_cast<unsigned>(atol(val()));
+        else if (a == "--cold-timeout") o.cold = atof(val());
         else if (a == "--kill") o.kill_child = true;
         else if (a == "--json") o.json = true;
         else if (!a.empty() && a[0] != '-' && o.pid == 0) o.pid = static_cast<pid_t>(atol(a.c_str()));
@@ -126,6 +132,7 @@ Options parse(int argc, char** argv) {
     if (o.points < 1) o.points = 1;
     if (o.points > 16) o.points = 16;
     if (o.window <= 0) o.window = 1;
+    if (o.cold <= 0) o.cold = 10;
     o.cmd.push_back(nullptr);
     return o;
 }
@@ -149,13 +156,26 @@ struct Mapping {
     // smaps
     uint64_t rss_kb = 0, anon_kb = 0, ref0_kb = 0;
     std::vector<uint64_t> ref_kb;   // Referenced at each point
-    // per-page tracking (present at t0)
-    std::vector<uintptr_t> pages;   // page-aligned vaddrs present at t0
-    std::vector<uint64_t> pfn;      // idle method: PFN at t0
+    std::vector<uint64_t> anon_at;  // Anonymous at each point
+    // per-page tracking (sorted by address; pages appearing at a point join then)
+    std::vector<uintptr_t> pages;   // page-aligned vaddrs
+    std::vector<uint64_t> pfn;      // idle method: PFN when first tracked
     std::vector<uint64_t> head;     // idle method: its folio's head PFN (bitmap index)
-    std::vector<uint8_t> first_hot; // point index first seen accessed (255 = never)
+    std::vector<uint32_t> hot;      // bit k-1: accessed in segment k (between points k-1 and k)
+    std::vector<uint8_t> born;      // tracked from segment born+1 on (0 = present at t0)
     std::vector<uint8_t> gone;      // no longer present / remapped
 };
+
+// Trailing idle segments of tracked page j at the end of a window of P segments.
+int trailingIdle(const Mapping& m, size_t j, int P) {
+    int t = 0;
+    for (int seg = P; seg > m.born[j]; --seg) {
+        if (m.hot[j] & (1u << (seg - 1))) break;
+        ++t;
+    }
+    return t;
+}
+
 
 bool readFile(const std::string& path, std::string& out) {
     out.clear();
@@ -220,6 +240,26 @@ std::vector<Mapping> readMaps(pid_t pid) {
     return out;
 }
 
+// A growing brk heap moves its end; pick up the current end of each mapping
+// (matched by start, as readSmaps does).
+void refreshEnds(pid_t pid, std::vector<Mapping>& maps) {
+    std::string txt;
+    if (!readFile("/proc/" + std::to_string(pid) + "/maps", txt)) return;
+    std::map<uintptr_t, Mapping*> by;
+    for (auto& m : maps) by[m.start] = &m;
+    size_t pos = 0;
+    while (pos < txt.size()) {
+        size_t nl = txt.find('\n', pos);
+        if (nl == std::string::npos) nl = txt.size();
+        unsigned long s = 0, e = 0;
+        if (sscanf(txt.c_str() + pos, "%lx-%lx", &s, &e) == 2) {
+            auto it = by.find(s);
+            if (it != by.end()) it->second->end = e;
+        }
+        pos = nl + 1;
+    }
+}
+
 // Thread stacks: each task's /proc/<pid>/task/<tid>/syscall ends with its
 // stack pointer and pc (readable with ptrace access; "running" tasks report
 // no registers). Mark the anonymous mapping holding any sp as a stack.
@@ -270,7 +310,10 @@ bool readSmaps(pid_t pid, std::vector<Mapping>& maps, int point) {
         } else if (cur) {
             unsigned long kb;
             if (point < 0 && sscanf(l, "Rss: %lu kB", &kb) == 1) cur->rss_kb = kb;
-            else if (point < 0 && sscanf(l, "Anonymous: %lu kB", &kb) == 1) cur->anon_kb = kb;
+            else if (sscanf(l, "Anonymous: %lu kB", &kb) == 1) {
+                if (point < 0) cur->anon_kb = kb;
+                else { cur->anon_at.resize(static_cast<size_t>(point) + 1); cur->anon_at[point] = kb; }
+            }
             else if (sscanf(l, "Referenced: %lu kB", &kb) == 1) {
                 if (point < 0) cur->ref0_kb = kb;
                 else { cur->ref_kb.resize(static_cast<size_t>(point) + 1); cur->ref_kb[point] = kb; }
@@ -389,6 +432,103 @@ void costPage(const unsigned char* p, ZSTD_CCtx* cctx, std::vector<unsigned char
     saving = static_cast<double>(g_page) - blob;
 }
 
+// ── smash's own footprint ───────────────────────────────────────────────────
+//
+// smash's metadata RSS, from the smash_rss_part_bytes{part="metadata"}
+// metric on cloudnew (x86-64, 4 KiB pages; agents/estimator.md): per resident
+// page of slab memory (4 KiB objects) and of large allocations (2 MiB
+// objects) and per compressed page, from bench_rss runs at 64 MiB - 1 GiB
+// before and after compression; the fixed part (compressor workers'
+// contexts, thread caches) from bench_sqlite, bench_kv_store and memcached
+// runs (3.7 - 4.7 MiB above the per-page terms).
+constexpr double kMetaFixed = 4.2 * 1048576, kMetaPerSlabPage = 28, kMetaPerLargePage = 14,
+                 kMetaPerCompressedPage = 30;
+// RSS smash adds outside its metadata: libsmash's own image, its non-metadata
+// mappings (fault-slot and compressor buffers) and thread stacks, measured as
+// the smash_rss_part_bytes{part="other"} growth over the program's glibc run
+// on bench_sqlite (a C++ program); plus libstdc++ and libm, which libsmash
+// pulls in, when the program does not map them already (memcached, C).
+constexpr double kRuntimeFixed = 4.4 * 1048576, kRuntimeLibstdcxx = 1.4 * 1048576,
+                 kRuntimeLibm = 0.25 * 1048576;
+
+// Bytes smash would use for one glibc chunk of `sz` bytes (header included):
+// the smallest request that maps to this chunk size, rounded to smash's size
+// class and charged its share of the span (tail waste included); requests
+// above the slab range are page-rounded, as in LargeAlloc.
+double smashBytesForChunk(uint64_t sz) {
+    const size_t req = sz > 24 ? static_cast<size_t>(sz - 23) : 1;
+    if (req <= smash::kMaxSmallSize) {
+        const smash::SizeClassInfo& c = smash::kSizeClasses[smash::sizeToClass(req)];
+        return static_cast<double>(c.pages) * static_cast<double>(smash::kPageSize) / c.objects;
+    }
+    return static_cast<double>((req + g_page - 1) / g_page * g_page);
+}
+
+// Walk the glibc chunk chain of a [heap] or arena mapping (reads only, via
+// process_vm_readv in 1 MiB blocks) and total the in-use chunks' bytes under
+// glibc and under smash's size classes. The chain is read while the target
+// runs, so it can break where the target was modifying it; the walk stops
+// there, and the caller uses the in-use ratio of the covered part when it
+// spans at least half of the mapping. Non-main arenas start
+// with heap_info (+ malloc_state); the first chunk is found by trying 16-byte
+// offsets for a chain of at least 32 plausible chunks.
+struct LayoutWalk { double glibc = 0, smash = 0, covered = 0; size_t chunks = 0; };
+bool walkGlibcHeap(pid_t pid, const Mapping& m, LayoutWalk& w) {
+    std::vector<unsigned char> buf(1 << 20);
+    uintptr_t bb = 0, be = 0;
+    auto rd = [&](uintptr_t a, uint64_t& v) -> bool {
+        if (a < m.start || a + 8 > m.end) return false;
+        if (a < bb || a + 8 > be) {
+            bb = a & ~(static_cast<uintptr_t>(g_page) - 1);
+            const size_t n = std::min<size_t>(buf.size(), m.end - bb);
+            struct iovec l{buf.data(), n}, r{reinterpret_cast<void*>(bb), n};
+            const ssize_t got = process_vm_readv(pid, &l, 1, &r, 1, 0);
+            if (got < 16) { bb = be = 0; return false; }
+            be = bb + static_cast<size_t>(got);
+            if (a + 8 > be) return false;
+        }
+        memcpy(&v, buf.data() + (a - bb), 8);
+        return true;
+    };
+    auto plausible = [&](uintptr_t c, uint64_t& sz) {
+        uint64_t v;
+        if (!rd(c + 8, v)) return false;
+        sz = v & ~static_cast<uint64_t>(7);
+        return sz >= 32 && (sz & 15) == 0 && c + sz <= m.end && !(v & 2);  // not IS_MMAPPED
+    };
+    uintptr_t first = m.start;
+    if (m.cls == kArena) {
+        first = 0;
+        for (uintptr_t off = 32; off < 8192 && !first; off += 16) {
+            uintptr_t c = m.start + off;
+            uint64_t sz;
+            int n = 0;
+            while (n < 32 && plausible(c, sz)) { c += sz; ++n; }
+            if (n >= 32 || (n > 0 && c == m.end)) first = m.start + off;
+        }
+        if (!first) return false;
+    }
+    uintptr_t c = first;
+    uint64_t sz;
+    if (!plausible(c, sz)) return false;
+    while (true) {
+        const uintptr_t next = c + sz;
+        uint64_t nsz, nv;
+        if (next + 16 > m.end || !rd(next + 8, nv)) { c = next; break; }  // c was the top chunk
+        nsz = nv & ~static_cast<uint64_t>(7);
+        if (nsz < 32 || (nsz & 15) || next + nsz > m.end) { c = next; break; }
+        if (nv & 1) {  // PREV_INUSE of the next chunk: c is allocated
+            w.glibc += static_cast<double>(sz);
+            w.smash += smashBytesForChunk(sz);
+            ++w.chunks;
+        }
+        c = next;
+        sz = nsz;
+    }
+    w.covered = static_cast<double>(c - first);
+    return w.chunks > 0;
+}
+
 std::string human(double bytes) {
     char b[64];
     const char* u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -473,162 +613,279 @@ int main(int argc, char** argv) {
                         "all present pages of each mapping (not only idle ones)");
 
     // ── t0: snapshot present pages, reset tracking ─────────────────────
+    // The window is split into --points segments; tracking is reset at the
+    // start of each, so every page gets an access bit per segment and its idle
+    // age at the END of the window is its run of trailing unaccessed segments
+    // (pages appearing mid-window join at the next point). That is the age
+    // smash's cold timeout tests at the moment the estimate stands for.
     const bool per_page = method != "referenced";
+    const int P = o.points;
     readSmaps(pid, maps, -1);
     KPageFlags kpf;
     if (pfn_ok) kpf.fd = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
     size_t n_zero = 0, n_tail = 0;
+    // Folio head of the previous tracked page, so consecutive tails of one
+    // folio (consecutive PFNs) don't each walk back to the head.
+    uint64_t prev_pfn = 0, prev_head = 0;
+    auto track = [&](Mapping& m, uintptr_t va, uint64_t e, uint8_t born) {
+        const uint64_t pfn = e & kPmPfnMask;
+        uint64_t h = 0;
+        if (method == "idle") {
+            h = !kpf.tail(pfn) ? pfn
+                : (prev_pfn && pfn == prev_pfn + 1) ? prev_head
+                : smash::vm::folioHeadPfn(kpf.fd, pfn);
+            n_tail += h != pfn;
+            prev_pfn = pfn;
+            prev_head = h;
+        }
+        m.pages.push_back(va);
+        m.pfn.push_back(method == "idle" ? pfn : 0);
+        m.head.push_back(h);
+        m.hot.push_back(0);
+        m.born.push_back(born);
+        m.gone.push_back(0);
+    };
+    // A present entry for the shared zero page: not in RSS, no idle state.
+    auto zeroPage = [&](uint64_t e) {
+        const uint64_t pfn = e & kPmPfnMask;
+        if (pfn && kpf.zero(pfn)) { ++n_zero; return true; }
+        return false;
+    };
     if (per_page) {
         for (auto& m : maps) {
-            uint64_t prev_pfn = 0, prev_head = 0;
+            prev_pfn = prev_head = 0;
             scanPagemap(pm, m.start, m.end, [&](uintptr_t va, uint64_t e) {
-                if (!(e & kPmPresent) || (e & kPmSwap)) return;
-                const uint64_t pfn = e & kPmPfnMask;
-                if (pfn && kpf.zero(pfn)) { ++n_zero; return; }
-                m.pages.push_back(va);
-                if (method != "idle") return;
-                // Consecutive tails of one folio are consecutive PFNs.
-                const uint64_t h = !kpf.tail(pfn) ? pfn
-                                   : (prev_pfn && pfn == prev_pfn + 1) ? prev_head
-                                   : smash::vm::folioHeadPfn(kpf.fd, pfn);
-                n_tail += h != pfn;
-                m.pfn.push_back(pfn);
-                m.head.push_back(h);
-                prev_pfn = pfn;
-                prev_head = h;
+                if ((e & kPmPresent) && !(e & kPmSwap) && !zeroPage(e)) track(m, va, e, 0);
             });
-            m.first_hot.assign(m.pages.size(), 255);
-            m.gone.assign(m.pages.size(), 0);
         }
     }
-    if (can_clear) writeStr(proc + "/clear_refs", "1");  // referenced bits (all methods)
-    if (method == "soft-dirty") writeStr(proc + "/clear_refs", "4");
-    if (method == "idle") {
-        // Set the idle flag for every PFN we track: bitmap words are 64 PFNs.
-        std::map<uint64_t, uint64_t> words;
-        for (auto& m : maps) for (uint64_t f : m.head) words[f / 64] |= 1ULL << (f % 64);
-        for (auto& w : words)
-            if (pwrite(idle_fd, &w.second, 8, static_cast<off_t>(w.first * 8)) != 8) {}
-    }
+    auto resetTracking = [&]() {
+        if (can_clear) writeStr(proc + "/clear_refs", "1");  // referenced bits (all methods)
+        if (method == "soft-dirty") writeStr(proc + "/clear_refs", "4");
+        if (method == "idle") {
+            // Set the idle flag for every PFN we track: bitmap words are 64 PFNs.
+            std::map<uint64_t, uint64_t> words;
+            for (auto& m : maps)
+                for (size_t j = 0; j < m.pages.size(); ++j)
+                    if (!m.gone[j]) words[m.head[j] / 64] |= 1ULL << (m.head[j] % 64);
+            for (auto& w : words)
+                if (pwrite(idle_fd, &w.second, 8, static_cast<off_t>(w.first * 8)) != 8) {}
+        }
+    };
+    resetTracking();
     const auto t0 = std::chrono::steady_clock::now();
 
     // ── sample points ──────────────────────────────────────────────────
     std::vector<double> point_s;
-    for (int k = 1; k <= o.points; ++k) {
-        const double at = o.window * k / o.points;
+    for (int k = 1; k <= P; ++k) {
+        const double at = o.window * k / P;
         point_s.push_back(at);
         std::this_thread::sleep_until(t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                                std::chrono::duration<double>(at)));
         if (kill(pid, 0) != 0) { fprintf(stderr, "smash-estimate: target exited during the window\n"); return 1; }
+        refreshEnds(pid, maps);
         readSmaps(pid, maps, k - 1);
-        if (!per_page) continue;
+        if (!per_page) { if (k < P) resetTracking(); continue; }
+        const uint32_t bit = 1u << (k - 1);
         for (auto& m : maps) {
-            if (m.pages.empty()) continue;
-            // Re-read pagemap over the mapping; walk tracked pages in order.
+            // Re-read pagemap over the mapping; walk tracked pages in order and
+            // collect pages that appeared during this segment.
             size_t idx = 0;
+            std::vector<std::pair<uintptr_t, uint64_t>> fresh;
             scanPagemap(pm, m.start, m.end, [&](uintptr_t va, uint64_t e) {
                 while (idx < m.pages.size() && m.pages[idx] < va) ++idx;
-                if (idx >= m.pages.size() || m.pages[idx] != va) return;
-                if (m.first_hot[idx] != 255 || m.gone[idx]) return;
-                if (!(e & kPmPresent) || (e & kPmSwap)) { m.gone[idx] = 1; return; }
+                const bool present = (e & kPmPresent) && !(e & kPmSwap);
+                if (idx >= m.pages.size() || m.pages[idx] != va) {
+                    if (present && k < P && !zeroPage(e)) fresh.push_back({va, e});
+                    return;
+                }
+                if (m.gone[idx]) return;
+                if (!present) { m.gone[idx] = 1; return; }
                 if (method == "soft-dirty") {
-                    if (e & kPmSoftDirty) m.first_hot[idx] = static_cast<uint8_t>(k - 1);
+                    if (e & kPmSoftDirty) m.hot[idx] |= bit;
                 } else if ((e & kPmPfnMask) != m.pfn[idx]) {
                     m.gone[idx] = 1;  // migrated / replaced: idle flag lost
                 }
             });
+            for (size_t j = 0; j < m.pages.size(); ++j)
+                if (m.pages[j] >= m.end) m.gone[j] = 1;  // mapping shrank
+            if (!fresh.empty()) {
+                // Merge (both sorted by address).
+                Mapping old;
+                old.pages.swap(m.pages); old.pfn.swap(m.pfn); old.head.swap(m.head); old.hot.swap(m.hot);
+                old.born.swap(m.born); old.gone.swap(m.gone);
+                size_t i = 0, f = 0;
+                while (i < old.pages.size() || f < fresh.size()) {
+                    if (f >= fresh.size() || (i < old.pages.size() && old.pages[i] < fresh[f].first)) {
+                        m.pages.push_back(old.pages[i]); m.pfn.push_back(old.pfn[i]); m.head.push_back(old.head[i]);
+                        m.hot.push_back(old.hot[i]);
+                        m.born.push_back(old.born[i]); m.gone.push_back(old.gone[i]);
+                        ++i;
+                    } else {
+                        track(m, fresh[f].first, fresh[f].second, static_cast<uint8_t>(k));
+                        ++f;
+                    }
+                }
+            }
         }
         if (method == "idle") {
             // One bitmap read per 64-PFN word, then classify every tracked page.
             std::map<uint64_t, uint64_t> words;
             for (auto& m : maps)
                 for (size_t j = 0; j < m.pages.size(); ++j)
-                    if (m.first_hot[j] == 255 && !m.gone[j]) words[m.head[j] / 64] = 0;
+                    if (!m.gone[j] && m.born[j] < k) words[m.head[j] / 64] = 0;
             for (auto& w : words)
                 if (pread(idle_fd, &w.second, 8, static_cast<off_t>(w.first * 8)) != 8) w.second = 0;
             for (auto& m : maps)
                 for (size_t j = 0; j < m.pages.size(); ++j) {
-                    if (m.first_hot[j] != 255 || m.gone[j]) continue;
+                    if (m.gone[j] || m.born[j] >= k) continue;
                     const uint64_t f = m.head[j];
-                    if (!(words[f / 64] & (1ULL << (f % 64)))) m.first_hot[j] = static_cast<uint8_t>(k - 1);
+                    if (!(words[f / 64] & (1ULL << (f % 64)))) m.hot[j] |= bit;
                 }
         }
+        if (k < P) resetTracking();
+    }
+
+    // Which idle ages the projection uses (segment length L = window / P):
+    // idle >= the cold timeout is what smash compresses; idle >= twice it is
+    // what a run whose buckets backed off after a refault compresses (smash
+    // doubles the cold wait of a page, and of fresh pages from the same
+    // allocation site, once one of them refaults). When the window reaches 2x
+    // the cold timeout the projection uses the latter: the refaults that
+    // trigger the backoff are mostly reads of compressed pages, which this
+    // tool cannot attribute, and assuming none overestimated bench_sqlite by
+    // ~50 MiB (agents/estimator.md).
+    //
+    // smash acts on whole compressor ticks (1 s): a page reaching the cold
+    // timeout is read-checked or snapshotted the next tick and its frame is
+    // dropped one deferred-reclaim tick later (T + 2 s); a backed-off page is
+    // compressed at 2T and dropped at 2T + 1 s. The default window/points
+    // (10 s / 3) end at T; --window 21 --points 7 (3 s segments) gives both
+    // ages.
+    const double age_cold = o.cold + 2, age_back = 2 * o.cold + 1;
+    int k_cold = -1, k_back = -1;
+    for (int k = 0; k < P; ++k) {
+        if (k_cold < 0 && point_s[k] >= age_cold - 1e-6) k_cold = k;
+        if (k_back < 0 && point_s[k] >= age_back - 1e-6) k_back = k;
+    }
+    if (k_cold < 0) {
+        k_cold = P - 1;
+        if (point_s[k_cold] < o.cold - 1e-6)
+            notes.push_back("window shorter than the cold timeout: pages idle for the whole window are "
+                            "projected as compressed");
+    }
+    const bool backoff = k_back >= 0;
+    const int k_base = backoff ? k_back : k_cold;
+    if (!backoff) {
+        char nb[200];
+        snprintf(nb, sizeof(nb), "window too short for refault backoff (use --window %.0f --points %.0f); "
+                 "an upper bound when the program re-reads compressed pages", 2 * o.cold + 1,
+                 (2 * o.cold + 1) / 3);
+        notes.push_back(nb);
     }
 
     // ── per-class idle accounting ──────────────────────────────────────
     std::mt19937_64 rng(o.seed);
     struct ClassAgg {
         double present = 0;   // bytes present at t0 (per-page) or Anonymous (referenced)
-        std::vector<double> idle_at;  // bytes idle through each point
-        double idle = 0;      // bytes idle for the whole window (projection base)
+        std::vector<double> idle_at;  // [m]: bytes idle for >= m+1 segments at the end
+        double idle = 0;      // bytes idle at the projection's age (k_base)
+        double anon_end = 0;  // Anonymous at the last point (the RSS the projection is relative to)
         std::vector<std::pair<Mapping*, size_t>> cand;  // idle pages (per-page) or present pages
         std::vector<Sample> s;
         int mappings = 0;
     } agg[kNumClass];
-    for (auto& a : agg) a.idle_at.assign(static_cast<size_t>(o.points), 0);
+    for (auto& a : agg) a.idle_at.assign(static_cast<size_t>(P), 0);
     int n_polluted = 0;
     for (auto& m : maps) {
         auto& a = agg[m.cls];
-        const double anon_b = static_cast<double>(m.anon_kb) * 1024;
-        if (anon_b <= 0 && m.pages.empty()) continue;
+        const double anon0 = static_cast<double>(m.anon_kb) * 1024;
+        if (anon0 <= 0 && m.pages.empty()) continue;
         ++a.mappings;
-        std::vector<double> unref(static_cast<size_t>(o.points), anon_b);
-        for (int k = 0; k < o.points; ++k) {
-            double ref = k < static_cast<int>(m.ref_kb.size()) ? static_cast<double>(m.ref_kb[k]) * 1024 : 0;
-            unref[k] = std::max(0.0, anon_b - ref);
+        // anon_pt[q]: Anonymous at point q (0 = t0); ref_seg[k]: Referenced in segment k.
+        std::vector<double> anon_pt(static_cast<size_t>(P) + 1, anon0), ref_seg(static_cast<size_t>(P) + 1, 0);
+        for (int k = 1; k <= P; ++k) {
+            if (k - 1 < static_cast<int>(m.anon_at.size())) anon_pt[k] = static_cast<double>(m.anon_at[k - 1]) * 1024;
+            if (k - 1 < static_cast<int>(m.ref_kb.size())) ref_seg[k] = static_cast<double>(m.ref_kb[k - 1]) * 1024;
+        }
+        a.anon_end += anon_pt[P];
+        // unref[mi]: bytes idle for the last mi+1 segments (since point
+        // b = P-mi-1), mapping granularity. Pages faulted in after b are
+        // Referenced but were not there at b and cannot be idle; charging them
+        // against the older pages undercounted a growing brk heap by its growth
+        // (bench_sqlite's heap grows ~7 MiB/s while serving: ~65 MiB over a
+        // 10 s window). So each segment's Referenced bytes are reduced by the
+        // growth since b (every new page may be among them), and segments are
+        // combined with max(), a lower bound of the union of their referenced
+        // sets (exact for a stable hot set).
+        std::vector<double> unref(static_cast<size_t>(P), 0);
+        for (int mi = 0; mi < P; ++mi) {
+            const int b = P - mi - 1;
+            double refmax = 0;
+            for (int seg = b + 1; seg <= P; ++seg)
+                refmax = std::max(refmax, ref_seg[seg] - std::max(0.0, anon_pt[seg] - anon_pt[b]));
+            unref[mi] = std::max(0.0, std::min(anon_pt[b], anon_pt[P]) - refmax);
         }
         if (per_page) {
-            a.present += static_cast<double>(m.pages.size() * g_page);
-            std::vector<double> idle_k(static_cast<size_t>(o.points), 0);
+            for (size_t j = 0; j < m.pages.size(); ++j)
+                if (m.born[j] == 0) a.present += static_cast<double>(g_page);
+            std::vector<double> idle_k(static_cast<size_t>(P), 0);
             std::vector<std::pair<Mapping*, size_t>> mc;
             for (size_t j = 0; j < m.pages.size(); ++j) {
                 if (m.gone[j]) continue;
-                for (int k = 0; k < o.points; ++k)
-                    if (m.first_hot[j] > k) idle_k[k] += static_cast<double>(g_page);
-                if (m.first_hot[j] == 255) mc.push_back({&m, j});
+                const int t = trailingIdle(m, j, P);
+                for (int mi = 0; mi < t; ++mi) idle_k[mi] += static_cast<double>(g_page);
+                if (t > k_base) mc.push_back({&m, j});
             }
-            // A VMA that changed during the window (brk growth, mremap, a
+            // A VMA that changed during a segment (brk growth, mremap, a
             // neighbouring mprotect) gets VM_SOFTDIRTY and pagemap then reports
             // EVERY page in it dirty. Written pages are a subset of referenced
             // ones, so more dirty bytes than referenced bytes means the bits
             // are polluted: fall back to Referenced for this mapping.
             bool polluted = false;
             if (method == "soft-dirty" && can_clear) {
-                double live = 0;
-                for (size_t j = 0; j < m.pages.size(); ++j) if (!m.gone[j]) live += static_cast<double>(g_page);
-                const double dirty = live - idle_k.back();
-                const double ref = live - std::min(live, unref.back());
-                polluted = dirty > ref + std::max(4.0 * static_cast<double>(g_page), 0.05 * live);
+                for (int k = 1; k <= P && !polluted; ++k) {
+                    double live = 0, dirty = 0;
+                    for (size_t j = 0; j < m.pages.size(); ++j) {
+                        if (m.born[j] >= k || m.gone[j]) continue;
+                        live += static_cast<double>(g_page);
+                        if (m.hot[j] & (1u << (k - 1))) dirty += static_cast<double>(g_page);
+                    }
+                    polluted = dirty > ref_seg[k] + std::max(4.0 * static_cast<double>(g_page), 0.05 * live);
+                }
                 if (polluted) {
                     ++n_polluted;
-                    idle_k.assign(idle_k.size(), live);
+                    idle_k.assign(idle_k.size(), 0);
                     mc.clear();
-                    for (size_t j = 0; j < m.pages.size(); ++j) if (!m.gone[j]) mc.push_back({&m, j});
+                    for (size_t j = 0; j < m.pages.size(); ++j) {
+                        if (m.gone[j]) continue;
+                        for (int mi = 0; mi < P - m.born[j]; ++mi) idle_k[mi] += static_cast<double>(g_page);
+                        if (P - m.born[j] > k_base) mc.push_back({&m, j});
+                    }
                 }
             }
-            double last = 0;
-            for (int k = 0; k < o.points; ++k) {
+                double base = 0;
+            for (int mi = 0; mi < P; ++mi) {
                 // soft-dirty misses reads: cap by the mapping's unreferenced bytes.
-                double v = (method == "soft-dirty" && can_clear) ? std::min(idle_k[k], unref[k]) : idle_k[k];
-                a.idle_at[k] += v;
-                last = v;
+                double v = (method == "soft-dirty" && can_clear) ? std::min(idle_k[mi], unref[mi]) : idle_k[mi];
+                a.idle_at[mi] += v;
+                if (mi == k_base) base = v;
             }
             // The cap removed read-hot pages we cannot identify individually:
             // thin this mapping's candidates to match, so the sample pool
             // stays proportional to the idle bytes it stands for.
-            if (idle_k.back() > 0 && last < idle_k.back()) {
+            if (idle_k[k_base] > 0 && base < idle_k[k_base]) {
                 std::shuffle(mc.begin(), mc.end(), rng);
-                mc.resize(static_cast<size_t>(static_cast<double>(mc.size()) * last / idle_k.back() + 0.5));
+                mc.resize(static_cast<size_t>(static_cast<double>(mc.size()) * base / idle_k[k_base] + 0.5));
             }
             a.cand.insert(a.cand.end(), mc.begin(), mc.end());
         } else {
-            a.present += anon_b;
-            for (int k = 0; k < o.points; ++k) a.idle_at[k] += unref[k];
+            a.present += anon0;
+            for (int mi = 0; mi < P; ++mi) a.idle_at[mi] += unref[mi];
             // candidates: present pages (for sampling); read pagemap if we can
             if (pm >= 0) {
                 scanPagemap(pm, m.start, m.end, [&](uintptr_t va, uint64_t e) {
-                    if (!(e & kPmPresent) || (e & kPmSwap)) return;
-                    if ((e & kPmPfnMask) && kpf.zero(e & kPmPfnMask)) { ++n_zero; return; }
+                    if (!(e & kPmPresent) || (e & kPmSwap) || zeroPage(e)) return;
                     m.pages.push_back(va);
                 });
                 // Thin to the mapping's unreferenced fraction (see above):
@@ -636,14 +893,14 @@ int main(int argc, char** argv) {
                 std::vector<std::pair<Mapping*, size_t>> mc;
                 for (size_t j = 0; j < m.pages.size(); ++j) mc.push_back({&m, j});
                 const double pres = static_cast<double>(m.pages.size() * g_page);
-                if (pres > 0 && unref.back() < pres) {
+                if (pres > 0 && unref[k_base] < pres) {
                     std::shuffle(mc.begin(), mc.end(), rng);
-                    mc.resize(static_cast<size_t>(static_cast<double>(mc.size()) * unref.back() / pres + 0.5));
+                    mc.resize(static_cast<size_t>(static_cast<double>(mc.size()) * unref[k_base] / pres + 0.5));
                 }
                 a.cand.insert(a.cand.end(), mc.begin(), mc.end());
             }
         }
-        a.idle = a.idle_at.back();
+        a.idle = a.idle_at[k_base];
     }
 
     if (method == "idle" && kpf.fd < 0)
@@ -706,9 +963,37 @@ int main(int argc, char** argv) {
                         "reported but no savings");
 
     // ── projection ─────────────────────────────────────────────────────
+    // Allocator layout (glibc chunk walk) for the slab-managed classes.
+    struct Lay { double glibc = 0, smash = 0, factor = 1; size_t chunks = 0; int walked = 0, failed = 0; } lay[kNumClass];
+    if (read_ok && any_read) {
+        for (auto& m : maps) {
+            if (m.cls != kHeap && m.cls != kArena) continue;
+            LayoutWalk w;
+            const double anon = m.anon_at.empty() ? static_cast<double>(m.anon_kb) * 1024
+                                                  : static_cast<double>(m.anon_at.back()) * 1024;
+            if (walkGlibcHeap(pid, m, w) && w.covered >= 0.5 * anon) {
+                lay[m.cls].glibc += w.glibc; lay[m.cls].smash += w.smash; lay[m.cls].chunks += w.chunks;
+                ++lay[m.cls].walked;
+            } else if (anon >= 1048576) {
+                ++lay[m.cls].failed;
+            }
+        }
+        for (auto& l : lay) if (l.glibc > 0) l.factor = l.smash / l.glibc;
+        if (lay[kHeap].failed + lay[kArena].failed)
+            notes.push_back(std::to_string(lay[kHeap].failed + lay[kArena].failed) +
+                            " heap mapping(s) could not be walked as glibc chunks (another allocator, or the "
+                            "chain changed mid-walk): no layout adjustment for them");
+    }
+
     const double rss = static_cast<double>(statusKb(pid, "VmRSS:")) * 1024;
-    struct Out { double mean = 0, sd = 0, saving = 0, half = 0, ratio = 0; size_t n = 0, zero = 0, rej = 0; } out[kNumClass];
-    double tot_saving = 0, tot_var = 0, tot_idle = 0, tot_present = 0;
+    struct Out {
+        double mean = 0, sd = 0, saving = 0, saving_nb = 0, half = 0, ratio = 0, layout = 0, layout_nb = 0,
+               comp_pages = 0, comp_pages_nb = 0;
+        size_t n = 0, zero = 0, rej = 0;
+    } out[kNumClass];
+    double tot_saving = 0, tot_saving_nb = 0, tot_var = 0, tot_idle = 0, tot_present = 0;
+    double tot_layout = 0, tot_layout_nb = 0, comp_pages = 0, comp_pages_nb = 0;
+    double meta_pages = kMetaFixed;  // metadata bytes that do not depend on the compressed set
     std::vector<double> tot_idle_at(static_cast<size_t>(o.points), 0);
     for (int c = 0; c < kNumClass; ++c) {
         auto& a = agg[c];
@@ -716,6 +1001,9 @@ int main(int argc, char** argv) {
         tot_idle += a.idle;
         tot_present += a.present;
         for (int k = 0; k < o.points; ++k) tot_idle_at[k] += a.idle_at[k];
+        if (c != kStack)
+            meta_pages += a.anon_end / static_cast<double>(g_page) *
+                          (c == kAnon ? kMetaPerLargePage : kMetaPerSlabPage);
         r.n = a.s.size();
         if (!r.n) continue;
         double sum = 0, sq = 0, blob = 0;
@@ -723,29 +1011,61 @@ int main(int argc, char** argv) {
         r.mean = sum / static_cast<double>(r.n);
         r.sd = r.n > 1 ? std::sqrt(std::max(0.0, (sq - sum * sum / static_cast<double>(r.n)) / static_cast<double>(r.n - 1))) : 0;
         r.ratio = blob > 0 ? static_cast<double>(g_page) * static_cast<double>(r.n) / blob : 0;
-        const double pages = a.idle / static_cast<double>(g_page);
+        const double kept = 1.0 - static_cast<double>(r.rej) / static_cast<double>(r.n);
+        const double pages = a.idle_at[k_base] / static_cast<double>(g_page);
+        const double pages_nb = a.idle_at[k_cold] / static_cast<double>(g_page);
         const double N = static_cast<double>(a.cand.size());
         const double fpc = N > 1 ? std::sqrt(std::max(0.0, (N - static_cast<double>(r.n)) / (N - 1))) : 0;
         r.saving = pages * r.mean;
+        r.saving_nb = pages_nb * r.mean;
+        if (c != kStack) {
+            r.comp_pages = pages * kept;
+            r.comp_pages_nb = pages_nb * kept;
+            // smash stores these objects in factor x the bytes; idle pages
+            // compress that padding away, resident (hot) pages keep it.
+            r.layout = std::max(0.0, a.anon_end - a.idle_at[k_base]) * (lay[c].factor - 1);
+            r.layout_nb = std::max(0.0, a.anon_end - a.idle_at[k_cold]) * (lay[c].factor - 1);
+        }
         const double se = pages * r.sd / std::sqrt(static_cast<double>(r.n)) * fpc;
         r.half = 1.96 * se;
         tot_saving += r.saving;
+        tot_saving_nb += r.saving_nb;
+        tot_layout += r.layout;
+        tot_layout_nb += r.layout_nb;
+        comp_pages += r.comp_pages;
+        comp_pages_nb += r.comp_pages_nb;
         tot_var += se * se;
     }
+    double runtime = kRuntimeFixed;
+    {
+        std::string mtxt;
+        readFile(proc + "/maps", mtxt);
+        if (mtxt.find("libstdc++.so") == std::string::npos) runtime += kRuntimeLibstdcxx;
+        if (mtxt.find("/libm.so") == std::string::npos) runtime += kRuntimeLibm;
+    }
+    const double meta = meta_pages + comp_pages * kMetaPerCompressedPage;
+    const double meta_nb = meta_pages + comp_pages_nb * kMetaPerCompressedPage;
+    const double net = tot_saving - tot_layout - meta - runtime;
+    const double net_nb = tot_saving_nb - tot_layout_nb - meta_nb - runtime;
     const double tot_half = 1.96 * std::sqrt(tot_var);
     const bool have_savings = any_read;
     auto pct = [&](double v) { return rss > 0 ? 100.0 * v / rss : 0.0; };
 
     if (o.json) {
-        printf("{\"pid\": %d, \"comm\": \"%s\", \"method\": \"%s\", \"window_s\": %.1f, \"page_size\": %zu,\n",
-               pid, comm(pid).c_str(), method.c_str(), o.window, g_page);
+        printf("{\"pid\": %d, \"comm\": \"%s\", \"method\": \"%s\", \"window_s\": %.1f, \"page_size\": %zu,"
+               " \"cold_timeout_s\": %.1f,\n",
+               pid, comm(pid).c_str(), method.c_str(), o.window, g_page, o.cold);
         printf(" \"rss_bytes\": %.0f, \"anon_present_bytes\": %.0f, \"idle_bytes\": %.0f,\n", rss, tot_present, tot_idle);
         printf(" \"idle_age\": [");
         for (int k = 0; k < o.points; ++k)
             printf("%s{\"idle_for_s\": %.1f, \"bytes\": %.0f}", k ? ", " : "", point_s[k], tot_idle_at[k]);
         printf("],\n \"savings_available\": %s, \"projected_saving_bytes\": %.0f, \"ci95_bytes\": %.0f,"
                " \"projected_reduction_pct\": %.1f, \"ci95_pct\": %.1f,\n",
-               have_savings ? "true" : "false", tot_saving, tot_half, pct(tot_saving), pct(tot_half));
+               have_savings ? "true" : "false", net, tot_half, pct(net), pct(tot_half));
+        printf(" \"backoff_modeled\": %s, \"projected_saving_no_backoff_bytes\": %.0f,"
+               " \"compression_saving_bytes\": %.0f, \"compression_saving_no_backoff_bytes\": %.0f,\n"
+               " \"smash_metadata_bytes\": %.0f, \"smash_runtime_bytes\": %.0f, \"layout_bytes\": %.0f,\n",
+               backoff ? "true" : "false", net_nb, tot_saving, tot_saving_nb, meta, runtime, tot_layout);
         printf(" \"classes\": [\n");
         bool first = true;
         for (int c = 0; c < kNumClass; ++c) {
@@ -754,9 +1074,10 @@ int main(int argc, char** argv) {
             if (!a.mappings) continue;
             printf("%s  {\"class\": \"%s\", \"mappings\": %d, \"present_bytes\": %.0f, \"idle_bytes\": %.0f,"
                    " \"sampled_pages\": %zu, \"zero_pages\": %zu, \"rejected_pages\": %zu, \"ratio\": %.2f,"
-                   " \"projected_saving_bytes\": %.0f, \"ci95_bytes\": %.0f, \"smash\": \"%s\"}",
-                   first ? "" : ",\n", kClassName[c], a.mappings, a.present, a.idle, r.n, r.zero, r.rej,
-                   r.ratio, r.saving, r.half, kClassNote[c]);
+                   " \"projected_saving_bytes\": %.0f, \"ci95_bytes\": %.0f, \"layout_factor\": %.3f,"
+                   " \"layout_chunks\": %zu, \"layout_bytes\": %.0f, \"smash\": \"%s\"}",
+                   first ? "" : ",\n", kClassName[c], a.mappings, a.present, a.idle_at[k_base], r.n, r.zero,
+                   r.rej, r.ratio, r.saving, r.half, lay[c].factor, lay[c].chunks, r.layout, kClassNote[c]);
             first = false;
         }
         printf("\n ],\n \"notes\": [");
@@ -767,28 +1088,36 @@ int main(int argc, char** argv) {
         }
         printf("]}\n");
     } else {
-        printf("smash-estimate: pid %d (%s), method %s, idle window %.0f s\n", pid, comm(pid).c_str(),
-               method.c_str(), o.window);
+        printf("smash-estimate: pid %d (%s), method %s, idle window %.0f s, cold timeout %.0f s\n", pid,
+               comm(pid).c_str(), method.c_str(), o.window, o.cold);
         printf("RSS %s; anonymous present at start %s\n", human(rss).c_str(), human(tot_present).c_str());
         printf("idle for:");
         for (int k = 0; k < o.points; ++k)
             printf("  >=%.0fs %s (%.0f%%)", point_s[k], human(tot_idle_at[k]).c_str(),
                    tot_present > 0 ? 100.0 * tot_idle_at[k] / tot_present : 0.0);
-        printf("\n\n%-13s %10s %10s %8s %6s %12s  %s\n", "class", "present", "idle", "sampled", "ratio",
-               "saving", "managed by smash?");
+        printf("\n\n%-13s %10s %10s %8s %6s %7s %12s  %s\n", "class", "present", "idle", "sampled", "ratio",
+               "layout", "saving", "managed by smash?");
         for (int c = 0; c < kNumClass; ++c) {
             auto& a = agg[c];
             auto& r = out[c];
             if (!a.mappings) continue;
-            printf("%-13s %10s %10s %8zu %5.1fx %12s  %s\n", kClassName[c], human(a.present).c_str(),
-                   human(a.idle).c_str(), r.n, r.ratio, have_savings ? human(r.saving).c_str() : "n/a",
-                   kClassNote[c]);
+            printf("%-13s %10s %10s %8zu %5.1fx %6.3fx %12s  %s\n", kClassName[c], human(a.present).c_str(),
+                   human(a.idle_at[k_base]).c_str(), r.n, r.ratio, lay[c].factor,
+                   have_savings ? human(r.saving).c_str() : "n/a", kClassNote[c]);
         }
-        if (have_savings)
-            printf("\nProjected RSS reduction: %s (%.1f%% of RSS), 95%% CI +/- %s (%.1f%%)\n",
-                   human(tot_saving).c_str(), pct(tot_saving), human(tot_half).c_str(), pct(tot_half));
-        else
+        if (have_savings) {
+            printf("\ncompressed-page saving %s, minus smash's metadata %s, runtime %s and allocator layout %s\n",
+                   human(tot_saving).c_str(), human(meta).c_str(), human(runtime).c_str(),
+                   human(tot_layout).c_str());
+            printf("Projected RSS reduction: %s (%.1f%% of RSS), 95%% CI +/- %s (%.1f%%)%s\n",
+                   human(net).c_str(), pct(net), human(tot_half).c_str(), pct(tot_half),
+                   backoff ? ", with refault backoff" : "");
+            if (backoff)
+                printf("  without refault backoff (no compressed page is ever re-read): %s (%.1f%%)\n",
+                       human(net_nb).c_str(), pct(net_nb));
+        } else {
             printf("\nProjected RSS reduction: unavailable (page contents unreadable)\n");
+        }
         printf("(zstd-1, smash's 0.75 ratio gate and 16-byte blob granularity; assumes every idle page in a\n"
                " class is smash-managed -- see the class notes, and agents/estimator.md for what is not modeled)\n");
         for (auto& n : notes) printf("note: %s\n", n.c_str());

@@ -939,7 +939,24 @@ class CompressorThread {
         uint64_t max_saving_kb = 0, managed_kb = 0;
         long double sum_rss_kb = 0, sum_proj_kb = 0;
         uint64_t first_sec = 0;
+        // obsRefreshProjection() (coordinator, every tick).
+        int64_t held_pages = 0, held_bytes = 0;  // would still be resident under refault backoff
+        int64_t read_held_pages = 0, read_held_bytes = 0;  // reclaimed but read within the window
+        int64_t obs_meta_bytes = 0;              // resident observe-only arrays (a real run lacks them)
+        // obsReferencedTick(): per kObsRefSub-tick sub-window, the arena
+        // bytes the kernel saw referenced minus the pages observe read itself
+        // (snapshots, shadow re-reads: process_vm_readv sets the bits too);
+        // ref_bytes = the largest of the sub-windows in the last cold-timeout
+        // + 2 ticks (-1 = none yet).
+        int64_t ref_bytes = -1;
+        uint32_t ref_tick = 0;
+        uint64_t ref_self_mark = 0;
+        static constexpr int kRefRing = 32;
+        int64_t ref_ring[kRefRing] = {};
+        uint32_t ref_ring_tick[kRefRing] = {};
+        int ref_ring_n = 0;
     } obs_;
+    bool cfg_obs_referenced_ = true;             // SMASH_OBSERVE_REFERENCED=0: no clear_refs 1 read signal
     const char* cfg_observe_report_ = nullptr;   // SMASH_OBSERVE_REPORT=path (JSON)
     int cfg_observe_interval_ = 10;              // SMASH_OBSERVE_INTERVAL=seconds (0 = exit only)
     pid_t obs_pid_ = 0;                          // pid that read the config (fork children suffix)
@@ -7274,6 +7291,7 @@ public:
                 cfg_observe_interval_ = v < 0 ? 0 : v;
             }
             obs_pid_ = getpid();
+            if (const char* e = std::getenv("SMASH_OBSERVE_REFERENCED")) cfg_obs_referenced_ = std::atoi(e) != 0;
         }
         if (const char* e = std::getenv("SMASH_EAGER_FILL")) cfg_eager_fill_ = std::atoi(e) != 0;
         if (const char* e = std::getenv("SMASH_EAGER_FILL_TAIL")) {
@@ -8468,12 +8486,194 @@ public:
 #endif
     }
 
-    int64_t obsSavingBytes() const {
-        // Reclaimed pages give back their frame but keep their blob; shadow
-        // pages hold frame AND blob (a real run's transient overhead).
-        return obs_.recl_pages.load(std::memory_order_relaxed) * static_cast<int64_t>(kPageSize)
+    // Per-page bookkeeping a real run writes for each compressed or shadow
+    // page and observe mode never touches: CompressedPageInfo, the deferred
+    // madvise tick + pending flag, the shadow tick, the tier byte and the
+    // PROT_NONE byte (measured: 24.6 B/page more metadata RSS in a real
+    // bench_sqlite run than in observe mode, excluding the observe arrays).
+    static constexpr int64_t kRunMetaPerPage =
+        static_cast<int64_t>(sizeof(CompressedPageInfo) + 2 * sizeof(uint32_t) + 3);
+
+    // Projected saving without refault backoff: reclaimed pages give back
+    // their frame but keep their blob; shadow pages hold frame AND blob (a
+    // real run's transient overhead); every virtually compressed page costs
+    // the real run kRunMetaPerPage of metadata; the observe-only arrays are
+    // RSS a real run does not have.
+    int64_t obsSavingNoBackoff() const {
+        const int64_t recl = obs_.recl_pages.load(std::memory_order_relaxed);
+        const int64_t shadow = obs_.shadow_pages.load(std::memory_order_relaxed);
+        return recl * static_cast<int64_t>(kPageSize)
              - obs_.recl_blob.load(std::memory_order_relaxed)
-             - obs_.shadow_blob.load(std::memory_order_relaxed);
+             - obs_.shadow_blob.load(std::memory_order_relaxed)
+             - (recl + shadow) * kRunMetaPerPage
+             + obs_.obs_meta_bytes;
+    }
+    // Whether observe mode can see reads per page (the idle bitmap).
+    bool obsReadBlind() const {
+#ifdef __linux__
+        return idle_read_ok_ != 1;
+#else
+        return true;
+#endif
+    }
+    // Whether the projection assumes refault backoff. A real run doubles the
+    // cold wait of a page, and of fresh pages from the same (arena, size
+    // class), once one of them refaults (bucket_rc_ema_x256_). Observe mode
+    // does not simulate that; it assumes the backoff once a refault is
+    // projected, and always when it cannot see reads, the usual trigger
+    // (bench_sqlite: ~600 read refaults right after the first cold wave, no
+    // write refaults in those buckets): pages idle for less than twice the
+    // cold floor are then counted as still resident (obsRefreshProjection).
+    bool obsAssumesBackoff() const {
+        return obsReadBlind() || obs_.refault_w.load(std::memory_order_relaxed) +
+                                 obs_.refault_r.load(std::memory_order_relaxed) > 0;
+    }
+    int64_t obsSavingBytes() const {
+        int64_t s = obsSavingNoBackoff();
+        if (obsAssumesBackoff()) s -= obs_.held_bytes;
+        if (obsReadBlind()) s -= obs_.read_held_bytes;
+        return s;
+    }
+
+    // Read signal without the idle bitmap (Linux): the kernel's referenced
+    // bits, per mapping. Every kObsRefSub ticks sum smaps Referenced over the
+    // arena's VMAs, then clear the bits (clear_refs 1: young bits only; no
+    // data or protection changes, though pages look older to the kernel's
+    // LRU). Pages the program touches within a real run's compression age
+    // (cold timeout + 2 ticks) stay resident there (the pre-compression read
+    // check, or a refault right after). Per page they are invisible, but at
+    // least max(0, referenced - non-reclaimed resident) of them must be among
+    // the reclaimed pages, and the projection keeps those resident. The
+    // referenced count of a sub-window excludes the pages observe read itself
+    // in it, and the largest sub-window of the last cold-timeout + 2 ticks
+    // stands for the window (a lower bound of their union: a page read less
+    // often than every kObsRefSub ticks may be missed). bench_kv_store
+    // (hash-chain walks read cold pages): observe projected 448 MiB
+    // reclaimed, the arena saw 124 MiB referenced in 12 s with only 54 MiB
+    // not reclaimed, and the real run compressed 366 MiB.
+    static constexpr uint32_t kObsRefSub = 2;
+    __attribute__((noinline, cold)) void obsReferencedTick() {
+#ifdef __linux__
+        if (!cfg_obs_referenced_ || !obsReadBlind() || !vm_ || vm_->contigPages() == 0) return;
+        auto& o = obs_;
+        if (o.ref_tick != 0 && tick_counter_ - o.ref_tick < kObsRefSub) return;
+        const uint64_t self_mark = o.snapshots.load(std::memory_order_relaxed) +
+                                   o.reclaims.load(std::memory_order_relaxed) +
+                                   o.discards.load(std::memory_order_relaxed);
+        if (o.ref_tick != 0) {
+            const uintptr_t lo = reinterpret_cast<uintptr_t>(vm_->base());
+            const int64_t r = selfReferencedBytes(lo, lo + vm_->contigPages() * kPageSize);
+            if (r >= 0) {
+                int64_t app = r - static_cast<int64_t>(self_mark - o.ref_self_mark) * static_cast<int64_t>(kPageSize);
+                const int k = o.ref_ring_n++ % ObserveStats::kRefRing;
+                o.ref_ring[k] = app > 0 ? app : 0;
+                o.ref_ring_tick[k] = tick_counter_;
+                const uint32_t win = static_cast<uint32_t>(getColdTicks()) + 2;
+                int64_t best = 0;
+                const int n = o.ref_ring_n < ObserveStats::kRefRing ? o.ref_ring_n : ObserveStats::kRefRing;
+                for (int q = 0; q < n; ++q)
+                    if (tick_counter_ - o.ref_ring_tick[q] < win && o.ref_ring[q] > best) best = o.ref_ring[q];
+                o.ref_bytes = best;
+            }
+        }
+        o.ref_self_mark = self_mark;
+        const int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, "/proc/self/clear_refs",
+                                                O_WRONLY | O_CLOEXEC));
+        if (fd < 0) { cfg_obs_referenced_ = false; return; }
+        const bool ok = syscall(SYS_write, fd, "1", 1) == 1;
+        syscall(SYS_close, fd);
+        if (!ok) { cfg_obs_referenced_ = false; return; }
+        o.ref_tick = tick_counter_ ? tick_counter_ : 1;
+#endif
+    }
+
+#ifdef __linux__
+    // Sum of smaps "Referenced:" over the VMAs overlapping [lo, hi). Raw syscalls
+    // and a stack buffer: no allocation. -1 if smaps is unreadable.
+    __attribute__((noinline, cold)) static int64_t selfReferencedBytes(uintptr_t lo, uintptr_t hi) {
+        const int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, "/proc/self/smaps", O_RDONLY | O_CLOEXEC));
+        if (fd < 0) return -1;
+        char buf[16384];
+        size_t have = 0;
+        bool in = false;
+        int64_t total = 0;
+        for (;;) {
+            const long n = syscall(SYS_read, fd, buf + have, sizeof(buf) - 1 - have);
+            if (n <= 0 && have == 0) break;
+            if (n > 0) have += static_cast<size_t>(n);
+            buf[have] = 0;
+            size_t pos = 0;
+            for (;;) {
+                char* nl = static_cast<char*>(memchr(buf + pos, '\n', have - pos));
+                if (!nl) break;
+                *nl = 0;
+                const char* l = buf + pos;
+                pos = static_cast<size_t>(nl - buf) + 1;
+                // VMA header: "start-end perms ..."; field lines start with a capital letter.
+                if ((l[0] >= '0' && l[0] <= '9') || (l[0] >= 'a' && l[0] <= 'f')) {
+                    char* e = nullptr;
+                    const uintptr_t s = static_cast<uintptr_t>(strtoull(l, &e, 16));
+                    const uintptr_t t = (e && *e == '-') ? static_cast<uintptr_t>(strtoull(e + 1, nullptr, 16)) : 0;
+                    // Overlap, not containment: the arena's first VMA can
+                    // start below base (merged with an adjacent anonymous
+                    // mapping), measured on cloudnew.
+                    in = s < hi && t > lo;
+                } else if (in && strncmp(l, "Referenced:", 11) == 0) {
+                    total += static_cast<int64_t>(strtoull(l + 11, nullptr, 10)) * 1024;
+                }
+            }
+            if (pos == 0 && have >= sizeof(buf) - 1) have = 0;  // over-long line: drop it
+            else { memmove(buf, buf + pos, have - pos); have -= pos; }
+            if (n <= 0) break;
+        }
+        syscall(SYS_close, fd);
+        return total;
+    }
+#endif
+    // Coordinator, every tick (one pass over the page arrays, like Phase 1).
+    // held_*: reclaimed pages whose idle streak is below twice the base cold
+    // floor plus the deferred-reclaim delay (a backed-off page is compressed
+    // at 2x the floor and its frame dropped that many ticks later) -- their
+    // frame, minus their blob and metadata -- plus the blob of such shadow
+    // pages: what a run whose buckets all backed off would not have released
+    // yet.
+    __attribute__((noinline, cold)) void obsRefreshProjection() {
+        const uint32_t held_floor = 2u * static_cast<uint32_t>(getColdTicks()) +
+                                    static_cast<uint32_t>(getDeferredReclaimDelay());
+        int64_t held_pages = 0, held_blob = 0, held_shadow = 0, held_shadow_blob = 0;
+        const size_t n = vm_->committedPages();
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t stg = obs_stage_[i].load(std::memory_order_relaxed);
+            if (stg == kObsNone || cold_count_[i] >= held_floor) continue;
+            // Workers own obs_blob_[i]; the coordinator only samples it.
+            const int64_t blob = __atomic_load_n(&obs_blob_[i], __ATOMIC_RELAXED);
+            if (stg == kObsReclaimed) { ++held_pages; held_blob += blob; }
+            else { ++held_shadow; held_shadow_blob += blob; }
+        }
+        obs_.held_pages = held_pages;
+        obs_.held_bytes = held_pages * static_cast<int64_t>(kPageSize) - held_blob - held_shadow_blob
+                        - (held_pages + held_shadow) * kRunMetaPerPage;
+        // Read-hot pages hidden among the reclaimed ones (obsReferencedTick).
+        obs_.read_held_pages = obs_.read_held_bytes = 0;
+        const int64_t recl = obs_.recl_pages.load(std::memory_order_relaxed);
+        if (obs_.ref_bytes >= 0 && recl > held_pages) {
+            const int64_t ref_pages = obs_.ref_bytes / static_cast<int64_t>(kPageSize);
+            const int64_t not_recl = static_cast<int64_t>(resident_pages_last_) - recl;
+            int64_t x = ref_pages - (not_recl > 0 ? not_recl : 0);
+            if (x > recl - held_pages) x = recl - held_pages;
+            if (x > 0) {
+                const int64_t avg_blob = obs_.recl_blob.load(std::memory_order_relaxed) / recl;
+                obs_.read_held_pages = x;
+                obs_.read_held_bytes = x * (static_cast<int64_t>(kPageSize) - avg_blob - kRunMetaPerPage);
+            }
+        }
+        const size_t max_pages = vm_->totalPages();
+        vm::ResidentScan rs;
+        obs_.obs_meta_bytes = static_cast<int64_t>(
+            rs.residentBytes(obs_stage_, max_pages * sizeof(obs_stage_[0])) +
+            rs.residentBytes(obs_blob_, max_pages * sizeof(obs_blob_[0])) +
+            rs.residentBytes(obs_hash_, max_pages * sizeof(obs_hash_[0])) +
+            rs.residentBytes(obs_tick_, max_pages * sizeof(obs_tick_[0])));
     }
 
     // Coordinator, end of every tick.
@@ -8481,6 +8681,8 @@ public:
     // coordinator runs on a 128 KiB stack; sigusr1Handler is deep too).
     __attribute__((noinline, cold)) void observeTickSample() {
         auto& o = obs_;
+        obsReferencedTick();
+        obsRefreshProjection();
         const uint64_t rss = residentKb();
         const int64_t sav_b = obsSavingBytes();
         const uint64_t sav = sav_b > 0 ? static_cast<uint64_t>(sav_b) / 1024 : 0;
@@ -8525,7 +8727,11 @@ public:
         const uint64_t rss_kb = final ? residentKb() : o.rss_kb;
         uint64_t peak_kb = obsPeakRssKb();
         if (o.peak_rss_kb > peak_kb) peak_kb = o.peak_rss_kb;
+        if (final) obsRefreshProjection();
         const int64_t sav_b = obsSavingBytes();
+        const int64_t sav_nb = obsSavingNoBackoff();
+        const int64_t run_meta = (o.recl_pages.load(std::memory_order_relaxed) +
+                                  o.shadow_pages.load(std::memory_order_relaxed)) * kRunMetaPerPage;
         const uint64_t rss_b = rss_kb * 1024;
         const int64_t proj_b = static_cast<int64_t>(rss_b) - (sav_b > 0 ? sav_b : 0);
         const uint64_t n = o.ticks ? o.ticks : 1;
@@ -8551,11 +8757,12 @@ public:
         const auto sgn = [](long v) { return v < 0 ? "-" : ""; };
         const auto ab = [](long v) { return v < 0 ? -v : v; };
 
-        char buf[768];
+        char buf[896];
         int len = smash::safe_snprintf(buf, sizeof(buf),
             "[smash observe] %s pid=%d t=%llus mode=%s write_track=%s read_track=%s"
             " rss=%ldMiB peak_rss=%ldMiB managed=%ldMiB would_compress=%ldMiB blob=%ldMiB"
             " projected_saving=%ldMiB projected_rss=%ldMiB reduction=%s%ld.%ld%%"
+            " no_backoff_saving=%ldMiB backoff=%s"
             " avg_reduction=%s%ld.%ld%% peak_relative=%s%ld.%ld%% refaults=%llu(w=%llu,r=%llu)"
             " refault_rate=%ld.%ld%% discards=%llu rejected=%llu"
             " hist[rej,<2,2-4,4-8,8-16,16+,zero]=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
@@ -8567,7 +8774,9 @@ public:
             MiB(static_cast<long double>(o.recl_blob.load(std::memory_order_relaxed) +
                                          o.shadow_blob.load(std::memory_order_relaxed))),
             MiB(static_cast<long double>(sav_b)), MiB(static_cast<long double>(proj_b)),
-            sgn(red), ab(red) / 10, ab(red) % 10, sgn(avg_red), ab(avg_red) / 10, ab(avg_red) % 10,
+            sgn(red), ab(red) / 10, ab(red) % 10,
+            MiB(static_cast<long double>(sav_nb)), obsAssumesBackoff() ? "assumed" : "none",
+            sgn(avg_red), ab(avg_red) / 10, ab(avg_red) % 10,
             sgn(peak_red), ab(peak_red) / 10, ab(peak_red) % 10,
             static_cast<unsigned long long>(rw + rr), static_cast<unsigned long long>(rw),
             static_cast<unsigned long long>(rr), rf / 10, rf % 10,
@@ -8584,7 +8793,8 @@ public:
             ? smash::safe_snprintf(path, sizeof(path), "%s", cfg_observe_report_)
             : smash::safe_snprintf(path, sizeof(path), "%s.%d", cfg_observe_report_, static_cast<int>(getpid()));
         if (pl <= 0 || static_cast<size_t>(pl) >= sizeof(path)) return;
-        char js[2048];
+        const RssBreakdown rb = rssBreakdown();
+        char js[3072];
         int jl = smash::safe_snprintf(js, sizeof(js),
             "{\"pid\": %d, \"final\": %s, \"elapsed_s\": %llu, \"ticks\": %llu,"
             " \"mode\": \"%s\", \"write_tracking\": \"%s\", \"read_tracking\": \"%s\",\n"
@@ -8598,6 +8808,11 @@ public:
             " \"snapshots\": %llu, \"rejected\": %llu, \"zero_pages\": %llu, \"shadow_discards\": %llu,"
             " \"reclaims\": %llu, \"refaults_write\": %llu, \"refaults_read\": %llu,"
             " \"refault_rate_pct\": %ld.%ld, \"freed_while_compressed\": %llu,\n"
+            " \"projected_saving_no_backoff_bytes\": %lld, \"backoff_held_bytes\": %lld,"
+            " \"read_held_bytes\": %lld, \"referenced_bytes\": %lld,"
+            " \"assumes_backoff\": %s, \"observe_metadata_bytes\": %lld, \"run_metadata_bytes\": %lld,\n"
+            " \"rss_parts\": {\"data_live\": %llu, \"data_shadow\": %llu, \"data_empty\": %llu,"
+            " \"store\": %llu, \"metadata\": %llu, \"other\": %llu},\n"
             " \"ratio_hist\": {\"rejected\": %llu, \"lt2x\": %llu, \"2_4x\": %llu, \"4_8x\": %llu,"
             " \"8_16x\": %llu, \"ge16x\": %llu, \"zero\": %llu}}\n",
             static_cast<int>(getpid()), final ? "true" : "false",
@@ -8619,6 +8834,12 @@ public:
             (unsigned long long)o.discards.load(std::memory_order_relaxed),
             (unsigned long long)reclaims, (unsigned long long)rw, (unsigned long long)rr,
             rf / 10, rf % 10, (unsigned long long)o.freed.load(std::memory_order_relaxed),
+            (long long)sav_nb, (long long)(obsAssumesBackoff() ? o.held_bytes : 0),
+            (long long)(obsReadBlind() ? o.read_held_bytes : 0), (long long)o.ref_bytes,
+            obsAssumesBackoff() ? "true" : "false", (long long)o.obs_meta_bytes, (long long)run_meta,
+            (unsigned long long)rb.data_live, (unsigned long long)rb.data_shadow,
+            (unsigned long long)rb.data_empty, (unsigned long long)(rb.store_header + rb.store_data),
+            (unsigned long long)rb.metadata, (unsigned long long)rb.other,
             (unsigned long long)h[0], (unsigned long long)h[1], (unsigned long long)h[2],
             (unsigned long long)h[3], (unsigned long long)h[4], (unsigned long long)h[5],
             (unsigned long long)h[6]);
@@ -8770,6 +8991,9 @@ public:
     const char* cfg_report_ = nullptr;        // SMASH_REPORT
     const char* cfg_metrics_path_ = nullptr;  // SMASH_METRICS_FILE
     uint64_t cfg_metrics_interval_ns_ = 10ull * 1000000000ull;
+    // SMASH_METRICS_RSS_PARTS=1: also export smash_rss_part_bytes (a pagemap
+    // read per resident page per interval; off by default for big heaps).
+    bool cfg_metrics_rss_parts_ = false;
     uint64_t metrics_last_ns_ = 0;
     char* metrics_buf_ = nullptr;             // BootstrapAlloc, kMetricsBufSize
     static constexpr size_t kMetricsBufSize = 16384;
@@ -8781,6 +9005,7 @@ public:
         cfg_report_ = (r && *r && std::strcmp(r, "0") != 0) ? r : nullptr;
         const char* m = std::getenv("SMASH_METRICS_FILE");
         cfg_metrics_path_ = (m && *m) ? m : nullptr;
+        if (const char* rp = std::getenv("SMASH_METRICS_RSS_PARTS")) cfg_metrics_rss_parts_ = std::atoi(rp) != 0;
         if (const char* iv = std::getenv("SMASH_METRICS_INTERVAL_SEC")) {
             double sec = std::atof(iv);
             if (sec < 1) sec = 1;
@@ -8900,6 +9125,69 @@ public:
         return s;
     }
 
+    // Where the process's resident memory is, by smash's own accounting
+    // (mincore): data pages of the VmRegion split by page state, the
+    // CompressStore (header pages, blob pages, live blob bytes) and the
+    // bootstrap metadata. `other` = RSS minus all of these (program image,
+    // libraries, stacks, system-malloc memory, smash's other mappings).
+    // Used to decompose estimator error (bench/validate_estimator.py); cost
+    // is one mincore per 4096 data pages plus one per store region, so it
+    // is computed only for the metrics file and the observe JSON.
+    struct RssBreakdown {
+        uint64_t rss = 0;
+        uint64_t data_live = 0;      // ACTIVE / ACTIVE_MONITORING / COMPRESSING
+        uint64_t data_shadow = 0;    // COMPRESSED_SHADOW: frame + blob held
+        uint64_t data_pending = 0;   // COMPRESSED, deferred madvise not yet run
+        uint64_t data_compressed_resident = 0;  // COMPRESSED, not pending, still resident
+        uint64_t data_empty = 0;     // EMPTY (freed) pages still holding a frame
+        uint64_t store_header = 0, store_data = 0, store_live = 0, store_regions = 0;
+        uint64_t metadata = 0;       // BootstrapAlloc regions + direct maps
+        uint64_t other = 0;
+    };
+    __attribute__((noinline, cold)) RssBreakdown rssBreakdown() const {
+        RssBreakdown b;
+        b.rss = residentKb() * 1024;
+#if defined(__linux__) || defined(__APPLE__)
+        if (states_ && vm_) {
+            const size_t total = vm_->committedPages();
+            const size_t gap_lo = vm_->rawNextPage(), gap_hi = vm_->contigPages();
+            auto bucket = [&](size_t i) {
+                const PageState st = states_->get(i);
+                uint64_t* slot = &b.data_live;
+                if (st == PageState::EMPTY) slot = &b.data_empty;
+                else if (st == PageState::COMPRESSED_SHADOW) slot = &b.data_shadow;
+                else if (st == PageState::COMPRESSED)
+                    slot = (deferred_pending_ && deferred_pending_[i].load(std::memory_order_relaxed))
+                        ? &b.data_pending : &b.data_compressed_resident;
+                *slot += kPageSize;
+            };
+            vm::ResidentScan rs;
+            // Contiguous arena [0, min(bump, contig)). In tracking mode
+            // (compress_only) contig is 0 and every page is external.
+            size_t contig_end = gap_lo < total ? gap_lo : total;
+            if (contig_end > gap_hi) contig_end = gap_hi;
+            if (contig_end && kPageSize == rs.pageSize())
+                rs.scan(vm_->pageAddress(0), contig_end, bucket);
+            // External pages (SMASH_TRACK_EXTERNAL): arbitrary addresses.
+            for (size_t i = gap_hi > contig_end ? gap_hi : contig_end; i < total; ++i) {
+                if (states_->get(i) == PageState::EMPTY) continue;
+                void* a = vm_->pageAddress(i);
+                if (a && rs.residentBytes(a, kPageSize)) bucket(i);
+            }
+        }
+        if (store_) {
+            const auto r = store_->resident();
+            b.store_header = r.header; b.store_data = r.data;
+            b.store_live = r.live; b.store_regions = r.regions;
+        }
+        b.metadata = BootstrapAlloc::instance().resident();
+#endif
+        const uint64_t acc = b.data_live + b.data_shadow + b.data_pending + b.data_compressed_resident +
+                             b.data_empty + b.store_header + b.store_data + b.metadata;
+        b.other = b.rss > acc ? b.rss - acc : 0;
+        return b;
+    }
+
     static uint64_t peakRssKb() {
         struct rusage ru{};
         if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
@@ -9002,6 +9290,24 @@ public:
         put("smash_compressed_bytes %llu\n", (unsigned long long)(ps.compressed * kPageSize));
         metric("smash_store_bytes", "gauge", "Bytes of compressed blobs held in the store.");
         put("smash_store_bytes %llu\n", (unsigned long long)ps.stored_bytes);
+        if (cfg_metrics_rss_parts_) {
+            const RssBreakdown rb = rssBreakdown();
+            metric("smash_rss_part_bytes", "gauge",
+                   "Resident bytes by owner (pagemap; mincore on macOS): data_* = smash data pages by state, store_* = "
+                   "compressed-blob store, metadata = smash bookkeeping, other = the rest of RSS.");
+            const struct { const char* k; uint64_t v; } parts[] = {
+                {"data_live", rb.data_live}, {"data_shadow", rb.data_shadow},
+                {"data_pending_madvise", rb.data_pending},
+                {"data_compressed_resident", rb.data_compressed_resident},
+                {"data_empty", rb.data_empty}, {"store_header", rb.store_header},
+                {"store_data", rb.store_data}, {"metadata", rb.metadata}, {"other", rb.other}};
+            for (const auto& p : parts)
+                put("smash_rss_part_bytes{part=\"%s\"} %llu\n", p.k, (unsigned long long)p.v);
+            metric("smash_store_live_bytes", "gauge", "Live blob bytes in the store (region accounting).");
+            put("smash_store_live_bytes %llu\n", (unsigned long long)rb.store_live);
+            metric("smash_store_regions", "gauge", "CompressStore regions mapped.");
+            put("smash_store_regions %llu\n", (unsigned long long)rb.store_regions);
+        }
 
         metric("smash_compressions_total", "counter", "Pages compressed and kept.");
         put("smash_compressions_total %llu\n", (unsigned long long)ld(g.compressions));

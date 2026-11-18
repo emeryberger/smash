@@ -31,7 +31,8 @@ Find out without risk before running it for real:
   sample of them the way smash would, and prints the projected RSS reduction with a confidence
   interval, per mapping, with notes on which memory smash manages. It never writes the target's
   memory. Reading page contents needs ptrace access (root, or launch the program through it:
-  `smash-estimate -- ./your_server`).
+  `smash-estimate -- ./your_server`). `--window 21 --points 7` also accounts for smash backing off
+  on pages that come back after compression (recommended).
 - **`SMASH_MODE=observe`**: run with smash preloaded in dry-run mode. Cold detection and
   compression run as usual, but every compressed result is thrown away: no page is ever
   unmapped, protected against reads, or changed. It reports projected savings, the compression
@@ -39,7 +40,11 @@ Find out without risk before running it for real:
   `SMASH_OBSERVE_REPORT=path`). It still uses smash's allocator, so add `SMASH_LARGE_ONLY=1` for the
   most conservative run.
 
-Both overestimated the measured reduction on our SQLite benchmark (by 6.6 and 10.8 points); see
+Measured on cloudnew (dev numbers, 5 runs each, 25 s into each benchmark's serve phase), against a
+real smash run: `smash-estimate --window 21 --points 7` was within 1.2 points on our SQLite benchmark
+(45.4% projected vs 44.2% measured) and memcached (62.0% vs 61.9%), and 15.0 points low on an
+`std::unordered_map` workload (43.2% vs 58.2%), where smash's own layout keeps fewer pages hot than
+glibc's. Observe mode was 1.3, 1.0 and 3.1 points high on the same three. See
 [agents/estimator.md](agents/estimator.md) for what they do and don't capture.
 
 ## Install

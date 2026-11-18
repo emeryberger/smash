@@ -589,6 +589,38 @@ public:
 #endif
     }
 
+    // Resident bytes of the store's mappings, split into region header
+    // pages (Region struct) and data pages. Data minus the live blob bytes is
+    // the store's fragmentation: freed slots and partly used pages that still
+    // hold a frame. Diagnostics only (metrics / observe report); region
+    // bases are snapshotted under each shard lock and scanned outside it, as
+    // in keepWarm(). Regions are never unmapped, so that is safe.
+    struct Resident { size_t header = 0, data = 0, live = 0, regions = 0; };
+    Resident resident() const {
+        Resident out;
+        vm::ResidentScan rs;
+        const size_t ps = rs.pageSize();
+        const size_t first = (kDataStart + ps - 1) / ps;
+        constexpr int kMaxSpans = 256;
+        for (int s = 0; s < kCompressStoreShards; ++s) {
+            char* spans[kMaxSpans];
+            int n = 0;
+            {
+                LockGuard guard(const_cast<Spinlock&>(shards_[s].lock));
+                for (Region* r = shards_[s].current; r && n < kMaxSpans; r = r->next) {
+                    out.live += r->live_bytes.load(std::memory_order_relaxed);
+                    spans[n++] = r->base;
+                }
+            }
+            out.regions += static_cast<size_t>(n);
+            // Whole region: a reset region's bump offset restarts at
+            // kDataStart while pages past it may still be resident.
+            for (int k = 0; k < n; ++k)
+                rs.scan(spans[k], kRegionSize / ps, [&](size_t p) { (p < first ? out.header : out.data) += ps; });
+        }
+        return out;
+    }
+
     // Bytes of store pages whose blobs have all been released since the last
     // trim() (approximate: a page reused before the trim still counts).
     size_t deadBytesSinceTrim() const {

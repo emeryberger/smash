@@ -67,13 +67,25 @@ int main(int argc, char** argv) {
         return 1;
     }
     const double MiB = 1 << 20;
-    const double idle = num(js, "idle_bytes"), saving = num(js, "projected_saving_bytes");
-    const double ci = num(js, "ci95_bytes");
-    printf("idle=%.1f MiB saving=%.1f MiB +/- %.1f MiB\n", idle / MiB, saving / MiB, ci / MiB);
-    // Idle: cold_comp + cold_rand = 80 MiB; the two hot 16 MiB regions are out.
+    const double idle = num(js, "idle_bytes"), saving = num(js, "compression_saving_bytes");
+    const double ci = num(js, "ci95_bytes"), net = num(js, "projected_saving_bytes");
+    const double meta = num(js, "smash_metadata_bytes"), runtime = num(js, "smash_runtime_bytes");
+    const double layout = num(js, "layout_bytes");
+    printf("idle=%.1f MiB saving=%.1f MiB +/- %.1f MiB net=%.1f MiB (metadata %.1f, runtime %.1f, layout %.1f)\n",
+           idle / MiB, saving / MiB, ci / MiB, net / MiB, meta / MiB, runtime / MiB, layout / MiB);
+    // Idle: cold_comp + cold_rand = 80 MiB; the two hot 16 MiB regions are
+    // out, and so is the 10 MiB/s growth of cold_comp's VMA during the window.
     if (idle < 72 * MiB || idle > 92 * MiB) { fprintf(stderr, "FAIL: idle %.1f MiB not in [72, 92]\n", idle / MiB); return 1; }
     // Savings: the 64 MiB compressible region; random pages fail the ratio gate.
     if (saving < 54 * MiB || saving > 72 * MiB) { fprintf(stderr, "FAIL: saving %.1f MiB not in [54, 72]\n", saving / MiB); return 1; }
+    // The projection charges smash's own footprint (metadata for ~137 MiB of
+    // managed pages, libsmash's runtime; no layout change: the regions are
+    // mmaps, not glibc chunks).
+    if (meta < 1 * MiB || meta > 12 * MiB || runtime < 1 * MiB || runtime > 12 * MiB || layout != 0 ||
+        net < saving - meta - runtime - 0.01 * MiB || net > saving - meta - runtime + 0.01 * MiB) {
+        fprintf(stderr, "FAIL: projected saving is not compression - metadata - runtime\n");
+        return 1;
+    }
     if (js.find("\"savings_available\": true") == std::string::npos) { fprintf(stderr, "FAIL: no savings\n"); return 1; }
     // zero_read's 16 MiB of zero-page PTEs are present in pagemap but not in
     // RSS; with PFNs visible (idle method) they must not count as present.

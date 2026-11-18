@@ -969,3 +969,15 @@ function(add_peak_fill_test test_name large_only)
 endfunction()
 add_peak_fill_test(test_peak_fill 0)             # full mode
 add_peak_fill_test(test_peak_fill_large_only 1)  # large-only mode
+
+# SMASH_TEST_FORCE_TRACK_EXTERNAL=ON: run every test with
+# SMASH_TRACK_EXTERNAL=1 in its environment (the "TE-forced" CI matrix).
+# Preloaded tests pass it on to the program under test; a test that sets
+# SMASH_TRACK_EXTERNAL itself (cmake -E env) keeps its own value.
+option(SMASH_TEST_FORCE_TRACK_EXTERNAL "Run every test with SMASH_TRACK_EXTERNAL=1" OFF)
+if(SMASH_TEST_FORCE_TRACK_EXTERNAL)
+  get_property(_smash_all_tests DIRECTORY PROPERTY TESTS)
+  foreach(_t ${_smash_all_tests})
+    set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "SMASH_TRACK_EXTERNAL=1")
+  endforeach()
+endif()

@@ -359,11 +359,60 @@ cgroup knobs; `@cap` = per-config cap):
   allocations are all small, so large-only passes them to glibc. Under a cap,
   large-only is the config for "same as glibc"; full mode with the knobs is
   the config for "less memory".
-- Not measured this round (SSH access to cloudnew ended mid-batch):
-  `fine + ws + eager/guard` and `ws + eager/guard` on capped sqlite and rss
-  (batch `tmp/b4.json` was running), and the uncapped paper regression
-  (`check_paper_regression.py`) for the fine-class build, so the option
-  stays off.
+
+Combination batch, sqlite + redis + rss, `--seed 59` (`tmp/b4.json`; `ws` =
+both cgroup knobs, `eg` = `SMASH_EAGER_FILL=1 SMASH_PEAK_GUARD=1`, `fine` =
+the FINE_1K_CLASSES build):
+
+| config | sqlite mean MiB | sqlite cold p99 µs | sqlite ops/s | redis mean MiB | redis GET/s | rss mean MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| glibc + zswap | 245.9 | 2285 (1920–2380) | 89691 | 157.1 | 50142 (50000–50386) | 158.8 |
+| ws | 185.8 | 1850 (1784–1911) | 89562 | 111.6 | 41586 (41459–41789) | 58.0 |
+| ws + eg | 185.9 | 1750 (1717–1861) | 88592 | 85.5 | 41505 | 19.9 |
+| fine ws | 185.6 | 1805 (1743–1895) | 90708 | 109.5 | 44053 (43802–44274) | 58.3 |
+| fine ws + eg | 186.5 | **1726 (1707–1823)** | 89477 | **82.8** | **44066 (43840–45338)** | **20.3** |
+
+- `ws` reproduces b2/r3 (sqlite 1850 vs 1777 µs there, redis 41.6K in all
+  three batches).
+- Eager fill + peak guard: no memory change on capped sqlite (its fill is
+  not write-once, docs/PEAK.md), cold p99 −5%, sqlite throughput −1.1%;
+  redis mean memory −23% and bench_rss −66% at unchanged throughput.
+- Finer classes: redis +5.9% GET, sqlite and rss unchanged (no 1–2 KiB
+  objects).
+- Best measured capped config: fine + ws + eg. vs glibc+zswap at the same
+  cap: sqlite cold p99 −24% at 24% less mean memory; redis GET −12% at 47%
+  less mean memory; bench_rss 87% less mean memory.
+
+### Uncapped checks for the defaults question
+
+Outside a capped cgroup the policy is off (`SMASH_CGROUP=1` logs "no
+memory limit found, policy off" in the cloudnew user slice), so the two
+cgroup knobs cannot change uncapped behaviour. Measured anyway:
+`run_quick_ci.py` (bench_rss + bench_sqlite), 5 shuffled rounds of
+{full, large-only} × {knobs off, `SKIP_SWAPPED=2 WARM_MS=20`}: all 20 runs
+PASS; bench_rss best reduction 87% in every run; bench_sqlite median 59.1%
+(off, 58.9–59.5) vs 59.1% (on, 59.0–59.2) in full mode, 27.2% (26.8–27.5)
+vs 27.2% (27.2–27.3) in large-only.
+
+Fine-class build vs default, uncapped paper workloads:
+`run_paper_experiments.py --compress-only-only --configs full_smash --apps
+sqlite,rocksdb,memcached,redis,redis_ext --runs 1`, 5 rounds per build from
+`build-paper` / `build-paper-fine` (Release, bench deps on), build order
+shuffled per round; one default round failed to configure (transient alloc8
+fetch error) and was re-run after the others. `check_paper_regression.py`
+passes for both. Median (min–max) RSS reduction %, serve ops/s:
+
+| app | default | fine classes |
+|---|---|---|
+| SQLite | 70.6 (70.5–70.6), 90.4K (86.6–92.2K) | 70.5 (70.4–70.6), 89.4K (89.3–90.8K) |
+| RocksDB | 85.7 (85.5–85.8), 648K (623–671K) | 85.6 (85.5–85.6), 636K (630–651K) |
+| memcached | 89.8 (89.7–89.8), 215K (211–218K) | 89.7 (89.2–89.7), 214K (212–215K) |
+| Redis | 58.6 (58.6–58.6) | 58.5 (58.4–58.5) |
+| Redis-ext | 67.1 (66.9–67.7) | 67.1 (66.7–67.2) |
+
+Peak RSS medians are identical (406 / 314 / 295 / 283 / 283 MB). Reductions
+differ by ≤ 0.1 point; the throughput medians are 0.7–1.8% lower with fine
+classes but every fine range lies inside the default range.
 
 ### Bug found on the way (fixed)
 
@@ -383,9 +432,9 @@ zeroes the values in place and fails without the fix.
 - redis under a 160M cap: −10% GET vs glibc+zswap with finer classes and both
   knobs (at 31% less mean memory). The remaining footprint gap is 1088 vs
   1040 B per value plus heap slack.
-- Defaults for `SMASH_CGROUP_SKIP_SWAPPED=2`, `SMASH_CGROUP_WARM_MS=20` and
-  `SMASH_FINE_1K_CLASSES` need the uncapped Linux checks
-  (`run_quick_ci.py`, `check_paper_regression.py`) before they change.
+- `SMASH_CGROUP_SKIP_SWAPPED=2`, `SMASH_CGROUP_WARM_MS=20` and
+  `SMASH_FINE_1K_CLASSES` are still opt-in; the evidence for making them
+  defaults is above (capped wins in three batches, uncapped checks neutral).
 - Not measured: Kubernetes itself (the example manifest is untested on a
   cluster), memory.max-only caps without memory.high, hosts without zswap
   (disk swap only), cgroup v1.

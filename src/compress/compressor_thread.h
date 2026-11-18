@@ -347,8 +347,9 @@ class CompressorThread {
     vm::FaultHandler* fault_handler_ = nullptr;
 
     // Optional pre-tick callback (e.g., for VM region scanning in compress-only mode)
-    using PreTickFn = void(*)();
+    using PreTickFn = void(*)(void*);
     PreTickFn pre_tick_fn_ = nullptr;
+    void* pre_tick_ctx_ = nullptr;
 
     // Optional callback invoked once per successful page compression.
     // Used by SmashHeap to drive the A3 cold-arena feedback loop:
@@ -5571,7 +5572,7 @@ private:
         // Splits the count into slab vs large-alloc buckets so we can see at
         // a glance whether the gating is firing on large allocs (the case
         // for SMASH_LARGE_ONLY workloads).
-        if (s_debug_enabled_) {
+        if (debug_enabled_) {
             size_t n_compress_lg = 0, n_skip_lg = 0, n_explore_lg = 0;
             size_t n_rank_lg = 0;
             for (size_t i = 0; i < total; ++i) {
@@ -6435,7 +6436,7 @@ private:
     __attribute__((cold)) void tick() {
         ++tick_counter_;
         resident_pages_last_ = p1_resident_acc_.exchange(0, std::memory_order_relaxed);
-        if (pre_tick_fn_) pre_tick_fn_();
+        if (pre_tick_fn_) pre_tick_fn_(pre_tick_ctx_);
         if (fault_handler_) fault_handler_->ensureInstalled();
         // Kill switch / watchdog / SLO controller. While the switch is off
         // nothing below runs: no access tracking, no compression, no
@@ -6560,7 +6561,7 @@ private:
         // SMASH_DEBUG=1: print a stats line every 5 ticks (~5s at the
         // 1000ms compressor cadence — kCompressIntervalMs). Mirrors the
         // SIGUSR2 stats format so log scrapers can use one parser.
-        if (s_debug_enabled_) {
+        if (debug_enabled_) {
             static int debug_tick_counter = 0;
             if (++debug_tick_counter >= 5) {
                 debug_tick_counter = 0;
@@ -7262,7 +7263,7 @@ public:
         ROIConfig::instance().init(engine_);
     }
 
-    void setPreTickCallback(PreTickFn fn) { pre_tick_fn_ = fn; }
+    void setPreTickCallback(PreTickFn fn, void* ctx) { pre_tick_fn_ = fn; pre_tick_ctx_ = ctx; }
 
     // A3: feedback hook invoked once per successful page compression
     // with the originating span's arena_id and size_class.
@@ -7534,7 +7535,7 @@ public:
         cg_active_ = false;
         if (cfg_cgroup_ == 0) return;
         cg_active_ = cg_mon_.init(cfg_cgroup_root_);
-        if (cfg_cgroup_ == 1 || s_debug_enabled_) {
+        if (cfg_cgroup_ == 1 || debug_enabled_) {
             cgroup::Sample s = cg_active_ ? cg_mon_.sample() : cgroup::Sample{};
             char b[kPathMaxLog];
             int n = smash::safe_snprintf(b, sizeof(b),
@@ -7788,8 +7789,8 @@ public:
         // SMASH_STATS=1 (atexit-only) — SMASH_DEBUG is for watching
         // activity live without having to chase PIDs and send SIGUSR2.
         const char* dbg_env = std::getenv("SMASH_DEBUG");
-        s_debug_enabled_ = dbg_env && dbg_env[0] == '1';
-        if (s_debug_enabled_) {
+        debug_enabled_ = dbg_env && dbg_env[0] == '1';
+        if (debug_enabled_) {
             char ts[32] = {};
             vm::formatTimestamp(ts, sizeof(ts));
             char buf[200];
@@ -7846,7 +7847,10 @@ public:
 
     static inline CompressorThread* s_stats_instance_ = nullptr;
     static inline CompressorThread* s_stop_instance_ = nullptr;
-    static inline bool s_debug_enabled_ = false;
+    // SMASH_DEBUG=1, read in start(). Per instance (was a static): a test that
+    // runs a second CompressorThread beside the process singleton must not
+    // rewrite a field the singleton's coordinator is reading.
+    bool debug_enabled_ = false;
 
     // SMASH_STATS_SIGNAL=1 opts into installing the SIGUSR2 stats-dump handler
     // (and the per-tick reclaim). OFF by default so smash never hijacks

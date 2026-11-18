@@ -1074,8 +1074,6 @@ public:
         }
     }
 
-    static inline SmashHeap* tick_self_ = nullptr;
-
     static void compressedEventHook(size_t /*page_idx*/, uint8_t arena_id,
                                     uint8_t sc, void* ctx) {
         static_cast<SmashHeap*>(ctx)->onPageCompressed(arena_id, sc);
@@ -1390,15 +1388,18 @@ public:
             // Once per tick: return idle cached large blocks and long-empty
             // resident slab spans to the OS.
             if (!compress_only) {
-                tick_self_ = this;
-                compressor_.setPreTickCallback(+[] {
-                    SmashHeap* h = tick_self_;
-                    if (!h) return;
+                // The heap rides in the callback's context, not a static: a
+                // second SmashHeap (the unit tests build one beside the
+                // process singleton) would otherwise redirect the
+                // singleton's ticks to itself while its constructor was
+                // still writing the fields those ticks read.
+                compressor_.setPreTickCallback(+[](void* ctx) {
+                    SmashHeap* h = static_cast<SmashHeap*>(ctx);
                     h->large_alloc_.onTick();
                     Slab::advanceTick();
                     const int total = getTotalArenas() * kNumClasses;
                     for (int i = 0; i < total; ++i) h->slabs_[i].purgeResidentEmpty();
-                });
+                }, this);
             }
 
             if (!compress_only) {

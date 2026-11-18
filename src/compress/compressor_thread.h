@@ -765,13 +765,66 @@ class CompressorThread {
             locks_->unlock(i);
         }
     }
+    // The parent needs none of the PROT_NONEs uffdPrepareFork applied once
+    // fork() has returned: the child has its own copy of the VMAs (and keeps
+    // them protected), and the parent still has its uffd, under which a
+    // MISSING page faults to smash anyway. Left in place they fragmented the
+    // parent: bundled-jemalloc Valkey sat at ~40K VMAs after one BGSAVE (137
+    // before it), each later fork adding more. The first tick after the fork
+    // makes them RW again in address-contiguous runs (tryLock only:
+    // loosening a protection cannot fault an app thread, and no lock is
+    // waited for), never while another fork is pending; a page the app
+    // touched in between was restored and unprotected by the fault path.
+    static constexpr uint8_t kProtNoneFork = 2;  // prot_none_ value set by uffdPrepareFork
+    std::atomic<bool> fork_unprotect_{false};
+    void unprotectAfterFork() {
+        fork_unprotect_.store(false, std::memory_order_relaxed);
+        if (!uffd_mode_ || !prot_none_) return;
+        bool retry = false;
+        const size_t committed = vm_->committedPages();
+        constexpr size_t kRun = 256;
+        size_t run[kRun];
+        size_t i = 0;
+        while (i < committed) {
+            if (prot_none_[i] != kProtNoneFork) { ++i; continue; }
+            size_t n = 0, j = i;
+            uintptr_t expect = 0;
+            while (j < committed && n < kRun && prot_none_[j] == kProtNoneFork) {
+                const uintptr_t a = reinterpret_cast<uintptr_t>(vm_->pageAddress(j));
+                if (!a || (n && a != expect)) break;
+                if (!locks_->tryLock(j)) { retry = true; break; }
+                const PageState st = states_->get(j);
+                if (forkPending()) retry = true;
+                if (forkPending() || prot_none_[j] != kProtNoneFork ||
+                    (st != PageState::COMPRESSED && st != PageState::EMPTY)) {
+                    locks_->unlock(j);
+                    break;
+                }
+                run[n++] = j;
+                expect = a + kPageSize;
+                ++j;
+            }
+            if (n) {
+                if (vm::protectPages(vm_->pageAddress(run[0]), n * kPageSize, true, true)) {
+                    for (size_t k = 0; k < n; ++k) prot_none_[run[k]] = 0;
+                } else {
+                    retry = true;
+                }
+                for (size_t k = 0; k < n; ++k) locks_->unlock(run[k]);
+                i = j;
+            } else {
+                ++i;
+            }
+        }
+        if (retry) fork_unprotect_.store(true, std::memory_order_relaxed);
+    }
     // Page lock held, page COMPRESSED (MISSING). If the PROT_NONE fails (VMA
     // cap: the page sits between accessible neighbors), the child would read
     // the MISSING page as zeros: decompress it into place instead.
     void protectForFork(size_t i) {
         void* a = vm_->pageAddress(i);
         if (vm::protectPages(a, kPageSize, false, false)) {
-            prot_none_[i] = 1;
+            prot_none_[i] = kProtNoneFork;  // dropped again after the fork: unprotectAfterFork
             return;
         }
         if (!restoreCompressedLocked(i, a)) {
@@ -789,6 +842,9 @@ class CompressorThread {
     static void uffdDrop(void*) {}
     void uffdInit() {}
     void uffdPrepareFork() {}
+    static constexpr uint8_t kProtNoneFork = 2;
+    std::atomic<bool> fork_unprotect_{false};
+    void unprotectAfterFork() { fork_unprotect_.store(false, std::memory_order_relaxed); }
 #endif
     // uffd mode never splits arena VMAs, so it skips the /proc scan — but
     // EXTERNAL pages always take the classic mprotect path, which splits
@@ -1659,6 +1715,7 @@ public:
 
     // Resume after fork() in the parent.
     void resumeAfterFork() {
+        if (uffd_mode_) fork_unprotect_.store(true, std::memory_order_relaxed);
         fork_prepared_.store(false, std::memory_order_release);
         ext_fork_pending_.store(false, std::memory_order_release);
         paused_.store(false, std::memory_order_release);
@@ -1671,6 +1728,7 @@ public:
     // Without this, the singleton's startCompression() CAS fails (because
     // compression_started_ is true) and the child runs with no compressor.
     void resetForFork() {
+        fork_unprotect_.store(false, std::memory_order_relaxed);  // the child keeps them
         fork_prepared_.store(false, std::memory_order_release);
         ext_fork_pending_.store(false, std::memory_order_release);
         ext_detach_inflight_.store(0, std::memory_order_release);
@@ -6815,6 +6873,7 @@ private:
             if (store_) store_->trim();
             return;
         }
+        if (fork_unprotect_.load(std::memory_order_relaxed)) unprotectAfterFork();
         // Time-budget recompute is cheap (~144-4600 buckets sorted) and only
         // runs every kBudgetRecomputeEveryTicks ticks. When the budget knob
         // is unset this still runs but the inner loop short-circuits to the

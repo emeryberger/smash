@@ -936,6 +936,42 @@ bool testAppUffd() {
     return true;
 }
 
+// After a fork the parent must not keep the PROT_NONEs smash applies for the
+// child (uffd mode: a compressed page is MISSING, which a child without uffd
+// would read as zeros): with scattered compressed pages they fragmented the
+// parent's address space (Valkey: ~40K VMAs after one BGSAVE).
+bool testForkVma() {
+    constexpr size_t kRegion = 16 * 1024 * 1024;
+    char* p = static_cast<char*>(mapAnon(kRegion));
+    fill(p, kRegion, 51);
+    const size_t pages = kRegion / g_page;
+    double t0 = nowSec();
+    while (nowSec() - t0 < 30) {  // odd pages hot, even pages compress
+        for (size_t i = 1; i < pages; i += 2) p[i * g_page] = static_cast<char>(((i + 51) & 0xff) | 1);
+        if (compressedPages(p, kRegion) * 4 >= pages) break;
+        usleep(100 * 1000);
+    }
+    const long before = vmaCount();
+    pid_t pid = fork();
+    if (pid == 0) _exit(check(p, kRegion, 51) == SIZE_MAX ? 0 : 3);
+    const long just_after = vmaCount();
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) FAIL("[forkvma]: child status 0x%x", st);
+    long now = vmaCount();
+    t0 = nowSec();
+    while (now > before + 64 && nowSec() - t0 < 10) {
+        usleep(100 * 1000);
+        now = vmaCount();
+    }
+    fprintf(stderr, "  [forkvma] VMAs before fork %ld, right after %ld, settled %ld\n", before, just_after, now);
+    if (now > before + 64) FAIL("[forkvma]: parent kept %ld extra VMAs after a fork", now - before);
+    if (check(p, kRegion, 51) != SIZE_MAX) FAIL("[forkvma]: parent corrupted");
+    munmap(p, kRegion);
+    fprintf(stderr, "external_patterns_test: forkvma PASSED\n");
+    return true;
+}
+
 // Fork near vm.max_map_count with scattered compressed pages. In uffd mode
 // a compressed page is MISSING, which the child (no uffd) would read as
 // zeros, so before fork smash protects each one PROT_NONE. Near the cap that
@@ -1020,6 +1056,7 @@ int main(int argc, char** argv) {
     if (want("populate") && !testPopulate()) return 1;
     if (want("guardinstall") && !testGuardInstall()) return 1;
     if (want("appuffd") && !testAppUffd()) return 1;
+    if (want("forkvma") && !testForkVma()) return 1;
     if (want("forkcap") && !testForkCap()) return 1;
 #endif
     if (want("churn") && !testChurn()) return 1;

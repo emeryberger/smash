@@ -109,6 +109,17 @@ jobs:
         working-directory: smash
         run: python3 bench/run_quick_ci.py --build-dir build
 
+      # Same benchmarks in large-only mode (the production configuration) on
+      # macOS, where SQLite allocates through malloc_default_zone() and sizes
+      # blocks with zone->size(): system-passthrough pointers once sized as 0
+      # there and bench_sqlite spun forever in growOpArray(). ~1 min locally.
+      - name: Run quick benchmarks (large-only, macOS)
+        if: runner.os == 'macOS'
+        working-directory: smash
+        env:
+          SMASH_LARGE_ONLY: "1"
+        run: python3 bench/run_quick_ci.py --build-dir build
+
   # ── Packages + oldest supported glibc ────────────────────────────────────
   # Builds libsmash and its .deb/.rpm/.tar.gz exactly as release.yml does
   # (manylinux_2_28, packaging/linux/build-manylinux.sh), then installs the

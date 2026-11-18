@@ -80,7 +80,12 @@ Env: `SMASH_CGROUP=0|1` (unset = auto), `SMASH_CGROUP_ROOT` (tests),
 `SMASH_CGROUP_HEADROOM_PCT`, `SMASH_CGROUP_PSI_PCT`, ablations
 `SMASH_CGROUP_WARM=0`, `SMASH_CGROUP_SWAPIN=0`, `SMASH_CGROUP_SKIP_SWAPPED=0`;
 opt-ins `SMASH_CGROUP_EARLY=1`, `SMASH_CGROUP_SPILL=1` (both measured worse,
-below). The SIGUSR2 / `SMASH_DEBUG` stats line gains
+below), and two opt-ins from round 2 that measured better (see "Round 2"):
+
+- `SMASH_CGROUP_SKIP_SWAPPED=2`: skip non-resident pages whenever the cgroup
+  is capped, not only at a pressure level (`1`, the default).
+- `SMASH_CGROUP_WARM_MS=N`: while at a pressure level, also run keepWarm
+  every N ms between ticks (resident store pages only; no read-back). The SIGUSR2 / `SMASH_DEBUG` stats line gains
 `cg=level/headroomMiB/pressure_ticks/skipped/warm_pages/readback_pages`
 (level -1 = policy inactive).
 
@@ -198,12 +203,189 @@ Fix: `notePageProtNone()` in armReadCheck / escalateToDeepMonitoring. There is
 no ctest for it (it needs root, swap and a capped cgroup); repro in the commit
 message (8761687).
 
+## Round 2 (2026-11-17/18): where the remaining gaps came from
+
+cloudnew as above, but a 48-core taskset slice (136-183) and zswap
+`zstd/zsmalloc`, one 16 GiB swapfile (`/swapfile-smash-cgwin`). Base is
+master 4673d6c. All batches: 5 measured runs + 1 warmup per config, all
+interleaved (`--seed` given), same caps as above (sqlite 250M:400M, redis and
+rss 160M:240M), redis 8.8 built with `MALLOC=libc`. Each libsmash.so under
+test is a copy in `tmp/`; `tmp/*.json` paths are the raw results on cloudnew
+under `~/adoption/cgwin/`.
+
+### 1. The gaps on current master
+
+`run_cgroup_compare.py --config master=$M --config lo=$M,SMASH_LARGE_ONLY=1
+--apps sqlite,redis --seed 41` (`tmp/base1.json`):
+
+| app | config | mean mem.current MiB | ops/s | cold p99 / GET p99 µs | disk swap-ins |
+|---|---|---:|---:|---:|---:|
+| sqlite | glibc + zswap | 245.8 | 90003 | 2296 (2264–2385) | 0 |
+| sqlite | smash | 185.2 | 89611 | 2444 (2374–2939) | 25770–32120 |
+| sqlite | smash large-only | 245.9 | 89660 | 2291 | 3–12 |
+| redis | glibc + zswap | 156.7 | 50378 (50109–50463) | 1487 | 0 |
+| redis | smash | 115.8 | 39108 (38971–39830) | 1615 | 179–250 |
+| redis | smash large-only | 154.6 | 49751 (49570–49850) | 1503 | 0 |
+
+Both gaps were still there: sqlite cold p99 +6%, redis GET −22%. Redis
+does not swap the store to disk; its loss has a different cause (section 3).
+
+### 2. SQLite: two sources of store pages on disk
+
+`bench/cgroup_phase_probe.py` (one capped bench_sqlite run per config, cgroup and
+host counters every 0.1 s, bench stderr timestamped so phases line up; 2
+reps per config) split smash's disk traffic by phase. Across 6 runs of
+smash with the policy at its defaults: cooling phase 8.0–9.5K pswpout,
+serve phase 3.9–5.0K pswpin (the budgeted MADV_WILLNEED read-back of
+those), cold re-access phase 12–18K pswpout and 18–23K pswpin, cold phase
+9.5–13.5 s. glibc (2 runs): no disk swap in any phase, cold phase 4.5 s.
+
+- **Cooling.** The 0.1 s timeline shows memory.current at 104 MiB for ~10 s,
+  then 36K zswpin in 0.5 s, memory.current at the 250 MiB cap, and 8.1K
+  pswpout in the next 0.5 s. That is the compressor: `SKIP_SWAPPED=1` skips
+  swapped-out pages only while a pressure level is held, and when the hold
+  expires every page the kernel zswapped during the fill becomes a
+  candidate at once. Snapshotting them swaps them in, pushes the cgroup to
+  the cap, and the reclaim that follows takes freshly written store pages
+  (incompressible: zswap rejects them, so they go to disk).
+  `SKIP_SWAPPED=2` (skip whenever capped) removed this: cooling pswpout 0 in
+  both probe runs.
+- **Cold re-access.** Decompressing brings memory back to the cap and
+  reclaim cycles the cgroup's LRU faster than once a second, so the tick's
+  young bit does not protect the store. `WARM_MS=100` cut that phase's
+  pswpout to 4.4–5.7K, `WARM_MS=20` to 2.8–3.2K (probe, 2 runs each).
+
+5-run batch, `--config base=$L --config s2=$L,SMASH_CGROUP_SKIP_SWAPPED=2
+--config w20=$L,SMASH_CGROUP_WARM_MS=20 --config w20s2=$L,...both...
+--apps sqlite,redis,rss --seed 47` (`tmp/b2.json`):
+
+**sqlite**
+
+| config | mean mem.current MiB | ops/s | cold p99 µs | cold p50 µs | disk swap-ins | wall s |
+|---|---:|---:|---:|---:|---:|---:|
+| glibc + zswap | 245.9 | 89853 | 2286 (2197–2347) | 14.4 | 0 | 61.0 |
+| smash | 184.9 | 89118 | 2659 (2390–3083) | 22.4 | 25911 | 68.5 |
+| smash, SKIP_SWAPPED=2 | 186.3 | 89454 | 1904 (1822–2237) | 24.5 | 6113 | 64.4 |
+| smash, WARM_MS=20 | 182.5 | 89866 | 2269 (2217–2336) | 23.7 | 11033 | 64.8 |
+| smash, both | 186.1 | 90856 | **1777 (1740–1822)** | 24.8 | 4665 | 64.3 |
+
+**redis**
+
+| config | mean mem.current MiB | GET ops/s | GET p99 µs | zswpin |
+|---|---:|---:|---:|---:|
+| glibc + zswap | 156.9 | 50344 (50167–50497) | 1471 | 104805 |
+| smash | 115.8 | 39042 (38961–39216) | 1623 | 188874 |
+| smash, SKIP_SWAPPED=2 | 112.6 | 39620 | 1615 | 171865 |
+| smash, WARM_MS=20 | 114.6 | 42111 (41976–42259) | 1487 | 172162 |
+| smash, both | 111.2 | 41638 (41448–41725) | 1527 | 161054 |
+
+**bench_rss**
+
+| config | mean mem.current MiB | zswpin | majflt |
+|---|---:|---:|---:|
+| glibc + zswap | 159.1 | 159 | 119 |
+| smash | 61.6 | 27557 | 4624 |
+| smash, SKIP_SWAPPED=2 | 58.1 | 1442 | 1014 |
+| smash, both | 58.0 | 1307 | 741 |
+
+With both knobs, sqlite's cold p99 is 22% below glibc+zswap's (ranges do
+not overlap) and 33% below default smash, at the same mean memory (186 vs
+185 MiB) and throughput. The p50 is still higher than glibc's (24.8 vs
+14.4 µs: a smash fault costs more than a zswap fault) and the run's cold
+phase is still longer (wall time 64.3 vs 61.0 s). SKIP_SWAPPED=2 leaves more
+data in swap (mean memory.current + memory.swap.current 404 vs 331 MiB for
+sqlite), which matters only where memory.swap.max is set. Redis: +6.6% GET
+over default smash; WARM_MS alone was 1.1% faster than both (ranges do not
+overlap) but both used 3 MiB less mean memory. The knobs act only when a
+cgroup limit is detected; outside a cgroup the policy is inactive, so the
+uncapped paper workloads cannot be affected, but `run_quick_ci.py` /
+`check_paper_regression.py` were not re-run on Linux this round (SSH access
+ended), so both knobs stay opt-in.
+
+### 3. Redis: footprint, not the store
+
+Uncapped decomposition (`bench/redis_footprint.py`, same redis build and load,
+no cgroup, 3 runs + warmup per config; RSS sampled every 0.2 s, INFO memory
+and smaps at each phase; `tmp/decomp2.json`):
+
+| config | peak RSS MiB | RSS after fill | after 30 s idle | after GETs | used_memory MiB | GET ops/s |
+|---|---:|---:|---:|---:|---:|---:|
+| glibc | 208 | 208 | 208 | 208 | 198 | 63.3K–63.7K |
+| smash | 269–273 | 241–242 | 65 | 242 | 220–221 | 59.4K–59.9K |
+| smash, SMASH_FINE_1K_CLASSES | 256–258 | 228 | 62 | 228–229 | 209 | 59.5K–60.2K |
+
+- redis-benchmark's `-r 300000` gives ~190K distinct keys; each 1 KiB value
+  is a 1030 B sds string. smash puts it in the 1152 B class; glibc's chunk
+  is 1040 B. That is 120 B per value, the 23 MiB difference in used_memory
+  (redis counts malloc_usable_size), and most of the +33 MiB at the end of
+  the fill. The rest is the smash heap's slack (heap VMA RSS − used_memory:
+  5 MiB vs 3 for glibc's [heap]) and smash's own metadata mappings.
+- Uncapped, smash's GET loss is small (−5%): in one run, 20.5K
+  decompression faults and 0.42 s total fault service time
+  (`SMASH_METRICS_FILE`).
+- Under the 160M cap smash swaps more: zswpin 188K vs 105K (1.8x). The
+  uncapped footprints exceed the cap by 82 vs 48 MiB (1.7x); that the
+  footprint drives the extra swapping is a hypothesis consistent with the
+  frontier below (more cap, or a smaller footprint, both raise smash's GET
+  rate), not something measured directly.
+
+`SMASH_FINE_1K_CLASSES` (new CMake option, off by default) adds 8 classes
+(1088 .. 2048 in steps of 64) so these values take 1088 B.
+
+Frontier batch, redis only, `--seed 53` (`tmp/r3.json`; `ws` = both
+cgroup knobs; `@cap` = per-config cap):
+
+| config | cap | mean mem.current MiB | GET ops/s | GET p99 µs | zswpin |
+|---|---|---:|---:|---:|---:|
+| glibc + zswap | 160M | 156.8 | 50268 (50167–50633) | 1471 | 104673 |
+| glibc + zswap | 130M | 127.3 | 37932 (37755–38304) | 1719 | 242712 |
+| glibc + zswap | 115M | 113.0 | 31810 (31642–31952) | 1823 | 344115 |
+| smash | 160M | 115.9 | 39159 (38815–39463) | 1599 | 187840 |
+| smash ws | 160M | 111.4 | 41684 (41317–41759) | 1511 | 160741 |
+| smash ws | 190M | 123.8 | 47326 (47177–47551) | 1359 | 96967 |
+| smash ws + EAGER_FILL + PEAK_GUARD | 160M | **85.3** | 41586 (41414–41690) | 1511 | 161400 |
+| smash ws, FINE_1K_CLASSES build | 160M | 108.1 | **45188 (43541–45228)** | 1375 | 132257 |
+| smash large-only | 160M | 154.9 | 50243 (49423–50319) | 1487 | 109255 |
+
+- At equal mean memory smash is ahead: 41.7K GET/s at 111 MiB vs glibc's
+  31.8K at 113 MiB (+31%). At equal cap glibc is ahead, because glibc then
+  uses 41% more memory on average.
+- Finer classes: +8.4% GET over ws at 3 MiB less mean memory; the gap to
+  glibc at the same cap goes from −17% to −10%.
+- `SMASH_EAGER_FILL=1 SMASH_PEAK_GUARD=1` (docs/PEAK.md) compresses the
+  write-once fill before it goes cold: mean memory −23% (85 vs 111 MiB) at
+  the same GET throughput. Not measured on capped sqlite/rss this round.
+- Large-only mode matches glibc+zswap on throughput and memory: Redis's
+  allocations are all small, so large-only passes them to glibc. Under a cap,
+  large-only is the config for "same as glibc"; full mode with the knobs is
+  the config for "less memory".
+- Not measured this round (SSH access to cloudnew ended mid-batch):
+  `fine + ws + eager/guard` and `ws + eager/guard` on capped sqlite and rss
+  (batch `tmp/b4.json` was running), and the uncapped paper regression
+  (`check_paper_regression.py`) for the fine-class build, so the option
+  stays off.
+
+### Bug found on the way (fixed)
+
+Redis's `setproctitle` overwrites the original environment block after
+moving `environ`; smash kept getenv() pointers for `SMASH_METRICS_FILE`,
+`SMASH_REPORT`, `SMASH_CONTROL_FILE`, `SMASH_OBSERVE_REPORT`,
+`SMASH_SPILL_DIR` and `SMASH_CGROUP_ROOT`, so under redis-server the metrics
+file went to `.tmp.<pid>` in the cwd (strace) and was never renamed into
+place. They are now copied at init (`bootstrapEnv`); `test_report_clobbered_env`
+zeroes the values in place and fails without the fix.
+
 ## Open issues
 
-- sqlite cold p99 is still above glibc+zswap under a tight cap: some store
-  pages are swapped in the same tick they are written, before keep-warm runs.
-- redis under a cap loses GET throughput to glibc because smash's uncapped
-  footprint for 1 KiB values is larger.
+- sqlite cold p50 under a cap is higher than glibc+zswap's (24.8 vs
+  14.4 µs) even with both round-2 knobs: a smash decompression fault (signal,
+  decompress, mprotect) costs more than an in-kernel zswap fault.
+- redis under a 160M cap: −10% GET vs glibc+zswap with finer classes and both
+  knobs (at 31% less mean memory). The remaining footprint gap is 1088 vs
+  1040 B per value plus heap slack.
+- Defaults for `SMASH_CGROUP_SKIP_SWAPPED=2`, `SMASH_CGROUP_WARM_MS=20` and
+  `SMASH_FINE_1K_CLASSES` need the uncapped Linux checks
+  (`run_quick_ci.py`, `check_paper_regression.py`) before they change.
 - Not measured: Kubernetes itself (the example manifest is untested on a
   cluster), memory.max-only caps without memory.high, hosts without zswap
   (disk swap only), cgroup v1.

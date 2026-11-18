@@ -20,6 +20,10 @@
 // Idle detection methods (--method, default auto = first that works):
 //   idle        page_idle bitmap. Reads AND writes, per page. Needs root
 //               (CAP_SYS_ADMIN for PFNs) and CONFIG_IDLE_PAGE_TRACKING.
+//               Pages of a THP are tracked through the folio head PFN
+//               (/proc/kpageflags), so one access marks the whole folio.
+//               smash-idled cannot stand in for root here: it only answers
+//               for the connecting process's own pages (agents/estimator.md).
 //   soft-dirty  clear_refs 4 + pagemap bit 55. Writes only, per page. Same uid
 //               is enough; the arch must implement soft-dirty (x86-64 yes,
 //               arm64 no). Combined with the referenced method below to cap
@@ -37,6 +41,8 @@
 // See agents/estimator.md for what the projection does and does not capture.
 
 #include <zstd.h>
+
+#include "vm/page_idle.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -145,7 +151,8 @@ struct Mapping {
     std::vector<uint64_t> ref_kb;   // Referenced at each point
     // per-page tracking (present at t0)
     std::vector<uintptr_t> pages;   // page-aligned vaddrs present at t0
-    std::vector<uint64_t> pfn;      // idle method
+    std::vector<uint64_t> pfn;      // idle method: PFN at t0
+    std::vector<uint64_t> head;     // idle method: its folio's head PFN (bitmap index)
     std::vector<uint8_t> first_hot; // point index first seen accessed (255 = never)
     std::vector<uint8_t> gone;      // no longer present / remapped
 };
@@ -309,6 +316,32 @@ bool scanPagemap(int fd, uintptr_t start, uintptr_t end, Fn fn) {
     return true;
 }
 
+// /proc/kpageflags (root, like PFNs): the idle bitmap tracks a large folio
+// (THP, mTHP) by its head PFN only (vm/page_idle.h), and a present pagemap
+// entry can be the shared zero page (an anonymous page read but never
+// written), which is not in RSS and has no idle state.
+using smash::vm::kKpfCompoundTail;
+using smash::vm::kKpfZeroPage;
+
+struct KPageFlags {
+    int fd = -1;
+    std::vector<uint64_t> win = std::vector<uint64_t>(512);
+    uint64_t w0 = 0, wn = 0;
+    bool get(uint64_t pfn, uint64_t& f) {
+        if (fd < 0) return false;
+        if (pfn < w0 || pfn >= w0 + wn) {
+            w0 = pfn;
+            ssize_t r = pread(fd, win.data(), win.size() * 8, static_cast<off_t>(w0 * 8));
+            wn = r > 0 ? static_cast<uint64_t>(r) / 8 : 0;
+            if (wn == 0) return false;
+        }
+        f = win[pfn - w0];
+        return true;
+    }
+    bool zero(uint64_t pfn) { uint64_t f; return get(pfn, f) && (f & kKpfZeroPage); }
+    bool tail(uint64_t pfn) { uint64_t f; return get(pfn, f) && (f & kKpfCompoundTail); }
+};
+
 // Does this kernel/arch set soft-dirty? Probe on our own page.
 bool softDirtyWorks() {
     int cr = open("/proc/self/clear_refs", O_WRONLY | O_CLOEXEC);
@@ -442,12 +475,27 @@ int main(int argc, char** argv) {
     // ── t0: snapshot present pages, reset tracking ─────────────────────
     const bool per_page = method != "referenced";
     readSmaps(pid, maps, -1);
+    KPageFlags kpf;
+    if (pfn_ok) kpf.fd = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
+    size_t n_zero = 0, n_tail = 0;
     if (per_page) {
         for (auto& m : maps) {
+            uint64_t prev_pfn = 0, prev_head = 0;
             scanPagemap(pm, m.start, m.end, [&](uintptr_t va, uint64_t e) {
                 if (!(e & kPmPresent) || (e & kPmSwap)) return;
+                const uint64_t pfn = e & kPmPfnMask;
+                if (pfn && kpf.zero(pfn)) { ++n_zero; return; }
                 m.pages.push_back(va);
-                if (method == "idle") m.pfn.push_back(e & kPmPfnMask);
+                if (method != "idle") return;
+                // Consecutive tails of one folio are consecutive PFNs.
+                const uint64_t h = !kpf.tail(pfn) ? pfn
+                                   : (prev_pfn && pfn == prev_pfn + 1) ? prev_head
+                                   : smash::vm::folioHeadPfn(kpf.fd, pfn);
+                n_tail += h != pfn;
+                m.pfn.push_back(pfn);
+                m.head.push_back(h);
+                prev_pfn = pfn;
+                prev_head = h;
             });
             m.first_hot.assign(m.pages.size(), 255);
             m.gone.assign(m.pages.size(), 0);
@@ -458,7 +506,7 @@ int main(int argc, char** argv) {
     if (method == "idle") {
         // Set the idle flag for every PFN we track: bitmap words are 64 PFNs.
         std::map<uint64_t, uint64_t> words;
-        for (auto& m : maps) for (uint64_t f : m.pfn) words[f / 64] |= 1ULL << (f % 64);
+        for (auto& m : maps) for (uint64_t f : m.head) words[f / 64] |= 1ULL << (f % 64);
         for (auto& w : words)
             if (pwrite(idle_fd, &w.second, 8, static_cast<off_t>(w.first * 8)) != 8) {}
     }
@@ -495,13 +543,13 @@ int main(int argc, char** argv) {
             std::map<uint64_t, uint64_t> words;
             for (auto& m : maps)
                 for (size_t j = 0; j < m.pages.size(); ++j)
-                    if (m.first_hot[j] == 255 && !m.gone[j]) words[m.pfn[j] / 64] = 0;
+                    if (m.first_hot[j] == 255 && !m.gone[j]) words[m.head[j] / 64] = 0;
             for (auto& w : words)
                 if (pread(idle_fd, &w.second, 8, static_cast<off_t>(w.first * 8)) != 8) w.second = 0;
             for (auto& m : maps)
                 for (size_t j = 0; j < m.pages.size(); ++j) {
                     if (m.first_hot[j] != 255 || m.gone[j]) continue;
-                    const uint64_t f = m.pfn[j];
+                    const uint64_t f = m.head[j];
                     if (!(words[f / 64] & (1ULL << (f % 64)))) m.first_hot[j] = static_cast<uint8_t>(k - 1);
                 }
         }
@@ -579,7 +627,9 @@ int main(int argc, char** argv) {
             // candidates: present pages (for sampling); read pagemap if we can
             if (pm >= 0) {
                 scanPagemap(pm, m.start, m.end, [&](uintptr_t va, uint64_t e) {
-                    if ((e & kPmPresent) && !(e & kPmSwap)) m.pages.push_back(va);
+                    if (!(e & kPmPresent) || (e & kPmSwap)) return;
+                    if ((e & kPmPfnMask) && kpf.zero(e & kPmPfnMask)) { ++n_zero; return; }
+                    m.pages.push_back(va);
                 });
                 // Thin to the mapping's unreferenced fraction (see above):
                 // which pages are idle is unknown, but how many is.
@@ -596,6 +646,14 @@ int main(int argc, char** argv) {
         a.idle = a.idle_at.back();
     }
 
+    if (method == "idle" && kpf.fd < 0)
+        notes.push_back("cannot read /proc/kpageflags: pages of transparent huge pages are reported hot");
+    if (n_tail)
+        notes.push_back(std::to_string(n_tail) + " page(s) in large folios (THP): tracked by the folio's head "
+                        "page, so one access marks the whole folio hot");
+    if (n_zero)
+        notes.push_back(human(static_cast<double>(n_zero * g_page)) + " mapped to the shared zero page (read, "
+                        "never written; not in RSS): excluded");
     if (n_polluted)
         notes.push_back(std::to_string(n_polluted) + " mapping(s) changed during the window (soft-dirty "
                         "reports every page of a changed VMA dirty); used smaps Referenced for them");

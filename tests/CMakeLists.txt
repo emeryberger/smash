@@ -727,6 +727,9 @@ endforeach()
 # regions; runs unprivileged (soft-dirty or the referenced fallback; idle-page
 # tracking when run as root). The _referenced variant forces the per-mapping
 # fallback, the only method on kernels without soft-dirty or page_idle access.
+# The _idle variants force the page_idle bitmap method (root via `sudo -n`,
+# CONFIG_IDLE_PAGE_TRACKING; skipped with 77 otherwise); _idle_thp backs the
+# target with transparent huge pages, whose tail PFNs the bitmap never tracks.
 if(TARGET smash-estimate)
   add_executable(estimate_target estimate_target.cpp)
   add_executable(estimate_test estimate_test.cpp)
@@ -734,7 +737,13 @@ if(TARGET smash-estimate)
            COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target>)
   add_test(NAME test_smash_estimate_referenced
            COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> referenced)
-  set_tests_properties(test_smash_estimate test_smash_estimate_referenced PROPERTIES TIMEOUT 60)
+  add_test(NAME test_smash_estimate_idle
+           COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> idle)
+  add_test(NAME test_smash_estimate_idle_thp
+           COMMAND estimate_test $<TARGET_FILE:smash-estimate> $<TARGET_FILE:estimate_target> idle thp)
+  set_tests_properties(test_smash_estimate test_smash_estimate_referenced
+                       test_smash_estimate_idle test_smash_estimate_idle_thp PROPERTIES TIMEOUT 60)
+  set_tests_properties(test_smash_estimate_idle test_smash_estimate_idle_thp PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # ── Deployment safety: kill switch, watchdog, SLO controller (agents/safety.md) ──

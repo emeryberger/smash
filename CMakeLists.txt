@@ -240,6 +240,15 @@ else()
   message(STATUS "Thread hooks enabled")
 endif()
 
+# Size classes: 16 per doubling between 1 and 2 KiB (step 64) instead of 8
+# (step 128). A 1 KiB payload plus a small header (Redis's 1 KiB values are
+# 1030-byte sds strings) then rounds to 1088 instead of 1152 bytes. Global
+# definition: tests include the size-class headers directly.
+option(SMASH_FINE_1K_CLASSES "16 size classes per doubling in 1-2 KiB" OFF)
+if(SMASH_FINE_1K_CLASSES)
+  add_compile_definitions(SMASH_FINE_1K_CLASSES=1)
+endif()
+
 add_library(smash SHARED
   src/smash_heap.cpp
   src/linux_syscall_wrappers.cpp

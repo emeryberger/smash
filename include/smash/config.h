@@ -22,7 +22,11 @@ inline constexpr int kPageShift = (kPageSize == 16384) ? 14 : 12;
 
 // ── Size classes ─────────────────────────────────────────────────────────────
 inline constexpr size_t kMaxSmallSize = 16384;
-inline constexpr int kNumClasses = 52;
+#ifndef SMASH_FINE_1K_CLASSES
+#define SMASH_FINE_1K_CLASSES 0
+#endif
+// SMASH_FINE_1K_CLASSES=1 (build flag): 16 classes per doubling in 1-2 KiB.
+inline constexpr int kNumClasses = SMASH_FINE_1K_CLASSES ? 60 : 52;
 inline constexpr size_t kMinAlignment = 16;
 
 // ── Large-allocation pseudo size-classes (compression-tracking only) ─────────

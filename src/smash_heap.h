@@ -1450,6 +1450,7 @@ public:
                 +[](uintptr_t start, uintptr_t end, int mode) -> size_t {
                     auto& c = s_external_self_->compressor_;
                     if (mode == 3) return c.detachAllExternal();  // ext::kRestoreAll
+                    if (mode == 4) { c.refillExternalRange(start, end); return 0; }  // ext::kRefill
                     return c.detachExternalRange(
                         start, end, static_cast<CompressorThread::ExtDetach>(mode));
                 },

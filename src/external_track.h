@@ -16,7 +16,9 @@ namespace smash {
 
 namespace ext {
 
-enum Mode : int { kUnmap = 0, kPurge = 1, kRestore = 2, kRestoreAll = 3 };
+// kRefill: after a discard madvise, map the purged pages that smash's uffd
+// covers to the zero page (see CompressorThread::refillExternalRange).
+enum Mode : int { kUnmap = 0, kPurge = 1, kRestore = 2, kRestoreAll = 3, kRefill = 4 };
 
 inline bool enabled() {
     static const bool on = [] {
@@ -142,6 +144,42 @@ inline size_t detachRange(VmRegion* vm, void* base, size_t len, Mode mode) {
     ExternalDetachFn fn = g_smash_external_detach.load(std::memory_order_acquire);
     if (!fn) return 0;
     return fn(pageDown(base), pageUp(base, len), mode);
+}
+
+// After the app's discard madvise of [base, base+len) returned: zero-fill
+// the uffd-registered pages it purged.
+inline void refillRange(VmRegion* vm, void* base, size_t len) {
+    if (!vm || !base || !len || !enabled() || vm::g_uffd_fd < 0) return;
+    if (vm->externalLivePages() == 0) return;
+    ExternalDetachFn fn = g_smash_external_detach.load(std::memory_order_acquire);
+    if (fn) fn(pageDown(base), pageUp(base, len), kRefill);
+}
+
+// madvise advice values after which the range must not be compressed again
+// (it keeps its contents): WIPEONFORK (a child must see zeros, not the
+// parent's blob), DONTFORK (the child has no mapping for the compressor to
+// touch), GUARD_INSTALL (accesses must fault for the app, not be served by
+// smash). Detached with kRestore, i.e. untracked and unregistered.
+inline bool untrackAdvice(int advice) {
+    switch (advice) {
+#ifdef __linux__
+    case 10:   // MADV_DONTFORK
+    case 18:   // MADV_WIPEONFORK
+    case 102:  // MADV_GUARD_INSTALL (Linux 6.13)
+        return true;
+#endif
+    default:
+        (void)advice;
+        return false;
+    }
+}
+inline bool populateAdvice(int advice) {
+#ifdef __linux__
+    return advice == 22 || advice == 23;  // MADV_POPULATE_READ / _WRITE (5.14)
+#else
+    (void)advice;
+    return false;
+#endif
 }
 
 // Untrack every external page (mlockall). Walks the external slots via the

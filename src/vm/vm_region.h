@@ -887,6 +887,23 @@ public:
         if (locks) locks->unlock(idx);
     }
 
+    // Return an untracked external slot to the free list. For callers that
+    // untrack with recycle=false, finish their per-page bookkeeping, and only
+    // then let the next registration reuse the index.
+    void recycleExternalSlot(size_t idx) {
+        if (idx < contig_pages_) return;
+        const size_t local = idx - contig_pages_;
+        LockGuard g(track_lock_);
+        if (local < kTrackMaxPages && track_reverse_[local] == 0 && ext_free_top_ < kTrackMaxPages)
+            ext_free_slots_[ext_free_top_++] = static_cast<uint32_t>(local);
+    }
+    // Hold off external track / untrack (the compressor registers a run of
+    // tracked pages with its userfaultfd under this, so no page of the run is
+    // untracked between the check and the registration). Leaf lock; never
+    // taken in a signal handler.
+    void lockTracking() SMASH_NO_TS_ANALYSIS { track_lock_.lock(); }
+    void unlockTracking() SMASH_NO_TS_ANALYSIS { track_lock_.unlock(); }
+
     size_t externalLivePages() const { return external_live_.load(std::memory_order_relaxed); }
 
     bool contains(uintptr_t addr) const {

@@ -41,6 +41,34 @@ namespace smash::vm {
 inline int g_uffd_fd = -1;
 inline bool g_uffd_wp = false;  // arena also registered for (async) uffd-wp
 inline uintptr_t g_uffd_lo = 0, g_uffd_hi = 0;
+// Map every MISSING page of [lo, hi) to the zero page. Present pages (and
+// swap entries) are skipped. Stops at the first page that is not registered
+// with smash's uffd (ENOENT / EINVAL): the caller passes ranges it knows are
+// registered, so that only happens when the app unmapped them meanwhile.
+inline void uffdZeroFillRange(uintptr_t lo, uintptr_t hi) {
+#if defined(__linux__)
+    if (g_uffd_fd < 0 || hi <= lo) return;
+    const uintptr_t ps = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    lo &= ~(ps - 1);
+    if (g_uffd_wp) {
+        struct { uint64_t start, len, mode; } w{lo, hi - lo, 0};
+        const unsigned long kWp = (3UL << 30) | (sizeof(w) << 16) | (0xAAUL << 8) | 0x06UL;
+        (void)syscall(SYS_ioctl, g_uffd_fd, kWp, &w);
+    }
+    while (lo < hi) {
+        struct { uint64_t start, len, mode; int64_t zeropage; } z{lo, hi - lo, 0, 0};
+        const unsigned long kZero = (3UL << 30) | (sizeof(z) << 16) | (0xAAUL << 8) | 0x04UL;
+        if (syscall(SYS_ioctl, g_uffd_fd, kZero, &z) == 0) return;
+        if (z.zeropage > 0) { lo += static_cast<uintptr_t>(z.zeropage); continue; }
+        if (errno == EAGAIN) continue;
+        if (errno == ENOENT || errno == EINVAL || errno == ESRCH) return;
+        lo += ps;  // EEXIST (page present): skip this page
+    }
+#else
+    (void)lo; (void)hi;
+#endif
+}
+
 inline void uffdZeroFill(void* addr, size_t size) {
 #if defined(__linux__)
     if (g_uffd_fd < 0 || size == 0) return;

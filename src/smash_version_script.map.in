@@ -145,6 +145,8 @@
     mlock;
     mlock2;
     mlockall;
+    # An app's own userfaultfd registration (UFFDIO_REGISTER) takes the range over
+    ioctl;
 
     # Path-argument syscalls: warm a compressed path string before the kernel copies it
     open;
@@ -402,3 +404,16 @@ CXXABI_1.3.11 {
     _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11;
     _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11;
 } CXXABI_1.3.9;
+
+# liburing fixed-buffer registration: untrack the buffers before the kernel
+# pins them (linux_syscall_wrappers.cpp). Same version nodes as liburing.so.2.
+LIBURING_2.0 {
+  global:
+    io_uring_register_buffers;
+};
+
+LIBURING_2.1 {
+  global:
+    io_uring_register_buffers_tags;
+    io_uring_register_buffers_update_tag;
+} LIBURING_2.0;

@@ -48,6 +48,7 @@
 // Fails (exit 1) on the first mismatch, printing which case and where.
 
 #include <atomic>
+#include <vector>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -55,7 +56,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
@@ -63,6 +66,8 @@
 #include <time.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <linux/userfaultfd.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
 #endif
 
@@ -148,6 +153,49 @@ size_t inaccessiblePages(const void* base, size_t len) {
     return n;
 }
 
+// Pages of [base, base+len) smash holds compressed right now: PROT_NONE
+// (classic path) or, on Linux, not resident: in uffd mode smash reclaims a
+// compressed page with UFFDIO_MOVE, leaving it MISSING with its protection
+// untouched. Only meaningful for regions the test filled.
+size_t compressedPages(const void* base, size_t len) {
+#ifdef __linux__
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+    const size_t np = len / g_page;
+    std::vector<uint64_t> e(np);
+    static int fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || pread(fd, e.data(), np * 8, static_cast<off_t>(lo / g_page * 8)) !=
+                      static_cast<ssize_t>(np * 8))
+        return inaccessiblePages(base, len);
+    size_t n = 0;
+    for (size_t k = 0; k < np; ++k) {
+        if (!(e[k] & (3ULL << 62))) { ++n; continue; }  // neither present nor swapped
+        // Resident but PROT_NONE: classic path, madvise still deferred.
+        size_t run = 1;
+        while (k + run < np && (e[k + run] & (3ULL << 62))) ++run;
+        n += inaccessiblePages(reinterpret_cast<void*>(lo + k * g_page), run * g_page);
+        k += run - 1;
+    }
+    return n;
+#else
+    return inaccessiblePages(base, len);
+#endif
+}
+
+#ifdef __linux__
+// smash reclaims through userfaultfd in this process (Linux 6.8+ default).
+bool uffdActive() {
+    char path[64], link[128];
+    for (int fd = 0; fd < 1024; ++fd) {
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(path, link, sizeof(link) - 1);
+        if (n <= 0) continue;
+        link[n] = 0;
+        if (std::strstr(link, "userfaultfd")) return true;
+    }
+    return false;
+}
+#endif
+
 double nowSec() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -161,12 +209,12 @@ bool waitCompressed(Region* rs, int n, double timeout_s = 30) {
     for (;;) {
         int ok = 0;
         for (int i = 0; i < n; ++i)
-            if (inaccessiblePages(rs[i].p, rs[i].len) * 2 >= rs[i].len / g_page) ++ok;
+            if (compressedPages(rs[i].p, rs[i].len) * 2 >= rs[i].len / g_page) ++ok;
         if (ok == n) return true;
         if (nowSec() - t0 > timeout_s) {
             for (int i = 0; i < n; ++i)
                 fprintf(stderr, "  [%s] inaccessible=%zu of %zu pages\n", rs[i].tag,
-                        inaccessiblePages(rs[i].p, rs[i].len), rs[i].len / g_page);
+                        compressedPages(rs[i].p, rs[i].len), rs[i].len / g_page);
             return false;
         }
         usleep(100 * 1000);
@@ -442,6 +490,23 @@ bool testNoreserve() {
     sleep(1);
     if (size_t n = inaccessiblePages(p + kLen, kRes - kLen); n != 0)
         FAIL("[noreserve]: %zu untouched pages were made inaccessible", n);
+#ifdef __linux__
+    // uffd mode: registering the reservation maps its untouched pages to the
+    // zero page (a MISSING PTE in a registered range would make a kernel
+    // access fail with EFAULT), and none of them may be reclaimed.
+    if (uffdActive()) {
+        if (size_t n = compressedPages(p + kLen, kRes - kLen); n != 0)
+            FAIL("[noreserve]: %zu untouched pages left MISSING in a uffd-registered range", n);
+        // A kernel-mode write into an untouched page must not EFAULT.
+        int pfd[2];
+        if (pipe(pfd) != 0) FAIL("[noreserve]: pipe");
+        if (write(pfd[1], "xyz", 3) != 3) FAIL("[noreserve]: write");
+        const ssize_t r = syscall(SYS_read, pfd[0], p + kLen + 5 * g_page, 3);
+        close(pfd[0]);
+        close(pfd[1]);
+        if (r != 3) FAIL("[noreserve]: raw read() into an untouched page returned %zd errno=%d", r, errno);
+    }
+#endif
     if (check(p, kLen, 14) != SIZE_MAX) FAIL("[noreserve]: touched part corrupted");
     if (!allZero(p + kLen, 4 * g_page)) FAIL("[noreserve]: untouched part not zero");
     munmap(p, kRes);
@@ -558,7 +623,7 @@ bool testMlock() {
     if (mlock(p, kLen) != 0) FAIL("[mlock]: mlock errno=%d", errno);
     if (size_t bad = check(p, kLen, 17); bad != SIZE_MAX) FAIL("[mlock]: page %zu wrong", bad);
     sleep(3);  // several cold timeouts
-    if (size_t n = inaccessiblePages(p, kLen); n != 0) FAIL("[mlock]: %zu locked pages compressed", n);
+    if (size_t n = compressedPages(p, kLen); n != 0) FAIL("[mlock]: %zu locked pages compressed", n);
     munlock(p, kLen);
     munmap(p, kLen);
     fprintf(stderr, "external_patterns_test: mlock PASSED\n");
@@ -585,13 +650,13 @@ bool testPathArgs() {
     int fd = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0600);
     if (fd < 0) FAIL("[path]: open(compressed path) errno=%d", errno);
     close(fd);
-    while (inaccessiblePages(p + 10 * g_page, g_page) == 0 ||
-           inaccessiblePages(p + 20 * g_page, g_page) == 0)
+    while (compressedPages(p + 10 * g_page, g_page) == 0 ||
+           compressedPages(p + 20 * g_page, g_page) == 0)
         usleep(100 * 1000);  // let both recompress, so rename sees compressed paths
     if (rename(a, b) != 0) FAIL("[path]: rename(compressed paths) errno=%d", errno);
     struct stat st;
     if (stat(b, &st) != 0) FAIL("[path]: stat errno=%d", errno);
-    while (inaccessiblePages(p + 20 * g_page, g_page) == 0) usleep(100 * 1000);
+    while (compressedPages(p + 20 * g_page, g_page) == 0) usleep(100 * 1000);
     FILE* f = fopen(b, "r");  // glibc/libSystem open internally: no syscall wrapper sees it
     if (!f) FAIL("[path]: fopen(compressed path) errno=%d", errno);
     fclose(f);
@@ -643,6 +708,283 @@ bool testChurn() {
     return true;
 }
 
+// ── Hazard guards: memory smash must never compress ────────────────────
+//
+// Each case waits until a CONTROL region mapped and filled at the same time
+// has compressed (so enough cold ticks have passed), then checks the guarded
+// region was never compressed and still holds its data.
+
+// Fill a control region and the guarded one, wait for the control.
+bool waitControl(const char* tag, void** ctl_out) {
+    void* ctl = mapAnon(kLen);
+    fill(ctl, kLen, 40);
+    Region r{ctl, kLen, tag};
+    *ctl_out = ctl;
+    return waitCompressed(&r, 1);
+}
+
+// MAP_PRIVATE|MAP_ANON|PROT_EXEC (a JIT code arena): never tracked. smash
+// restores PROT_RW on decompress, which would strip PROT_EXEC.
+bool testExec() {
+    void* x = mmap(nullptr, kLen, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (x == MAP_FAILED) {
+        fprintf(stderr, "external_patterns_test: exec SKIPPED (RWX mmap errno=%d)\n", errno);
+        return true;
+    }
+    fill(x, kLen, 41);
+    void* ctl = nullptr;
+    if (!waitControl("exec-control", &ctl)) FAIL("[exec]: control never compressed");
+    if (size_t n = compressedPages(x, kLen); n != 0) FAIL("[exec]: %zu PROT_EXEC pages compressed", n);
+    if (check(x, kLen, 41) != SIZE_MAX) FAIL("[exec]: RWX region corrupted");
+    munmap(x, kLen);
+    munmap(ctl, kLen);
+    fprintf(stderr, "external_patterns_test: exec PASSED\n");
+    return true;
+}
+
+#ifdef MAP_LOCKED
+// mmap(MAP_LOCKED): locked at creation, never tracked.
+bool testMapLocked() {
+    rlimit rl{};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < 2 * kLen) {
+        fprintf(stderr, "external_patterns_test: maplocked SKIPPED (RLIMIT_MEMLOCK=%llu)\n",
+                (unsigned long long)rl.rlim_cur);
+        return true;
+    }
+    void* l = mmap(nullptr, kLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_LOCKED, -1, 0);
+    if (l == MAP_FAILED) FAIL("[maplocked]: mmap errno=%d", errno);
+    fill(l, kLen, 42);
+    void* ctl = nullptr;
+    if (!waitControl("maplocked-control", &ctl)) FAIL("[maplocked]: control never compressed");
+    if (size_t n = compressedPages(l, kLen); n != 0) FAIL("[maplocked]: %zu MAP_LOCKED pages compressed", n);
+    if (check(l, kLen, 42) != SIZE_MAX) FAIL("[maplocked]: corrupted");
+    munmap(l, kLen);
+    munmap(ctl, kLen);
+    fprintf(stderr, "external_patterns_test: maplocked PASSED\n");
+    return true;
+}
+#endif
+
+#ifdef __linux__
+// madvise(MADV_WIPEONFORK) (OpenSSL / glibc arc4random keep RNG state in
+// such pages): a fork child must read zeros. A page smash holds compressed
+// used to come back in the child decompressed from the PARENT's blob.
+bool testWipeOnFork() {
+    void* p = mapAnon(kLen);
+    fill(p, kLen, 43);
+    Region r{p, kLen, "wipeonfork"};
+    if (!waitCompressed(&r, 1)) FAIL("[wipeonfork]: never compressed");
+    if (madvise(p, kLen, 18 /* MADV_WIPEONFORK */) != 0) {
+        munmap(p, kLen);
+        fprintf(stderr, "external_patterns_test: wipeonfork SKIPPED (errno=%d)\n", errno);
+        return true;
+    }
+    pid_t pid = fork();
+    if (pid == 0) _exit(allZero(p, kLen) ? 0 : 3);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        FAIL("[wipeonfork]: child status 0x%x (3 = child saw the parent's data)", st);
+    if (check(p, kLen, 43) != SIZE_MAX) FAIL("[wipeonfork]: parent corrupted");
+    munmap(p, kLen);
+    fprintf(stderr, "external_patterns_test: wipeonfork PASSED\n");
+    return true;
+}
+
+// madvise(MADV_DONTFORK) (RDMA / DMA buffers): the child has no mapping
+// there. The child's compressor must not touch those pages.
+bool testDontFork() {
+    void* p = mapAnon(kLen);
+    fill(p, kLen, 44);
+    Region r{p, kLen, "dontfork"};
+    if (!waitCompressed(&r, 1)) FAIL("[dontfork]: never compressed");
+    if (madvise(p, kLen, 10 /* MADV_DONTFORK */) != 0) FAIL("[dontfork]: madvise errno=%d", errno);
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Give the child's compressor several cold timeouts over the
+        // inherited page table entries.
+        void* q = mapAnon(kLen);
+        fill(q, kLen, 45);
+        sleep(4);
+        _exit(check(q, kLen, 45) == SIZE_MAX ? 0 : 3);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) FAIL("[dontfork]: child status 0x%x", st);
+    if (check(p, kLen, 44) != SIZE_MAX) FAIL("[dontfork]: parent corrupted");
+    munmap(p, kLen);
+    fprintf(stderr, "external_patterns_test: dontfork PASSED\n");
+    return true;
+}
+
+// madvise(MADV_POPULATE_WRITE) of a compressed range must succeed (the
+// kernel's prefault fails on a MISSING or PROT_NONE page).
+bool testPopulate() {
+    {
+        void* probe = mapAnon(g_page);
+        const int rc = madvise(probe, g_page, 23 /* MADV_POPULATE_WRITE */);
+        munmap(probe, g_page);
+        if (rc != 0) {
+            fprintf(stderr, "external_patterns_test: populate SKIPPED (errno=%d, kernel < 5.14)\n", errno);
+            return true;
+        }
+    }
+    void* p = mapAnon(kLen);
+    fill(p, kLen, 46);
+    Region r{p, kLen, "populate"};
+    if (!waitCompressed(&r, 1)) FAIL("[populate]: never compressed");
+    if (madvise(p, kLen, 23 /* MADV_POPULATE_WRITE */) != 0)
+        FAIL("[populate]: MADV_POPULATE_WRITE on compressed pages errno=%d", errno);
+    if (check(p, kLen, 46) != SIZE_MAX) FAIL("[populate]: corrupted");
+    munmap(p, kLen);
+    fprintf(stderr, "external_patterns_test: populate PASSED\n");
+    return true;
+}
+
+// madvise(MADV_GUARD_INSTALL) (Linux 6.13 lightweight guard pages): the
+// range must fault for the app afterwards, not be served by smash.
+sigjmp_buf g_guard_jmp;
+void guardSegv(int) { siglongjmp(g_guard_jmp, 1); }
+bool testGuardInstall() {
+    char* p = static_cast<char*>(mapAnon(kLen));
+    fill(p, kLen, 47);
+    Region r{p, kLen, "guardinstall"};
+    if (!waitCompressed(&r, 1)) FAIL("[guardinstall]: never compressed");
+    if (madvise(p, g_page, 102 /* MADV_GUARD_INSTALL */) != 0) {
+        munmap(p, kLen);
+        fprintf(stderr, "external_patterns_test: guardinstall SKIPPED (errno=%d, kernel < 6.13)\n", errno);
+        return true;
+    }
+    // Rest of the range intact.
+    if (check(p + g_page, kLen - g_page, 47 + 1) != SIZE_MAX) FAIL("[guardinstall]: rest corrupted");
+    // The guard page faults (SIGSEGV to the app), it is not decompressed.
+    // smash's handler forwards a fault it does not own to the previous
+    // handler, which is ours here.
+    struct sigaction sa{}, old{};
+    sa.sa_handler = guardSegv;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old);
+    volatile bool faulted = false;
+    if (sigsetjmp(g_guard_jmp, 1) == 0) {
+        (void)*reinterpret_cast<volatile char*>(p);
+    } else {
+        faulted = true;
+    }
+    sigaction(SIGSEGV, &old, nullptr);
+    if (!faulted) FAIL("[guardinstall]: guard page readable");
+    munmap(p, kLen);
+    fprintf(stderr, "external_patterns_test: guardinstall PASSED\n");
+    return true;
+}
+
+// An application that uses userfaultfd itself. (1) It registers a range
+// smash has compressed (through smash's own uffd, where uffd is on): the
+// REGISTER must succeed and the data survive; smash never compresses the
+// range again. (2) It registered a range before smash saw it (raw ioctl,
+// i.e. not through libsmash's ioctl()): smash's own registration fails
+// with EBUSY and the range must never be compressed.
+long appUffd() {
+    long fd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+    if (fd < 0) fd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return -1;
+    // SIGBUS on a MISSING fault: a page smash left MISSING under the app's
+    // registration kills the test visibly instead of blocking it forever.
+    uffdio_api api{};
+    api.api = UFFD_API;
+    api.features = UFFD_FEATURE_SIGBUS;
+    if (ioctl(static_cast<int>(fd), UFFDIO_API, &api) != 0) { close(static_cast<int>(fd)); return -1; }
+    return fd;
+}
+bool testAppUffd() {
+    long ufd = appUffd();
+    if (ufd < 0) {
+        fprintf(stderr, "external_patterns_test: appuffd SKIPPED (userfaultfd unavailable)\n");
+        return true;
+    }
+    // (1)
+    void* p = mapAnon(kLen);
+    fill(p, kLen, 48);
+    Region r{p, kLen, "appuffd"};
+    if (!waitCompressed(&r, 1)) FAIL("[appuffd]: never compressed");
+    uffdio_register reg{};
+    reg.range.start = reinterpret_cast<uint64_t>(p);
+    reg.range.len = kLen;
+    reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+    if (ioctl(static_cast<int>(ufd), UFFDIO_REGISTER, &reg) != 0)
+        FAIL("[appuffd]: app's UFFDIO_REGISTER of a range smash compressed errno=%d", errno);
+    if (check(p, kLen, 48) != SIZE_MAX) FAIL("[appuffd]: data lost under the app's registration");
+    // (2) raw ioctl: libsmash never sees it. Fill first: the app's MISSING
+    // registration only covers pages that are not present.
+    void* q = mapAnon(kLen);
+    fill(q, kLen, 49);
+    uffdio_register reg2{};
+    reg2.range.start = reinterpret_cast<uint64_t>(q);
+    reg2.range.len = kLen;
+    reg2.mode = UFFDIO_REGISTER_MODE_MISSING;
+    if (syscall(SYS_ioctl, ufd, UFFDIO_REGISTER, &reg2) != 0) FAIL("[appuffd]: raw REGISTER errno=%d", errno);
+    void* ctl = nullptr;
+    if (!waitControl("appuffd-control", &ctl)) FAIL("[appuffd]: control never compressed");
+    if (size_t n = compressedPages(p, kLen); n != 0) FAIL("[appuffd]: %zu pages of the app's range compressed", n);
+    if (size_t n = compressedPages(q, kLen); n != 0)
+        FAIL("[appuffd]: %zu pages of a range the app registered first were compressed", n);
+    if (check(p, kLen, 48) != SIZE_MAX || check(q, kLen, 49) != SIZE_MAX) FAIL("[appuffd]: corrupted");
+    close(static_cast<int>(ufd));
+    munmap(p, kLen);
+    munmap(q, kLen);
+    munmap(ctl, kLen);
+    fprintf(stderr, "external_patterns_test: appuffd PASSED\n");
+    return true;
+}
+
+// Fork near vm.max_map_count with scattered compressed pages. In uffd mode
+// a compressed page is MISSING, which the child (no uffd) would read as
+// zeros, so before fork smash protects each one PROT_NONE. Near the cap that
+// mprotect fails; the page must then be decompressed in place, not left
+// MISSING.
+bool testForkCap() {
+    const long cap = readLongFile("/proc/sys/vm/max_map_count");
+    if (cap <= 0 || cap > (1L << 20)) {
+        fprintf(stderr, "external_patterns_test: forkcap SKIPPED (max_map_count=%ld)\n", cap);
+        return true;
+    }
+    constexpr size_t kRegion = 16 * 1024 * 1024;
+    char* p = static_cast<char*>(mapAnon(kRegion));
+    fill(p, kRegion, 50);
+    const size_t pages = kRegion / g_page;
+    // Odd pages hot, even pages age into compression.
+    double t0 = nowSec();
+    while (nowSec() - t0 < 30) {
+        for (size_t i = 1; i < pages; i += 2) p[i * g_page] = static_cast<char>(((i + 50) & 0xff) | 1);
+        if (compressedPages(p, kRegion) * 4 >= pages) break;
+        usleep(100 * 1000);
+    }
+    const size_t comp = compressedPages(p, kRegion);
+    // Use up VMAs to just below the cap.
+    const long need = cap - 200 - vmaCount();
+    char* filler = nullptr;
+    size_t filler_len = 0;
+    if (need > 0) {
+        filler_len = static_cast<size_t>(need + 2) * g_page;
+        filler = static_cast<char*>(mmap(nullptr, filler_len, PROT_NONE,
+                                         MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0));
+        if (filler == MAP_FAILED) FAIL("[forkcap]: filler mmap errno=%d", errno);
+        for (long k = 0; k < need; k += 2)
+            if (mprotect(filler + k * g_page, g_page, PROT_READ) != 0) break;
+    }
+    pid_t pid = fork();
+    if (pid == 0) _exit(check(p, kRegion, 50) == SIZE_MAX ? 0 : 3);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (filler) munmap(filler, filler_len);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        FAIL("[forkcap]: child status 0x%x (3 = a page read wrong in the child; %zu compressed at fork)", st, comp);
+    if (check(p, kRegion, 50) != SIZE_MAX) FAIL("[forkcap]: parent corrupted");
+    munmap(p, kRegion);
+    fprintf(stderr, "external_patterns_test: forkcap PASSED (%zu pages compressed at fork)\n", comp);
+    return true;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -667,6 +1009,18 @@ int main(int argc, char** argv) {
     if (want("sbrk") && !testSbrk()) return 1;
     if (want("ucstack") && !testCoroutineStack()) return 1;
     if (want("vmacap") && !testVmaCap()) return 1;
+#endif
+    if (want("exec") && !testExec()) return 1;
+#ifdef MAP_LOCKED
+    if (want("maplocked") && !testMapLocked()) return 1;
+#endif
+#ifdef __linux__
+    if (want("wipeonfork") && !testWipeOnFork()) return 1;
+    if (want("dontfork") && !testDontFork()) return 1;
+    if (want("populate") && !testPopulate()) return 1;
+    if (want("guardinstall") && !testGuardInstall()) return 1;
+    if (want("appuffd") && !testAppUffd()) return 1;
+    if (want("forkcap") && !testForkCap()) return 1;
 #endif
     if (want("churn") && !testChurn()) return 1;
     if (g_failures) return 1;

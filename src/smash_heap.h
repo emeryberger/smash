@@ -633,27 +633,41 @@ class SmashHeap {
     // Design: 4096 entries, direct-mapped by (ra >> 12) hash. Each entry
     // stores the full ra_page key + precomputed stable hash. On collision,
     // we just recompute (rare - most programs have <1000 unique call sites).
+    //
+    // The cache is shared by all threads, so each entry is a small seqlock:
+    // `seq` is odd while one writer fills the entry, and a reader accepts
+    // (ra, stable_hash) only if seq was even and unchanged around its loads.
+    // Without it two threads missing on the same slot could interleave their
+    // two stores and leave {ra_A, hash_B}: every later allocation from call
+    // site A would route to B's arena (a homogeneity loss, not a memory-safety
+    // bug; ThreadSanitizer reported the plain stores racing the plain loads).
+    // All fields are accessed with relaxed atomics plus fences, which compile
+    // to plain loads/stores on x86-64; this runs only on arena-memo misses
+    // and large allocations, never on the memo-hit malloc path.
     static constexpr size_t kStableBucketCacheSize = 4096;
     static constexpr size_t kStableBucketCacheMask = kStableBucketCacheSize - 1;
     struct alignas(16) StableBucketEntry {
         uintptr_t ra;           // full return address as cache key
         uint32_t stable_hash;   // precomputed ASLR-stable hash
-        uint32_t pad;
+        uint32_t seq;           // even: stable; odd: a writer is filling
     };
     StableBucketEntry stable_bucket_cache_[kStableBucketCacheSize]{};
 
     // Compute ASLR-resilient hash for a return address.
     // Uses dladdr() to get offset within shared object, caches result.
-    // Hot path: single cache lookup with no atomics (ok for single-writer
-    // per slot assumption - collisions just cause re-lookup).
     [[gnu::always_inline]]
     uint32_t stableCallsiteHash(uintptr_t ra) {
         size_t slot = (ra * 0x9E3779B97F4A7C15ULL) & kStableBucketCacheMask;
 
-        // Fast path: direct cache hit (no atomics, just plain loads)
+        // Fast path: direct cache hit, validated by the entry's seqlock.
         StableBucketEntry& e = stable_bucket_cache_[slot];
-        if (e.ra == ra) [[likely]] {
-            return e.stable_hash;
+        const uint32_t s0 = __atomic_load_n(&e.seq, __ATOMIC_ACQUIRE);
+        const uintptr_t key = __atomic_load_n(&e.ra, __ATOMIC_RELAXED);
+        const uint32_t hash = __atomic_load_n(&e.stable_hash, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (key == ra && !(s0 & 1) &&
+            __atomic_load_n(&e.seq, __ATOMIC_RELAXED) == s0) [[likely]] {
+            return hash;
         }
 
         // Slow path: cache miss, call dladdr and populate
@@ -788,9 +802,18 @@ class SmashHeap {
             hash = static_cast<uint32_t>(ra & 0xFFFFF);
         }
 
-        // Store in cache (direct-mapped, overwrites any existing entry)
-        stable_bucket_cache_[slot].stable_hash = hash;
-        stable_bucket_cache_[slot].ra = ra;  // Write key last
+        // Store in cache (direct-mapped, overwrites any existing entry). One
+        // writer at a time: claim the entry by making seq odd; if another
+        // thread holds it, skip caching (the next miss retries).
+        StableBucketEntry& e = stable_bucket_cache_[slot];
+        uint32_t s = __atomic_load_n(&e.seq, __ATOMIC_RELAXED);
+        if (!(s & 1) && __atomic_compare_exchange_n(&e.seq, &s, s + 1, false,
+                                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            __atomic_store_n(&e.stable_hash, hash, __ATOMIC_RELAXED);
+            __atomic_store_n(&e.ra, ra, __ATOMIC_RELAXED);
+            __atomic_store_n(&e.seq, s + 2, __ATOMIC_RELEASE);
+        }
         return hash;
     }
 

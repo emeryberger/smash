@@ -191,7 +191,7 @@ struct PolicyParams {
     // compressing it swaps it in (a frame, plus a blob that, under zswap, is
     // no smaller than the copy zswap already held). With 1, the first tick
     // after the hold window expires swaps every skipped page back in at once.
-    uint8_t skip_swapped = 1;
+    uint8_t skip_swapped = 2;  // default: skip non-resident pages whenever capped (round-2 measurements)
 };
 
 struct Decision {

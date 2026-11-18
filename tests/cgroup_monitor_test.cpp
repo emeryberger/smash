@@ -77,6 +77,8 @@ static Sample mk(int64_t limit, int64_t current, uint32_t psi_x100 = 0) {
 
 static void testPolicy() {
     PolicyParams p;            // elevated 10%, critical 3%, psi 10%, hold 10
+    CHECK(p.skip_swapped == 2, "default skip mode is 2 (skip non-resident whenever capped)");
+    p.skip_swapped = 1;        // the checks below exercise mode 1 (skip only at a pressure level)
     const uint32_t base = 10, minf = 2;
     uint32_t hold = 0;
     const int64_t L = 1000LL << 20;
@@ -133,7 +135,7 @@ static void testPolicy() {
     d = decide(mk(L, L), p, Pressure::kNone, &hold, 1, minf);
     CHECK(d.cold_floor == 1, "floor <= base (%u)", d.cold_floor);
 
-    // Between-tick warming only at a pressure level (default skip mode 1).
+    // Between-tick warming only at a pressure level (skip mode 1, set above).
     hold = 0;
     d = decide(mk(L, L - L / 5), p, Pressure::kNone, &hold, base, minf);
     CHECK(d.keep_warm && !d.warm_between_ticks, "no between-tick warming without pressure");

@@ -7796,7 +7796,8 @@ public:
         v = std::getenv("SMASH_CGROUP_SWAPIN");
         cfg_cgroup_swapin_ = !(v && v[0] == '0');
         v = std::getenv("SMASH_CGROUP_WARM_MS");
-        cfg_cgroup_warm_ms_ = v ? static_cast<uint32_t>(std::atoi(v) > 0 ? std::atoi(v) : 0) : 0;
+        // Default 20 ms (only acts under cgroup pressure); SMASH_CGROUP_WARM_MS=0 turns it off.
+        cfg_cgroup_warm_ms_ = v ? static_cast<uint32_t>(std::atoi(v) > 0 ? std::atoi(v) : 0) : 20;
         v = std::getenv("SMASH_CGROUP_HEADROOM_PCT");
         if (v && std::atoi(v) > 0 && std::atoi(v) < 100) {
             cg_params_.elevated_pct = static_cast<uint32_t>(std::atoi(v));

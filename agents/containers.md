@@ -80,12 +80,15 @@ Env: `SMASH_CGROUP=0|1` (unset = auto), `SMASH_CGROUP_ROOT` (tests),
 `SMASH_CGROUP_HEADROOM_PCT`, `SMASH_CGROUP_PSI_PCT`, ablations
 `SMASH_CGROUP_WARM=0`, `SMASH_CGROUP_SWAPIN=0`, `SMASH_CGROUP_SKIP_SWAPPED=0`;
 opt-ins `SMASH_CGROUP_EARLY=1`, `SMASH_CGROUP_SPILL=1` (both measured worse,
-below), and two opt-ins from round 2 that measured better (see "Round 2"):
+below), and two round-2 settings, on by default since they measured better
+in three capped batches with no uncapped effect (see "Round 2"):
 
-- `SMASH_CGROUP_SKIP_SWAPPED=2`: skip non-resident pages whenever the cgroup
-  is capped, not only at a pressure level (`1`, the default).
-- `SMASH_CGROUP_WARM_MS=N`: while at a pressure level, also run keepWarm
-  every N ms between ticks (resident store pages only; no read-back). The SIGUSR2 / `SMASH_DEBUG` stats line gains
+- `SMASH_CGROUP_SKIP_SWAPPED=2` (default): skip non-resident pages whenever
+  the cgroup is capped; `1` = only at a pressure level (the round-1
+  behaviour), `0` = never.
+- `SMASH_CGROUP_WARM_MS=N` (default 20): while at a pressure level, also run
+  keepWarm every N ms between ticks (resident store pages only; no
+  read-back); `0` = once per tick only. The SIGUSR2 / `SMASH_DEBUG` stats line gains
 `cg=level/headroomMiB/pressure_ticks/skipped/warm_pages/readback_pages`
 (level -1 = policy inactive).
 

@@ -434,6 +434,24 @@ baseline); "before" is the round-1 code on the same runs:
 | kvstore | 46.9% (−11.5) | 43.5% (−14.8) | 58.3% | 73.7% (+13.3) | 63.2% (+2.9) | 60.4% |
 | memcached, large-only | (full mode) | | 62.3% | 64.1% (+1.0) | 63.7% (+0.6) | 63.1% |
 
+Re-measured after rebasing onto origin/master 9ed1c70 (THP / zero-page
+handling in smash-estimate, `--methods`), same commands and seeds
+(`--json-out tmp/rebased5.json` / `tmp/rebased5-lo.json`), cloudnew
+2026-11-18 with a 16 GiB swapfile and zswap (zstd/zsmalloc) enabled by
+another workstream (the workloads are not memory-capped; no notes about
+zero pages or large folios appeared, so #133's paths did not trigger here):
+
+| workload | smash-estimate before | after | measured vs glibc | observe before | after | measured vs observe |
+|---|---|---|---|---|---|---|
+| sqlite | 50.8% (+6.6 pp) | 45.4% (+1.2) | 44.2% | 59.0% (+10.7) | 49.6% (+1.3) | 48.3% |
+| memcached | 65.2% (+3.3) | 62.0% (+0.1) | 61.9% | 64.3% (+1.4) | 63.9% (+1.0) | 62.9% |
+| kvstore | 46.9% (−11.3) | 43.2% (−15.0) | 58.2% | 73.7% (+13.5) | 63.3% (+3.1) | 60.2% |
+| memcached, large-only | (full mode) | | 62.4% | 64.1% (+1.0) | 63.7% (+0.6) | 63.1% |
+
+The one change beyond noise: on sqlite smash-estimate saw 377.8 ± 0.3 MiB
+idle (was 360.4 ± 0.1) and projected 0.6 pp more; the measured run and the
+other rows moved by ≤ 0.6 pp. Not investigated further.
+
 RSS (MiB, mean ± sd): sqlite glibc 524.8±1.0, observe 563.9±2.1, smash
 294.5±1.4, smash with backoff off 240.4±1.3; memcached 464.0±0.0 /
 475.9±0.1 / 176.5±0.1 / 176.8±0.1; kvstore 487.6±0.5 / 512.4±0.4 /

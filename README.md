@@ -41,10 +41,10 @@ Find out without risk before running it for real:
   most conservative run.
 
 Measured on cloudnew (dev numbers, 5 runs each, 25 s into each benchmark's serve phase), against a
-real smash run: `smash-estimate --window 21 --points 7` was within 1 point on our SQLite benchmark
-(44.8% projected vs 43.9% measured) and memcached (62.1% vs 62.0%), and 14.8 points low on an
-`std::unordered_map` workload (43.5% vs 58.3%), where smash's own layout keeps fewer pages hot than
-glibc's. Observe mode was 1.9, 1.0 and 2.9 points high on the same three. See
+real smash run: `smash-estimate --window 21 --points 7` was within 1.2 points on our SQLite benchmark
+(45.4% projected vs 44.2% measured) and memcached (62.0% vs 61.9%), and 15.0 points low on an
+`std::unordered_map` workload (43.2% vs 58.2%), where smash's own layout keeps fewer pages hot than
+glibc's. Observe mode was 1.3, 1.0 and 3.1 points high on the same three. See
 [agents/estimator.md](agents/estimator.md) for what they do and don't capture.
 
 ## Install

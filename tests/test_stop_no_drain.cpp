@@ -76,6 +76,8 @@ int main() {
     }
     if (compressed == 0) {
         fprintf(stderr, "FAIL: no page reached COMPRESSED before stop()\n");
+        ct.stop();   // join the coordinator before `owner` frees it
+        fault_handler.stop();
         return 1;
     }
 

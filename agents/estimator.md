@@ -6,9 +6,11 @@ Two ways to find out how much smash would save before running it for real:
 |---|---|---|
 | Needs | preload + restart | nothing (Linux, running process) |
 | Allocator | smash's (full or `SMASH_LARGE_ONLY=1`) | the app's own (glibc, jemalloc, ...) |
-| Cold detection | smash's own (same thresholds, ROI, backoffs) | idle over one window |
+| Cold detection | smash's own (same thresholds, ROI, backoffs) | idle age at the end of a window |
 | Compression | smash's codec + ROI per page, blob discarded | zstd-1 on a random sample |
 | Refaults | estimated (see below) | not estimated |
+| Refault backoff | assumed without read tracking (held pages) | assumed with a long enough window |
+| smash's own RSS | in the measured RSS (same allocator) | modeled: metadata, runtime, glibc-chunk layout |
 | Output | `[smash observe]` stderr lines + JSON file | text or `--json` |
 
 ## Observe mode (`SMASH_MODE=observe`)
@@ -67,21 +69,59 @@ What observe mode can still do to the application:
      projection is then an upper bound with no refault signal.
 3. **CPU**: snapshots + compression of every page that becomes eligible, plus
    one re-read per page after the shadow delay, on the compressor threads.
+4. **Referenced bits** (Linux, no idle bitmap, `SMASH_OBSERVE_REFERENCED`
+   default on): every 2 ticks observe mode reads `/proc/self/smaps` and
+   writes `/proc/self/clear_refs` `1`, which clears the young bits of the
+   process's pages (no data or protection changes). Pages then look older
+   to the kernel's LRU, so under memory pressure they may be reclaimed
+   sooner, as with `smash-estimate`. `SMASH_OBSERVE_REFERENCED=0` turns it
+   off (and with it the read-hot correction below).
 
 ### What the projection does and doesn't capture
 
-- `projected_saving_bytes` = reclaimed pages x page size − their blob bytes −
-  blob bytes of pages still in the shadow window (a real run holds both). Blob
-  bytes are `CompressStore::store()`'s charge (16-byte rounding). **Not
-  modeled**: CompressStore region fragmentation and partially drained
-  regions, per-page metadata, decompression buffers, and the RSS that real
-  refaults would re-inflate (observed refaults are reported separately).
-- Reads: only visible with the idle-page bitmap (root or `smash-idled`). Without
-  it (`read_track=none`) a read-hot page that is never written counts as
-  reclaimed and its reads are not counted as refaults, so the saving is an
-  upper bound and `refault_rate` a lower bound for read-heavy workloads. A real
-  run would also have filtered such pages with the PROT_NONE read check, which
-  observe mode skips.
+`projected_saving_bytes` = reclaimed pages x page size − their blob bytes −
+blob bytes of pages still in the shadow window (a real run holds both) −
+the metadata a real run writes per compressed page (`kRunMetaPerPage`,
+27 B: `CompressedPageInfo`, ticks, flags) + the resident observe-only
+arrays − two holds that model how a real run behaves beyond "not written
+for the cold timeout":
+
+- **Refault backoff** (`backoff_held_bytes`). A real run doubles the cold
+  wait of a page, and of fresh pages from the same (arena, size class),
+  once one of them refaults (`bucket_rc_ema_x256_`). Observe mode does not
+  simulate that. When it cannot see reads (no idle bitmap) or once it has
+  projected a refault, it assumes the backoff: reclaimed pages idle for
+  less than 2x the cold floor + the deferred-reclaim delay are counted
+  resident. This is transient for a page (it ends at that idle age) but
+  steady for a growing workload: on bench_sqlite a few hundred read
+  refaults right after the first cold wave doubled the floor of the
+  buckets that every serve-phase page lands in, and the real run held
+  54 MiB more than the same run with `SMASH_RECOMPRESS_BACKOFF=0` (5 runs,
+  below).
+  `assumes_backoff` says whether the hold applies.
+- **Read-hot pages** (`read_held_bytes`, Linux without the idle bitmap).
+  Write tracking cannot see reads, so a page that is only read counts as
+  reclaimed; a real run keeps it (pre-compression read check) or refaults
+  it. Observe mode reads the arena's smaps `Referenced` every 2 ticks
+  (`clear_refs 1`, see the risk model), subtracts the pages it read itself
+  (snapshots, shadow re-reads), and keeps the largest sub-window of the
+  last cold timeout + 2 ticks (`referenced_bytes`). At least
+  `max(0, referenced − non-reclaimed resident)` of those pages must be
+  among the reclaimed ones; they are counted resident. This is a lower
+  bound: a page read less often than every 2 ticks can be missed.
+
+`projected_saving_no_backoff_bytes` is the projection without either hold
+(the round-1 formula plus the metadata terms). Still **not modeled**:
+CompressStore fragmentation from refault churn (bench_kv_store: 56.3 MiB of
+resident store pages for 46.4 MiB of live blobs), the RSS of pages that
+refault and stay resident, allocator feedback loops (a real run steers new
+allocations away from compressed pages, observe pages stay ACTIVE), and
+the write-detection gap between Phase 1's scan and the end-of-tick
+`clear_refs` (caught by the shadow hash check only inside the shadow
+window, as in a real run).
+
+With the idle bitmap (root or `smash-idled`) reads are visible per page:
+
 - Read tracking with the bitmap (`read_track=page_idle` or `smash-idled`) was
   first exercised on the arm64 dev VM on 2026-11-17 and was broken there: with
   PROT_READ write tracking (no soft-dirty) Phase 1 consulted the idle bit of
@@ -99,12 +139,6 @@ What observe mode can still do to the application:
   A region read every 100 ms (never written) was still projected once in the
   first ~3 s and then counted as read refaults before it backed off; why it
   passed the base-floor arm at all has not been established.
-- Allocator feedback loops: a real run steers new allocations away from
-  compressed pages (`COMPRESSED_PAGE` slot class) and the arena feedback hook
-  sees compressions; observe pages stay ACTIVE, so placement can differ.
-- Write-detection gap: writes between Phase 1's scan and the end-of-tick
-  `clear_refs` are caught by the shadow hash check only during the shadow
-  window, as in a real run.
 
 ### Report
 
@@ -123,6 +157,10 @@ report (fork children write `path.<pid>`). Fields: `rss_bytes`,
 `peak_rss_bytes` (max of sampled RSS and `ru_maxrss`), `managed_bytes`
 (resident smash-managed pages), `would_compress_bytes`, `shadow_bytes`,
 `blob_bytes`, `projected_saving_bytes`, `projected_rss_bytes`,
+`projected_saving_no_backoff_bytes`, `backoff_held_bytes`,
+`read_held_bytes`, `referenced_bytes` (-1 = no signal), `assumes_backoff`,
+`observe_metadata_bytes`, `run_metadata_bytes`, `rss_parts` (see
+`smash_rss_part_bytes` below),
 `projected_reduction_pct` (saving / current RSS), `avg_projected_reduction_pct`
 (time average over ticks), `peak_relative_reduction_pct`
 (1 − min projected RSS / peak RSS, the paper's metric), `snapshots`,
@@ -133,7 +171,10 @@ report (fork children write `path.<pid>`). Fields: `rss_bytes`,
 Tests: `test_observe_full`, `test_observe_large_only` (`tests/observe_mode_test.cpp`):
 cold regions projected, a hot region not, rewriting a projected region counts
 refaults, SIGUSR2 stats show `compressed=0 shadow=0`, RSS keeps every page,
-every byte reads back.
+every byte reads back. `test_observe_projection_{full,large_only}`
+(`tests/observe_projection_test.cpp`, cold timeout 6 s): right after the
+first projected reclaim the backoff hold covers the cold region and later
+ends; on Linux a region that is only read lands in `read_held_bytes`.
 `test_observe_read_{root,idled}_{full,large_only}[_thp]`
 (`tests/observe_read_track_test.cpp`, Linux): read tracking through the idle
 bitmap — `root` re-runs the test as root (`sudo -n`), `idled` starts
@@ -150,19 +191,62 @@ failed under `THP=always` (`refaults_read grew by 8, want >= 3276`).
 ## `smash-estimate` (Linux)
 
 ```
-smash-estimate [--window 10] [--points 3] [--samples 4096] [--method auto] [--json] <pid>
+smash-estimate [--window 10] [--points 3] [--cold-timeout 10] [--samples 4096] [--method auto] [--json] <pid>
+smash-estimate --window 21 --points 7 <pid>      # also models refault backoff (recommended)
 smash-estimate [options] [--warmup 5] [--kill] -- <command> [args...]
 ```
 
 Built by default on Linux (`SMASH_BUILD_ESTIMATE`, `tools/smash-estimate/`),
 installed to `bin/`. Steps: list anonymous private writable mappings
-(`/proc/pid/maps`), record present pages (`pagemap`), reset tracking, wait
-`--window` seconds reading the tracker at `--points` evenly spaced times
-(idle-age curve), then sample pages that stayed idle, compress each with
-zstd-1 under smash's store rules (all-zero page = free, blob > 75% of a page =
-stays uncompressed, 16-byte blob granularity) and scale the mean per-page
-saving by the idle page count. The 95% CI is from the sampling variance (with
-finite-population correction); it does not cover idle-detection error.
+(`/proc/pid/maps`), record present pages (`pagemap`), then split `--window`
+into `--points` segments, resetting the tracker at the start of each, so
+every page gets one access bit per segment (pages that appear mid-window
+join at the next point, and a growing mapping's end is re-read). A page's
+idle age at the END of the window is its run of trailing idle segments;
+`idle_age` is that curve (bytes idle for >= s at the end). The projection
+takes the pages idle for the age at which smash drops a page's frame and
+compresses a sample of them with zstd-1 under smash's store rules (all-zero
+page = free, blob > 75% of a page = stays uncompressed, 16-byte blob
+granularity), scales the mean per-page saving by the idle page count, and
+subtracts smash's own footprint (below). The 95% CI is from the sampling
+variance (with finite-population correction); it covers neither
+idle-detection error nor the footprint model.
+
+**Which idle age.** smash works in 1 s ticks: a page that reaches the cold
+timeout T is read-checked or snapshotted the next tick and its frame is
+dropped one deferred-reclaim tick later, at T + 2 s. Once any page of a
+bucket (arena, size class) refaults, smash doubles that bucket's cold wait,
+and the backed-off pages are dropped at 2T + 1 s. The refaults are mostly
+reads of compressed pages, which the tool cannot attribute, so when the
+window has a point at or past 2T + 1 the projection uses that age
+(`backoff_modeled`) and reports the T + 2 figure as
+`projected_saving_no_backoff_bytes`, an upper bound for programs that never
+re-read a compressed page. `--window 21 --points 7` (3 s segments) has both
+ages for the default T = 10 (`--cold-timeout` sets T). The default window
+(10 s, 3 points) ends at T: no backoff, and pages are counted at idle >= 10 s.
+
+**smash's own footprint** (`smash_metadata_bytes`, `smash_runtime_bytes`,
+`layout_bytes`), measured on cloudnew with `smash_rss_part_bytes`:
+
+- metadata: 4.2 MiB fixed + 28 B per resident page of the slab classes
+  (`heap`, `malloc-arena`), 14 B per page of `anon-mmap` (large
+  allocations), 30 B per projected compressed page. The per-page terms are
+  from bench_rss at 64 MiB - 1 GiB before and after compression; the fixed
+  part is the residual on bench_sqlite, bench_kv_store and memcached
+  (3.7-4.7 MiB: compressor worker contexts, thread caches);
+- runtime: 4.4 MiB (libsmash's image, its fault-slot and compressor
+  buffers, thread stacks: the `other` part's growth over the glibc run of
+  bench_sqlite), + 1.4 MiB for libstdc++ and 0.25 MiB for libm when the
+  program does not map them (libsmash pulls them in);
+- layout: for `heap` and `malloc-arena` mappings the tool walks the glibc
+  chunk chain (reads only, `process_vm_readv` in 1 MiB blocks), prices
+  every in-use chunk with smash's size classes (`src/core/size_classes.h`:
+  smallest request for the chunk size, rounded to the class, its share of
+  the span) and charges `resident bytes x (factor - 1)`; idle pages
+  compress the padding away. bench_sqlite: factor 1.068 (its ~4.4 KB pages
+  take the 4608 class). A walk that breaks within the first half of a
+  mapping (another allocator, or the chain changed mid-walk) leaves the
+  factor at 1, with a note.
 
 **Idle methods** (`--method auto` takes the first available):
 
@@ -174,14 +258,21 @@ finite-population correction); it does not cover idle-detection error.
 
 - `soft-dirty` also clears referenced bits and caps each mapping's idle bytes
   by its unreferenced bytes (`smaps Referenced`), thinning that mapping's
-  sample pool to match. A VMA that changes during the window (a growing brk
+  sample pool to match. A VMA that changes during a segment (a growing brk
   heap) gets `VM_SOFTDIRTY` and every page reads dirty; such mappings (more
-  dirty than referenced bytes, impossible otherwise) fall back to the
-  `referenced` method, noted in the output.
+  dirty than referenced bytes in a segment, impossible otherwise) fall back
+  to the `referenced` method, noted in the output.
+- Referenced bytes are per segment. For "idle for the last m segments" a
+  mapping's unreferenced bytes are its size at the start of those segments
+  minus the largest per-segment Referenced, each reduced by the growth since
+  that start (pages faulted in later are referenced but were never idle
+  candidates; without this a growing heap lost its growth from the idle
+  count: ~65 MiB on bench_sqlite's serve phase). The max is a lower bound of
+  the union of the segments' referenced sets (exact for a stable hot set).
 - `referenced` cannot tell which pages are idle, only how many, so it samples
   compressibility from all present pages of each mapping.
-- `idle` marks every tracked page's PFN idle at t0 and reads the bitmap at
-  each point. Two details matter (both fixed 2026-11-17 after the first runs
+- `idle` marks every tracked page's folio-head PFN idle at the start of
+  each segment and reads the bitmap at its end. Two details matter (both fixed 2026-11-17 after the first runs
   on a host with the bitmap, the dev VM below):
   - **Transparent huge pages.** The bitmap tracks a large folio by its head
     PFN only: writes to a tail PFN's bit are ignored and a tail always reads
@@ -219,10 +310,11 @@ access: root, being the target's parent (`-- <command>`), yama
 the idle bytes are still printed, with no savings (exit code 3).
 
 **Side effects on the target** (no memory contents are written): `clear_refs`
-makes the kernel write-protect / age the target's PTEs (minor faults on its
-next write per page; pages look older to reclaim); a target that relies on
-soft-dirty itself (CRIU, a smash run) loses one window of write data. The
-idle method sets idle flags in the global page_idle bitmap.
+(at the start of every segment) makes the kernel write-protect / age the
+target's PTEs (minor faults on its next write per page; pages look older to
+reclaim); a target that relies on soft-dirty itself (CRIU, a smash run)
+loses that window's write data. The idle method sets idle flags in the
+global page_idle bitmap. The layout walk only reads.
 
 **Classes and what smash would manage** (heuristic, from `/proc/pid/maps`):
 `heap` (brk; glibc small allocations: full mode; large-only only for
@@ -233,17 +325,25 @@ direct mmaps, which need `SMASH_TRACK_EXTERNAL=1`), `stack` (from each task's
 page; never managed). The projection assumes every idle page of a class is
 managed — read the class notes.
 
-**Not modeled**: smash's own layout (it segregates call sites into arenas and
-keeps allocator metadata out of data pages, so a glibc heap's access pattern
-— chunk headers touched by frees and consolidation — overstates touches);
-compression thresholds (smash's default cold timeout is 10 s: use a window at
-least that long); refaults; CompressStore fragmentation.
+**Not modeled**: how smash's layout changes which pages are hot. It
+segregates call sites into arenas and size classes and keeps allocator
+metadata out of data pages, so a read of one object touches fewer pages than
+in a glibc heap where hot and cold objects (and chunk headers) share pages.
+On bench_kv_store (hash-chain walks through an `std::unordered_map`) this
+is most of the error: the glibc heap had ~168 MiB referenced per 12 s, smash
+kept ~129 MiB resident (diagnostic runs), and the estimate is 14.8 pp low (below).
+Also: refaults and their re-inflation, CompressStore fragmentation, the
+ROI gate, large-only mode (the tool projects full mode), and allocators
+other than glibc for the layout factor.
 
 Tests: `test_smash_estimate` (auto method) and `test_smash_estimate_referenced`
 (`tests/estimate_test.cpp` + `tests/estimate_target.cpp`): launch mode, a
 target with 64 MiB compressible-idle, 16 MiB random-idle, 16 MiB write-hot,
-16 MiB read-hot and 16 MiB read-only (zero page) regions; asserts idle in
-[72, 92] MiB and saving in [54, 72] MiB. Unprivileged, so they run in CI.
+16 MiB read-hot and 16 MiB read-only (zero page) regions, and the
+compressible-idle VMA growing by 10 MiB/s of write-hot pages; asserts idle
+in [72, 92] MiB, compression saving in [54, 72] MiB, and projected saving =
+compression saving − metadata − runtime (no layout change: the regions are
+mmaps). Unprivileged, so they run in CI.
 `test_smash_estimate_idle` and `test_smash_estimate_idle_thp` force
 `--method idle`, running smash-estimate via `sudo -n` when not root, and
 exit 77 (skipped) without passwordless sudo or `/sys/kernel/mm/page_idle`;
@@ -253,41 +353,136 @@ must not be `never`) and requires the "large folios" note. Before the fixes:
 `_idle` failed with "anon present 128.0 MiB > RSS 112.9 MiB", `_idle_thp`
 with "idle 2.2 MiB not in [72, 92]"; after: both pass (dev VM, 2026-11-17).
 
+
+## Where a smash process's RSS is: `smash_rss_part_bytes`
+
+With `SMASH_METRICS_FILE=path SMASH_METRICS_RSS_PARTS=1` the metrics file
+also has `smash_rss_part_bytes{part=...}`: smash's data pages by page state
+(`data_live`, `data_shadow`, `data_pending_madvise` = compressed with the
+deferred madvise still pending, `data_compressed_resident`, `data_empty` =
+freed pages still holding a frame), the CompressStore's `store_header` and
+`store_data` pages (with `smash_store_live_bytes`, fragmentation is
+`store_data` minus live blobs), BootstrapAlloc `metadata`, and `other` = RSS
+minus all of these (program image, libraries, stacks, smash's own buffers).
+Residency comes from `/proc/self/pagemap` (present and exclusively mapped;
+mincore on macOS): mincore also reports the shared zero page that reads of
+never-written memory map, and smash's metadata then read as more than the
+whole RSS. Off by default because it reads a pagemap entry per committed
+page every interval. Observe mode's JSON always carries the same split
+(`rss_parts`).
+
 ## Comparing estimates with a real run
 
-`bench/validate_estimator.py --build-dir build-bench --runs 5` (needs
-`-DSMASH_BUILD_BENCH=ON`) runs bench_sqlite under glibc (+ `smash-estimate`),
-observe mode, and full smash in random interleaved order and compares, at the
-same point of the serve phase, each projection with the measured RSS
-reduction. `--methods idle,referenced` runs one glibc config per
-`smash-estimate --method` (reported per config). Measured numbers are in the
-section below.
+```
+python3 bench/validate_estimator.py --build-dir build-bench --runs 5 \
+    [--baseline-build-dir build-base] [--workloads sqlite,memcached,kvstore] [--large-only]
+python3 bench/validate_estimator.py --summarize out.json     # re-print a saved run
+```
+
+Needs `-DSMASH_BUILD_BENCH=ON` (and `memcached` on PATH for that workload;
+`memtier_benchmark` if installed drives its GETs). Each workload loads data,
+idles for `--cool` seconds and then serves a hot subset; every config is
+measured at the same point of the serve phase (`--at`, default 25 s), in
+random interleaved order:
+
+| workload | load | serve |
+|---|---|---|
+| `sqlite` | bench_sqlite, 500K rows in an in-memory DB | hot-only queries; the heap grows ~7 MiB/s |
+| `memcached` | 400K keys of 1000-byte JSON-like values over the text protocol (1 MiB slab allocations) | GETs of the first 5% of the keys |
+| `kvstore` | bench_kv_store, `std::unordered_map` of 1M ~200-byte values | lookups of the first 5% of the keys |
+
+Configs: `glibc` (RSS + `smash-estimate --window 21 --points 7` attached
+21 s before the measurement, via `sudo -n`), `observe`, `smash` (full mode,
+or `--large-only`), `smash_nb` (`SMASH_RECOMPRESS_BACKOFF=0`: the RSS
+difference to `smash` is what refault backoff holds) and, with
+`--baseline-build-dir`, `glibc_base` / `observe_base` from another build
+(its estimate with `--baseline-est-args`, default the round-1
+`--window 10 --points 1`). `--methods idle,referenced` runs one glibc
+config per `smash-estimate --method` (reported per config). Runs under libsmash set
+`SMASH_METRICS_RSS_PARTS=1`; the script prints, per workload, the measured
+smash RSS by component next to the RSS each estimator implies for it:
+`other` (program, libraries, stacks: the glibc run's non-heap RSS +
+modeled runtime, or observe's measured `other`), `metadata`, and data pages
++ store (glibc heap − projected compression saving + layout, or observe's
+resident data − reclaimed pages + blobs + holds). The differences add up to
+the projection error in MiB.
 
 ### Dev measurements
 
-Development numbers, not results: cloudnew (EPYC 9R14, kernel 6.12 x86-64)
-under a 24-core taskset, 2026-11-16, 5 randomized interleaved rounds, medians.
-Command: `python3 bench/validate_estimator.py --build-dir build-bench --runs 5`
-(bench_sqlite `--rows 500000 --cool 5 --serve 60`, measured 25 s into the
-serve phase; `smash-estimate --window 10` run via `sudo -n`, method
-`soft-dirty`, heap via the changed-VMA Referenced fallback; observe mode
-`write_track=soft-dirty`).
+Development numbers, not results: cloudnew (EPYC 9R14, kernel 6.12 x86-64,
+40-core taskset slice), 2026-11-18, 5 randomized interleaved rounds each,
+means (all standard deviations of the percentages <= 0.2 pp). Commands:
 
-| | RSS (MiB) | projected / measured reduction |
-|---|---|---|
-| glibc | 524.9 | `smash-estimate`: **50.8%** of glibc RSS (CI half-width ~0.25 MiB) |
-| observe (smash allocator, nothing reclaimed) | 563.6 | observe projection: **58.8%** of observe RSS |
-| smash full mode | 293.1 | measured: **44.2%** vs glibc, **48.0%** vs observe |
+```
+python3 bench/validate_estimator.py --build-dir build-bench --baseline-build-dir build-base \
+    --runs 5 --seed 2 --workloads sqlite,memcached,kvstore --json-out tmp/final5.json
+python3 bench/validate_estimator.py --build-dir build-bench --baseline-build-dir build-base \
+    --runs 5 --seed 3 --workloads memcached --large-only --no-decompose --json-out tmp/final5-lo.json
+```
 
-Gap: `smash-estimate` overestimates the measured reduction by **6.6 pp**;
-observe mode by **10.8 pp** (median projected saving 329.9 MiB vs 270.5 MiB
-between the median observe-run and smash-run RSS). Both are overestimates; the unmodeled
-items above (CompressStore fragmentation and metadata, refault re-inflation,
-reads invisible without idle tracking) are the candidate causes — this has
-not been decomposed. Single workload; treat as a sanity check, not a
-calibration.
+(`build-base` = origin/master 4673d6c, the round-1 code; `smash-estimate`
+method `soft-dirty`, sqlite's heap via the changed-VMA Referenced fallback;
+observe `write_track=soft-dirty read_track=none`.) Reductions are
+1 − smash RSS / glibc RSS for `smash-estimate` and 1 − smash RSS / observe
+RSS for observe (observe runs smash's allocator, so its own RSS is the
+baseline); "before" is the round-1 code on the same runs:
 
-**Idle method, dev VM** (Lima `smash`: Ubuntu 24.04 arm64, kernel 6.8, 10
+| workload | smash-estimate before | after | measured vs glibc | observe before | after | measured vs observe |
+|---|---|---|---|---|---|---|
+| sqlite | 50.8% (+6.9 pp) | 44.8% (+0.9) | 43.9% | 59.1% (+11.3) | 49.7% (+1.9) | 47.8% |
+| memcached | 65.3% (+3.3) | 62.1% (+0.1) | 62.0% | 64.3% (+1.4) | 63.9% (+1.0) | 62.9% |
+| kvstore | 46.9% (−11.5) | 43.5% (−14.8) | 58.3% | 73.7% (+13.3) | 63.2% (+2.9) | 60.4% |
+| memcached, large-only | (full mode) | | 62.3% | 64.1% (+1.0) | 63.7% (+0.6) | 63.1% |
+
+RSS (MiB, mean ± sd): sqlite glibc 524.8±1.0, observe 563.9±2.1, smash
+294.5±1.4, smash with backoff off 240.4±1.3; memcached 464.0±0.0 /
+475.9±0.1 / 176.5±0.1 / 176.8±0.1; kvstore 487.6±0.5 / 512.4±0.4 /
+203.1±0.4 / 203.2±0.3.
+
+**Where round 1's error came from** (sqlite, MiB, the decomposition above):
+the real run's store had no fragmentation (97.9 MiB of resident store pages
+for 97.9 MiB of live blobs) and its metadata was 10.1 MiB, in observe's RSS
+too. The gap was pages the real run still held: refault backoff 54.1 ± 1.1
+(smash vs smash with backoff off). ~790 decompression faults by then, most
+of them reads (an instrumented run counted 662 read and 113 write faults),
+the first ones right after the first cold wave; they set the bucket bias,
+and every page the serve phase writes then waited 20 s instead of 10. For
+`smash-estimate` two errors had cancelled: the growth bias undercounted
+idle pages by ~68 MiB (diagnostic runs: 367 vs 436 MiB idle), and the
+missing backoff, smash's metadata (10.4 modeled), runtime (4.4) and
+allocator layout (10.8: factor 1.068) went the other way.
+
+**Residuals after the fix** (smash RSS implied − measured, MiB):
+
+| | other | metadata | data + store | total |
+|---|---|---|---|---|
+| sqlite, smash-estimate | −0.0 | +0.3 | −2.9 | −2.7 |
+| sqlite, observe | +0.0 | +0.9 | −4.8 | −3.9 |
+| memcached, smash-estimate | −0.5 | +0.1 | −0.1 | −0.5 |
+| memcached, observe | +0.0 | +0.3 | −4.9 | −4.6 |
+| kvstore, smash-estimate | +0.3 | −1.4 | +73.3 | +72.2 |
+| kvstore, observe | +0.0 | +0.1 | −14.5 | −14.4 |
+
+- **kvstore, smash-estimate (−14.8 pp)**: smash's layout makes fewer pages
+  hot (see "Not modeled" above). In single diagnostic runs the glibc heap
+  had ~168 MiB referenced per 12 s, while smash compressed 366 of 502 MiB
+  and kept 129 MiB of data pages resident.
+  The new footprint terms are real costs and move this estimate 3.3 pp
+  further below; it errs low (conservative) on this kind of workload.
+- **kvstore, observe (+2.9 pp)**: the read signal keeps 51.7 MiB of read-hot
+  pages resident (`referenced_bytes` 115.6 MiB). The rest is store
+  fragmentation the real run builds through ~11,700 refaults (56.2 MiB of
+  store pages for 46.4 MiB of live blobs) and pages read less often than the
+  2-tick sub-windows catch.
+- **memcached, observe (+1.0 pp)**: ~1,100 refaults in the real run re-inflate
+  pages observe counts as reclaimed; no backoff (the run with backoff off has
+  the same RSS).
+- The `metadata` constants of `smash-estimate` were fitted on these runs'
+  smash metadata (see above), so its metadata row is in-sample.
+
+**Idle method, dev VM** (measured with the code before the growth fix and
+the end-of-window / footprint model above; not re-measured since, the VM
+was not available to this work) (Lima `smash`: Ubuntu 24.04 arm64, kernel 6.8, 10
 vCPUs on an Apple-silicon Mac, THP `madvise`, 2026-11-17; 5 randomized
 interleaved rounds, medians; smash-estimate as root via `sudo -n`; observe
 mode `write_track=prot-read`, `read_track=none`). Command:

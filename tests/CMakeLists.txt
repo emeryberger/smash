@@ -259,6 +259,30 @@ foreach(_lo 0 1)
   set_tests_properties(${_name} PROPERTIES TIMEOUT 120)
 endforeach()
 
+# Realloc / usable-size contract under interposition, both malloc modes. On
+# macOS it replays SQLite mem1.c's pattern (malloc_zone_* on
+# malloc_default_zone() + default_zone->size()) — the large-only bench_sqlite
+# hang, where system-passthrough pointers sized as 0 and growOpArray() spun
+# forever. The loop is bounded, so a regression fails instead of hanging.
+add_executable(realloc_size_test realloc_size_test.cpp)
+set_target_properties(realloc_size_test PROPERTIES CXX_STANDARD 20)
+foreach(_lo 0 1)
+  if(_lo STREQUAL "0")
+    set(_name test_realloc_size)
+  else()
+    set(_name test_realloc_size_large_only)
+  endif()
+  if(APPLE)
+    set(_preload "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_preload "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(NAME ${_name}
+    COMMAND ${CMAKE_COMMAND} -E env ${_preload} "SMASH_LARGE_ONLY=${_lo}"
+      $<TARGET_FILE:realloc_size_test>)
+  set_tests_properties(${_name} PROPERTIES TIMEOUT 30)
+endforeach()
+
 # Mode compression test: ONE executable (mode_compression_test.cpp), run twice
 # with SMASH_LARGE_ONLY={0,1}, so FULL mode (test_malloc_compression) and
 # LARGE-ONLY mode (test_large_only_compression) execute byte-identical

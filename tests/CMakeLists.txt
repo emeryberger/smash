@@ -561,7 +561,7 @@ if(NOT APPLE)
       COMMAND ${CMAKE_COMMAND} -E env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=${lo}"
         "SMASH_UFFD=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
         $<TARGET_FILE:move_refused_test>)
-    set_tests_properties(${_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    set_tests_properties(${_name} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
   endforeach()
 endif()
 

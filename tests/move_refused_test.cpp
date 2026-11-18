@@ -5,7 +5,9 @@
 // refused page now drops its shadow copy and backs off.
 //
 // With a sleeping child holding the COW sharing for 8 s, the blob bytes smash
-// holds must stay small, and every byte must read back intact. (Reclaiming
+// holds must stay small, and every byte must read back intact. Once the child
+// has exited the same pages must be reclaimed (they are still not
+// PageAnonExclusive: smash unshares them first). (Reclaiming
 // such pages -- fork also clears PageAnonExclusive until a write fault -- is
 // not attempted; see agents/syscall-compat.md.) Exits 77 if libsmash is not
 // preloaded.
@@ -59,6 +61,29 @@ int main() {
     // A blob kept past its refusal is the bug; allow one tick's batch in flight.
     if (held > kN * kChunk / 256) {
         fprintf(stderr, "FAIL: %llu blob bytes still held for unreclaimable (COW-shared) pages\n", held);
+        return 1;
+    }
+    // The child is gone: the pages are mapped by this process alone, but fork
+    // cleared PageAnonExclusive and nothing has written them since, so MOVE
+    // still refuses them. They must become reclaimable again (smash unshares
+    // a page only this process maps before retrying the MOVE).
+    const time_t t0 = time(nullptr);
+    unsigned long long comp = 0;
+    while (time(nullptr) - t0 < 90) {
+        comp = stats().compressed_bytes;
+        if (comp >= kN * kChunk / 2) break;
+        sleep(1);
+    }
+    fprintf(stderr, "move_refused_test: %llu bytes reclaimed after the child exited (%lld s)\n", comp,
+            static_cast<long long>(time(nullptr) - t0));
+    for (size_t i = 0; i < kN; ++i)
+        for (size_t j = 0; j < kChunk; ++j)
+            if (c[i][j] != static_cast<unsigned char>((i * 13 + j / 256) & 0x3f)) {
+                fprintf(stderr, "FAIL: chunk %zu byte %zu after the child exited\n", i, j);
+                return 1;
+            }
+    if (comp < kN * kChunk / 2) {
+        fprintf(stderr, "FAIL: formerly COW-shared pages never reclaimed after the child exited\n");
         return 1;
     }
     fprintf(stderr, "move_refused_test: PASS\n");

@@ -4021,6 +4021,37 @@ private:
     // For pages in COMPRESSED_SHADOW, verify content hasn't changed since
     // Phase A, then reclaim physical memory (decommit + PROT_NONE).
 
+    // UFFDIO_MOVE refuses (EBUSY) a page that is not PageAnonExclusive.
+    // After a fork every page resident at that moment stays non-exclusive in
+    // the parent until it is written, even once the child has exited, so a
+    // page that went cold after a fork could never be reclaimed again (in
+    // Valkey: everything resident at a BGSAVE). If pagemap says this process
+    // is the only one mapping it (bit 56: the child is gone), a write fault
+    // that changes no data (MADV_POPULATE_WRITE) reuses the frame and marks
+    // it exclusive, and the MOVE can be retried. While a child still maps it
+    // unsharing would copy the page and cost memory, so the caller discards
+    // the shadow instead (noteMoveRefused). A pinned page is exclusive
+    // already: the populate is a no-op and MOVE refuses again. Page lock
+    // held; never while a fork is pending.
+    std::atomic<uint64_t> uffd_unshare_{0};
+    bool unshareForMove(void* page_addr) {
+#ifdef __linux__
+        if (pagemap_fd_ < 0 || forkPending()) return false;
+        uint64_t e = 0;
+        const off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(page_addr) / kPageSize * sizeof(e));
+        if (pread(pagemap_fd_, &e, sizeof(e), off) != static_cast<ssize_t>(sizeof(e))) return false;
+        if (!((e >> 63) & 1) || !((e >> 56) & 1)) return false;  // not present / still shared
+        if (syscall(SYS_madvise, page_addr, kPageSize, 23 /* MADV_POPULATE_WRITE */) != 0) return false;
+        uffd_unshare_.fetch_add(1, std::memory_order_relaxed);
+        if (wp_scan_) uffdWp(page_addr, false);  // the write fault resolved it; keep MOVE's precondition
+        errno = EBUSY;
+        return true;
+#else
+        (void)page_addr;
+        return false;
+#endif
+    }
+
     // uffd reclaim of a verified-idle COMPRESSED_SHADOW page; called with
     // the page lock held, releases it. Returns false (lock still held, page
     // untouched) if the MOVE is refused, so the caller can fall back.
@@ -4033,7 +4064,9 @@ private:
         void* scratch = scratchPage(slot);
         // MOVE refuses a uffd-wp'd PTE (EBUSY); the page is cold, clear it.
         if (wp_scan_) uffdWp(page_addr, false);
-        if (!uffdMove(scratch, page_addr)) {
+        bool moved = uffdMove(scratch, page_addr);
+        if (!moved && errno == EBUSY && unshareForMove(page_addr)) moved = uffdMove(scratch, page_addr);
+        if (!moved) {
             if (uffd_move_fail_.fetch_add(1, std::memory_order_relaxed) == 0) {
                 char b[96];
                 int n = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); shadow discarded\n", errno);
@@ -4116,7 +4149,9 @@ private:
                 locks_->unlock(i);
                 continue;
             }
-            if (!uffdMove(scratch, page_addr)) {
+            bool moved = uffdMove(scratch, page_addr);
+            if (!moved && errno == EBUSY && unshareForMove(page_addr)) moved = uffdMove(scratch, page_addr);
+            if (!moved) {
                 if (uffd_move_fail_.fetch_add(1, std::memory_order_relaxed) == 0) {
                     char b[96];
                     int m = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); shadow discarded\n", errno);
@@ -8297,12 +8332,13 @@ public:
             // vmas = /proc/self/maps lines now.
             n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash stats] external live=%zu cpages=%zu slots_hw=%zu uffd=%zu busy=%llu "
-                "regfail=%llu vmas=%ld\n",
+                "regfail=%llu unshare=%llu vmas=%ld\n",
                 self->vm_->externalLivePages(), ext_c,
                 total > contig ? total - contig : size_t{0},
                 self->ext_uffd_pages_.load(std::memory_order_relaxed),
                 (unsigned long long)self->ext_reg_busy_.load(std::memory_order_relaxed),
                 (unsigned long long)self->ext_reg_fail_.load(std::memory_order_relaxed),
+                (unsigned long long)self->uffd_unshare_.load(std::memory_order_relaxed),
                 readVmaCount());
             if (n > 0) (void)!write(2, buf, (size_t)n);
         }

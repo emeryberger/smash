@@ -273,7 +273,7 @@ def run_redis(cg: Cgroup, env: dict, args) -> dict[str, float]:
 
 
 def one_run(app: str, cfg_name: str, cfg: dict, idx: int, args) -> dict:
-    high, mx = args.caps.get(app, DEFAULT_CAPS[app])
+    high, mx = cfg.get("cap") or args.caps.get(app, DEFAULT_CAPS[app])
     cg = Cgroup(f"{app}-{cfg_name}-{idx}-{os.getpid()}", high, mx)
     env = dict(os.environ)
     env.pop("LD_PRELOAD", None)
@@ -383,7 +383,10 @@ def summarize(results: list[dict]) -> str:
                     cells.append("-")
                 else:
                     cells.append(f"{statistics.median(v):.1f} ({min(v):.0f}..{max(v):.0f})")
-            lines.append(f"| {c} | {len(ok)} | {len(cr) - len(ok)} | " + " | ".join(cells) + " |")
+            label = c
+            if cr and (cr[0]["high"], cr[0]["max"]) != (hi, mx):
+                label += f" @{cr[0]['high']}:{cr[0]['max']}"
+            lines.append(f"| {label} | {len(ok)} | {len(cr) - len(ok)} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
@@ -393,7 +396,11 @@ def parse_config(s: str) -> tuple[str, dict]:
     cfg = {"lib": parts[0] or None, "env": {}}
     for kv in parts[1:]:
         k, _, v = kv.partition("=")
-        cfg["env"][k] = v
+        if k == "@cap":   # per-config HIGH:MAX, overrides --cap for every app
+            h, _, m = v.partition(":")
+            cfg["cap"] = (h, m or "max")
+        else:
+            cfg["env"][k] = v
     return name, cfg
 
 
@@ -401,7 +408,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build-dir", default=os.environ.get("BUILD_DIR", "build"))
     ap.add_argument("--config", action="append", default=[],
-                    help="NAME=/path/libsmash.so[,ENV=VAL...] (repeatable); 'glibc' is always added")
+                    help="NAME=/path/libsmash.so[,ENV=VAL...][,@cap=HIGH:MAX] (repeatable; an empty "
+                         "path runs without a preload); 'glibc' is always added")
     ap.add_argument("--no-glibc", action="store_true")
     ap.add_argument("--apps", default="sqlite,rss")
     ap.add_argument("--runs", type=int, default=5)

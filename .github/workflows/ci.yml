@@ -120,6 +120,62 @@ jobs:
           SMASH_LARGE_ONLY: "1"
         run: python3 bench/run_quick_ci.py --build-dir build
 
+  # ── SMASH_TRACK_EXTERNAL=1 forced ────────────────────────────────────────
+  # The whole suite with SMASH_TRACK_EXTERNAL=1 in every test's environment
+  # (tests/CMakeLists.txt: SMASH_TEST_FORCE_TRACK_EXTERNAL), then the soak and
+  # fork-under-threads stress with it set, on both Linux ISAs and macOS: the
+  # evidence base for making external tracking the default. liburing-dev
+  # builds the liburing fixed-buffer case of test_iouring_*.
+  te-forced:
+    name: TRACK_EXTERNAL=1 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: smash
+      - uses: actions/checkout@v4
+        with:
+          repository: emeryberger/alloc8
+          path: alloc8
+      - name: liburing (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y liburing-dev || true
+      - name: Configure + build
+        working-directory: smash
+        run: |
+          extra=""
+          if [ "$RUNNER_OS" = "macOS" ]; then extra="-DCMAKE_OSX_ARCHITECTURES=arm64"; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSMASH_BUILD_TESTS=ON \
+            -DSMASH_TEST_FORCE_TRACK_EXTERNAL=ON $extra
+          cmake --build build -j
+      - name: Run tests (SMASH_TRACK_EXTERNAL=1)
+        working-directory: smash
+        run: ctest --test-dir build --output-on-failure --timeout 120
+      - name: Soak, both modes, SMASH_TRACK_EXTERNAL=1
+        working-directory: smash
+        run: |
+          set -e
+          if [ "$RUNNER_OS" = "macOS" ]; then pre="DYLD_INSERT_LIBRARIES=$PWD/build/libsmash.dylib MallocNanoZone=0"
+          else pre="LD_PRELOAD=$PWD/build/libsmash.so"; fi
+          for lo in 0 1; do
+            env $pre SMASH_TRACK_EXTERNAL=1 SMASH_LARGE_ONLY=$lo SMASH_DEFER_PHASES_MS=0 \
+              SMASH_COLD_TIMEOUT_SEC=1 SMASH_SOAK_TOGGLE=1 timeout 300 build/tests/soak_test 60 8
+          done
+      - name: fork() under threads, both modes, SMASH_TRACK_EXTERNAL=1
+        if: runner.os == 'Linux'
+        working-directory: smash
+        run: |
+          set -e
+          for lo in 0 1 0 1; do
+            env LD_PRELOAD="$PWD/build/libsmash.so" SMASH_TRACK_EXTERNAL=1 SMASH_LARGE_ONLY=$lo \
+              SMASH_DEFER_PHASES_MS=0 SMASH_COLD_TIMEOUT_SEC=1 \
+              timeout 600 build/tests/fork_stress_test 300 6
+          done
+
   # ── Packages + oldest supported glibc ────────────────────────────────────
   # Builds libsmash and its .deb/.rpm/.tar.gz exactly as release.yml does
   # (manylinux_2_28, packaging/linux/build-manylinux.sh), then installs the

@@ -8645,8 +8645,10 @@ public:
         for (size_t i = 0; i < n; ++i) {
             const uint8_t stg = obs_stage_[i].load(std::memory_order_relaxed);
             if (stg == kObsNone || cold_count_[i] >= held_floor) continue;
-            if (stg == kObsReclaimed) { ++held_pages; held_blob += obs_blob_[i]; }
-            else { ++held_shadow; held_shadow_blob += obs_blob_[i]; }
+            // Workers own obs_blob_[i]; the coordinator only samples it.
+            const int64_t blob = __atomic_load_n(&obs_blob_[i], __ATOMIC_RELAXED);
+            if (stg == kObsReclaimed) { ++held_pages; held_blob += blob; }
+            else { ++held_shadow; held_shadow_blob += blob; }
         }
         obs_.held_pages = held_pages;
         obs_.held_bytes = held_pages * static_cast<int64_t>(kPageSize) - held_blob - held_shadow_blob

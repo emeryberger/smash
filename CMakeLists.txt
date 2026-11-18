@@ -450,9 +450,12 @@ else()
 endif()
 if(SMASH_BUILD_ESTIMATE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(smash-estimate tools/smash-estimate/smash_estimate.cpp)
-  set_target_properties(smash-estimate PROPERTIES CXX_STANDARD 17)
-  target_include_directories(smash-estimate PRIVATE ${zstd_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(smash-estimate PRIVATE libzstd_static)
+  set_target_properties(smash-estimate PROPERTIES CXX_STANDARD 20)
+  # smash's size-class table (src/core/size_classes.h) for the allocator-layout
+  # model; alloc8::headers only supplies the page-size macro (no interposer).
+  target_include_directories(smash-estimate PRIVATE ${zstd_SOURCE_DIR}/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(smash-estimate PRIVATE libzstd_static alloc8::headers)
   # Same fixed layout and component as libsmash and the launcher (see Install).
   install(TARGETS smash-estimate RUNTIME DESTINATION bin COMPONENT smash)
 endif()

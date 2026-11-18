@@ -227,22 +227,16 @@ jobs:
             -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread \
             -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread
           cmake --build build-tsan -j
-      # Gating: in-process unit tests that are TSan-clean today (a new race in
-      # any of them fails CI). Preload tests are not run under TSan (its
-      # runtime and an interposed malloc do not mix).
-      - name: ThreadSanitizer (gating set)
+      # Gating: every in-process unit test (a race in any of them fails CI),
+      # including the two that run the live compressor threads against app
+      # threads (test_contention, test_stop_no_drain). Preload tests are not
+      # run under TSan (its runtime and an interposed malloc do not mix);
+      # test_smash_estimate* measure a target's RSS, which TSan's shadow
+      # memory inflates; test_fault_cycle is disabled everywhere.
+      - name: ThreadSanitizer
         working-directory: smash
         env:
           TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
         run: >
           ctest --test-dir build-tsan --output-on-failure --timeout 600
-          -R '^(test_size_classes|test_bootstrap|test_span|test_slab|test_vm_region|test_spill_store|test_safety|test_integration|test_compression|test_dictionary|test_prefetch|test_compression_ratio|test_profile_dict_persistence)$'
-      # Report-only: these two exercise the live compressor threads and report
-      # known races (agents/safety.md, "ThreadSanitizer findings"). Kept visible
-      # in the log until they are fixed or annotated.
-      - name: ThreadSanitizer (report-only)
-        working-directory: smash
-        continue-on-error: true
-        env:
-          TSAN_OPTIONS: halt_on_error=0
-        run: ctest --test-dir build-tsan --output-on-failure --timeout 600 -R '^(test_contention|test_stop_no_drain)$'
+          -R '^(test_size_classes|test_bootstrap|test_span|test_slab|test_vm_region|test_spill_store|test_integration|test_compression|test_dictionary|test_prefetch|test_compression_ratio|test_profile_dict_persistence|test_contention|test_stop_no_drain|test_cgroup_monitor|test_safety|test_profile_.*)$'

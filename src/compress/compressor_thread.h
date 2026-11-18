@@ -9291,7 +9291,7 @@ public:
         if (cfg_metrics_rss_parts_) {
             const RssBreakdown rb = rssBreakdown();
             metric("smash_rss_part_bytes", "gauge",
-                   "Resident bytes by owner (mincore): data_* = smash data pages by state, store_* = "
+                   "Resident bytes by owner (pagemap; mincore on macOS): data_* = smash data pages by state, store_* = "
                    "compressed-blob store, metadata = smash bookkeeping, other = the rest of RSS.");
             const struct { const char* k; uint64_t v; } parts[] = {
                 {"data_live", rb.data_live}, {"data_shadow", rb.data_shadow},

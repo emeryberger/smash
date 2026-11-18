@@ -388,6 +388,34 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   endforeach()
 endif()
 
+# Observe-mode projection model (agents/estimator.md): the refault-backoff
+# hold, the referenced-bits read signal (Linux soft-dirty) and refault
+# feedback into the cold-floor backoff. Same executable in both modes.
+add_executable(observe_projection_test observe_projection_test.cpp)
+set_target_properties(observe_projection_test PROPERTIES CXX_STANDARD 20)
+function(add_observe_projection_test test_name large_only)
+  if(APPLE)
+    set(_preload "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  else()
+    set(_preload "LD_PRELOAD=$<TARGET_FILE:smash>")
+  endif()
+  add_test(
+    NAME ${test_name}
+    COMMAND ${CMAKE_COMMAND} -E env
+      ${_preload}
+      "SMASH_MODE=observe"
+      "SMASH_LARGE_ONLY=${large_only}"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=6"
+      "SMASH_OBSERVE_INTERVAL=1"
+      "SMASH_OBSERVE_REPORT=${CMAKE_CURRENT_BINARY_DIR}/${test_name}.json"
+      $<TARGET_FILE:observe_projection_test>
+  )
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 240)
+endfunction()
+add_observe_projection_test(test_observe_projection_full 0)
+add_observe_projection_test(test_observe_projection_large_only 1)
+
 # SMASH_CGROUP (container memory-limit policy). Unit test: parsers, the pure
 # policy decision, and the Monitor walking a fake pod/container cgroup tree.
 smash_add_test(test_cgroup_monitor cgroup_monitor_test.cpp)

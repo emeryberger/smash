@@ -13,6 +13,7 @@ gh release create vX.Y.Z-alpha --target master --prerelease \
 - **Version convention:** all releases so far are `vX.Y.Z-alpha` pre-releases (`--prerelease`). Full mode is still experimental; large-only is the production-supported config.
 - **Notes use `append_body: true`,** so the workflow *appends* a per-platform usage block (Linux `LD_PRELOAD`, macOS `xattr -d` + preload, arm64e zip instructions) to whatever notes you write. Don't duplicate usage instructions in `--notes`.
 - **After publishing:** check that the `.deb`/`.rpm`/`.tar.gz` assets attached, that `ghcr.io/emeryberger/smash:<tag>` exists (make the GHCR package public after the very first push), and commit the source-tarball `sha256` from the `publish` job summary into `packaging/homebrew/smash.rb` (bump its `url` to the new tag too).
+- **If `publish-to-release` fails after the builds succeeded** (as v0.1.0-alpha did, on an artifact download), finish by hand from the same run instead of re-tagging: `gh run download <run> -p 'libsmash-*'`, flatten, `shasum -a 256 -- * > SHA256SUMS.txt`, `gh release upload <tag> …`, then append the usage block to the notes with `gh release edit`.
 - The build takes a few minutes; the assets appear on the Release when the `publish` job finishes. **Always confirm the assets actually attached** — a release with missing assets is worse than none. Check the `verify-macos-arm64e` job went green, not just that the run "succeeded."
 
 ## The assets

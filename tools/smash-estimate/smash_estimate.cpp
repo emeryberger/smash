@@ -149,6 +149,7 @@ struct Mapping {
     // smaps
     uint64_t rss_kb = 0, anon_kb = 0, ref0_kb = 0;
     std::vector<uint64_t> ref_kb;   // Referenced at each point
+    std::vector<uint64_t> anon_at;  // Anonymous at each point
     // per-page tracking (present at t0)
     std::vector<uintptr_t> pages;   // page-aligned vaddrs present at t0
     std::vector<uint64_t> pfn;      // idle method: PFN at t0
@@ -270,7 +271,10 @@ bool readSmaps(pid_t pid, std::vector<Mapping>& maps, int point) {
         } else if (cur) {
             unsigned long kb;
             if (point < 0 && sscanf(l, "Rss: %lu kB", &kb) == 1) cur->rss_kb = kb;
-            else if (point < 0 && sscanf(l, "Anonymous: %lu kB", &kb) == 1) cur->anon_kb = kb;
+            else if (sscanf(l, "Anonymous: %lu kB", &kb) == 1) {
+                if (point < 0) cur->anon_kb = kb;
+                else { cur->anon_at.resize(static_cast<size_t>(point) + 1); cur->anon_at[point] = kb; }
+            }
             else if (sscanf(l, "Referenced: %lu kB", &kb) == 1) {
                 if (point < 0) cur->ref0_kb = kb;
                 else { cur->ref_kb.resize(static_cast<size_t>(point) + 1); cur->ref_kb[point] = kb; }
@@ -575,7 +579,15 @@ int main(int argc, char** argv) {
         std::vector<double> unref(static_cast<size_t>(o.points), anon_b);
         for (int k = 0; k < o.points; ++k) {
             double ref = k < static_cast<int>(m.ref_kb.size()) ? static_cast<double>(m.ref_kb[k]) * 1024 : 0;
-            unref[k] = std::max(0.0, anon_b - ref);
+            double anon_k = k < static_cast<int>(m.anon_at.size()) ? static_cast<double>(m.anon_at[k]) * 1024 : anon_b;
+            // Pages faulted in during the window are Referenced too, but they
+            // were not present at t0 and cannot be idle; charging them against
+            // the t0 pages undercounted a growing brk heap by its growth
+            // (bench_sqlite's heap grows ~7 MiB/s while serving: ~65 MiB over
+            // a 10 s window). New pages are written, so all of them are
+            // referenced: subtract the growth.
+            const double growth = std::max(0.0, anon_k - anon_b);
+            unref[k] = std::max(0.0, std::min(anon_b, anon_k) - std::max(0.0, ref - growth));
         }
         if (per_page) {
             a.present += static_cast<double>(m.pages.size() * g_page);

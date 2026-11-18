@@ -15,6 +15,7 @@ and report the gap between each estimate and the measured reduction
 allocator fixed). Configs are interleaved in random order for --runs rounds.
 
   python3 bench/validate_estimator.py --build-dir build-bench --runs 5
+  python3 bench/validate_estimator.py --methods idle,referenced   # one glibc config per method
 
 Needs -DSMASH_BUILD_BENCH=ON. smash-estimate attaches to a non-child pid, so
 reading page contents needs ptrace access: the script runs it with `sudo -n`
@@ -78,9 +79,11 @@ def run_one(cfg, a, bench, lib, est, workdir):
         t_serve = wait_line(proc, "Serve phase", 600)
         drain(proc)
         est_proc = None
-        if cfg == "glibc":
+        if cfg.startswith("glibc"):
             time.sleep(max(0.0, a.at - a.window - (time.time() - t_serve)))
             cmd = [est, "--json", "--window", str(a.window), "--points", "1", str(proc.pid)]
+            if ":" in cfg:
+                cmd[1:1] = ["--method", cfg.split(":", 1)[1]]
             if a.sudo:
                 cmd = ["sudo", "-n"] + cmd
             est_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -119,6 +122,8 @@ def main():
     ap.add_argument("--at", type=float, default=25.0, help="seconds into the serve phase to measure")
     ap.add_argument("--window", type=float, default=10.0, help="smash-estimate idle window")
     ap.add_argument("--no-sudo", dest="sudo", action="store_false")
+    ap.add_argument("--methods", default="auto",
+                    help="comma-separated smash-estimate --method values; each is its own glibc config")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--json-out")
     a = ap.parse_args()
@@ -132,7 +137,9 @@ def main():
     if a.sudo and subprocess.call(["sudo", "-n", "true"], stderr=subprocess.DEVNULL) != 0:
         a.sudo = False
     rnd = random.Random(a.seed)
-    res = {"glibc": [], "observe": [], "smash": []}
+    methods = [m for m in a.methods.split(",") if m]
+    gcfgs = ["glibc"] if methods == ["auto"] else ["glibc:" + m for m in methods]
+    res = {c: [] for c in gcfgs + ["observe", "smash"]}
     os.makedirs("tmp", exist_ok=True)
     with tempfile.TemporaryDirectory(dir="tmp") as wd:
         for r in range(a.runs):
@@ -145,10 +152,12 @@ def main():
 
     def med(xs):
         return statistics.median(xs) if xs else float("nan")
-    g_rss = med([o["rss"] for o in res["glibc"]])
+    g_runs = [o for c in gcfgs for o in res[c]]
+    g_rss = med([o["rss"] for o in g_runs])
     o_rss = med([o["rss"] for o in res["observe"]])
     s_rss = med([o["rss"] for o in res["smash"]])
-    est_pct = med([100.0 * o["est_saving"] / o["est_rss"] for o in res["glibc"]])
+    est_by = {c: med([100.0 * o["est_saving"] / o["est_rss"] for o in res[c]]) for c in gcfgs}
+    est_pct = est_by[gcfgs[0]]
     obs_pct = med([100.0 * o["proj_saving"] / o["obs_rss"] for o in res["observe"]])
     act_g = 100.0 * (1 - s_rss / g_rss)
     act_o = 100.0 * (1 - s_rss / o_rss)
@@ -156,12 +165,14 @@ def main():
         "runs": a.runs, "rows": a.rows, "at_serve_s": a.at, "window_s": a.window,
         "median_rss_mib": {"glibc": g_rss / 2**20, "observe": o_rss / 2**20, "smash": s_rss / 2**20},
         "smash_estimate_pct_of_glibc_rss": est_pct,
+        "smash_estimate_pct_by_config": est_by,
         "observe_projected_pct_of_observe_rss": obs_pct,
         "actual_reduction_vs_glibc_pct": act_g,
         "actual_reduction_vs_observe_pct": act_o,
         "gap_estimate_minus_actual_vs_glibc_pp": est_pct - act_g,
+        "gap_by_config_pp": {c: v - act_g for c, v in est_by.items()},
         "gap_observe_minus_actual_vs_observe_pp": obs_pct - act_o,
-        "est_method": res["glibc"][0].get("est_method") if res["glibc"] else None,
+        "est_method": {c: res[c][0].get("est_method") for c in gcfgs if res[c]},
         "observe_write_tracking": res["observe"][0].get("write_tracking") if res["observe"] else None,
         "raw": res,
     }

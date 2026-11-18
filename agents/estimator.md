@@ -82,6 +82,23 @@ What observe mode can still do to the application:
   upper bound and `refault_rate` a lower bound for read-heavy workloads. A real
   run would also have filtered such pages with the PROT_NONE read check, which
   observe mode skips.
+- Read tracking with the bitmap (`read_track=page_idle` or `smash-idled`) was
+  first exercised on the arm64 dev VM on 2026-11-17 and was broken there: with
+  PROT_READ write tracking (no soft-dirty) Phase 1 consulted the idle bit of
+  every ACTIVE_MONITORING page, but a page is only armed (bit set) at the base
+  floor in `escalateToDeepMonitoring`, so every unarmed page read "accessed",
+  its cold count reset each tick, and it never reached the floor:
+  `would_compress=0` for 45 s. The same applied to a real (non-observe) run
+  with root or smash-idled on arm64. Now `armIdleRead()` records which pages
+  are armed (`idle_armed_`), and Phase 1 and the smash-idled QUERY consult
+  only those. A THP-backed page is armed and tested through its folio head
+  PFN (`src/vm/page_idle.h`), in-process and in smash-idled.
+- Measured with `tests/observe_read_track_test.cpp` (dev VM): reads of a
+  reclaimed region count as `refaults_read` (+4096..4103 for a 16 MiB region,
+  `refaults_write` unchanged), in both modes, in-process and via smash-idled.
+  A region read every 100 ms (never written) was still projected once in the
+  first ~3 s and then counted as read refaults before it backed off; why it
+  passed the base-floor arm at all has not been established.
 - Allocator feedback loops: a real run steers new allocations away from
   compressed pages (`COMPRESSED_PAGE` slot class) and the arena feedback hook
   sees compressions; observe pages stay ACTIVE, so placement can differ.
@@ -117,6 +134,18 @@ Tests: `test_observe_full`, `test_observe_large_only` (`tests/observe_mode_test.
 cold regions projected, a hot region not, rewriting a projected region counts
 refaults, SIGUSR2 stats show `compressed=0 shadow=0`, RSS keeps every page,
 every byte reads back.
+`test_observe_read_{root,idled}_{full,large_only}[_thp]`
+(`tests/observe_read_track_test.cpp`, Linux): read tracking through the idle
+bitmap — `root` re-runs the test as root (`sudo -n`), `idled` starts
+`sudo -n smash-idled -p <test pid>` on a private socket and runs the
+preloaded child unprivileged. Asserts a 32 MiB cold set is projected, a
+read-hot region is not projected after 30 more ticks, and reading (not
+writing) a projected 16 MiB region yields >= 80% of its pages as
+`refaults_read`. Skip (77) without page_idle, passwordless sudo, or if smash
+reports `read_track=none`; `_thp` also needs THP `always` and chunks that
+really got huge pages. Before the arming fix all four non-THP cases failed
+(`would_compress_bytes=0`); before the head-PFN fix the four `_thp` cases
+failed under `THP=always` (`refaults_read grew by 8, want >= 3276`).
 
 ## `smash-estimate` (Linux)
 
@@ -151,9 +180,38 @@ finite-population correction); it does not cover idle-detection error.
   `referenced` method, noted in the output.
 - `referenced` cannot tell which pages are idle, only how many, so it samples
   compressibility from all present pages of each mapping.
-- `idle` is implemented but has not been exercised on a host with
-  `CONFIG_IDLE_PAGE_TRACKING` and root (the dev VM had the bitmap, cloudnew
-  does not); treat it as untested.
+- `idle` marks every tracked page's PFN idle at t0 and reads the bitmap at
+  each point. Two details matter (both fixed 2026-11-17 after the first runs
+  on a host with the bitmap, the dev VM below):
+  - **Transparent huge pages.** The bitmap tracks a large folio by its head
+    PFN only: writes to a tail PFN's bit are ignored and a tail always reads
+    "not idle" (`mm/page_idle.c`). pagemap gives each 4 KiB page its own PFN,
+    so before the fix every tail of a THP read as accessed: `estimate_target`
+    under `THP=always` reported 2.2 MiB idle instead of 80 MiB. The tool now
+    resolves each page's folio head through `/proc/kpageflags`
+    (`src/vm/page_idle.h`, shared with smash and smash-idled), so one access
+    anywhere in a 2 MiB folio marks all 512 pages hot (that is the kernel's
+    granularity) and the output notes how many pages were in large folios.
+  - **The shared zero page.** An anonymous page that was read but never
+    written maps the zero page: present in pagemap, absent from RSS, and
+    never idle (not on an LRU). It was counted in `anon_present_bytes`
+    (128 MiB "present" vs 113 MiB RSS for `estimate_target`). With PFNs
+    visible (root) such pages are now skipped in every method and noted.
+  Unprivileged runs (soft-dirty, referenced) cannot see PFNs, so they still
+  count zero-page PTEs as present; soft-dirty additionally treats them as
+  idle up to the mapping's unreferenced bytes.
+- `--method auto` picks `idle` whenever the bitmap opens and pagemap shows
+  PFNs (root), even where soft-dirty works; on the arm64 dev VM it picks
+  `idle` as root and `referenced` otherwise (arm64 never sets soft-dirty).
+- **smash-idled cannot make `idle` unprivileged.** The daemon answers only
+  for the connecting process's own pages (it reads the peer's pagemap from
+  `SO_PEERCRED`) and only for one registered contiguous range; the estimator
+  needs another process's many mappings. Supporting it would mean a new op
+  that names a target pid, a scope rule for it (the target must be in the
+  daemon's scope and the client must already be able to ptrace it), and
+  multi-range registration — a larger, security-sensitive change to a root
+  daemon, for a one-shot tool whose user can run `sudo smash-estimate`
+  (which the daemon itself needs anyway). Not done.
 
 **Permissions.** Reading page contents uses `process_vm_readv`, i.e. ptrace
 access: root, being the target's parent (`-- <command>`), yama
@@ -183,9 +241,17 @@ least that long); refaults; CompressStore fragmentation.
 
 Tests: `test_smash_estimate` (auto method) and `test_smash_estimate_referenced`
 (`tests/estimate_test.cpp` + `tests/estimate_target.cpp`): launch mode, a
-target with 64 MiB compressible-idle, 16 MiB random-idle, 16 MiB write-hot and
-16 MiB read-hot regions; asserts idle in [72, 92] MiB and saving in
-[54, 72] MiB. Unprivileged, so they run in CI.
+target with 64 MiB compressible-idle, 16 MiB random-idle, 16 MiB write-hot,
+16 MiB read-hot and 16 MiB read-only (zero page) regions; asserts idle in
+[72, 92] MiB and saving in [54, 72] MiB. Unprivileged, so they run in CI.
+`test_smash_estimate_idle` and `test_smash_estimate_idle_thp` force
+`--method idle`, running smash-estimate via `sudo -n` when not root, and
+exit 77 (skipped) without passwordless sudo or `/sys/kernel/mm/page_idle`;
+they also assert `anon_present_bytes <= RSS + 4 MiB` (zero page excluded).
+The `_thp` variant has the target `madvise(MADV_HUGEPAGE)` its regions (THP
+must not be `never`) and requires the "large folios" note. Before the fixes:
+`_idle` failed with "anon present 128.0 MiB > RSS 112.9 MiB", `_idle_thp`
+with "idle 2.2 MiB not in [72, 92]"; after: both pass (dev VM, 2026-11-17).
 
 ## Comparing estimates with a real run
 
@@ -193,7 +259,9 @@ target with 64 MiB compressible-idle, 16 MiB random-idle, 16 MiB write-hot and
 `-DSMASH_BUILD_BENCH=ON`) runs bench_sqlite under glibc (+ `smash-estimate`),
 observe mode, and full smash in random interleaved order and compares, at the
 same point of the serve phase, each projection with the measured RSS
-reduction. Measured numbers are in the section below.
+reduction. `--methods idle,referenced` runs one glibc config per
+`smash-estimate --method` (reported per config). Measured numbers are in the
+section below.
 
 ### Dev measurements
 
@@ -218,6 +286,43 @@ items above (CompressStore fragmentation and metadata, refault re-inflation,
 reads invisible without idle tracking) are the candidate causes — this has
 not been decomposed. Single workload; treat as a sanity check, not a
 calibration.
+
+**Idle method, dev VM** (Lima `smash`: Ubuntu 24.04 arm64, kernel 6.8, 10
+vCPUs on an Apple-silicon Mac, THP `madvise`, 2026-11-17; 5 randomized
+interleaved rounds, medians; smash-estimate as root via `sudo -n`; observe
+mode `write_track=prot-read`, `read_track=none`). Command:
+`python3 bench/validate_estimator.py --build-dir build-vm --runs 5 --rows 650000 --serve 60 --at 50 --window 10 --methods idle,referenced`
+
+| | RSS (MiB) | projected / measured reduction |
+|---|---|---|
+| glibc | 849.0 | `idle`: **63.0%**; `referenced`: **56.2%** of glibc RSS |
+| observe | 871.7 | observe projection: **63.4%** |
+| smash full mode | 517.2 | measured: **39.1%** vs glibc, **40.7%** vs observe |
+
+Both methods overestimate here (+23.9 pp idle, +17.1 pp referenced). That
+`idle` reports more idle bytes than `referenced` is expected on a growing
+heap: `referenced` subtracts each mapping's Referenced bytes from its
+Anonymous bytes at t0, and pages the heap gains during the window count as
+referenced (bench_sqlite's glibc RSS grows ~8 MiB/s in the serve phase), while
+`idle` only follows pages present at t0. That accounts for the direction;
+whether it accounts for the whole 6.8 pp has not been measured. The gap to the
+measured smash run is not decomposed (candidates: the unmodeled items above,
+plus smash's refault backoff after the rehash described below, which lands
+inside the first ~20 s of serve on this VM).
+
+Same harness, default `--rows 500000 --at 25 --window 10`: `idle` 3.8%,
+`referenced` 48.0%, measured 42.8%. `idle` was right about the window — the
+pager rehash (below) fell inside it in all five idle runs and read every page
+— and `referenced` saw it in 1 of 5 runs; when the rehash lands relative to
+the window varies with insert throughput (not investigated further). At
+`--at 14 --window 8` smash itself had not finished compressing in 3 of 5 runs
+(RSS 373 vs 239 MiB), and at `--at 40` it measured only 6.5%: after the rehash
+decompresses everything, smash's refault backoff delays recompression, which
+no window-based estimate models.
+
+`estimate_target` (launch mode, 4 s window, VM): `idle` and `referenced`
+both report 80.0 MiB idle (exact: 80 MiB) and 62.3-62.7 MiB saving, with THP
+off and (after the fix) with `THP=always`.
 
 Pitfall seen while measuring: bench_sqlite's in-memory pager rehashes its page
 cache as the DB grows (a read of every page). One lands ~30 s into the serve

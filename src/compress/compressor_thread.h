@@ -1591,7 +1591,6 @@ public:
         runStatsResetForFork();
         work_gen_.store(0, std::memory_order_release);
         work_waker_.reinitAfterFork();
-        current_phase_ = 0;
         // /proc/self/{clear_refs,pagemap} fds inherited from the parent
         // refer to the parent's pid-namespace entries — the kernel
         // resolves /proc/self at open(2) time, not on every read. After
@@ -1660,11 +1659,27 @@ public:
     }
 private:
 
-    // Work dispatch: coordinator increments work_gen_ to signal helpers.
-    // Helpers compare against their last-seen gen to detect new work.
+    // Work dispatch: the coordinator publishes one word per dispatch,
+    // (sequence << 16) | (active workers << 8) | phase, and helpers compare it
+    // against their last-seen word to detect new work. The active count and
+    // phase travel in the same word as the sequence so a helper acts on the
+    // values of the dispatch it observed. When they were separate plain fields
+    // (active_workers_, current_phase_), a parked helper the coordinator was
+    // not waiting for could wake late, read an active_workers_ that
+    // adaptWorkerCount() had since raised to include it, and run a phase on
+    // its range outside any dispatch: concurrently with the coordinator's
+    // single-threaded steps (range partitioning, chunk-bitmap rebuild), or a
+    // second time in the next dispatch (Phase 1 aging its pages twice).
+    // ThreadSanitizer reported the active_workers_ read in helperEntry
+    // racing with the write in adaptWorkerCount.
     std::atomic<uint64_t> work_gen_{0};
+    static constexpr uint64_t kGenSeqShift = 16;
+    static_assert(kMaxCompressorWorkers <= 255, "active count must fit dispatch word byte");
+    static constexpr uint64_t dispatchWord(uint64_t seq, int nw, int phase) {
+        return (seq << kGenSeqShift) | (static_cast<uint64_t>(nw) << 8) |
+               static_cast<uint64_t>(phase);
+    }
     Waker work_waker_;       // helpers park here between dispatches
-    int current_phase_ = 0;  // 1=access, 2=compress, 3=monitor
     std::atomic<uint64_t> helper_done_gen_[kMaxHelpers]{};
 
     // ── Adaptive worker scaling (Little's Law) ─────────────────────────
@@ -3851,15 +3866,17 @@ private:
         int nw = active_workers_;
         bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
         if (helpers_active) {
-            current_phase_ = phase;
-            work_gen_.fetch_add(1, std::memory_order_release);
+            // Only this thread writes work_gen_, so load + store is the
+            // increment. Phase 1-4 fits the low byte.
+            const uint64_t target = dispatchWord(
+                (work_gen_.load(std::memory_order_relaxed) >> kGenSeqShift) + 1, nw, phase);
+            work_gen_.store(target, std::memory_order_release);
             work_waker_.notifyAll();
 
             // Coordinator does worker 0's range
             executePhase(phase, 0);
 
             // Wait for active helpers only (helpers with id >= nw-1 are parked)
-            uint64_t target = work_gen_.load(std::memory_order_relaxed);
             for (int i = 0; i < nw - 1; ++i) {
                 while (helper_done_gen_[i].load(std::memory_order_acquire) < target) {
                     // spin
@@ -7081,10 +7098,11 @@ private:
             }
             last_gen = gen;
 
-            // Only execute if this worker is active; otherwise just ACK
-            // so the coordinator's dispatch() doesn't block on parked helpers.
-            if (worker_id < self->active_workers_) {
-                self->executePhase(self->current_phase_, worker_id);
+            // Only execute if this worker is active in the dispatch that
+            // published `gen`; otherwise just ACK so the coordinator's
+            // dispatch() doesn't block on parked helpers.
+            if (worker_id < static_cast<int>((gen >> 8) & 0xff)) {
+                self->executePhase(static_cast<int>(gen & 0xff), worker_id);
                 rstats::publishThreadCpu(worker_id);
             }
             self->helper_done_gen_[helper_id].store(gen, std::memory_order_release);

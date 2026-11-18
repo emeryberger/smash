@@ -6159,8 +6159,7 @@ private:
         if (cfg_enable_signal_ == cfg_disable_signal_) cfg_enable_signal_ = 0;
         v = std::getenv("SMASH_START_DISABLED");
         cfg_start_disabled_ = v && v[0] == '1';
-        v = std::getenv("SMASH_CONTROL_FILE");
-        cfg_control_file_ = (v && *v) ? v : nullptr;
+        cfg_control_file_ = bootstrapEnv("SMASH_CONTROL_FILE");
     }
 
     static void ksDisableSignalHandler(int) { safety::post(safety::kDisable, safety::kReasonSignal); }
@@ -7285,7 +7284,7 @@ public:
             obs_blob_ = bootstrapArray<uint16_t>(max_pages);
             obs_hash_ = bootstrapArray<uint32_t>(max_pages);
             obs_tick_ = bootstrapArray<uint32_t>(max_pages);
-            cfg_observe_report_ = std::getenv("SMASH_OBSERVE_REPORT");
+            cfg_observe_report_ = bootstrapEnv("SMASH_OBSERVE_REPORT");
             if (const char* e = std::getenv("SMASH_OBSERVE_INTERVAL")) {
                 const int v = std::atoi(e);
                 cfg_observe_interval_ = v < 0 ? 0 : v;
@@ -7762,11 +7761,11 @@ public:
         cfg_spill_pageout_ = v && v[0] == '1';
         v = std::getenv("SMASH_SPILL_MAX_MB");
         cfg_spill_max_mb_ = v ? std::atol(v) : 1024L;
-        cfg_spill_dir_ = std::getenv("SMASH_SPILL_DIR");  // may be null
+        cfg_spill_dir_ = bootstrapEnv("SMASH_SPILL_DIR");  // may be null
         readSafetyConfig();
         v = std::getenv("SMASH_CGROUP");
         cfg_cgroup_ = !v ? -1 : (v[0] == '0' ? 0 : 1);
-        cfg_cgroup_root_ = std::getenv("SMASH_CGROUP_ROOT");  // may be null
+        cfg_cgroup_root_ = bootstrapEnv("SMASH_CGROUP_ROOT");  // may be null
         v = std::getenv("SMASH_CGROUP_SKIP_SWAPPED");
         cfg_cgroup_skip_swapped_ = !(v && v[0] == '0');
         v = std::getenv("SMASH_CGROUP_EARLY");
@@ -9001,10 +9000,11 @@ public:
     static inline bool s_report_registered_ = false;
 
     void runStatsInit() {
-        const char* r = std::getenv("SMASH_REPORT");
-        cfg_report_ = (r && *r && std::strcmp(r, "0") != 0) ? r : nullptr;
-        const char* m = std::getenv("SMASH_METRICS_FILE");
-        cfg_metrics_path_ = (m && *m) ? m : nullptr;
+        // Copies, not getenv pointers: the app may overwrite its original
+        // environment block (setproctitle) before these are used.
+        const char* r = bootstrapEnv("SMASH_REPORT");
+        cfg_report_ = (r && std::strcmp(r, "0") != 0) ? r : nullptr;
+        cfg_metrics_path_ = bootstrapEnv("SMASH_METRICS_FILE");
         if (const char* rp = std::getenv("SMASH_METRICS_RSS_PARTS")) cfg_metrics_rss_parts_ = std::atoi(rp) != 0;
         if (const char* iv = std::getenv("SMASH_METRICS_INTERVAL_SEC")) {
             double sec = std::atof(iv);

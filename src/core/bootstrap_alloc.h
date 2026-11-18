@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #ifdef __linux__
@@ -278,6 +279,21 @@ template<typename T>
 T* bootstrapArray(size_t count) {
     size_t bytes = count * sizeof(T);
     return static_cast<T*>(BootstrapAlloc::instance().allocateZeroed(bytes, alignof(T)));
+}
+
+// getenv(name) copied into bootstrap memory, or nullptr if unset/empty. Use
+// for any env string kept past init: getenv returns a pointer into the
+// original environment block, which setproctitle-style code (redis, nginx,
+// postgres) overwrites with the process title after moving environ, so a
+// kept pointer later reads as "" (SMASH_METRICS_FILE wrote ".tmp.<pid>").
+inline const char* bootstrapEnv(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return nullptr;
+    const size_t n = std::strlen(v) + 1;
+    char* c = static_cast<char*>(BootstrapAlloc::instance().allocate(n, 1));
+    if (!c) return nullptr;
+    std::memcpy(c, v, n);
+    return c;
 }
 
 } // namespace smash

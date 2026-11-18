@@ -534,7 +534,7 @@ class CompressorThread {
         if (uffd_verbose_) (void)!write(2, msg, std::strlen(msg));
     }
 #ifdef __linux__
-    bool uffdCopy(void* dst, const void* src) {
+    bool uffdCopy(void* dst, const void* src, bool exist_ok = false) {
         struct uffdio_copy c{};
         c.dst = reinterpret_cast<uintptr_t>(dst);
         c.src = reinterpret_cast<uintptr_t>(src);
@@ -545,6 +545,7 @@ class CompressorThread {
             if (errno != EAGAIN) break;
             c.copy = 0;
         }
+        if (exist_ok && errno == EEXIST) return true;
         const int err = errno;
         uffd_copy_fail_.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<int> warned{0};
@@ -733,7 +734,7 @@ class CompressorThread {
         }
     }
 #else
-    bool uffdCopy(void*, const void*) { return false; }
+    bool uffdCopy(void*, const void*, bool = false) { return false; }
     bool uffdResolve(void*) { return false; }
     bool uffdMove(void*, void*) { return false; }
     bool uffdWp(void*, bool) { return false; }
@@ -4785,13 +4786,22 @@ private:
         if (uffd_mode_) {
             const size_t pi = vm_->pageIndex(reinterpret_cast<uintptr_t>(page_addr));
             if (pi < vm_->contigPages()) {
-                // Dropped page (MISSING): install the bytes atomically. A
-                // page protected PROT_NONE for a fork gets RW back first;
-                // until the copy lands it is still MISSING, so a racing
-                // access faults and waits on the page lock we hold.
+                // Dropped page (MISSING): install the bytes atomically.
+                // A page protected PROT_NONE for an earlier fork: copy first,
+                // while it is still PROT_NONE (UFFDIO_COPY installs into an
+                // inaccessible VMA), and only then make it RW. Unprotecting
+                // first left it RW and MISSING until the copy; a fork() by
+                // another thread in that window gave the child (no uffd) a
+                // zero page: arm64 6.8 VM, fork_stress under load, 9/20 runs
+                // with a whole zero page in the child. EEXIST: an earlier
+                // attempt already copied it and only the mprotect failed (or
+                // a classic drop's decommit is still deferred): the bytes in
+                // place are the blob's.
                 if (prot_none_[pi]) {
+                    if (!uffdCopy(page_addr, src, /*exist_ok=*/true)) return false;
                     if (!vm::protectPages(page_addr, kPageSize, true, true)) return false;
                     prot_none_[pi] = 0;
+                    return true;
                 }
                 return uffdCopy(page_addr, src);
             }

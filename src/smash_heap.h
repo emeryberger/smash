@@ -2124,9 +2124,15 @@ public:
     //   -> call-site image table -> TSD free list -> thread-cache pool
     //   -> CompressStore shards (leaf: the fault path's releaseBlob)
     //   -> BootstrapAlloc (innermost: the others allocate from it).
-    // The compressor is already paused by smash's own pthread_atfork prepare
-    // handler, which runs before this.
+    // The compressor must be paused (and uffdPrepareFork done, which takes
+    // per-page locks) BEFORE any of these: a faulting thread holds a page lock
+    // while it takes a CompressStore shard lock (releaseBlob), so pausing after
+    // the store locks inverts the order and deadlocks fork(). On macOS smash's
+    // pthread_atfork prepare already ran (libSystem calls the malloc fork hooks
+    // after the atfork handlers); on Linux alloc8's atfork prepare, which calls
+    // this, runs FIRST. preparePauseForFork() is idempotent per fork.
     void lock() SMASH_NO_TS_ANALYSIS {
+        preparePauseForFork();
         const int total = getTotalArenas() * kNumClasses;
         if (!isCompressOnlyMode()) {
             for (int i = 0; i < total; ++i) slabs_[i].lockSlab();

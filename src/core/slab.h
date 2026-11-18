@@ -56,7 +56,7 @@ class Slab {
     // into Span so the bitmap walk can clear the cold counter on the page
     // it just handed out a chunk on — pages still receiving allocations
     // should not be eligible for compression yet.
-    uint8_t* cold_counts_ = nullptr;
+    Relaxed<uint8_t>* cold_counts_ = nullptr;
     void (*release_hook_)(size_t, size_t, void*) = nullptr;
     void* release_ctx_ = nullptr;
 
@@ -410,7 +410,7 @@ private:
     void resetColdCounts(Span* span) {
         if (!cold_counts_ || !vm_region_) return;
         size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
-        __builtin_memset(cold_counts_ + idx, 0, span->page_count);
+        relaxedFill<uint8_t>(cold_counts_ + idx, span->page_count, 0);
     }
 
     // Restore page state when reusing a decommitted empty span.
@@ -435,7 +435,7 @@ public:
               void* hook_ctx = nullptr,
               uint8_t arena_id = 0,
               uint32_t max_slots_per_page = 0,
-              uint8_t* cold_counts = nullptr) {
+              Relaxed<uint8_t>* cold_counts = nullptr) {
         size_class_ = sc;
         arena_id_ = arena_id;
         max_slots_per_page_ = max_slots_per_page;

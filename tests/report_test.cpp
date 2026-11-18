@@ -10,20 +10,27 @@
 // faults, so the latency histogram is non-empty), waits for one more metrics
 // interval and exits normally so the atexit report runs. The checker script
 // asserts on the report and the metrics file; this program only checks data.
+//
+// REPORT_TEST_CLOBBER_ENV=1 (test_report_clobbered_env): first overwrite the
+// SMASH_REPORT / SMASH_METRICS_FILE values in place, as setproctitle code
+// (redis, nginx) does to the original environment block after smash has
+// initialised. smash must have kept copies, not getenv() pointers.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <initializer_list>
 #include <string>
 #include <unistd.h>
 
 // smash_compressed_bytes from the SMASH_METRICS_FILE (%p = our pid), or -1.
 // Bytes, not pages: smash pages are 16 KiB on macOS arm64, 4 KiB elsewhere.
+static std::string g_metrics_tmpl;
+
 static long compressedBytesFromMetrics() {
-    const char* tmpl = getenv("SMASH_METRICS_FILE");
-    if (!tmpl) return -1;
-    std::string path(tmpl);
+    if (g_metrics_tmpl.empty()) return -1;
+    std::string path(g_metrics_tmpl);
     size_t at = path.find("%p");
     if (at != std::string::npos) path.replace(at, 2, std::to_string(getpid()));
     FILE* f = fopen(path.c_str(), "r");
@@ -37,6 +44,11 @@ static long compressedBytesFromMetrics() {
 }
 
 int main() {
+    if (const char* m = getenv("SMASH_METRICS_FILE")) g_metrics_tmpl = m;
+    if (const char* c = getenv("REPORT_TEST_CLOBBER_ENV"); c && c[0] == '1') {
+        for (const char* name : {"SMASH_REPORT", "SMASH_METRICS_FILE"})
+            if (char* v = getenv(name)) memset(v, 0, strlen(v));
+    }
     constexpr size_t kLarge = 2u << 20, kNumLarge = 16;
     constexpr size_t kSmall = 4096, kNumSmall = 256;
     unsigned char* large[kNumLarge];

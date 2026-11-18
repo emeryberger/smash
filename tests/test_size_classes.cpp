@@ -74,11 +74,21 @@ static void testSpanInfo() {
     }
 }
 
+// A 1 KiB payload + small header (Redis's 1030 B sds values): 1152 B with
+// 8 classes per doubling, 1088 B with SMASH_FINE_1K_CLASSES.
+static void testOneKibPlusHeader() {
+    const uint32_t want = SMASH_FINE_1K_CLASSES ? 1088 : 1152;
+    CHECK(classSize(sizeToClass(1030)) == want, "1030 B -> %u, want %u",
+          classSize(sizeToClass(1030)), want);
+    CHECK(classSize(sizeToClass(2049)) == 2304, "2049 B -> %u", classSize(sizeToClass(2049)));
+}
+
 // Minimal test runner
 int main() {
     testSizeToClass();
     testClassSizes();
     testSpanInfo();
+    testOneKibPlusHeader();
 
     if (failures == 0) {
         fprintf(stderr, "size_classes: all tests passed\n");

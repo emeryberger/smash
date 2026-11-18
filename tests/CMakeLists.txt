@@ -752,6 +752,15 @@ foreach(lo 0 1)
       ${CMAKE_CURRENT_BINARY_DIR}/${_name}.d)
   set_tests_properties(${_name} PROPERTIES TIMEOUT 90)
 endforeach()
+# Same, with the env values overwritten in place after smash initialised
+# (what setproctitle does in redis): the report and metrics file must still
+# land at the configured paths.
+add_test(NAME test_report_clobbered_env
+  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/check_report.sh
+    $<TARGET_FILE:smash> $<TARGET_FILE:report_test> 0
+    ${CMAKE_CURRENT_BINARY_DIR}/test_report_clobbered_env.d)
+set_tests_properties(test_report_clobbered_env PROPERTIES TIMEOUT 90
+  ENVIRONMENT REPORT_TEST_CLOBBER_ENV=1)
 if(APPLE)
   set(_ro_preload DYLD_INSERT_LIBRARIES)
 else()

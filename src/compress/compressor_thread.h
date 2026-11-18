@@ -6159,8 +6159,7 @@ private:
         if (cfg_enable_signal_ == cfg_disable_signal_) cfg_enable_signal_ = 0;
         v = std::getenv("SMASH_START_DISABLED");
         cfg_start_disabled_ = v && v[0] == '1';
-        v = std::getenv("SMASH_CONTROL_FILE");
-        cfg_control_file_ = (v && *v) ? v : nullptr;
+        cfg_control_file_ = bootstrapEnv("SMASH_CONTROL_FILE");
     }
 
     static void ksDisableSignalHandler(int) { safety::post(safety::kDisable, safety::kReasonSignal); }
@@ -7096,6 +7095,7 @@ private:
                    pstats::monoNs() < tick_deadline_ns) {
                 usleep(kSleepIntervalMs * 1000);
                 self->maybePromptTrim();
+                self->maybeSubTickWarm();
                 // Kill-switch request: act now, not at the next 1 s boundary.
                 if (safety::g_request.load(std::memory_order_relaxed)) [[unlikely]] break;
             }
@@ -7162,6 +7162,24 @@ private:
         if (!store_ || store_->deadBytesSinceTrim() < promptTrimBytes()) [[likely]] return;
         in_tick_.store(true, std::memory_order_seq_cst);
         if (!paused_.load(std::memory_order_seq_cst)) store_->trim();
+        in_tick_.store(false, std::memory_order_release);
+    }
+
+    // SMASH_CGROUP_WARM_MS=N: under cgroup pressure, repeat keepWarm every
+    // N ms between ticks. A tight cgroup's reclaimer can cycle the whole
+    // anon LRU in well under a second, so a once-a-tick young bit does not
+    // keep a blob page off the inactive tail. Resident pages only, no
+    // read-back (that stays on the tick, budgeted). Same fork fence as a
+    // tick.
+    void maybeSubTickWarm() {
+        if (cfg_cgroup_warm_ms_ == 0 || !cg_active_ || !store_) [[likely]] return;
+        if (!cg_dec_.warm_between_ticks) return;
+        const uint64_t now = pstats::monoNs();
+        if (now - cg_warm_last_ns_ < static_cast<uint64_t>(cfg_cgroup_warm_ms_) * 1000000ull) return;
+        cg_warm_last_ns_ = now;
+        in_tick_.store(true, std::memory_order_seq_cst);
+        if (!paused_.load(std::memory_order_seq_cst))
+            cg_warm_pages_.fetch_add(store_->keepWarm(0, nullptr), std::memory_order_relaxed);
         in_tick_.store(false, std::memory_order_release);
     }
 
@@ -7285,7 +7303,7 @@ public:
             obs_blob_ = bootstrapArray<uint16_t>(max_pages);
             obs_hash_ = bootstrapArray<uint32_t>(max_pages);
             obs_tick_ = bootstrapArray<uint32_t>(max_pages);
-            cfg_observe_report_ = std::getenv("SMASH_OBSERVE_REPORT");
+            cfg_observe_report_ = bootstrapEnv("SMASH_OBSERVE_REPORT");
             if (const char* e = std::getenv("SMASH_OBSERVE_INTERVAL")) {
                 const int v = std::atoi(e);
                 cfg_observe_interval_ = v < 0 ? 0 : v;
@@ -7649,8 +7667,7 @@ public:
         const uint32_t base = ROIConfig::instance().cold_ticks_floor;
         cgroup::Decision d = cgroup::decide(cg_last_, cg_params_, cg_level_, &cg_hold_,
                                             base, kAdaptiveMinTicks);
-        if (!cfg_cgroup_skip_swapped_) d.skip_nonresident = false;
-        if (!cfg_cgroup_warm_) d.keep_warm = false;
+        if (!cfg_cgroup_warm_) d.keep_warm = d.warm_between_ticks = false;
         if (!cfg_cgroup_early_) d.cold_floor = 0;
         cg_level_ = d.level;
         cg_dec_ = d;
@@ -7735,11 +7752,12 @@ public:
     const char* cfg_spill_dir_ = nullptr;  // SMASH_SPILL_DIR (else /var/tmp, cwd)
     int cfg_cgroup_ = -1;          // SMASH_CGROUP: -1 auto (on when capped), 0 off, 1 on + log
     const char* cfg_cgroup_root_ = nullptr;  // SMASH_CGROUP_ROOT: own cgroup dir (tests)
-    bool cfg_cgroup_skip_swapped_ = true;    // SMASH_CGROUP_SKIP_SWAPPED=0 ablates
     bool cfg_cgroup_early_ = false;          // SMASH_CGROUP_EARLY=1 opts in (hurt redis)
     bool cfg_cgroup_spill_ = false;          // SMASH_CGROUP_SPILL=1: spill new blobs when critical
     bool cfg_cgroup_warm_ = true;            // SMASH_CGROUP_WARM=0 ablates store keep-warm
     bool cfg_cgroup_swapin_ = true;          // SMASH_CGROUP_SWAPIN=0 ablates store read-back
+    uint32_t cfg_cgroup_warm_ms_ = 0;        // SMASH_CGROUP_WARM_MS=N: also keep warm every N ms between ticks
+    uint64_t cg_warm_last_ns_ = 0;
     cgroup::PolicyParams cg_params_{};       // SMASH_CGROUP_HEADROOM_PCT / _PSI_PCT
 
     void warmupClassStatics() {
@@ -7762,13 +7780,13 @@ public:
         cfg_spill_pageout_ = v && v[0] == '1';
         v = std::getenv("SMASH_SPILL_MAX_MB");
         cfg_spill_max_mb_ = v ? std::atol(v) : 1024L;
-        cfg_spill_dir_ = std::getenv("SMASH_SPILL_DIR");  // may be null
+        cfg_spill_dir_ = bootstrapEnv("SMASH_SPILL_DIR");  // may be null
         readSafetyConfig();
         v = std::getenv("SMASH_CGROUP");
         cfg_cgroup_ = !v ? -1 : (v[0] == '0' ? 0 : 1);
-        cfg_cgroup_root_ = std::getenv("SMASH_CGROUP_ROOT");  // may be null
-        v = std::getenv("SMASH_CGROUP_SKIP_SWAPPED");
-        cfg_cgroup_skip_swapped_ = !(v && v[0] == '0');
+        cfg_cgroup_root_ = bootstrapEnv("SMASH_CGROUP_ROOT");  // may be null
+        v = std::getenv("SMASH_CGROUP_SKIP_SWAPPED");   // 0 / 1 (pressure) / 2 (always)
+        if (v && v[0] >= '0' && v[0] <= '2') cg_params_.skip_swapped = static_cast<uint8_t>(v[0] - '0');
         v = std::getenv("SMASH_CGROUP_EARLY");
         cfg_cgroup_early_ = v && v[0] == '1';
         v = std::getenv("SMASH_CGROUP_SPILL");
@@ -7777,6 +7795,9 @@ public:
         cfg_cgroup_warm_ = !(v && v[0] == '0');
         v = std::getenv("SMASH_CGROUP_SWAPIN");
         cfg_cgroup_swapin_ = !(v && v[0] == '0');
+        v = std::getenv("SMASH_CGROUP_WARM_MS");
+        // Default 20 ms (only acts under cgroup pressure); SMASH_CGROUP_WARM_MS=0 turns it off.
+        cfg_cgroup_warm_ms_ = v ? static_cast<uint32_t>(std::atoi(v) > 0 ? std::atoi(v) : 0) : 20;
         v = std::getenv("SMASH_CGROUP_HEADROOM_PCT");
         if (v && std::atoi(v) > 0 && std::atoi(v) < 100) {
             cg_params_.elevated_pct = static_cast<uint32_t>(std::atoi(v));
@@ -9001,10 +9022,11 @@ public:
     static inline bool s_report_registered_ = false;
 
     void runStatsInit() {
-        const char* r = std::getenv("SMASH_REPORT");
-        cfg_report_ = (r && *r && std::strcmp(r, "0") != 0) ? r : nullptr;
-        const char* m = std::getenv("SMASH_METRICS_FILE");
-        cfg_metrics_path_ = (m && *m) ? m : nullptr;
+        // Copies, not getenv pointers: the app may overwrite its original
+        // environment block (setproctitle) before these are used.
+        const char* r = bootstrapEnv("SMASH_REPORT");
+        cfg_report_ = (r && std::strcmp(r, "0") != 0) ? r : nullptr;
+        cfg_metrics_path_ = bootstrapEnv("SMASH_METRICS_FILE");
         if (const char* rp = std::getenv("SMASH_METRICS_RSS_PARTS")) cfg_metrics_rss_parts_ = std::atoi(rp) != 0;
         if (const char* iv = std::getenv("SMASH_METRICS_INTERVAL_SEC")) {
             double sec = std::atof(iv);

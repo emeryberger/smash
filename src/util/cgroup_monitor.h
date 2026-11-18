@@ -185,6 +185,13 @@ struct PolicyParams {
     // tick, and a growing process can cross from ~20% headroom to the limit
     // inside one tick, long enough for reclaim to push store pages out.
     uint32_t warm_pct = 25;
+    // When to leave swapped-out pages to the kernel (Decision::
+    // skip_nonresident): 0 never, 1 only at a pressure level, 2 whenever the
+    // cgroup is capped. A non-resident page costs the cgroup nothing;
+    // compressing it swaps it in (a frame, plus a blob that, under zswap, is
+    // no smaller than the copy zswap already held). With 1, the first tick
+    // after the hold window expires swaps every skipped page back in at once.
+    uint8_t skip_swapped = 2;  // default: skip non-resident pages whenever capped (round-2 measurements)
 };
 
 struct Decision {
@@ -198,6 +205,9 @@ struct Decision {
     uint32_t cold_floor = 0;
     // Touch resident CompressStore pages this tick (CompressStore::keepWarm).
     bool keep_warm = false;
+    // Also touch them between ticks (SMASH_CGROUP_WARM_MS): only at a
+    // pressure level, where reclaim is actively scanning the cgroup's LRU.
+    bool warm_between_ticks = false;
 };
 
 // Pure policy. `prev_level` + `*hold` implement the sticky window; the caller
@@ -221,12 +231,14 @@ inline Decision decide(const Sample& s, const PolicyParams& p, Pressure prev_lev
         now = prev_level;   // sticky: keep the previous level while held
     }
     d.level = now;
-    if (s.valid && s.limit > 0 &&
-        s.headroom < s.limit / 100 * static_cast<int64_t>(p.warm_pct))
+    const bool capped = s.valid && s.limit > 0;
+    if (capped && s.headroom < s.limit / 100 * static_cast<int64_t>(p.warm_pct))
         d.keep_warm = true;
+    if (capped && p.skip_swapped == 2) d.skip_nonresident = true;
     if (now == Pressure::kNone) return d;
     d.keep_warm = true;
-    d.skip_nonresident = true;
+    d.warm_between_ticks = true;
+    d.skip_nonresident = p.skip_swapped != 0;
     if (now == Pressure::kCritical) {
         d.cold_floor = min_floor < base_floor ? min_floor : base_floor;
     } else {

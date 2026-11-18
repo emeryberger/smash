@@ -386,10 +386,11 @@ def rebuild(build_dir, cmake_flags, source_dir):
     # Build only the targets needed for experiments (avoid broken bench targets)
     targets = ["smash", "smash_noopt", "smash_compress_only",
                "bench_sqlite"]
-    r = subprocess.run(["make"] + targets + ["-j"], cwd=build_dir,
+    # cmake --build, not make: works with any generator (Ninja build dirs).
+    r = subprocess.run(["cmake", "--build", ".", "-j", "--target"] + targets, cwd=build_dir,
                        capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"    MAKE FAILED: {r.stderr[-300:]}")
+        print(f"    BUILD FAILED: {(r.stderr or r.stdout)[-300:]}")
         return None
 
     lib_path = Path(build_dir) / f"libsmash{LIB_SUFFIX}"

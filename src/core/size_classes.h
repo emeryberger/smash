@@ -13,6 +13,11 @@
 // was 25% at 4 per doubling). The coarse spacing cost SQLite ~25%: its
 // in-memory DB pages are ~4.37 KB, which rounded to 5120 and packed 6 to a
 // 32 KiB span (5461 B each); they now take the 4608 class, 7 per span.
+//
+// SMASH_FINE_1K_CLASSES (CMake option, default off): 60 classes, with
+// 1088 .. 2048 in steps of 64 (16 classes). Redis's 1 KiB values are 1030 B
+// sds strings: 1152 B each (+12%) by default, 1088 B (+6%) with the option;
+// glibc's boundary-tag chunks are 1040 B. See agents/containers.md.
 #pragma once
 
 #include "smash/config.h"
@@ -35,7 +40,12 @@ constexpr uint32_t kClassSizes[kNumClasses] = {
     160,   192,   224,   256,                                // step 32
     320,   384,   448,   512,                                // step 64
     640,   768,   896,   1024,                               // step 128
+#if SMASH_FINE_1K_CLASSES
+    1088,  1152,  1216,  1280,  1344,  1408,  1472,  1536,   // step 64
+    1600,  1664,  1728,  1792,  1856,  1920,  1984,  2048,   // step 64
+#else
     1152,  1280,  1408,  1536,  1664,  1792,  1920,  2048,   // step 128
+#endif
     2304,  2560,  2816,  3072,  3328,  3584,  3840,  4096,   // step 256
     4608,  5120,  5632,  6144,  6656,  7168,  7680,  8192,   // step 512
     9216,  10240, 11264, 12288, 13312, 14336, 15360, 16384,  // step 1024
@@ -112,13 +122,16 @@ inline uint8_t sizeToClass(size_t size) {
         return kSmallLookup[(size + 15) >> 4];
     }
     if (size <= kMaxSmallSize) {
+#if SMASH_FINE_1K_CLASSES
+        if (size <= 2048) return static_cast<uint8_t>(20 + ((size - 1025) >> 6));
+#endif
         // Log2-based computation for sizes 1025..16384
         int bits = 63 - __builtin_clzll(size - 1);   // floor(log2(size-1))
         int group = bits - 10;                         // 0..3
         size_t groupBase = 1ULL << bits;               // 1024, 2048, 4096, 8192
         // step = groupBase / 8 (128, 256, 512, 1024): a shift, not a div.
         int sub = static_cast<int>((size - groupBase - 1) >> (bits - 3));
-        return static_cast<uint8_t>(20 + group * 8 + sub);
+        return static_cast<uint8_t>(20 + group * 8 + sub + (SMASH_FINE_1K_CLASSES ? 8 : 0));
     }
     return kNumClasses;
 }

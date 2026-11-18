@@ -7095,6 +7095,7 @@ private:
                    pstats::monoNs() < tick_deadline_ns) {
                 usleep(kSleepIntervalMs * 1000);
                 self->maybePromptTrim();
+                self->maybeSubTickWarm();
                 // Kill-switch request: act now, not at the next 1 s boundary.
                 if (safety::g_request.load(std::memory_order_relaxed)) [[unlikely]] break;
             }
@@ -7161,6 +7162,24 @@ private:
         if (!store_ || store_->deadBytesSinceTrim() < promptTrimBytes()) [[likely]] return;
         in_tick_.store(true, std::memory_order_seq_cst);
         if (!paused_.load(std::memory_order_seq_cst)) store_->trim();
+        in_tick_.store(false, std::memory_order_release);
+    }
+
+    // SMASH_CGROUP_WARM_MS=N: under cgroup pressure, repeat keepWarm every
+    // N ms between ticks. A tight cgroup's reclaimer can cycle the whole
+    // anon LRU in well under a second, so a once-a-tick young bit does not
+    // keep a blob page off the inactive tail. Resident pages only, no
+    // read-back (that stays on the tick, budgeted). Same fork fence as a
+    // tick.
+    void maybeSubTickWarm() {
+        if (cfg_cgroup_warm_ms_ == 0 || !cg_active_ || !store_) [[likely]] return;
+        if (!cg_dec_.warm_between_ticks) return;
+        const uint64_t now = pstats::monoNs();
+        if (now - cg_warm_last_ns_ < static_cast<uint64_t>(cfg_cgroup_warm_ms_) * 1000000ull) return;
+        cg_warm_last_ns_ = now;
+        in_tick_.store(true, std::memory_order_seq_cst);
+        if (!paused_.load(std::memory_order_seq_cst))
+            cg_warm_pages_.fetch_add(store_->keepWarm(0, nullptr), std::memory_order_relaxed);
         in_tick_.store(false, std::memory_order_release);
     }
 
@@ -7648,8 +7667,7 @@ public:
         const uint32_t base = ROIConfig::instance().cold_ticks_floor;
         cgroup::Decision d = cgroup::decide(cg_last_, cg_params_, cg_level_, &cg_hold_,
                                             base, kAdaptiveMinTicks);
-        if (!cfg_cgroup_skip_swapped_) d.skip_nonresident = false;
-        if (!cfg_cgroup_warm_) d.keep_warm = false;
+        if (!cfg_cgroup_warm_) d.keep_warm = d.warm_between_ticks = false;
         if (!cfg_cgroup_early_) d.cold_floor = 0;
         cg_level_ = d.level;
         cg_dec_ = d;
@@ -7734,11 +7752,12 @@ public:
     const char* cfg_spill_dir_ = nullptr;  // SMASH_SPILL_DIR (else /var/tmp, cwd)
     int cfg_cgroup_ = -1;          // SMASH_CGROUP: -1 auto (on when capped), 0 off, 1 on + log
     const char* cfg_cgroup_root_ = nullptr;  // SMASH_CGROUP_ROOT: own cgroup dir (tests)
-    bool cfg_cgroup_skip_swapped_ = true;    // SMASH_CGROUP_SKIP_SWAPPED=0 ablates
     bool cfg_cgroup_early_ = false;          // SMASH_CGROUP_EARLY=1 opts in (hurt redis)
     bool cfg_cgroup_spill_ = false;          // SMASH_CGROUP_SPILL=1: spill new blobs when critical
     bool cfg_cgroup_warm_ = true;            // SMASH_CGROUP_WARM=0 ablates store keep-warm
     bool cfg_cgroup_swapin_ = true;          // SMASH_CGROUP_SWAPIN=0 ablates store read-back
+    uint32_t cfg_cgroup_warm_ms_ = 0;        // SMASH_CGROUP_WARM_MS=N: also keep warm every N ms between ticks
+    uint64_t cg_warm_last_ns_ = 0;
     cgroup::PolicyParams cg_params_{};       // SMASH_CGROUP_HEADROOM_PCT / _PSI_PCT
 
     void warmupClassStatics() {
@@ -7766,8 +7785,8 @@ public:
         v = std::getenv("SMASH_CGROUP");
         cfg_cgroup_ = !v ? -1 : (v[0] == '0' ? 0 : 1);
         cfg_cgroup_root_ = bootstrapEnv("SMASH_CGROUP_ROOT");  // may be null
-        v = std::getenv("SMASH_CGROUP_SKIP_SWAPPED");
-        cfg_cgroup_skip_swapped_ = !(v && v[0] == '0');
+        v = std::getenv("SMASH_CGROUP_SKIP_SWAPPED");   // 0 / 1 (pressure) / 2 (always)
+        if (v && v[0] >= '0' && v[0] <= '2') cg_params_.skip_swapped = static_cast<uint8_t>(v[0] - '0');
         v = std::getenv("SMASH_CGROUP_EARLY");
         cfg_cgroup_early_ = v && v[0] == '1';
         v = std::getenv("SMASH_CGROUP_SPILL");
@@ -7776,6 +7795,8 @@ public:
         cfg_cgroup_warm_ = !(v && v[0] == '0');
         v = std::getenv("SMASH_CGROUP_SWAPIN");
         cfg_cgroup_swapin_ = !(v && v[0] == '0');
+        v = std::getenv("SMASH_CGROUP_WARM_MS");
+        cfg_cgroup_warm_ms_ = v ? static_cast<uint32_t>(std::atoi(v) > 0 ? std::atoi(v) : 0) : 0;
         v = std::getenv("SMASH_CGROUP_HEADROOM_PCT");
         if (v && std::atoi(v) > 0 && std::atoi(v) < 100) {
             cg_params_.elevated_pct = static_cast<uint32_t>(std::atoi(v));

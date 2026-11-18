@@ -132,6 +132,31 @@ static void testPolicy() {
     hold = 0;
     d = decide(mk(L, L), p, Pressure::kNone, &hold, 1, minf);
     CHECK(d.cold_floor == 1, "floor <= base (%u)", d.cold_floor);
+
+    // Between-tick warming only at a pressure level (default skip mode 1).
+    hold = 0;
+    d = decide(mk(L, L - L / 5), p, Pressure::kNone, &hold, base, minf);
+    CHECK(d.keep_warm && !d.warm_between_ticks, "no between-tick warming without pressure");
+    d = decide(mk(L, L - L / 20), p, Pressure::kNone, &hold, base, minf);
+    CHECK(d.warm_between_ticks, "between-tick warming at elevated");
+
+    // skip_swapped=2: swapped pages are skipped whenever capped, even with
+    // plenty of headroom (mode 1 swaps them all back in once the hold ends).
+    PolicyParams p2 = p;
+    p2.skip_swapped = 2;
+    hold = 0;
+    d = decide(mk(L, L / 2), p2, Pressure::kNone, &hold, base, minf);
+    CHECK(d.level == Pressure::kNone && d.skip_nonresident && !d.keep_warm,
+          "skip_swapped=2 skips with headroom");
+    d = decide(inv, p2, Pressure::kNone, &hold, base, minf);
+    CHECK(!d.skip_nonresident, "skip_swapped=2 needs a valid capped sample");
+    // skip_swapped=0: never, even at critical.
+    PolicyParams p0 = p;
+    p0.skip_swapped = 0;
+    hold = 0;
+    d = decide(mk(L, L + 4096), p0, Pressure::kNone, &hold, base, minf);
+    CHECK(d.level == Pressure::kCritical && !d.skip_nonresident && d.keep_warm,
+          "skip_swapped=0 never skips");
 }
 
 static void testMonitorFakeTree() {

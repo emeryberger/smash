@@ -182,20 +182,67 @@ first version had a test bug, a 64-byte memset into allocations as small as 8
 bytes, which glibc reported as `malloc(): corrupted top size` even without
 smash preloaded; fixed before the measurements above.)
 
-## ThreadSanitizer findings (not fixed)
+## ThreadSanitizer
 
-A `-fsanitize=thread` build (clang 15, cloudnew) of the in-process unit tests:
-13 tests report no race and gate CI. `test_contention` (7 reports) and
-`test_stop_no_drain` (2 reports) report races; CI runs them report-only.
-Reported pairs: `stableCallsiteHash` vs `stableCallsiteHashSlow` (unsynchronized
-call-site hash cache); `releaseCompressedPages` vs `phase1Range` (plain
-per-page `uint8_t` arrays such as `cold_count_`, racy by design);
-`adaptWorkerCount` vs `helperEntry` (`active_workers_` is a plain `int`);
-`armShadowBudget` vs `operator delete`; and `SmashHeap()` / `start()` writes vs
-first `tick()` reads, which pthread_create should order. That last group may be
-a TSan artifact of alloc8 interposing `pthread_create`; not verified. Each of
-these is a C++ data race (undefined behaviour) even where the algorithm
-tolerates stale values; converting them to relaxed atomics is the follow-up.
+The `stress` CI job builds the in-process unit tests with `-fsanitize=thread`
+(clang) and runs all of them gating, `halt_on_error=1`: every test except the
+preload tests (TSan's runtime and an interposed malloc do not mix),
+`test_smash_estimate*` (they assert on a target's RSS, which TSan's shadow
+memory inflates; they fail under TSan on master too) and `test_fault_cycle`
+(disabled everywhere). Ubuntu 24.04 needs `vm.mmap_rnd_bits=28` for TSan's
+fixed shadow layout.
+
+On master 4673d6c (clang 15, cloudnew x86-64), `test_contention` and
+`test_stop_no_drain` reported 9 distinct races (raw logs were kept under the
+worktree's `tmp/base/`). All are fixed in code; there is no TSan
+suppressions file. Each fix was checked by reverting it alone: the race
+reappears (counts below), and with all fixes in no report appears.
+
+- **Per-page metadata arrays** (`releaseCompressedPages` vs `phase1Range` /
+  `phase2Range`; 3 report pairs, 24 of 24 loaded `test_contention` runs with
+  only this fix reverted). `cold_count_`, `recompress_count_`,
+  `compress_fail_count_`, `shadow_tick_`, `restore_mark_`, `migrate_count_`,
+  `probed_`, `page_tier_`, `write_clean_streak_`, `fill_mark_`, `read_armed_`
+  and Span's `cold_counts` are hints read and updated by the compressor without
+  the page lock while app threads (free, malloc's cold reset) and the fault
+  handler write them. Racy by design (correctness rests on the PageState CAS
+  and the page lock), so they are now `Relaxed<T>` (`src/util/relaxed.h`):
+  same layout, relaxed `__atomic` loads/stores, increments still a load plus a
+  store. Arrays touched only by the coordinator / range-partitioned workers
+  (`arm_cc_`, `probe_level_`, `probe_skip_`, `prot_none_` (under the page
+  lock), idle-tracking buffers) stay plain: dispatch() orders them.
+- **`active_workers_` / `current_phase_`** (`adaptWorkerCount` vs
+  `helperEntry`; 3 of 3 `test_stop_no_drain` runs with the fix reverted). A
+  real ordering bug: a parked helper the coordinator does not wait for could
+  wake late, read an `active_workers_` raised to include it, and run a phase
+  outside any dispatch (concurrently with the coordinator's range partitioning
+  or chunk-bitmap rebuild, or twice in one tick). dispatch() now publishes
+  `(seq << 16) | (nw << 8) | phase` in `work_gen_` and a helper uses the word
+  it observed. Not observed as a functional failure.
+- **Call-site hash cache** (`stableCallsiteHash` vs `stableCallsiteHashSlow`;
+  2 pairs, 5 of 5 `test_contention` runs). Also a real bug: two threads missing on one slot
+  could leave `{ra_A, hash_B}` and send call site A to B's arena (homogeneity,
+  not memory safety). Each entry's pad word is now a seqlock sequence.
+- **Constructor / `start()` writes vs the first `tick()`** (4 pairs, 23 of 24 loaded
+  runs). Not an artifact of alloc8's `pthread_create` interposition: alloc8's
+  wrapper (`linux_threads.cpp`) is not linked into the unit tests (`nm` shows
+  only TSan's `__interceptor_pthread_create`), and the racing threads were
+  the *process singleton's* coordinator (created from
+  `smash_start_main_thread`) and `main` constructing the test's *second*
+  SmashHeap. The pre-tick callback found its heap through a static
+  (`tick_self_`), so the second constructor redirected the singleton's ticks
+  to a half-built heap, and `start()` rewrote the static `s_debug_enabled_`.
+  The callback now carries a context pointer; the flag is a member.
+- **`armShadowBudget` vs `operator delete`**: a test bug.
+  `test_stop_no_drain`'s failure path freed the CompressorThread with its
+  coordinator still running; it now calls `stop()` first.
+
+Clean after the fixes: 10 of 10 consecutive full-set runs (`ctest -j8`,
+`halt_on_error=0`, zero reports), 40 runs each of `test_contention` and
+`test_stop_no_drain` 16-way parallel, 3 runs of `test_fault_cycle`, and the
+CI command itself 10 times. TSan only sees interleavings the tests produce;
+the preload paths (syscall wrappers, fork handlers, signal-driven stats) are
+not covered.
 
 ## Not covered / not modeled
 

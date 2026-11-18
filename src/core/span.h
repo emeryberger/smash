@@ -8,6 +8,7 @@
 #include "bootstrap_alloc.h"
 #include "size_classes.h"
 #include "../util/bitops.h"
+#include "../util/relaxed.h"
 #include "../vm/page_state.h"
 
 #include <atomic>
@@ -81,7 +82,7 @@ struct Span {
     // Optional: per-page cold-tick counter array owned by CompressorThread.
     // allocate() resets the counter for the page that just received a chunk,
     // so phase2 doesn't compress pages that are still being filled.
-    uint8_t*        cold_counts;
+    Relaxed<uint8_t>* cold_counts;
 
     // Initialize a slab span for the given size class.
     //
@@ -252,8 +253,8 @@ struct Span {
 
     // Reset the cold-tick counter for the page containing the slot we just
     // handed out, so phase2 won't see this page as "idle" while it's still
-    // receiving fresh allocations.  Plain (non-atomic) write — cold_count_
-    // is a uint8_t snapshot read by phase1/phase2 with no ordering needs.
+    // receiving fresh allocations.  Relaxed write — cold_count_
+    // is a racy-by-design snapshot read by phase1/phase2 with no ordering needs.
     // telemetry_ticks classifies the overwrite: clobbering a streak that had
     // already crossed coolingCloseDefaultTicks() is an allocator-induced
     // re-heat, counted in g_reheat_events. The telemetry threshold is fixed

@@ -22,6 +22,7 @@
 #include "../core/page_map.h"
 #include "../util/waker.h"
 #include "../util/spinlock.h"
+#include "../util/relaxed.h"
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 #include "../util/run_stats.h"    // SMASH_REPORT / SMASH_METRICS_FILE counters
 #include "safety.h"               // kill switch / watchdog / SLO controller
@@ -346,8 +347,9 @@ class CompressorThread {
     vm::FaultHandler* fault_handler_ = nullptr;
 
     // Optional pre-tick callback (e.g., for VM region scanning in compress-only mode)
-    using PreTickFn = void(*)();
+    using PreTickFn = void(*)(void*);
     PreTickFn pre_tick_fn_ = nullptr;
+    void* pre_tick_ctx_ = nullptr;
 
     // Optional callback invoked once per successful page compression.
     // Used by SmashHeap to drive the A3 cold-arena feedback loop:
@@ -386,12 +388,12 @@ class CompressorThread {
     // Per-page metadata (allocated from bootstrap, indexed by VmRegion page index)
     CompressedPageInfo* compressed_ = nullptr;
     std::atomic<bool>* accessed_ = nullptr;
-    uint8_t* cold_count_ = nullptr;
+    Relaxed<uint8_t>* cold_count_ = nullptr;
     // Ticks left in which a page counts as "just restored from compressed"
     // (set on fault/prefetch/near-cap restore, decremented by Phase 1). Feeds
     // smash_migrate_hint(): a hot object on such a page is a hot passenger
     // on a mostly cold page, worth moving.
-    uint8_t* restore_mark_ = nullptr;
+    Relaxed<uint8_t>* restore_mark_ = nullptr;
     // Ticks a restored page stays open for migration (SMASH_RESTORE_MARK_TICKS,
     // default 3). Read once in init(): this runs on the fault path, where a
     // lazy getenv can fault on a compressed environment string and deadlock
@@ -403,7 +405,7 @@ class CompressorThread {
     // slots): a page whose objects are *all* being read (a keyspace scan) is
     // hot, not a cold page with hot passengers, and moving everything off it
     // would only duplicate it.
-    uint8_t* migrate_count_ = nullptr;
+    Relaxed<uint8_t>* migrate_count_ = nullptr;
     // Migration pre-filter: one bit per page, set when a page is (or may be)
     // cold for migration purposes (compressing/compressed/shadow or restore
     // mark open). Set eagerly at those transitions, rebuilt each phase 1.
@@ -712,7 +714,7 @@ class CompressorThread {
     bool read_check_ = true;
     uint32_t read_check_ticks_ = 1;  // SMASH_READ_CHECK_TICKS: unread ticks after arming
     bool softdirty_now_ = false;   // soft-dirty tracking active this tick
-    uint8_t* read_armed_ = nullptr;
+    Relaxed<uint8_t>* read_armed_ = nullptr;
     uint8_t* arm_cc_ = nullptr;  // cold_count_ when armed
     bool readCheckPassed(size_t i) const {
         return read_armed_[i] &&
@@ -767,7 +769,7 @@ class CompressorThread {
     size_t probe_cursor_ = 0;
     uint8_t* probe_level_ = nullptr;
     uint8_t* probe_skip_ = nullptr;
-    uint8_t* probed_ = nullptr;
+    Relaxed<uint8_t>* probed_ = nullptr;
     void probeMigration() {
         if (probe_pct_ == 0 || !restore_mark_) return;
         const size_t committed = vm_->committedPages();
@@ -836,19 +838,19 @@ class CompressorThread {
         // so decompress is unchanged; only the RELEASE path dispatches on this.
         kTierSpilled = 4,
     };
-    uint8_t* page_tier_ = nullptr;
+    Relaxed<uint8_t>* page_tier_ = nullptr;
     // Per-page recompression count: bumped on every COMPRESSED → ACTIVE
     // fault, decayed in phase1Range when the page settles cold.  phase2Range
     // raises the effective cold-tick floor by 2^min(rc + bucket_bias, kMaxBackoffShift).
     // Saturating uint8_t — the bucket EMA captures values above ~6 anyway.
-    uint8_t* recompress_count_ = nullptr;
+    Relaxed<uint8_t>* recompress_count_ = nullptr;
 
     // Per-page count of ratio-gate failures (compressPage attempts whose
     // output exceeded min_compress_ratio). Feeds the same exponential
     // effective-floor backoff as recompress_count_, but is reset ONLY by a
     // real access to the page — an idle incompressible page's contents
     // cannot change, so cold-streak decay must not re-arm eager retries.
-    uint8_t* compress_fail_count_ = nullptr;
+    Relaxed<uint8_t>* compress_fail_count_ = nullptr;
 
     // ── Soft-dirty ROI per-page state (SMASH_SOFTDIRTY_ROI) ─────────────────
     // write_clean_streak_: consecutive ticks a page's soft-dirty (write) bit
@@ -857,11 +859,11 @@ class CompressorThread {
     // is stable, so its compressed blob would survive. Drives the per-page
     // "streak relief" that lets a long-write-clean page override a thrashy
     // bucket's re-dirty prior. Saturating uint8_t.
-    uint8_t* write_clean_streak_ = nullptr;
+    Relaxed<uint8_t>* write_clean_streak_ = nullptr;
 
     // Deferred-reclaim mode: tick at which Phase A completed for each page.
     // Non-zero only for pages in COMPRESSED_SHADOW state.
-    uint32_t* shadow_tick_ = nullptr;
+    Relaxed<uint32_t>* shadow_tick_ = nullptr;
 
     // ── Observe (dry-run) mode (SMASH_MODE=observe) ─────────────────────────
     // compressPage() snapshots and compresses exactly as a real run would,
@@ -1590,7 +1592,6 @@ public:
         runStatsResetForFork();
         work_gen_.store(0, std::memory_order_release);
         work_waker_.reinitAfterFork();
-        current_phase_ = 0;
         // /proc/self/{clear_refs,pagemap} fds inherited from the parent
         // refer to the parent's pid-namespace entries — the kernel
         // resolves /proc/self at open(2) time, not on every read. After
@@ -1659,11 +1660,27 @@ public:
     }
 private:
 
-    // Work dispatch: coordinator increments work_gen_ to signal helpers.
-    // Helpers compare against their last-seen gen to detect new work.
+    // Work dispatch: the coordinator publishes one word per dispatch,
+    // (sequence << 16) | (active workers << 8) | phase, and helpers compare it
+    // against their last-seen word to detect new work. The active count and
+    // phase travel in the same word as the sequence so a helper acts on the
+    // values of the dispatch it observed. When they were separate plain fields
+    // (active_workers_, current_phase_), a parked helper the coordinator was
+    // not waiting for could wake late, read an active_workers_ that
+    // adaptWorkerCount() had since raised to include it, and run a phase on
+    // its range outside any dispatch: concurrently with the coordinator's
+    // single-threaded steps (range partitioning, chunk-bitmap rebuild), or a
+    // second time in the next dispatch (Phase 1 aging its pages twice).
+    // ThreadSanitizer reported the active_workers_ read in helperEntry
+    // racing with the write in adaptWorkerCount.
     std::atomic<uint64_t> work_gen_{0};
+    static constexpr uint64_t kGenSeqShift = 16;
+    static_assert(kMaxCompressorWorkers <= 255, "active count must fit dispatch word byte");
+    static constexpr uint64_t dispatchWord(uint64_t seq, int nw, int phase) {
+        return (seq << kGenSeqShift) | (static_cast<uint64_t>(nw) << 8) |
+               static_cast<uint64_t>(phase);
+    }
     Waker work_waker_;       // helpers park here between dispatches
-    int current_phase_ = 0;  // 1=access, 2=compress, 3=monitor
     std::atomic<uint64_t> helper_done_gen_[kMaxHelpers]{};
 
     // ── Adaptive worker scaling (Little's Law) ─────────────────────────
@@ -3850,15 +3867,17 @@ private:
         int nw = active_workers_;
         bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
         if (helpers_active) {
-            current_phase_ = phase;
-            work_gen_.fetch_add(1, std::memory_order_release);
+            // Only this thread writes work_gen_, so load + store is the
+            // increment. Phase 1-4 fits the low byte.
+            const uint64_t target = dispatchWord(
+                (work_gen_.load(std::memory_order_relaxed) >> kGenSeqShift) + 1, nw, phase);
+            work_gen_.store(target, std::memory_order_release);
             work_waker_.notifyAll();
 
             // Coordinator does worker 0's range
             executePhase(phase, 0);
 
             // Wait for active helpers only (helpers with id >= nw-1 are parked)
-            uint64_t target = work_gen_.load(std::memory_order_relaxed);
             for (int i = 0; i < nw - 1; ++i) {
                 while (helper_done_gen_[i].load(std::memory_order_acquire) < target) {
                     // spin
@@ -4052,7 +4071,7 @@ private:
     enum : uint8_t { kFillUnseen = 0, kFillSeen = 1, kFillPage = 2, kFillEagerDone = 3 };
     bool cfg_eager_fill_ = false;
     uint32_t cfg_eager_tail_ticks_ = 1;  // SMASH_EAGER_FILL_TAIL: eager ticks after growth stops
-    uint8_t* fill_mark_ = nullptr;
+    Relaxed<uint8_t>* fill_mark_ = nullptr;
     bool growth_active_ = false;
     bool eager_on_ = false;
     uint32_t growth_quiet_ticks_ = 0;
@@ -4065,7 +4084,7 @@ private:
     // Phase 1 (per page, range-disjoint across workers).
     void eagerTrack(size_t i) {
         const PageState st = states_->get(i);
-        uint8_t& m = fill_mark_[i];
+        Relaxed<uint8_t>& m = fill_mark_[i];
         if (st == PageState::EMPTY) { m = kFillUnseen; return; }
         if (m == kFillUnseen) {
             m = growth_active_ ? kFillPage : kFillSeen;
@@ -5553,7 +5572,7 @@ private:
         // Splits the count into slab vs large-alloc buckets so we can see at
         // a glance whether the gating is firing on large allocs (the case
         // for SMASH_LARGE_ONLY workloads).
-        if (s_debug_enabled_) {
+        if (debug_enabled_) {
             size_t n_compress_lg = 0, n_skip_lg = 0, n_explore_lg = 0;
             size_t n_rank_lg = 0;
             for (size_t i = 0; i < total; ++i) {
@@ -6417,7 +6436,7 @@ private:
     __attribute__((cold)) void tick() {
         ++tick_counter_;
         resident_pages_last_ = p1_resident_acc_.exchange(0, std::memory_order_relaxed);
-        if (pre_tick_fn_) pre_tick_fn_();
+        if (pre_tick_fn_) pre_tick_fn_(pre_tick_ctx_);
         if (fault_handler_) fault_handler_->ensureInstalled();
         // Kill switch / watchdog / SLO controller. While the switch is off
         // nothing below runs: no access tracking, no compression, no
@@ -6542,7 +6561,7 @@ private:
         // SMASH_DEBUG=1: print a stats line every 5 ticks (~5s at the
         // 1000ms compressor cadence — kCompressIntervalMs). Mirrors the
         // SIGUSR2 stats format so log scrapers can use one parser.
-        if (s_debug_enabled_) {
+        if (debug_enabled_) {
             static int debug_tick_counter = 0;
             if (++debug_tick_counter >= 5) {
                 debug_tick_counter = 0;
@@ -7080,10 +7099,11 @@ private:
             }
             last_gen = gen;
 
-            // Only execute if this worker is active; otherwise just ACK
-            // so the coordinator's dispatch() doesn't block on parked helpers.
-            if (worker_id < self->active_workers_) {
-                self->executePhase(self->current_phase_, worker_id);
+            // Only execute if this worker is active in the dispatch that
+            // published `gen`; otherwise just ACK so the coordinator's
+            // dispatch() doesn't block on parked helpers.
+            if (worker_id < static_cast<int>((gen >> 8) & 0xff)) {
+                self->executePhase(static_cast<int>(gen & 0xff), worker_id);
                 rstats::publishThreadCpu(worker_id);
             }
             self->helper_done_gen_[helper_id].store(gen, std::memory_order_release);
@@ -7096,7 +7116,7 @@ public:
     // Slab::allocate exposes this to Span so freshly-allocated chunks reset
     // the cold counter for their containing page — pages still receiving
     // allocations should never be eligible for compression.
-    uint8_t* coldCounts() const { return cold_count_; }
+    Relaxed<uint8_t>* coldCounts() const { return cold_count_; }
 
     void init(VmRegion* vm, PageStateTable* states, PageLockTable* locks,
               CompressStore* store, CompressEngine* engine,
@@ -7123,15 +7143,15 @@ public:
         size_t max_pages = vm->totalPages();
         compressed_ = bootstrapArray<CompressedPageInfo>(max_pages);
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
-        cold_count_ = bootstrapArray<uint8_t>(max_pages);
-        restore_mark_ = bootstrapArray<uint8_t>(max_pages);
+        cold_count_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
+        restore_mark_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
         if (const char* e = std::getenv("SMASH_READ_CHECK")) read_check_ = std::atoi(e) != 0;
         if (const char* e = std::getenv("SMASH_READ_CHECK_TICKS")) {
             const int v = std::atoi(e);
             read_check_ticks_ = static_cast<uint32_t>(v < 1 ? 1 : v > 60 ? 60 : v);
         }
         if (read_check_) {
-            read_armed_ = bootstrapArray<uint8_t>(max_pages);
+            read_armed_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
             arm_cc_ = bootstrapArray<uint8_t>(max_pages);
         }
         if (const char* e = std::getenv("SMASH_MIGRATE_PROBE_PCT")) {
@@ -7141,7 +7161,7 @@ public:
         if (probe_pct_) {
             probe_level_ = bootstrapArray<uint8_t>(max_pages);
             probe_skip_ = bootstrapArray<uint8_t>(max_pages);
-            probed_ = bootstrapArray<uint8_t>(max_pages);
+            probed_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
         }
         if (const char* e = std::getenv("SMASH_RESTORE_MARK_TICKS")) {
             const int v = std::atoi(e);
@@ -7152,19 +7172,19 @@ public:
             const long mb = r ? std::atol(r) : 64;
             adaptive_ref_pages_ = static_cast<size_t>(mb > 0 ? mb : 64) * 1024 * 1024 / kPageSize;
         }
-        migrate_count_ = bootstrapArray<uint8_t>(max_pages);
+        migrate_count_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
         mig_bits_ = bootstrapArray<std::atomic<uint64_t>>((max_pages + 63) / 64);
-        recompress_count_ = bootstrapArray<uint8_t>(max_pages);
-        compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
+        recompress_count_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
+        compress_fail_count_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
         // Soft-dirty ROI per-page arrays: only allocate when the gate is on
         // (~2 bytes/page = ~32 MiB at full VM otherwise wasted). Read the env
         // directly here — ROIConfig::init() runs later in this function, so the
         // singleton flag isn't set yet at allocation time.
         if (const char* sr = std::getenv("SMASH_SOFTDIRTY_ROI"); sr && std::atoi(sr) != 0) {
-            write_clean_streak_ = bootstrapArray<uint8_t>(max_pages);
+            write_clean_streak_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
         }
         if (isDeferredReclaimMode())
-            shadow_tick_ = bootstrapArray<uint32_t>(max_pages);
+            shadow_tick_ = bootstrapArray<Relaxed<uint32_t>>(max_pages);
         observe_ = isObserveMode();
         if (observe_) {
             obs_stage_ = bootstrapArray<std::atomic<uint8_t>>(max_pages);
@@ -7183,9 +7203,9 @@ public:
             const int v = std::atoi(e);
             cfg_eager_tail_ticks_ = static_cast<uint32_t>(v < 0 ? 0 : v > 60 ? 60 : v);
         }
-        if (cfg_eager_fill_) fill_mark_ = bootstrapArray<uint8_t>(max_pages);
+        if (cfg_eager_fill_) fill_mark_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
         if (const char* e = std::getenv("SMASH_PEAK_GUARD")) cfg_peak_guard_ = std::atoi(e) != 0;
-        page_tier_ = bootstrapArray<uint8_t>(max_pages);
+        page_tier_ = bootstrapArray<Relaxed<uint8_t>>(max_pages);
         // Always allocate; sweeper short-circuits on the env knob anyway,
         // and unconditional init keeps pointer-null checks out of fault path.
         deferred_pending_ = bootstrapArray<std::atomic<bool>>(max_pages);
@@ -7243,7 +7263,7 @@ public:
         ROIConfig::instance().init(engine_);
     }
 
-    void setPreTickCallback(PreTickFn fn) { pre_tick_fn_ = fn; }
+    void setPreTickCallback(PreTickFn fn, void* ctx) { pre_tick_fn_ = fn; pre_tick_ctx_ = ctx; }
 
     // A3: feedback hook invoked once per successful page compression
     // with the originating span's arena_id and size_class.
@@ -7515,7 +7535,7 @@ public:
         cg_active_ = false;
         if (cfg_cgroup_ == 0) return;
         cg_active_ = cg_mon_.init(cfg_cgroup_root_);
-        if (cfg_cgroup_ == 1 || s_debug_enabled_) {
+        if (cfg_cgroup_ == 1 || debug_enabled_) {
             cgroup::Sample s = cg_active_ ? cg_mon_.sample() : cgroup::Sample{};
             char b[kPathMaxLog];
             int n = smash::safe_snprintf(b, sizeof(b),
@@ -7769,8 +7789,8 @@ public:
         // SMASH_STATS=1 (atexit-only) — SMASH_DEBUG is for watching
         // activity live without having to chase PIDs and send SIGUSR2.
         const char* dbg_env = std::getenv("SMASH_DEBUG");
-        s_debug_enabled_ = dbg_env && dbg_env[0] == '1';
-        if (s_debug_enabled_) {
+        debug_enabled_ = dbg_env && dbg_env[0] == '1';
+        if (debug_enabled_) {
             char ts[32] = {};
             vm::formatTimestamp(ts, sizeof(ts));
             char buf[200];
@@ -7827,7 +7847,10 @@ public:
 
     static inline CompressorThread* s_stats_instance_ = nullptr;
     static inline CompressorThread* s_stop_instance_ = nullptr;
-    static inline bool s_debug_enabled_ = false;
+    // SMASH_DEBUG=1, read in start(). Per instance (was a static): a test that
+    // runs a second CompressorThread beside the process singleton must not
+    // rewrite a field the singleton's coordinator is reading.
+    bool debug_enabled_ = false;
 
     // SMASH_STATS_SIGNAL=1 opts into installing the SIGUSR2 stats-dump handler
     // (and the per-tick reclaim). OFF by default so smash never hijacks
@@ -8739,7 +8762,7 @@ public:
     // the read check still apply (never 255, which would skip the read check).
     // smash_hint_hot: every page overlapping [lo, hi) is marked written, so
     // Phase 1 resets its cold streak; compressed ones are faulted back now by
-    // a read. Plain relaxed stores, like the app-side writers of these arrays.
+    // a read. Relaxed stores, like the app-side writers of these arrays.
     void hintRange(uintptr_t lo, uintptr_t hi, bool cold) {
         if (!vm_ || !states_ || !cold_count_ || !accessed_ || hi <= lo) return;
         const uintptr_t first = cold ? (lo + kPageSize - 1) & ~(uintptr_t)(kPageSize - 1)
@@ -8752,8 +8775,8 @@ public:
             const size_t i = vm_->pageIndex(a);
             if (i >= committed || states_->get(i) == PageState::EMPTY) continue;
             if (cold) {
-                if (__atomic_load_n(&cold_count_[i], __ATOMIC_RELAXED) < to)
-                    __atomic_store_n(&cold_count_[i], to, __ATOMIC_RELAXED);
+                if (cold_count_[i].load() < to)
+                    cold_count_[i].store(to);
             } else {
                 accessed_[i].store(true, std::memory_order_relaxed);
                 const PageState st = states_->get(i);

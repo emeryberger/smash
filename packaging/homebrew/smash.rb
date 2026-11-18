@@ -20,12 +20,13 @@
 class Smash < Formula
   desc "Compression-aware malloc that transparently compresses cold heap pages"
   homepage "https://github.com/emeryberger/smash"
-  # PLACEHOLDERS: url must name a release tag that contains the CMake install()
-  # rules (v0.0.3-alpha and earlier predate them). sha256 is NOT a real hash:
-  # release automation / `brew bump-formula-pr --url=<tarball>` fills in the
-  # sha256 of the published tarball. Do not hand-edit a guessed value in.
-  url "https://github.com/emeryberger/smash/archive/refs/tags/v0.0.4-alpha.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  # On each release, bump url to the new tag and sha256 to the value the
+  # publish job writes to its step summary ("Source tarball sha256"), or use
+  # `brew bump-formula-pr --url=<tarball>`. Never hand-enter a guessed hash.
+  # v0.1.0-alpha: sha256 of the GitHub tag tarball, computed from two
+  # independent downloads (identical).
+  url "https://github.com/emeryberger/smash/archive/refs/tags/v0.1.0-alpha.tar.gz"
+  sha256 "46ecb038d564d0abc8f797b27d79122edf11b2834077a750a8c9de6f7f87e6bc"
   license "Apache-2.0"
   head "https://github.com/emeryberger/smash.git", branch: "master"
 

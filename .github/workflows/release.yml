@@ -459,6 +459,12 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          # Only our build outputs: docker/build-push-action also uploads a
+          # build-record artifact (<owner>~<repo>~<id>.dockerbuild) that
+          # download-artifact cannot extract; downloading everything failed
+          # the v0.1.0-alpha publish ("Artifact download failed after 5
+          # retries"), so its assets were attached by hand from the run.
+          pattern: libsmash-*
           path: dist
 
       - name: Flatten and checksum
@@ -505,7 +511,7 @@ jobs:
             ```sh
             sudo apt install ./smash-linux-x86_64.deb    # Debian 11+/Ubuntu 20.04+
             sudo dnf install ./smash-linux-x86_64.rpm    # RHEL/Alma/Rocky 8+, AL2023, Fedora
-            smash ./your_program
+            smash run -- ./your_program
             ```
 
             **Docker** — copy the FROM-scratch image into any glibc ≥ 2.28 image:

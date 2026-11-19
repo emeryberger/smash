@@ -58,13 +58,26 @@ def smash_env(lib, mode, track):
     return env
 
 
-def sample_cool(pid, cool, peak):
+def vma_count(pid):
+    try:
+        with open(f"/proc/{pid}/maps", "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def sample_cool(pid, cool, peak, stats=None):
+    """Min RSS over the cool phase; stats (dict) also gets the max VMA count."""
     lo = peak
+    vmax = 0
     for _ in range(cool):
         time.sleep(1)
         r = rss_mb(pid)
         if r > 0:
             lo = min(lo, r)
+        vmax = max(vmax, vma_count(pid))
+    if stats is not None:
+        stats["vma_max"] = vmax
     return lo
 
 
@@ -80,12 +93,13 @@ def run_child_workload(cmd, env, cool):
         p.kill()
         return {"ok": False, "error": f"no FILLED (rc={p.wait()}): {err[-400:]}"}
     peak = rss_mb(p.pid)
-    lo = sample_cool(p.pid, cool, peak)
+    st = {"vma_fill": vma_count(p.pid)}
+    lo = sample_cool(p.pid, cool, peak, st)
     out, err = p.communicate(timeout=600)
     check = out.strip().splitlines()[-1] if out.strip() else ""
     ok = check.startswith("CHECK ok") and p.returncode == 0
     return {"ok": ok, "peak_mb": peak, "min_mb": lo, "fill_s": fill_s,
-            "check": check, "rc": p.returncode,
+            "check": check, "rc": p.returncode, **st,
             "error": "" if ok else err[-400:]}
 
 
@@ -135,8 +149,10 @@ def run_valkey(vdir, env, cool, n_ops, value_size, port):
         d1 = c("DEBUG", "DIGEST")
         dbsize = c("DBSIZE")
         peak = rss_mb(p.pid)
-        lo = sample_cool(p.pid, cool, peak)
+        st = {"vma_fill": vma_count(p.pid)}
+        lo = sample_cool(p.pid, cool, peak, st)
         d2 = c("DEBUG", "DIGEST")
+        st["vma_digest"] = vma_count(p.pid)
         subprocess.run([bench, "-p", str(port), "-c", "50", "-n", str(n_ops), "-r", str(n_ops),
                         "-d", str(value_size), "-t", "get", "-q"], capture_output=True, timeout=1200)
         c("BGSAVE")
@@ -147,6 +163,7 @@ def run_valkey(vdir, env, cool, n_ops, value_size, port):
                 break
             time.sleep(0.2)
         bgsave_s = time.time() - t1
+        st["vma_bgsave"] = vma_count(p.pid)
         bg = "rdb_last_bgsave_status:ok" in c("INFO", "persistence")
         c("DEBUG", "RELOAD", "NOSAVE")
         d3 = c("DEBUG", "DIGEST")
@@ -155,7 +172,7 @@ def run_valkey(vdir, env, cool, n_ops, value_size, port):
             reloaded = "DB reloaded by DEBUG RELOAD" in f.read()
         alive = p.poll() is None
         ok = alive and bool(d1) and d1 == d2 == d3 and bg and reloaded
-        return {"ok": ok, "peak_mb": peak, "min_mb": lo, "fill_s": fill_s, "bgsave_s": bgsave_s,
+        return {"ok": ok, "peak_mb": peak, "min_mb": lo, "fill_s": fill_s, "bgsave_s": bgsave_s, **st,
                 "check": f"dbsize={dbsize} digest_fill={d1[:12]} cool={d2[:12]} "
                          f"reload={d3[:12]} reloaded={reloaded} bgsave_ok={bg} alive={alive}",
                 "error": "" if ok else log_tail().replace("\n", " | ")}
@@ -247,11 +264,12 @@ def main():
         results.append(res)
         print(f"{app:7s} {cfg:13s} run{r} ok={res['ok']} peak={res.get('peak_mb', 0):8.1f} "
               f"min={res.get('min_mb', 0):8.1f} red={res.get('reduction_pct', 0):5.1f}% "
+              f"fill={res.get('fill_s', 0):.2f}s vmas={res.get('vma_max', 0)} "
               f"{res.get('check', '')} {res.get('error', '')}", flush=True)
     if a.json:
         with open(a.json, "w") as f:
             json.dump(results, f, indent=1)
-    print("\nmedian over runs: app config ok peak_MB min_MB reduction%")
+    print("\nmedian over runs: app config ok peak_MB min_MB reduction% fill_s vma_max")
     for app in apps:
         for cfg in configs:
             rs = [x for x in results if x["app"] == app and x["config"] == cfg]
@@ -261,7 +279,8 @@ def main():
                 v = sorted(x.get(k, 0.0) for x in rs)
                 return v[len(v) // 2]
             print(f"  {app:7s} {cfg:13s} {sum(x['ok'] for x in rs)}/{len(rs)} "
-                  f"{med('peak_mb'):8.1f} {med('min_mb'):8.1f} {med('reduction_pct'):6.1f}")
+                  f"{med('peak_mb'):8.1f} {med('min_mb'):8.1f} {med('reduction_pct'):6.1f} "
+                  f"{med('fill_s'):7.2f} {med('vma_max'):7.0f}")
     return 0 if all(r["ok"] for r in results) else 1
 
 

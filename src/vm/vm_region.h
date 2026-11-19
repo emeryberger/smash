@@ -323,8 +323,19 @@ class VmRegion {
     static constexpr int kTrackHashBits = __builtin_ctzll(kTrackHashCap);
     static_assert((kTrackHashCap & kTrackHashMask) == 0, "hash cap must be a power of 2");
     static constexpr uintptr_t kTombstone = ~uintptr_t{0};
+    // Hash 64-page groups; a group's pages take adjacent slots. Hashing each
+    // page on its own scattered a mapping's pages over the whole 32 MiB
+    // table, one demand-zero 4 KiB table page per tracked page: RocksDB
+    // (~4.7K external pages over its run) carried ~21 MB more smash metadata
+    // with SMASH_TRACK_EXTERNAL=1. Grouped, a mapping fills the table densely
+    // (a group is 1 KiB of table), and a lookup of a neighbouring page hits
+    // the same cache lines. Larger groups would make colliding groups probe
+    // further.
+    static constexpr int kTrackGroupBits = 6;
     static size_t trackHashSlot(uintptr_t key) {
-        return static_cast<size_t>(key * 0x9E3779B97F4A7C15ULL) >> (64 - kTrackHashBits);
+        const size_t group = static_cast<size_t>((key >> kTrackGroupBits) * 0x9E3779B97F4A7C15ULL) >>
+                             (64 - (kTrackHashBits - kTrackGroupBits));
+        return (group << kTrackGroupBits) | (key & ((uintptr_t{1} << kTrackGroupBits) - 1));
     }
 
     struct TrackEntry {
@@ -905,6 +916,26 @@ public:
     void unlockTracking() SMASH_NO_TS_ANALYSIS { track_lock_.unlock(); }
 
     size_t externalLivePages() const { return external_live_.load(std::memory_order_relaxed); }
+
+    // Diagnostics / tests: resident bytes of the (demand-zero) tracking hash.
+    size_t trackHashResidentBytes() const {
+        const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        const size_t bytes = kTrackHashCap * sizeof(TrackEntry);
+        const size_t n = (bytes + ps - 1) / ps;
+        size_t resident = 0;
+        unsigned char vec[512];
+        for (size_t off = 0; off < n; off += sizeof(vec)) {
+            const size_t m = n - off < sizeof(vec) ? n - off : sizeof(vec);
+#ifdef __APPLE__
+            char* v = reinterpret_cast<char*>(vec);  // macOS: char*
+#else
+            unsigned char* v = vec;
+#endif
+            if (mincore(reinterpret_cast<char*>(track_hash_) + off * ps, m * ps, v) != 0) return 0;
+            for (size_t k = 0; k < m; ++k) resident += vec[k] & 1;
+        }
+        return resident * ps;
+    }
 
     bool contains(uintptr_t addr) const {
         if (tracking_mode_) {

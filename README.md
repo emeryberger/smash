@@ -142,17 +142,18 @@ smash can only compress memory it knows about. By default that is everything the
 |---|---|---|---|
 | `malloc`'d objects ≤ 16 KB | compressed (full mode); passed to the system allocator with `SMASH_LARGE_ONLY=1` | same | CI tests + the results above |
 | `malloc`'d objects > 16 KB | compressed (both modes) | same | CI tests + the results above |
-| Direct anonymous `mmap` / `sbrk` (private, read-write) | not compressed | compressed; `munmap`, `madvise`, `mprotect`, `mremap`, `MAP_FIXED`, `mlock` on it are handled | `test_external_patterns` (both modes) |
+| Direct anonymous `mmap` / `sbrk` (private, read-write) | not compressed | compressed; `munmap`, `madvise`, `mprotect`, `mremap`, `MAP_FIXED`, `mlock` on it are handled. On Linux 6.8+ through userfaultfd, so compressing it does not fragment the address space | `test_external_patterns` (both modes; also every test with `SMASH_TRACK_EXTERNAL=1` forced, in CI on x86-64, arm64 and macOS) |
 | A bundled allocator: Redis/Valkey built with jemalloc, mimalloc, gperftools tcmalloc | not compressed (it never calls `malloc`) | compressed, with no allocator-specific hooks: the allocator gets its memory from `mmap`/`sbrk`, which smash interposes | Valkey 9.1 + jemalloc (data checked with `DEBUG DIGEST`, `BGSAVE`, reload), mimalloc and tcmalloc test programs; development measurements in [agents/external-tracking.md](agents/external-tracking.md) |
 | CPython small objects (obmalloc arenas, mapped with `mmap`) | not compressed | compressed | CPython 3.12 dict workload, development measurement in the same doc |
 | Shared, file-backed, read-only, executable, locked, stack or hugetlbfs mappings | never | never (deliberately) | `test_external_patterns`, `test_external_mapping` |
+| Memory the kernel or a device keeps using: io_uring fixed buffers, ranges the app registers with its own userfaultfd, `MADV_WIPEONFORK` / `MADV_DONTFORK` / guard ranges | not compressed if mapped directly (a `malloc`'d one is compressible; on Linux 6.8+ the kernel refuses to let smash reclaim a pinned page) | not compressed once smash sees the registration (liburing, `ioctl`, `madvise`); on Linux 6.8+ a pinned page registered any other way is refused by the kernel's `UFFDIO_MOVE`, so smash never reclaims it. Not detectable on macOS or older kernels | `test_iouring_*`, `test_external_patterns` |
 | Huge pools kept warm by the app (bigger than the 4 GiB tracking budget, e.g. a database buffer pool) | never | skipped with a one-time warning | — |
 | Mappings made with raw syscalls or before smash loads (Go runtime, MariaDB's `MAP_FIXED` buffer pool) | never | never: the interposers can't see them | — |
 | Garbage-collected heaps (JVM, Go, V8/Node) | out of scope | out of scope | — |
 
 Garbage-collected runtimes are out of scope because the collector itself defeats page-level compression: it walks live objects on every cycle, so little stays cold; it installs its own `SIGSEGV` handlers for safepoints and null checks, which collide with smash's fault handler; and the Go runtime maps memory with raw system calls no interposer sees. Compressing under a collector needs the collector's cooperation.
 
-`SMASH_TRACK_EXTERNAL` is still opt-in; [agents/external-tracking.md](agents/external-tracking.md) lists what it changes, what it does not cover yet (the main limit is the kernel's `vm.max_map_count`), and what blocks making it the default.
+`SMASH_TRACK_EXTERNAL` is still opt-in. Development measurements on an AMD EPYC 9R14 host (Linux 6.12, five interleaved runs, 1 s cold timeout): Valkey 9.1 with its bundled jemalloc 84–85 % RSS reduction after a 3 M-op fill (was 17–24 % before external pages were reclaimed through userfaultfd), mimalloc and tcmalloc test programs 93–94 %, a CPython 3.12 dict workload 79–81 %; the paper workloads, which allocate through `malloc`, measure the same with it on or off (largest difference RocksDB 85.8 vs 85.5 %). It costs fill time (+5 % Valkey to +22 % CPython). [agents/external-tracking.md](agents/external-tracking.md) has the numbers, what it changes, what it does not cover, and what remains before making it the default.
 
 ### smash and zswap
 

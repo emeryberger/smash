@@ -20,13 +20,8 @@ namespace ext {
 // covers to the zero page (see CompressorThread::refillExternalRange).
 enum Mode : int { kUnmap = 0, kPurge = 1, kRestore = 2, kRestoreAll = 3, kRefill = 4 };
 
-inline bool enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("SMASH_TRACK_EXTERNAL");
-        return v && v[0] == '1';
-    }();
-    return on;
-}
+// SMASH_TRACK_EXTERNAL=1 / =0, or (unset) auto: see vm::teEnabled.
+inline bool enabled() { return vm::teEnabled(); }
 
 inline uintptr_t pageDown(const void* p) {
     return reinterpret_cast<uintptr_t>(p) & ~(uintptr_t{kPageSize} - 1);

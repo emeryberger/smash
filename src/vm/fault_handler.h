@@ -153,13 +153,19 @@ inline int aarch64FaultIsWrite(const unsigned char* p, size_t len) {
 // with SA_ONSTACK. Threads without an alternate stack are unaffected by
 // SA_ONSTACK; a thread whose app installs its own keeps the app's (see the
 // sigaltstack interposers, which also untrack it).
-// SMASH_ALTSTACK=0 disables; default on iff SMASH_TRACK_EXTERNAL=1.
+// SMASH_ALTSTACK=0/1 decides; otherwise on iff external tracking may be on:
+// SMASH_TRACK_EXTERNAL=1, or unset on Linux (auto, decided later, possibly
+// after the first threads started; an unused 64 KiB alternate stack costs
+// address space, not RSS).
 inline bool altStackWanted() {
     static const bool on = [] {
-        const char* te = std::getenv("SMASH_TRACK_EXTERNAL");
         const char* as = std::getenv("SMASH_ALTSTACK");
         if (as) return as[0] == '1';
-        return te && te[0] == '1';
+#if defined(__linux__)
+        return teEnv() != 0;
+#else
+        return teEnv() == 1;
+#endif
     }();
     return on;
 }

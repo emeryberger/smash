@@ -514,6 +514,44 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# SMASH_TRACK_EXTERNAL unset = auto: external mappings are compressed iff
+# smash reclaims through userfaultfd. Linux: expectation detected (is smash's
+# uffd open), plus SMASH_UFFD=0 -> off; macOS: off. Both modes. --unset keeps
+# the TE-forced matrix from overriding the setting under test.
+add_executable(te_auto_test te_auto_test.cpp)
+set_target_properties(te_auto_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(te_auto_test PRIVATE ${CMAKE_DL_LIBS})
+if(APPLE)
+  set(_te_pre "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  set(_te_cases "off|")
+else()
+  set(_te_pre "LD_PRELOAD=$<TARGET_FILE:smash>")
+  set(_te_cases "detect|" "off|SMASH_UFFD=0")
+endif()
+foreach(lo 0 1)
+  foreach(c ${_te_cases})
+    string(REPLACE "|" ";" _parts "${c}")
+    list(GET _parts 0 _expect)
+    list(LENGTH _parts _np)
+    set(_extra "")
+    set(_name test_te_auto)
+    if(_np GREATER 1)
+      list(GET _parts 1 _extra)
+    endif()
+    if(_extra)
+      set(_name test_te_auto_uffd_off)
+    endif()
+    if(lo)
+      set(_name ${_name}_large_only)
+    endif()
+    add_test(NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env --unset=SMASH_TRACK_EXTERNAL ${_te_pre} "SMASH_LARGE_ONLY=${lo}"
+        "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1" ${_extra}
+        $<TARGET_FILE:te_auto_test> ${_expect})
+    set_tests_properties(${_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endforeach()
+endforeach()
+
 # io_uring fixed buffers (pinned pages) under SMASH_TRACK_EXTERNAL=1: a
 # pinned page must never be reclaimed out from under the kernel (uffd MOVE
 # refuses it), and liburing's io_uring_register_buffers of a compressed

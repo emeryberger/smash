@@ -1,6 +1,7 @@
 // smash/src/vm/platform_mem.h - Raw OS memory primitives (never calls malloc)
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -31,6 +32,69 @@
 #endif
 
 namespace smash::vm {
+
+// ── SMASH_TRACK_EXTERNAL policy ───────────────────────────────────────────
+// "1" on, any other non-empty value off, unset/empty: auto, decided once in
+// SmashHeap init (teDecide) before the VmRegion is published, i.e. before
+// any mapping can be registered: on iff smash will reclaim through
+// userfaultfd (Linux 6.8+ with UFFDIO_MOVE, SMASH_UFFD not 0). On the classic
+// path (macOS, older kernels, uffd unavailable) external pages would be
+// compressed with PROT_NONE, which splits VMAs and cannot see pinned pages.
+enum TeWhy : int {
+    kTeUndecided = 0,
+    kTeEnvOn,             // SMASH_TRACK_EXTERNAL=1
+    kTeEnvOff,            // SMASH_TRACK_EXTERNAL=0
+    kTeAutoUffd,          // unset; uffd reclaim available
+    kTeAutoClassic,       // unset; classic reclaim only: off
+    kTeAutoUffdFailed,    // unset; uffd probed ok but its init failed later: stays on (classic)
+};
+inline std::atomic<int> g_te_why{kTeUndecided};
+inline int teEnv() {
+    static const int v = [] {
+        const char* e = std::getenv("SMASH_TRACK_EXTERNAL");
+        if (!e || !*e) return -1;
+        return e[0] == '1' ? 1 : 0;
+    }();
+    return v;
+}
+inline bool teEnabled() {
+    const int w = g_te_why.load(std::memory_order_acquire);
+    if (w == kTeUndecided) return teEnv() == 1;
+    return w == kTeEnvOn || w == kTeAutoUffd || w == kTeAutoUffdFailed;
+}
+inline void teDecide(bool uffd_reclaim) {
+    const int e = teEnv();
+    g_te_why.store(e == 1 ? kTeEnvOn : e == 0 ? kTeEnvOff : uffd_reclaim ? kTeAutoUffd : kTeAutoClassic,
+                   std::memory_order_release);
+}
+inline const char* teReason() {
+    switch (g_te_why.load(std::memory_order_acquire)) {
+    case kTeEnvOn: return "on (SMASH_TRACK_EXTERNAL=1)";
+    case kTeEnvOff: return "off (SMASH_TRACK_EXTERNAL=0)";
+    case kTeAutoUffd: return "on (auto: userfaultfd reclaim)";
+    case kTeAutoClassic: return "off (auto: no userfaultfd reclaim)";
+    case kTeAutoUffdFailed: return "on (auto: userfaultfd init failed; classic reclaim)";
+    default: return teEnv() == 1 ? "on (SMASH_TRACK_EXTERNAL=1)" : "off (undecided)";
+    }
+}
+// Can this process use userfaultfd with UFFDIO_MOVE (Linux 6.8+)? A throwaway
+// uffd: userfaultfd(UFFD_USER_MODE_ONLY, falling back to plain) + UFFDIO_API
+// with SIGBUS | MOVE. Raw syscalls only (runs during heap construction).
+inline bool uffdMoveSupported() {
+#if defined(__linux__)
+    long fd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | 1 /* UFFD_USER_MODE_ONLY */);
+    if (fd < 0) fd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return false;
+    struct { uint64_t api, features, ioctls; } a{0xAA /* UFFD_API */, (1ULL << 7) | (1ULL << 16), 0};
+    // _IOWR(0xAA, 0x3F, struct uffdio_api) = UFFDIO_API
+    const unsigned long kApi = (3UL << 30) | (sizeof(a) << 16) | (0xAAUL << 8) | 0x3FUL;
+    const bool ok = syscall(SYS_ioctl, fd, kApi, &a) == 0;
+    syscall(SYS_close, fd);
+    return ok;
+#else
+    return false;
+#endif
+}
 
 // userfaultfd mode (SMASH_UFFD): the arena range registered for MISSING
 // faults. Only pages smash drops on purpose (compressed) may be MISSING

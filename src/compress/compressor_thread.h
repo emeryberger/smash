@@ -625,6 +625,23 @@ class CompressorThread {
     static void uffdDrop(void* page) {
         syscall(SYS_madvise, page, kPageSize, MADV_DONTNEED);  // never MADV_FREE here
     }
+    // Will uffdInit() turn uffd reclaim on? Its preconditions plus a
+    // capability probe; called during heap construction (SMASH_TRACK_EXTERNAL
+    // auto), so no allocation and no dlsym.
+public:
+    bool uffdReclaimPlanned() const {
+#ifdef __linux__
+        if (observe_ || !vm_) return false;
+        const char* e = std::getenv("SMASH_UFFD");
+        if (e && e[0] == '0') return false;
+        const char* mf = std::getenv("SMASH_MADV_FREE");
+        if (!isDeferredReclaimMode() || (mf && mf[0] == '1') || vm_->contigPages() == 0) return false;
+        return vm::uffdMoveSupported();
+#else
+        return false;
+#endif
+    }
+private:
     void uffdInit() {
         if (uffd_init_done_) return;
         uffd_init_done_ = true;
@@ -840,6 +857,9 @@ class CompressorThread {
     bool uffdMove(void*, void*) { return false; }
     bool uffdWp(void*, bool) { return false; }
     static void uffdDrop(void*) {}
+public:
+    bool uffdReclaimPlanned() const { return false; }
+private:
     void uffdInit() {}
     void uffdPrepareFork() {}
     static constexpr uint8_t kProtNoneFork = 2;
@@ -8157,6 +8177,11 @@ public:
             (void)!write(2, msg, sizeof(msg) - 1);
         }
         uffdInit();
+        // Auto-enabled external tracking stays on if uffd init failed after
+        // the probe succeeded (pages may already be tracked; the classic path
+        // handles them as with SMASH_TRACK_EXTERNAL=1); record why.
+        if (!uffd_mode_ && vm::g_te_why.load(std::memory_order_acquire) == vm::kTeAutoUffd)
+            vm::g_te_why.store(vm::kTeAutoUffdFailed, std::memory_order_release);
         if (cfg_start_disabled_ && !ks_disabled_.load(std::memory_order_relaxed)) {
             setReason(safety::kReasonStartup, nullptr);
             ks_disabled_.store(true, std::memory_order_release);
@@ -8390,8 +8415,9 @@ public:
             // splits); busy = runs another uffd owns (never compressed);
             // vmas = /proc/self/maps lines now.
             n = smash::safe_snprintf(buf, sizeof(buf),
-                "[smash stats] external live=%zu cpages=%zu slots_hw=%zu uffd=%zu busy=%llu "
+                "[smash stats] external %s live=%zu cpages=%zu slots_hw=%zu uffd=%zu busy=%llu "
                 "regfail=%llu unshare=%llu vmas=%ld\n",
+                vm::teReason(),
                 self->vm_->externalLivePages(), ext_c,
                 total > contig ? total - contig : size_t{0},
                 self->ext_uffd_pages_.load(std::memory_order_relaxed),
@@ -9765,6 +9791,7 @@ public:
         char a[32], b[32], c[32];
         put("[smash report] pid=%d ran %.1f s  profile=%s mode=%s tracking=%s cold-timeout=%.0f s\n",
             pid, ran, smashProfileName(getSmashProfile()), modeName(), trackingName(), cold);
+        put("[smash report]   external mappings (SMASH_TRACK_EXTERNAL): %s\n", vm::teReason());
         fmtBytes(a, sizeof(a), peak_kb * 1024);
         fmtBytes(c, sizeof(c), cur_kb * 1024);
         put("[smash report]   RSS: peak %s, at exit %s\n", a, c);

@@ -1,6 +1,6 @@
 # External-Mapping Tracking (`SMASH_TRACK_EXTERNAL=1`)
 
-Standard smash compresses pages of its own `malloc` arena. Memory the process maps itself — a bundled allocator's arenas (Valkey/Redis built with `MALLOC=jemalloc`, mimalloc, gperftools tcmalloc), CPython's obmalloc arenas, FFmpeg frame pools — never passes through `malloc` and so escapes the compressor. With `SMASH_TRACK_EXTERNAL=1` the `mmap` / `sbrk` / Mach VM interposers register such memory with the VmRegion's external-page table, and the compressor treats it like arena pages. This makes smash a compression layer *under* a bundled allocator with no allocator-specific hooks: those allocators get their memory from libc `mmap` / `__sbrk` through the PLT, which `LD_PRELOAD` interposes. **Opt-in, default off** — see "Default: what the evidence says" below.
+Standard smash compresses pages of its own `malloc` arena. Memory the process maps itself — a bundled allocator's arenas (Valkey/Redis built with `MALLOC=jemalloc`, mimalloc, gperftools tcmalloc), CPython's obmalloc arenas, FFmpeg frame pools — never passes through `malloc` and so escapes the compressor. With `SMASH_TRACK_EXTERNAL=1` the `mmap` / `sbrk` / Mach VM interposers register such memory with the VmRegion's external-page table, and the compressor treats it like arena pages. This makes smash a compression layer *under* a bundled allocator with no allocator-specific hooks: those allocators get their memory from libc `mmap` / `__sbrk` through the PLT, which `LD_PRELOAD` interposes. **Default: on where smash reclaims through userfaultfd (Linux 6.8+), off on the classic path (macOS, older kernels)**; `SMASH_TRACK_EXTERNAL=1` / `=0` force it — see "Default since round 3" below.
 
 Code: `src/external_track.h` (registration policy + hooks shared by both platforms), the interposers in `src/linux_syscall_wrappers.cpp` and `src/smash_heap.cpp` (macOS), `VmRegion::trackExternalPage` / `untrackExternalPage` (`src/vm/vm_region.h`), `CompressorThread::detachExternalRange` / `scanExternalWritten` (`src/compress/compressor_thread.h`). Regression test: `tests/external_patterns_test.cpp` (`test_external_patterns`, `test_external_patterns_large_only`).
 
@@ -186,9 +186,36 @@ Micro-costs (`tmp`-built `mmap_churn.c`, 5 runs, medians; cloudnew, dev): 1 MiB 
 fork: `pauseForFork` now waits for in-flight external detaches (and blocks new ones until the parent/child handlers run), and the child releases page locks whose owner thread did not survive the fork.
 
 
-## Default: what the evidence says
+## Default since round 3: on where uffd reclaim is active
 
-Decision (this branch): **not flipped** — `SMASH_TRACK_EXTERNAL` stays opt-in; the maintainer decides from the round-2 evidence above.
+`SMASH_TRACK_EXTERNAL` unset means **auto**: on iff the compressor will reclaim through userfaultfd — Linux 6.8+ with `UFFDIO_MOVE`, `SMASH_UFFD` not `0`, deferred reclaim, not observe mode. Off on the classic path: macOS, Linux < 6.8 (AL2023's default 6.1 kernel; its 6.12 kernel gets uffd and therefore TE on), userfaultfd unavailable (seccomp, `vm.unprivileged_userfaultfd=0` with a kernel that lacks `UFFD_USER_MODE_ONLY`). `SMASH_TRACK_EXTERNAL=1` / `=0` still win.
+
+- **When it is decided.** `vm::teDecide` (`src/vm/platform_mem.h`) runs in `SmashHeap` init, right after `CompressorThread::init`, from `uffdReclaimPlanned()` (the preconditions `uffdInit` checks, plus a throwaway `userfaultfd` + `UFFDIO_API(SIGBUS|MOVE)` probe; raw syscalls only, no allocation, no `dlsym`), and **before** the VmRegion is published. Until then `registerRange` cannot track anything (it needs the VmRegion), so no mapping is registered ahead of the decision; mappings made before the heap exists were never tracked under `=1` either. A mapping made between the decision and the compressor's start is tracked and registered with uffd on the first ticks (test: a 4 MiB mapping from an `__attribute__((constructor(101)))` compresses). If `uffdInit` later fails after a successful probe, tracking stays on with classic reclaim (exactly the `=1` behaviour), recorded as `on (auto: userfaultfd init failed; classic reclaim)`.
+- **Visible in** the stats line (`[smash stats] external on (auto: userfaultfd reclaim) live=…`), the `SMASH_REPORT` summary (`external mappings (SMASH_TRACK_EXTERNAL): …`), and `smash doctor` ("external mappings … compressed by default here (userfaultfd reclaim; SMASH_TRACK_EXTERNAL=0 to opt out)" / "not compressed by default here").
+- **Alternate signal stack**: `SMASH_ALTSTACK` unset now defaults on whenever `SMASH_TRACK_EXTERNAL` is unset on Linux (the decision can come after the first threads start); an unused 64 KiB stack costs address space only.
+- **Tests**: `test_te_auto[_large_only]` (TE unset; Linux: expects on iff smash's uffd is open in the process, macOS: off) and `test_te_auto_uffd_off[_large_only]` (Linux, `SMASH_UFFD=0`: off), with an early-constructor mapping, a mapping from `main`, and a `malloc`'d control that must compress either way. cloudnew 6.12: 4/4 pass, and `te_auto_test on` with 5bab2bf's library fails (external mappings not compressed). macOS: 2/2 (off).
+
+### Measured at the default cold timeout (10 s), TE auto vs 0 (dev numbers)
+
+cloudnew (EPYC 9R14, AL2023 6.12 → auto = on), 5 randomized interleaved runs, medians; every run correct (Valkey: `DEBUG DIGEST` after fill = after cool = after `BGSAVE` + `DEBUG RELOAD`). `bench/te_auto_chain.sh tmp/r3` = `bench_bundled_alloc.py … --configs full:0,full:auto,large:0,large:auto --cold-timeout "" --runs 5 --cool 40 --mib 1024 --py-entries 3000000 --valkey-ops 3000000`, then the paper suite and the quick-CI A/B with `0` vs `auto`.
+
+| App | Mode | Reduction % TE=0 → auto | Fill s TE=0 → auto | Peak MB TE=0 → auto | VMAs (cool max) auto |
+|---|---|---|---|---|---|
+| Valkey (bundled jemalloc) | full | 0.0 → 84.7 [84.6, 84.8] | 44.54 → 44.63 (+0.2 %) | 712 → 731 (+2.7 %) | 134 |
+| Valkey | large-only | 0.0 → 85.0 [84.9, 85.0] | 44.65 → 44.90 (+0.6 %) | 710 → 728 (+2.5 %) | 152 |
+| mimalloc | full / large-only | 0.0 → 92.7 / 92.8 | 2.79 → 2.96 (+6 %) / 2.78 → 2.96 (+6 %) | 1149 → 1184 / 1185 (+3 %) | 110 / 106 |
+| tcmalloc | full / large-only | 0.0 → 93.7 / 93.8 | 2.86 → 3.17 (+11 %) / 2.86 → 3.18 (+11 %) | 1149 → 1173 (+2 %) | 110 / 110 |
+| CPython 3.12 | full / large-only | 8.0 → 80.3 / 8.2 → 80.7 | 6.68 → 7.20 (+8 %) / 6.57 → 7.20 (+10 %) | 1149 → 1169 / 1148 → 1167 (+2 %) | 156 / 177 |
+
+Valkey BGSAVE: 3.57 → 4.38 s (full), 3.36 → 5.20 s (large-only). At 10 s the Valkey fill (44 s) costs nothing measurable. The mi/tc/CPython fills take 3–7 s, shorter than the cold timeout, so their remaining cost is not compression during the fill; the likely source (hypothesis, not decomposed) is tracking itself — the `mmap` interposer registers every page of each new mapping (a 1 GiB mimalloc / tcmalloc heap is ~262K pages) — with the peak rise being smash's per-page metadata for those pages.
+
+Paper workloads, full smash (`SETTINGS="0 auto" bench/paper_te_ab.sh build-paper tmp/r3/paper 5`): SQLite 70.5 / 70.5 %, RocksDB 85.8 / 85.4 % (minimum RSS 44.7 → 45.9 MB), memcached 89.7 / 89.7 %, Redis 58.5 / 58.5 %, Redis-ext 59.5 / 59.3 %; throughput within run-to-run spread (e.g. SQLite 91 715 / 90 846 ops/s, RocksDB 635 282 / 631 269). Quick-CI A/B (`ab_track_external.py --runs 5 --settings 0,auto`): `bench_rss` 87 % in all four cells; `bench_sqlite --quick` full 58.9 / 58.9 %, 91 725 / 92 630 ops/s; large-only 27.6 / 27.5 %, 99 342 / 98 997 ops/s.
+
+fork_stress with TE unset (auto = on), `taskset -c 0-1`, 150 forks × 6 threads (`bench/fork_stress_loop.sh build-linux 0-1 20`): 20/20 full, 20/20 large-only. ctest at the gate commit: cloudnew 95/95 normal (auto on) and 95/95 TE-forced; macOS 74/74 and 74/74.
+
+## Default: what the evidence says (round 2)
+
+Decision (maintainer, round 3): **on by default where uffd reclaim is active, off on the classic path** — see "Default since round 3" below. The rest of this section is the round-2 analysis that led to it.
 
 Resolved since round 1: the VMA budget (uffd reclaim, measured above: Valkey 57K → 134–153 VMAs, reduction 17–24 % → 84–85 %; no VMA growth across BGSAVE), the fill-phase cost on Valkey (+5–6 % vs TE=0, was +22 %), io_uring fixed buffers and other pins in uffd mode (MOVE refuses them), apps using userfaultfd themselves, WIPEONFORK/DONTFORK/guard pages/populate, and a TE-only metadata leak that cost RocksDB 5 points. Malloc-only workloads (the paper suite and the quick-CI benches) do not change with TE=1.
 

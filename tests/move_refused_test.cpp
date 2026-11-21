@@ -10,7 +10,7 @@
 // PageAnonExclusive: smash unshares them first). (Reclaiming
 // such pages -- fork also clears PageAnonExclusive until a write fault -- is
 // not attempted; see agents/syscall-compat.md.) Exits 77 if libsmash is not
-// preloaded.
+// preloaded or smash is not reclaiming through userfaultfd (Linux < 6.8).
 #include <dlfcn.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -18,6 +18,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 
 #include "smash/smash.h"
@@ -27,9 +28,23 @@ static StatsFn get_stats;
 
 static SmashStats stats() { SmashStats s{}; get_stats(&s); return s; }
 
+// smash opens its userfaultfd at heap init, before main().
+static bool uffdOpen() {
+    char path[64], link[128];
+    for (int fd = 0; fd < 1024; ++fd) {
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(path, link, sizeof(link) - 1);
+        if (n <= 0) continue;
+        link[n] = 0;
+        if (strstr(link, "userfaultfd")) return true;
+    }
+    return false;
+}
+
 int main() {
     get_stats = reinterpret_cast<StatsFn>(dlsym(RTLD_DEFAULT, "smash_get_stats"));
     if (!get_stats) { fprintf(stderr, "move_refused_test: libsmash not preloaded; skipping\n"); return 77; }
+    if (!uffdOpen()) { fprintf(stderr, "move_refused_test: smash is not using userfaultfd; skipping\n"); return 77; }
     constexpr size_t kChunk = 1u << 20, kN = 32;  // 32 MiB, managed in both modes
     unsigned char* c[kN];
     for (size_t i = 0; i < kN; ++i) {

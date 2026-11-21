@@ -47,14 +47,19 @@ def rss_mb(pid):
     return 0.0
 
 
-def smash_env(lib, mode, track):
+def smash_env(lib, mode, track, cold_timeout="1"):
+    """track 'auto' leaves SMASH_TRACK_EXTERNAL unset; cold_timeout '' keeps
+    smash's default cold timeout."""
     env = os.environ.copy()
+    env.pop("SMASH_TRACK_EXTERNAL", None)
     if mode == "none":
         return env
     env["LD_PRELOAD"] = lib
     env["SMASH_LARGE_ONLY"] = "1" if mode == "large" else "0"
-    env["SMASH_TRACK_EXTERNAL"] = str(track)
-    env["SMASH_COLD_TIMEOUT_SEC"] = "1"
+    if track != "auto":
+        env["SMASH_TRACK_EXTERNAL"] = str(track)
+    if cold_timeout:
+        env["SMASH_COLD_TIMEOUT_SEC"] = cold_timeout
     return env
 
 
@@ -220,7 +225,8 @@ def main():
     ap.add_argument("--valkey-dir", default="")
     ap.add_argument("--apps", default="valkey,mi,tc,python")
     ap.add_argument("--configs", default="none,full:0,full:1,large:0,large:1",
-                    help="mode:track[@lib] list; 'none' = no smash; @lib selects an --alt-lib")
+                    help="mode:track[@lib] list (track 0, 1, or auto = unset); 'none' = no smash; "
+                         "@lib selects an --alt-lib")
     ap.add_argument("--alt-lib", action="append", default=[],
                     help="NAME=path/to/libsmash.so, usable as mode:track@NAME (A/B builds)")
     ap.add_argument("--runs", type=int, default=1)
@@ -231,6 +237,8 @@ def main():
     ap.add_argument("--valkey-value", type=int, default=256)
     ap.add_argument("--port", type=int, default=16499, help="valkey port")
     ap.add_argument("--json", default="")
+    ap.add_argument("--cold-timeout", default="1",
+                    help="SMASH_COLD_TIMEOUT_SEC; empty = smash's default (10 s)")
     ap.add_argument("--python", default=sys.executable, help="interpreter for the python app")
     ap.add_argument("--mimalloc-inc", default="", help="mimalloc include dir (if not system)")
     ap.add_argument("--mimalloc-lib", default="", help="mimalloc library dir (if not system)")
@@ -249,7 +257,7 @@ def main():
     for app, cfg, r in jobs:
         base_cfg, _, libname = cfg.partition("@")
         mode, track = (base_cfg.split(":") + ["0"])[:2] if base_cfg != "none" else ("none", "0")
-        env = smash_env(os.path.abspath(alt[libname]) if libname else lib, mode, track)
+        env = smash_env(os.path.abspath(alt[libname]) if libname else lib, mode, track, a.cold_timeout)
         if app == "valkey":
             res = run_valkey(a.valkey_dir, env, a.cool, a.valkey_ops, a.valkey_value, a.port)
         elif app == "python":

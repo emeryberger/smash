@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--build-dir", required=True)
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--modes", default="0,1", help="SMASH_LARGE_ONLY values")
+    ap.add_argument("--settings", default="0,1",
+                    help="SMASH_TRACK_EXTERNAL values; 'auto' leaves it unset")
     ap.add_argument("--sqlite-modes", default=None,
                     help="SMASH_LARGE_ONLY values for bench_sqlite (default: --modes)")
     a = ap.parse_args()
@@ -59,7 +61,7 @@ def main():
 
     sq_modes = (a.sqlite_modes or a.modes).split(",")
     jobs = [(bench, lo, te, r) for r in range(a.runs) for bench in ("rss", "sqlite")
-            for lo in (a.modes.split(",") if bench == "rss" else sq_modes) for te in ("0", "1")]
+            for lo in (a.modes.split(",") if bench == "rss" else sq_modes) for te in a.settings.split(",")]
     random.shuffle(jobs)
     rows = {}
     failures = 0
@@ -67,6 +69,8 @@ def main():
         env = dict(os.environ)
         env.update({preload: lib, "SMASH_LARGE_ONLY": lo, "SMASH_TRACK_EXTERNAL": te,
                     "SMASH_COLD_TIMEOUT_SEC": "2"})
+        if te == "auto":  # unset: smash decides (on iff userfaultfd reclaim)
+            env.pop("SMASH_TRACK_EXTERNAL")
         if sys.platform == "darwin":
             env["MallocNanoZone"] = "0"
         if bench == "rss":

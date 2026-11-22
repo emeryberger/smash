@@ -37,6 +37,9 @@ smash_add_test(test_slab test_slab.cpp)
 # VM region test (no LZ4 dependency)
 smash_add_test(test_vm_region test_vm_region.cpp)
 
+# Thread-exit alternate-stack release leaves no registered (dangling) stack
+smash_add_test(test_altstack_release test_altstack_release.cpp)
+
 # SpillStore test (file-backed very-cold blob storage; no codec dependency)
 smash_add_test(test_spill_store test_spill_store.cpp)
 

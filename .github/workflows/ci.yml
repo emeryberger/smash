@@ -161,9 +161,13 @@ jobs:
           set -e
           if [ "$RUNNER_OS" = "macOS" ]; then pre="DYLD_INSERT_LIBRARIES=$PWD/build/libsmash.dylib MallocNanoZone=0"
           else pre="LD_PRELOAD=$PWD/build/libsmash.so"; fi
+          # macOS runners have no coreutils timeout: perl's alarm survives the
+          # exec. env runs inside it, so the preload variable reaches soak_test.
+          if command -v timeout >/dev/null 2>&1; then to() { timeout "$@"; }
+          else to() { perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$@"; }; fi
           for lo in 0 1; do
-            env $pre SMASH_TRACK_EXTERNAL=1 SMASH_LARGE_ONLY=$lo SMASH_DEFER_PHASES_MS=0 \
-              SMASH_COLD_TIMEOUT_SEC=1 SMASH_SOAK_TOGGLE=1 timeout 300 build/tests/soak_test 60 8
+            to 300 env $pre SMASH_TRACK_EXTERNAL=1 SMASH_LARGE_ONLY=$lo SMASH_DEFER_PHASES_MS=0 \
+              SMASH_COLD_TIMEOUT_SEC=1 SMASH_SOAK_TOGGLE=1 build/tests/soak_test 60 8
           done
       - name: fork() under threads, both modes, SMASH_TRACK_EXTERNAL=1
         if: runner.os == 'Linux'

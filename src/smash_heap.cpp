@@ -1307,6 +1307,20 @@ extern "C" int smash_mlockall(int flags) {
     return reinterpret_cast<mlockall_fn>(smash_interpose_smash_mlockall.original)(flags);
 }
 
+// minherit: anything but VM_INHERIT_COPY changes what a fork child sees —
+// VM_INHERIT_SHARE shares the pages (a parent blob goes stale when the child
+// writes, as for MAP_SHARED), VM_INHERIT_NONE leaves the child no mapping
+// for its compressor to touch. Untrack (restoring) first; never re-tracked.
+using minherit_fn = int(*)(void*, size_t, int);
+extern "C" int smash_minherit(void* addr, size_t len, int inherit);
+SMASH_INTERPOSE(smash_minherit, minherit);
+extern "C" int smash_minherit(void* addr, size_t len, int inherit) {
+    auto* vm = smash::g_smash_vm_region;
+    if (vm && addr && len && inherit != VM_INHERIT_COPY)
+        smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    return reinterpret_cast<minherit_fn>(smash_interpose_smash_minherit.original)(addr, len, inherit);
+}
+
 // ── Path-argument syscalls ──────────────────────────────────────────────────
 // A path on a compressed page makes the kernel's copyinstr fail with EFAULT
 // (no signal). Warm the string first; see warmString in syscall_compat.h.

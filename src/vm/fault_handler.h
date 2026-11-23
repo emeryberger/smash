@@ -153,13 +153,19 @@ inline int aarch64FaultIsWrite(const unsigned char* p, size_t len) {
 // with SA_ONSTACK. Threads without an alternate stack are unaffected by
 // SA_ONSTACK; a thread whose app installs its own keeps the app's (see the
 // sigaltstack interposers, which also untrack it).
-// SMASH_ALTSTACK=0 disables; default on iff SMASH_TRACK_EXTERNAL=1.
+// SMASH_ALTSTACK=0/1 decides; otherwise on iff external tracking may be on:
+// SMASH_TRACK_EXTERNAL=1, or unset on Linux (auto, decided later, possibly
+// after the first threads started; an unused 64 KiB alternate stack costs
+// address space, not RSS).
 inline bool altStackWanted() {
     static const bool on = [] {
-        const char* te = std::getenv("SMASH_TRACK_EXTERNAL");
         const char* as = std::getenv("SMASH_ALTSTACK");
         if (as) return as[0] == '1';
-        return te && te[0] == '1';
+#if defined(__linux__)
+        return teEnv() != 0;
+#else
+        return teEnv() == 1;
+#endif
     }();
     return on;
 }
@@ -191,16 +197,29 @@ inline void installThreadAltStack() {
     g_altstack_mem = static_cast<char*>(m);
 }
 // Thread exit: disable the alternate stack if it is still ours, unmap it.
+//
+// The SS_DISABLE request carries the stack's real sp/size: XNU (macOS 26)
+// rejects SS_DISABLE with ss_size < MINSIGSTKSZ (ENOMEM) and leaves the stack
+// registered. Unmapping it anyway left the exiting thread with a dangling
+// alternate stack; its next fault (TSD destructors freeing into a tracked,
+// compressed libmalloc region) made the kernel push the signal frame into
+// unmapped memory, and a failed signal delivery kills the process with
+// SIGILL (test_soak_large_only, TE=1, macOS CI). So: unmap only once the stack
+// is verifiably not registered any more; otherwise leak it.
 inline void releaseThreadAltStack() {
     char* m = g_altstack_mem;
     if (!m) return;
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     stack_t cur{};
-    if (rawSigaltstack(nullptr, &cur) == 0 && cur.ss_sp == m + page) {
+    if (rawSigaltstack(nullptr, &cur) != 0) return;  // state unknown: leak
+    if (!(cur.ss_flags & SS_DISABLE) && cur.ss_sp == m + page) {
         if (cur.ss_flags & SS_ONSTACK) return;  // running on it (can't happen at exit)
         stack_t off{};
+        off.ss_sp = m + page;
+        off.ss_size = kAltStackSize;
         off.ss_flags = SS_DISABLE;
-        (void)rawSigaltstack(&off, nullptr);
+        if (rawSigaltstack(&off, nullptr) != 0) return;   // still registered: leak
+        if (rawSigaltstack(nullptr, &cur) != 0 || !(cur.ss_flags & SS_DISABLE)) return;
     }
     g_altstack_mem = nullptr;
     rawMunmap(m, kAltStackSize + page);

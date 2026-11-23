@@ -136,23 +136,24 @@ The defaults are the tuned configuration. Each one targets a way a compressing a
 
 ### What memory does smash manage?
 
-smash can only compress memory it knows about. By default that is everything the program gets from `malloc`; memory the program (or a library it bundles) maps itself needs `SMASH_TRACK_EXTERNAL=1`.
+smash can only compress memory it knows about: everything the program gets from `malloc`, and — by default where smash reclaims pages through userfaultfd (Linux 6.8+) — private anonymous memory the program (or a library it bundles) maps itself. The second part is `SMASH_TRACK_EXTERNAL`: unset means that automatic choice, `=1` forces it on (on macOS and older kernels it then reclaims with `PROT_NONE`, which splits the process's memory map), `=0` turns it off. On AL2023, for example, the default 6.1 kernel gets the classic path (external tracking off by default) and the 6.12 kernel gets userfaultfd (on). `smash doctor` and the `SMASH_REPORT` summary say which applies.
 
-| Memory | Default | `SMASH_TRACK_EXTERNAL=1` | Verified |
+| Memory | Linux 6.8+ (default) | macOS, Linux < 6.8, or `SMASH_TRACK_EXTERNAL=0` | Verified |
 |---|---|---|---|
 | `malloc`'d objects ≤ 16 KB | compressed (full mode); passed to the system allocator with `SMASH_LARGE_ONLY=1` | same | CI tests + the results above |
 | `malloc`'d objects > 16 KB | compressed (both modes) | same | CI tests + the results above |
-| Direct anonymous `mmap` / `sbrk` (private, read-write) | not compressed | compressed; `munmap`, `madvise`, `mprotect`, `mremap`, `MAP_FIXED`, `mlock` on it are handled | `test_external_patterns` (both modes) |
-| A bundled allocator: Redis/Valkey built with jemalloc, mimalloc, gperftools tcmalloc | not compressed (it never calls `malloc`) | compressed, with no allocator-specific hooks: the allocator gets its memory from `mmap`/`sbrk`, which smash interposes | Valkey 9.1 + jemalloc (data checked with `DEBUG DIGEST`, `BGSAVE`, reload), mimalloc and tcmalloc test programs; development measurements in [agents/external-tracking.md](agents/external-tracking.md) |
-| CPython small objects (obmalloc arenas, mapped with `mmap`) | not compressed | compressed | CPython 3.12 dict workload, development measurement in the same doc |
-| Shared, file-backed, read-only, executable, locked, stack or hugetlbfs mappings | never | never (deliberately) | `test_external_patterns`, `test_external_mapping` |
-| Huge pools kept warm by the app (bigger than the 4 GiB tracking budget, e.g. a database buffer pool) | never | skipped with a one-time warning | — |
-| Mappings made with raw syscalls or before smash loads (Go runtime, MariaDB's `MAP_FIXED` buffer pool) | never | never: the interposers can't see them | — |
+| Direct anonymous `mmap` / `sbrk` (private, read-write) | compressed through userfaultfd (no address-space fragmentation); `munmap`, `madvise`, `mprotect`, `mremap`, `MAP_FIXED`, `mlock` on it are handled | not compressed (`SMASH_TRACK_EXTERNAL=1` opts in) | `test_external_patterns`, `test_te_auto` (both modes; CI also runs every test with `SMASH_TRACK_EXTERNAL=1` forced on x86-64, arm64 and macOS) |
+| A bundled allocator: Redis/Valkey built with jemalloc, mimalloc, gperftools tcmalloc | compressed, with no allocator-specific hooks: the allocator gets its memory from `mmap`/`sbrk`, which smash interposes | not compressed (it never calls `malloc`) | Valkey 9.1 + jemalloc (data checked with `DEBUG DIGEST`, `BGSAVE`, reload), mimalloc and tcmalloc test programs; development measurements in [agents/external-tracking.md](agents/external-tracking.md) |
+| CPython small objects (obmalloc arenas, mapped with `mmap`) | compressed | not compressed | CPython 3.12 dict workload, same doc |
+| Shared, file-backed, read-only, executable, locked, stack or hugetlbfs mappings | never (deliberately) | never | `test_external_patterns`, `test_external_mapping` |
+| Memory the kernel or a device keeps using: io_uring fixed buffers, ranges the app registers with its own userfaultfd, `MADV_WIPEONFORK` / `MADV_DONTFORK` / guard ranges | not compressed once smash sees the registration (liburing, `ioctl`, `madvise`); a page pinned any other way is refused by the kernel's `UFFDIO_MOVE`, so smash never reclaims it | not compressed if mapped directly; a `malloc`'d one is (a pin is not detectable there) | `test_iouring_*`, `test_external_patterns` |
+| Huge pools kept warm by the app (bigger than the 4 GiB tracking budget, e.g. a database buffer pool) | skipped with a one-time warning | never | — |
+| Mappings made with raw syscalls or before smash loads (Go runtime, MariaDB's `MAP_FIXED` buffer pool) | never: the interposers can't see them | never | — |
 | Garbage-collected heaps (JVM, Go, V8/Node) | out of scope | out of scope | — |
 
 Garbage-collected runtimes are out of scope because the collector itself defeats page-level compression: it walks live objects on every cycle, so little stays cold; it installs its own `SIGSEGV` handlers for safepoints and null checks, which collide with smash's fault handler; and the Go runtime maps memory with raw system calls no interposer sees. Compressing under a collector needs the collector's cooperation.
 
-`SMASH_TRACK_EXTERNAL` is still opt-in; [agents/external-tracking.md](agents/external-tracking.md) lists what it changes, what it does not cover yet (the main limit is the kernel's `vm.max_map_count`), and what blocks making it the default.
+Development measurements of the default on an AMD EPYC 9R14 host (AL2023, Linux 6.12, so external tracking is on; five interleaved runs, default 10 s cold timeout): Valkey 9.1 with its bundled jemalloc 85 % RSS reduction after a 3 M-op fill (0 % with `SMASH_TRACK_EXTERNAL=0`), mimalloc and tcmalloc test programs 93–94 %, a CPython 3.12 dict workload 80–81 % (8 % with it off). The paper workloads, which allocate through `malloc`, measure the same with it on or off (largest difference RocksDB 85.8 vs 85.4 %). It costs fill time on programs that map a lot of memory quickly (+6 % mimalloc, +11 % tcmalloc, +8–10 % CPython; Valkey +0.2–0.6 %) and 2–3 % peak RSS. [agents/external-tracking.md](agents/external-tracking.md) has the numbers, what it changes, and what it does not cover.
 
 ### smash and zswap
 
@@ -190,7 +191,7 @@ Everything below is optional; the defaults are what the results above use.
 | `SMASH_MODE=compress_only` | Don't replace `malloc` at all; just compress cold heap pages, whichever allocator owns them. For programs linked against jemalloc or tcmalloc. |
 | `SMASH_DISABLE_SIGNAL=SIG` / `SMASH_CONTROL_FILE=path` | Kill switch: a signal or a file (`disable` / `enable`) that turns compression off and restores every page, or back on. See above. |
 | `SMASH_WATCHDOG_FAULT_RATE=N` / `SMASH_MAX_FAULT_RATE=N` | Disable compression when refaults exceed N/s, or back off the cold threshold to stay under N/s. |
-| `SMASH_TRACK_EXTERNAL=1` | Also compress private anonymous memory the program maps itself (`mmap`, `sbrk`) — this is how smash reaches a bundled jemalloc/mimalloc/tcmalloc or CPython's arenas. Opt-in; see "What memory does smash manage?" above. |
+| `SMASH_TRACK_EXTERNAL=0\|1` | Whether to compress private anonymous memory the program maps itself (`mmap`, `sbrk`) — how smash reaches a bundled jemalloc/mimalloc/tcmalloc or CPython's arenas. Unset: on where smash reclaims through userfaultfd (Linux 6.8+), off elsewhere; see "What memory does smash manage?" above. |
 
 Every other variable (tuning, compatibility and diagnostics) is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 

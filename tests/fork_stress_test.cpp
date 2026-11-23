@@ -8,9 +8,15 @@
 // path), then _exit(0)s. A child that does not finish within 20 s inherited a
 // lock held by a thread that no longer exists: the test fails (and kills it).
 //
+// External memory (exercised with SMASH_TRACK_EXTERNAL=1): a second cold
+// set mapped directly with mmap is read by the workers and verified by every
+// child, and the workers map / fill / DONTNEED / unmap extents the way a
+// bundled allocator does.
+//
 //   fork_stress_test [forks] [threads]      (defaults 120, 6)
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -25,6 +31,7 @@ namespace {
 
 constexpr size_t kColdBytes = 16u << 20;
 unsigned char* g_cold;
+unsigned char* g_ext;  // kColdBytes, mmap'd directly: external memory
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_fail{0};
 
@@ -41,9 +48,11 @@ size_t pickSize(uint64_t& r) {
     return (1u << 20) + xorshift(r) % (1u << 20);
 }
 
+constexpr size_t kExtent = 256u << 10;
 void* worker(void* arg) {
     uint64_t r = reinterpret_cast<uint64_t>(arg) | 1;
     void* slot[256] = {};
+    unsigned char* ext[8] = {};
     while (!g_stop.load(std::memory_order_relaxed)) {
         const int i = static_cast<int>(xorshift(r) % 256);
         if (slot[i]) {
@@ -62,10 +71,35 @@ void* worker(void* arg) {
         if (xorshift(r) % 8 == 0) {
             const size_t off = xorshift(r) % kColdBytes;
             if (g_cold[off] != patByte(off)) g_fail.fetch_add(1);
+            if (g_ext[off] != patByte(off)) g_fail.fetch_add(1);
+        }
+        if (xorshift(r) % 64 == 0) {
+            unsigned char*& e = ext[xorshift(r) % 8];
+            if (!e) {
+                void* m = mmap(nullptr, kExtent, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (m != MAP_FAILED) {
+                    e = static_cast<unsigned char*>(m);
+                    for (size_t j = 0; j < kExtent; ++j) e[j] = patByte(j);
+                }
+            } else {
+                for (size_t j = 0; j < kExtent; j += 997)
+                    if (e[j] != patByte(j)) g_fail.fetch_add(1);
+                if (xorshift(r) % 2) {
+                    madvise(e, kExtent, MADV_DONTNEED);  // reads zero, refilled lazily below
+                    for (size_t j = 0; j < kExtent; j += 4093)
+                        if (e[j] != 0) g_fail.fetch_add(1);
+                    for (size_t j = 0; j < kExtent; ++j) e[j] = patByte(j);
+                } else {
+                    munmap(e, kExtent);
+                    e = nullptr;
+                }
+            }
         }
         if (xorshift(r) % 2000 == 0) usleep(static_cast<useconds_t>(xorshift(r) % 20000));
     }
     for (void* p : slot) free(p);
+    for (unsigned char* e : ext)
+        if (e) munmap(e, kExtent);
     return nullptr;
 }
 
@@ -81,8 +115,19 @@ int childBody(uint64_t seed) {
         }
         for (int i = 0; i < 512; ++i) free(p[i]);
     }
-    for (size_t off = 0; off < kColdBytes; off += 1024)
-        if (g_cold[off] != patByte(off)) return 4;
+    for (int set = 0; set < 2; ++set) {
+        const unsigned char* c = set ? g_ext : g_cold;
+        for (size_t off = 0; off < kColdBytes; off += 1024)
+            if (c[off] != patByte(off)) {
+                size_t zeros = 0;  // how much of that page reads zero
+                const size_t pg = off & ~size_t{4095};
+                for (size_t k = 0; k < 4096; ++k) zeros += c[pg + k] == 0;
+                fprintf(stderr, "  child: %s cold set offset %zu (page %zu, %p) = 0x%02x want 0x%02x; "
+                        "%zu/4096 zero bytes in the page\n", set ? "external" : "malloc", off, off / 4096,
+                        static_cast<const void*>(c + pg), c[off], patByte(off), zeros);
+                return 4 + set;
+            }
+    }
     return 0;
 }
 
@@ -96,6 +141,10 @@ int main(int argc, char** argv) {
             lo && lo[0] == '1' ? "large-only" : "full");
     g_cold = static_cast<unsigned char*>(malloc(kColdBytes));
     for (size_t j = 0; j < kColdBytes; ++j) g_cold[j] = patByte(j);
+    g_ext = static_cast<unsigned char*>(mmap(nullptr, kColdBytes, PROT_READ | PROT_WRITE,
+                                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (g_ext == MAP_FAILED) { perror("mmap"); return 2; }
+    for (size_t j = 0; j < kColdBytes; ++j) g_ext[j] = patByte(j);
     sleep(3);  // let the compressor reclaim the cold set first
 
     pthread_t th[32];
@@ -139,6 +188,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; ++i) pthread_join(th[i], nullptr);
     for (size_t j = 0; j < kColdBytes; j += 4096)
         if (g_cold[j] != patByte(j)) { fprintf(stderr, "FAIL: parent cold set\n"); ++bad; break; }
+    for (size_t j = 0; j < kColdBytes; j += 4096)
+        if (g_ext[j] != patByte(j)) { fprintf(stderr, "FAIL: parent external cold set\n"); ++bad; break; }
     if (g_fail.load()) fprintf(stderr, "FAIL: %d worker mismatches\n", g_fail.load());
     fprintf(stderr, "fork_stress_test: hung=%d bad=%d -> %s\n", hung, bad,
             hung || bad || g_fail.load() ? "FAIL" : "PASS");

@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
 
 using namespace smash;
 
@@ -127,7 +129,39 @@ static void testPageLockTable() {
     plt.unlock(1);
 }
 
+// External-page tracking hash: tracking a few thousand contiguous pages
+// (RocksDB carried ~4.7K external pages) must not fault in one 4 KiB page of
+// the 32 MiB table per tracked page (it did, ~19 MB, while pages hashed one
+// by one); lookups and untracking must still work.
+static void testTrackHashLocality() {
+    VmRegion vm;
+    if (!vm.init(64 * kPageSize)) { CHECK(false, "init"); return; }
+    constexpr size_t kN = 4096;
+    void* r = mmap(nullptr, kN * kPageSize, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    CHECK(r != MAP_FAILED, "reserve");
+    const uintptr_t base = reinterpret_cast<uintptr_t>(r);
+    const size_t before = vm.trackHashResidentBytes();
+    for (size_t i = 0; i < kN; ++i)
+        CHECK(vm.trackExternalPage(base + i * kPageSize) != 0, "track page %zu", i);
+    const size_t grown = vm.trackHashResidentBytes() - before;
+    const size_t os_page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    fprintf(stderr, "vm_region: tracking %zu pages made %zu bytes (%zu OS pages) of the hash resident\n", kN,
+            grown, grown / os_page);
+    // At least 32 tracked pages per resident table page on average.
+    CHECK(grown / os_page <= kN / 32, "tracking %zu pages faulted in %zu bytes of hash table", kN, grown);
+    for (size_t i = 0; i < kN; ++i) {
+        const size_t idx = vm.pageIndex(base + i * kPageSize);
+        CHECK(idx >= vm.contigPages() && vm.pageAddress(idx) == reinterpret_cast<void*>(base + i * kPageSize),
+              "lookup of page %zu", i);
+    }
+    for (size_t i = 0; i < kN; i += 2) vm.untrackExternalPage(base + i * kPageSize, true);
+    for (size_t i = 0; i < kN; ++i)
+        CHECK(vm.contains(base + i * kPageSize) == (i % 2 == 1), "contains after untrack, page %zu", i);
+    munmap(r, kN * kPageSize);
+}
+
 int main() {
+    testTrackHashLocality();
     testBasicAlloc();
     testContains();
     testReleaseAndReuse();

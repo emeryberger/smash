@@ -94,6 +94,12 @@ struct pm_scan_arg {
 #ifndef PAGE_IS_PRESENT
 #define PAGE_IS_PRESENT (1ULL << 3)
 #endif
+#ifndef PAGE_IS_SWAPPED
+#define PAGE_IS_SWAPPED (1ULL << 4)
+#endif
+#ifndef PAGE_IS_PFNZERO
+#define PAGE_IS_PFNZERO (1ULL << 5)
+#endif
 #ifndef UFFDIO_MOVE  // Linux 6.8 uAPI; older headers lack it
 #define UFFD_FEATURE_MOVE (1ULL << 16)
 #define _UFFDIO_MOVE (0x05)
@@ -485,7 +491,13 @@ class CompressorThread {
     // every app page fault behind it (the residual p99.9 tail).
     bool wp_scan_ = false;
     std::atomic<uint64_t> uffd_move_fail_{0}, uffd_move_ok_{0}, uffd_copy_fail_{0};
-    bool uffdPage(size_t i) const { return uffd_mode_ && i < vm_->contigPages(); }
+    // A page smash reclaims with UFFDIO_MOVE and restores with UFFDIO_COPY:
+    // the arena, and every external page whose range is registered with
+    // smash's uffd for MISSING faults (ext_wp_ & kExtMiss, see
+    // registerExternalRun).
+    bool uffdPage(size_t i) const {
+        return uffd_mode_ && (i < vm_->contigPages() || (ext_wp_ && (ext_wp_[i] & kExtMiss)));
+    }
     // Record that a still-ACTIVE uffd page was armed PROT_NONE (read-check
     // fallback). compressPage's deferred snapshot skips the PROT_RW mprotect
     // for uffd pages unless prot_none_ says otherwise, so an unrecorded arm
@@ -527,6 +539,16 @@ class CompressorThread {
     // is a protection fault and takes the classic path.
     bool uffdFault(size_t i) const { return uffdPage(i) && vm::faultSignal() == SIGBUS; }
     void* scratchPage(int slot) const { return uffd_scratch_ + static_cast<size_t>(slot) * kPageSize; }
+    // smash's own ioctls bypass libsmash's exported ioctl() (which watches
+    // for an app's UFFDIO_REGISTER, see linux_syscall_wrappers.cpp).
+    static long ioctlRaw(int fd, unsigned long req, void* arg) {
+#ifdef __linux__
+        return syscall(SYS_ioctl, fd, req, arg);
+#else
+        (void)fd; (void)req; (void)arg;
+        return -1;  // only the Linux uffd / pagemap paths use it
+#endif
+    }
     // uffd messages print only when SMASH_UFFD was set explicitly; the
     // default (try uffd, fall back quietly) must not write to the app's stderr.
     bool uffd_verbose_ = false;
@@ -603,6 +625,23 @@ class CompressorThread {
     static void uffdDrop(void* page) {
         syscall(SYS_madvise, page, kPageSize, MADV_DONTNEED);  // never MADV_FREE here
     }
+    // Will uffdInit() turn uffd reclaim on? Its preconditions plus a
+    // capability probe; called during heap construction (SMASH_TRACK_EXTERNAL
+    // auto), so no allocation and no dlsym.
+public:
+    bool uffdReclaimPlanned() const {
+#ifdef __linux__
+        if (observe_ || !vm_) return false;
+        const char* e = std::getenv("SMASH_UFFD");
+        if (e && e[0] == '0') return false;
+        const char* mf = std::getenv("SMASH_MADV_FREE");
+        if (!isDeferredReclaimMode() || (mf && mf[0] == '1') || vm_->contigPages() == 0) return false;
+        return vm::uffdMoveSupported();
+#else
+        return false;
+#endif
+    }
+private:
     void uffdInit() {
         if (uffd_init_done_) return;
         uffd_init_done_ = true;
@@ -631,7 +670,7 @@ class CompressorThread {
             const char* w = std::getenv("SMASH_UFFD_WP_SCAN");
             if (w && w[0] == '0') wp = false;
         }
-        if (!wp || ioctl(fd, UFFDIO_API, &api) != 0) {
+        if (!wp || ioctlRaw(fd, UFFDIO_API, &api) != 0) {
             // No async WP (e.g. arm64 6.8): UFFDIO_API is once per fd.
             close(fd);
             fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
@@ -641,7 +680,7 @@ class CompressorThread {
             api.api = UFFD_API;
             api.features = UFFD_FEATURE_SIGBUS | UFFD_FEATURE_MOVE;
             wp = false;
-            if (ioctl(fd, UFFDIO_API, &api) != 0) {
+            if (ioctlRaw(fd, UFFDIO_API, &api) != 0) {
                 uffdLog("[smash] SMASH_UFFD: UFFDIO_API failed (needs Linux 6.8 for MOVE); off\n");
                 close(fd);
                 return;
@@ -666,12 +705,12 @@ class CompressorThread {
         sreg.range.start = reinterpret_cast<uintptr_t>(sc);
         sreg.range.len = scratch_len;
         sreg.mode = UFFDIO_REGISTER_MODE_MISSING;
-        if (ioctl(fd, UFFDIO_REGISTER, &sreg) != 0) { vm::rawMunmap(sc, scratch_len); return fail("scratch REGISTER"); }
+        if (ioctlRaw(fd, UFFDIO_REGISTER, &sreg) != 0) { vm::rawMunmap(sc, scratch_len); return fail("scratch REGISTER"); }
         struct uffdio_register reg{};
         reg.range.start = reinterpret_cast<uintptr_t>(vm_->base());
         reg.range.len = vm_->contigPages() * kPageSize;
         reg.mode = UFFDIO_REGISTER_MODE_MISSING | (wp ? UFFDIO_REGISTER_MODE_WP : 0);
-        if (ioctl(fd, UFFDIO_REGISTER, &reg) != 0) { vm::rawMunmap(sc, scratch_len); return fail("arena REGISTER"); }
+        if (ioctlRaw(fd, UFFDIO_REGISTER, &reg) != 0) { vm::rawMunmap(sc, scratch_len); return fail("arena REGISTER"); }
         wp_scan_ = wp;
         vm::g_uffd_wp = wp;
         uffd_ = fd;
@@ -726,11 +765,90 @@ class CompressorThread {
             const PageState pre = states_->get(i);
             if (pre != PageState::COMPRESSED && pre != PageState::COMPRESSED_SHADOW) continue;
             locks_->lock(i);
-            if (states_->get(i) == PageState::COMPRESSED) {
-                vm::protectPages(vm_->pageAddress(i), kPageSize, false, false);
-                prot_none_[i] = 1;
-            }
+            if (states_->get(i) == PageState::COMPRESSED) protectForFork(i);
             locks_->unlock(i);
+        }
+        // External pages reclaimed through uffd are MISSING the same way;
+        // the child's copy of their VMA is not registered either.
+        const size_t committed = vm_->committedPages();
+        if (!ext_wp_ || committed <= vm_->contigPages() || ext_uffd_pages_.load(std::memory_order_relaxed) == 0)
+            return;
+        for (size_t i = vm_->contigPages(); i < committed; ++i) {
+            if (!(ext_wp_[i] & kExtMiss)) continue;
+            const PageState pre = states_->get(i);
+            if (pre != PageState::COMPRESSED && pre != PageState::COMPRESSED_SHADOW) continue;
+            locks_->lock(i);
+            if (states_->get(i) == PageState::COMPRESSED && uffdPage(i)) protectForFork(i);
+            locks_->unlock(i);
+        }
+    }
+    // The parent needs none of the PROT_NONEs uffdPrepareFork applied once
+    // fork() has returned: the child has its own copy of the VMAs (and keeps
+    // them protected), and the parent still has its uffd, under which a
+    // MISSING page faults to smash anyway. Left in place they fragmented the
+    // parent: bundled-jemalloc Valkey sat at ~40K VMAs after one BGSAVE (137
+    // before it), each later fork adding more. The first tick after the fork
+    // makes them RW again in address-contiguous runs (tryLock only:
+    // loosening a protection cannot fault an app thread, and no lock is
+    // waited for), never while another fork is pending; a page the app
+    // touched in between was restored and unprotected by the fault path.
+    static constexpr uint8_t kProtNoneFork = 2;  // prot_none_ value set by uffdPrepareFork
+    std::atomic<bool> fork_unprotect_{false};
+    void unprotectAfterFork() {
+        fork_unprotect_.store(false, std::memory_order_relaxed);
+        if (!uffd_mode_ || !prot_none_) return;
+        bool retry = false;
+        const size_t committed = vm_->committedPages();
+        constexpr size_t kRun = 256;
+        size_t run[kRun];
+        size_t i = 0;
+        while (i < committed) {
+            if (prot_none_[i] != kProtNoneFork) { ++i; continue; }
+            size_t n = 0, j = i;
+            uintptr_t expect = 0;
+            while (j < committed && n < kRun && prot_none_[j] == kProtNoneFork) {
+                const uintptr_t a = reinterpret_cast<uintptr_t>(vm_->pageAddress(j));
+                if (!a || (n && a != expect)) break;
+                if (!locks_->tryLock(j)) { retry = true; break; }
+                const PageState st = states_->get(j);
+                if (forkPending()) retry = true;
+                if (forkPending() || prot_none_[j] != kProtNoneFork ||
+                    (st != PageState::COMPRESSED && st != PageState::EMPTY)) {
+                    locks_->unlock(j);
+                    break;
+                }
+                run[n++] = j;
+                expect = a + kPageSize;
+                ++j;
+            }
+            if (n) {
+                if (vm::protectPages(vm_->pageAddress(run[0]), n * kPageSize, true, true)) {
+                    for (size_t k = 0; k < n; ++k) prot_none_[run[k]] = 0;
+                } else {
+                    retry = true;
+                }
+                for (size_t k = 0; k < n; ++k) locks_->unlock(run[k]);
+                i = j;
+            } else {
+                ++i;
+            }
+        }
+        if (retry) fork_unprotect_.store(true, std::memory_order_relaxed);
+    }
+    // Page lock held, page COMPRESSED (MISSING). If the PROT_NONE fails (VMA
+    // cap: the page sits between accessible neighbors), the child would read
+    // the MISSING page as zeros: decompress it into place instead.
+    void protectForFork(size_t i) {
+        void* a = vm_->pageAddress(i);
+        if (vm::protectPages(a, kPageSize, false, false)) {
+            prot_none_[i] = kProtNoneFork;  // dropped again after the fork: unprotectAfterFork
+            return;
+        }
+        if (!restoreCompressedLocked(i, a)) {
+            // Cannot happen for a MISSING uffd page (UFFDIO_COPY needs no
+            // VMA change); report it rather than fork silently.
+            const char m[] = "[smash] fork: a compressed page could be neither protected nor restored\n";
+            (void)!write(2, m, sizeof(m) - 1);
         }
     }
 #else
@@ -739,8 +857,14 @@ class CompressorThread {
     bool uffdMove(void*, void*) { return false; }
     bool uffdWp(void*, bool) { return false; }
     static void uffdDrop(void*) {}
+public:
+    bool uffdReclaimPlanned() const { return false; }
+private:
     void uffdInit() {}
     void uffdPrepareFork() {}
+    static constexpr uint8_t kProtNoneFork = 2;
+    std::atomic<bool> fork_unprotect_{false};
+    void unprotectAfterFork() { fork_unprotect_.store(false, std::memory_order_relaxed); }
 #endif
     // uffd mode never splits arena VMAs, so it skips the /proc scan — but
     // EXTERNAL pages always take the classic mprotect path, which splits
@@ -1611,6 +1735,7 @@ public:
 
     // Resume after fork() in the parent.
     void resumeAfterFork() {
+        if (uffd_mode_) fork_unprotect_.store(true, std::memory_order_relaxed);
         fork_prepared_.store(false, std::memory_order_release);
         ext_fork_pending_.store(false, std::memory_order_release);
         paused_.store(false, std::memory_order_release);
@@ -1623,6 +1748,7 @@ public:
     // Without this, the singleton's startCompression() CAS fails (because
     // compression_started_ is true) and the child runs with no compressor.
     void resetForFork() {
+        fork_unprotect_.store(false, std::memory_order_relaxed);  // the child keeps them
         fork_prepared_.store(false, std::memory_order_release);
         ext_fork_pending_.store(false, std::memory_order_release);
         ext_detach_inflight_.store(0, std::memory_order_release);
@@ -3973,6 +4099,37 @@ private:
     // For pages in COMPRESSED_SHADOW, verify content hasn't changed since
     // Phase A, then reclaim physical memory (decommit + PROT_NONE).
 
+    // UFFDIO_MOVE refuses (EBUSY) a page that is not PageAnonExclusive.
+    // After a fork every page resident at that moment stays non-exclusive in
+    // the parent until it is written, even once the child has exited, so a
+    // page that went cold after a fork could never be reclaimed again (in
+    // Valkey: everything resident at a BGSAVE). If pagemap says this process
+    // is the only one mapping it (bit 56: the child is gone), a write fault
+    // that changes no data (MADV_POPULATE_WRITE) reuses the frame and marks
+    // it exclusive, and the MOVE can be retried. While a child still maps it
+    // unsharing would copy the page and cost memory, so the caller discards
+    // the shadow instead (noteMoveRefused). A pinned page is exclusive
+    // already: the populate is a no-op and MOVE refuses again. Page lock
+    // held; never while a fork is pending.
+    std::atomic<uint64_t> uffd_unshare_{0};
+    bool unshareForMove(void* page_addr) {
+#ifdef __linux__
+        if (pagemap_fd_ < 0 || forkPending()) return false;
+        uint64_t e = 0;
+        const off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(page_addr) / kPageSize * sizeof(e));
+        if (pread(pagemap_fd_, &e, sizeof(e), off) != static_cast<ssize_t>(sizeof(e))) return false;
+        if (!((e >> 63) & 1) || !((e >> 56) & 1)) return false;  // not present / still shared
+        if (syscall(SYS_madvise, page_addr, kPageSize, 23 /* MADV_POPULATE_WRITE */) != 0) return false;
+        uffd_unshare_.fetch_add(1, std::memory_order_relaxed);
+        if (wp_scan_) uffdWp(page_addr, false);  // the write fault resolved it; keep MOVE's precondition
+        errno = EBUSY;
+        return true;
+#else
+        (void)page_addr;
+        return false;
+#endif
+    }
+
     // uffd reclaim of a verified-idle COMPRESSED_SHADOW page; called with
     // the page lock held, releases it. Returns false (lock still held, page
     // untouched) if the MOVE is refused, so the caller can fall back.
@@ -3985,7 +4142,9 @@ private:
         void* scratch = scratchPage(slot);
         // MOVE refuses a uffd-wp'd PTE (EBUSY); the page is cold, clear it.
         if (wp_scan_) uffdWp(page_addr, false);
-        if (!uffdMove(scratch, page_addr)) {
+        bool moved = uffdMove(scratch, page_addr);
+        if (!moved && errno == EBUSY && unshareForMove(page_addr)) moved = uffdMove(scratch, page_addr);
+        if (!moved) {
             if (uffd_move_fail_.fetch_add(1, std::memory_order_relaxed) == 0) {
                 char b[96];
                 int n = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); shadow discarded\n", errno);
@@ -4048,7 +4207,12 @@ private:
         if (wp_scan_) {  // MOVE refuses a uffd-wp'd PTE; the pages are cold
             for (int k = 0; k < n;) {
                 int e = k + 1;
-                while (e < n && rb[e] == rb[e - 1] + 1) ++e;
+                // Index AND address contiguous: consecutive external slots
+                // need not be adjacent pages.
+                while (e < n && rb[e] == rb[e - 1] + 1 &&
+                       static_cast<char*>(vm_->pageAddress(rb[e])) ==
+                           static_cast<char*>(vm_->pageAddress(rb[e - 1])) + kPageSize)
+                    ++e;
                 uffdWp(vm_->pageAddress(rb[k]), false, static_cast<size_t>(e - k) * kPageSize);
                 k = e;
             }
@@ -4063,7 +4227,9 @@ private:
                 locks_->unlock(i);
                 continue;
             }
-            if (!uffdMove(scratch, page_addr)) {
+            bool moved = uffdMove(scratch, page_addr);
+            if (!moved && errno == EBUSY && unshareForMove(page_addr)) moved = uffdMove(scratch, page_addr);
+            if (!moved) {
                 if (uffd_move_fail_.fetch_add(1, std::memory_order_relaxed) == 0) {
                     char b[96];
                     int m = smash::safe_snprintf(b, sizeof(b), "[smash] uffd MOVE refused (errno %d); shadow discarded\n", errno);
@@ -4404,7 +4570,7 @@ private:
                     locks_->unlock(i);
                     continue;
                 }
-                if (uffd_mode_ && i < vm_->contigPages()) prot_none_[i] = 1;  // classic drop
+                if (uffdPage(i)) prot_none_[i] = 1;  // classic drop
                 shadow_tick_[i] = 0;
                 states_->set(i, PageState::COMPRESSED);
                 // FixAv: PROT_NONE → membarrier → madvise so a remote reader
@@ -4785,7 +4951,7 @@ private:
         }
         if (uffd_mode_) {
             const size_t pi = vm_->pageIndex(reinterpret_cast<uintptr_t>(page_addr));
-            if (pi < vm_->contigPages()) {
+            if (uffdPage(pi)) {
                 // Dropped page (MISSING): install the bytes atomically.
                 // A page protected PROT_NONE for an earlier fork: copy first,
                 // while it is still PROT_NONE (UFFDIO_COPY installs into an
@@ -5313,7 +5479,7 @@ private:
             a.vec_len = kVec;
             a.category_mask = PAGE_IS_WRITTEN;
             a.return_mask = PAGE_IS_WRITTEN;
-            const long n = ioctl(pagemap_fd_, PAGEMAP_SCAN, &a);
+            const long n = ioctlRaw(pagemap_fd_, PAGEMAP_SCAN, &a);
             if (n < 0) {
                 static std::atomic<int> warned{0};
                 if (warned.fetch_add(1) == 0) {
@@ -5340,88 +5506,243 @@ private:
 #endif
     }
 
-    // uffd-wp write tracking for EXTERNAL (SMASH_TRACK_EXTERNAL) pages. With
-    // clear_refs gone in wp mode their soft-dirty bits never reset, so they
-    // used to be treated as always-written — i.e. never compressed on any
-    // kernel with async uffd-wp (x86-64 6.7+). Instead, register each run of
-    // address-contiguous tracked pages for async write-protect (WP only, no
-    // MISSING: first touch stays an ordinary kernel zero-fill, nothing reaches
-    // smash's SIGBUS path) on first sight, then PAGEMAP_SCAN it each tick like
-    // the arena. A run that can't be registered (e.g. the mapping is gone)
-    // falls back to "written". Registration does not survive fork (no
-    // EVENT_FORK) or mremap (no EVENT_REMAP); the child uses soft-dirty and a
-    // moved range is re-registered by mremap's re-track.
-    uint8_t* ext_wp_ = nullptr;  // per page idx: 0 = not registered, 1 = registered
+    // External (SMASH_TRACK_EXTERNAL) pages and smash's userfaultfd.
+    //
+    // Reclaim. External pages used to take the classic path (PROT_NONE +
+    // MADV_DONTNEED), which splits a VMA at every compressed/accessible
+    // boundary: Valkey with a bundled jemalloc parked at the
+    // vm.max_map_count guard (~57K VMAs) with most of its cold heap
+    // uncompressed. Now each run of address-contiguous tracked pages is
+    // registered with smash's uffd for MISSING faults (plus async WP on
+    // kernels that have it) on first sight, and its pages are reclaimed with
+    // UFFDIO_MOVE and restored with UFFDIO_COPY exactly like the arena: no
+    // protection change, no VMA split. Registration first maps every
+    // never-touched page of the run to the zero page (no RSS; the first write
+    // is an ordinary kernel CoW fault): a MISSING PTE in a registered range
+    // turns a kernel-mode access (read() into it) into EFAULT. For the same
+    // reason a discard madvise of such pages is followed by a refill
+    // (refillExternalRange), MADV_FREE on them becomes MADV_DONTNEED, and a
+    // page that leaves tracking while its range stays mapped is unregistered
+    // (detachExternalRange). SMASH_EXT_UFFD=0 keeps the classic path.
+    //
+    // Fallbacks: a range another uffd already owns (EBUSY: the app's own
+    // userfaultfd) is never compressed (kExtForeign); any other registration
+    // failure keeps the classic path (uffd-wp only where available, as
+    // before). Registration does not survive fork (no EVENT_FORK: the child
+    // runs classic, and uffdPrepareFork protects every MISSING page first) or
+    // mremap (the wrapper restores, unregisters and re-tracks).
+    //
+    // Write tracking (wp mode, x86-64 6.7+): PAGEMAP_SCAN each tick like the
+    // arena. Never-touched pages (not present, or the zero page) count as
+    // written: there is nothing to save.
+    static constexpr uint8_t kExtWp = 1;       // registered for async uffd-wp
+    static constexpr uint8_t kExtMiss = 2;     // registered MISSING: uffd reclaim
+    static constexpr uint8_t kExtForeign = 4;  // another uffd owns it: never compress
+    static constexpr uint8_t kExtClassic = 8;  // MISSING registration failed: classic reclaim
+    uint8_t* ext_wp_ = nullptr;  // per page idx: kExt* flags
+    std::atomic<size_t> ext_uffd_pages_{0};  // tracked pages with kExtMiss
+    uint8_t ext_uffd_ever_ = 0;  // a MISSING registration was ever made (stray-fault check)
+    bool cfg_ext_uffd_ = true;   // SMASH_EXT_UFFD (default 1)
+    std::atomic<uint64_t> ext_reg_ok_{0}, ext_reg_busy_{0}, ext_reg_fail_{0};
+
+    // Contiguous run [i, j) of tracked external pages starting at a0 whose
+    // registration state is still undecided (ext_wp_ == 0). Registers it and
+    // returns the flags now set (0: registration failed, or the run changed
+    // under us; retried next tick).
+    uint8_t registerExternalRun(size_t i, size_t j, uintptr_t a0) {
+#ifdef __linux__
+        const uint64_t len = static_cast<uint64_t>(j - i) * kPageSize;
+        uint8_t f = 0;
+        if (cfg_ext_uffd_) {
+            // Under the track lock no page of the run can be untracked (and
+            // its index recycled) between this check and the REGISTER; a
+            // detach after it reads the flags and unregisters. Only a run of
+            // ACTIVE pages switches: a page compressed the classic way (e.g.
+            // before a fork) must keep the classic restore.
+            vm_->lockTracking();
+            bool ok = true;
+            for (size_t k = i; k < j && ok; ++k)
+                ok = vm_->pageIndex(a0 + (k - i) * kPageSize) == k && ext_wp_[k] == 0 &&
+                     states_->get(k) == PageState::ACTIVE;
+            if (!ok) { vm_->unlockTracking(); return 0; }
+            ext_uffd_ever_ = 1;
+            // Flag first: a MISSING fault on a never-touched page between the
+            // REGISTER and the zero-fill below resolves in handleFault.
+            for (size_t k = i; k < j; ++k) ext_wp_[k] = kExtMiss;
+            struct uffdio_register reg{};
+            reg.range.start = a0;
+            reg.range.len = len;
+            reg.mode = UFFDIO_REGISTER_MODE_MISSING | (wp_scan_ ? UFFDIO_REGISTER_MODE_WP : 0);
+            const bool reg_ok = syscall(SYS_ioctl, uffd_, UFFDIO_REGISTER, &reg) == 0;
+            const int err = errno;
+            if (reg_ok) {
+                f = kExtMiss | (wp_scan_ ? kExtWp : 0);
+                for (size_t k = i; k < j; ++k) ext_wp_[k] = f;
+                ext_uffd_pages_.fetch_add(j - i, std::memory_order_relaxed);
+                ext_reg_ok_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // EBUSY: another uffd owns it. Otherwise, without uffd-wp to
+                // fall back on, settle on the classic path for good.
+                const uint8_t g = err == EBUSY ? kExtForeign : (wp_scan_ ? 0 : kExtClassic);
+                for (size_t k = i; k < j; ++k) ext_wp_[k] = g;
+            }
+            vm_->unlockTracking();
+            if (reg_ok) {
+                zeroFillExternal(a0, a0 + len);
+                return f;
+            }
+            if (err == EBUSY) {
+                ext_reg_busy_.fetch_add(1, std::memory_order_relaxed);
+                return kExtForeign;
+            }
+            ext_reg_fail_.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Classic reclaim; uffd-wp write tracking only (as before).
+        if (wp_scan_) {
+            struct uffdio_register reg{};
+            reg.range.start = a0;
+            reg.range.len = len;
+            reg.mode = UFFDIO_REGISTER_MODE_WP;
+            if (syscall(SYS_ioctl, uffd_, UFFDIO_REGISTER, &reg) == 0) {
+                for (size_t k = i; k < j; ++k) ext_wp_[k] = kExtWp;
+                return kExtWp;
+            }
+            if (errno == EBUSY) {
+                for (size_t k = i; k < j; ++k) ext_wp_[k] = kExtForeign;
+                ext_reg_busy_.fetch_add(1, std::memory_order_relaxed);
+                return kExtForeign;
+            }
+        }
+        return f;
+#else
+        (void)i; (void)j; (void)a0;
+        return 0;
+#endif
+    }
+
+    // Map the never-touched (not present, not swapped) pages of a freshly
+    // registered range to the zero page. PAGEMAP_SCAN finds the holes, so a
+    // fully resident range costs one ioctl, not one EEXIST per page.
+    void zeroFillExternal(uintptr_t lo, uintptr_t hi) {
+#ifdef __linux__
+        if (pagemap_fd_ < 0) { vm::uffdZeroFillRange(lo, hi); return; }
+        constexpr size_t kVec = 128;
+        struct page_region vec[kVec];
+        uint64_t start = lo;
+        while (start < hi) {
+            struct pm_scan_arg a{};
+            a.size = sizeof(a);
+            a.start = start;
+            a.end = hi;
+            a.vec = reinterpret_cast<uintptr_t>(vec);
+            a.vec_len = kVec;
+            a.category_inverted = PAGE_IS_PRESENT | PAGE_IS_SWAPPED;
+            a.category_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED;
+            a.return_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED;
+            const long n = ioctlRaw(pagemap_fd_, PAGEMAP_SCAN, &a);
+            if (n < 0) { vm::uffdZeroFillRange(start, hi); return; }
+            for (long r = 0; r < n; ++r) vm::uffdZeroFillRange(vec[r].start, vec[r].end);
+            if (a.walk_end <= start) break;
+            start = a.walk_end;
+        }
+#else
+        (void)lo; (void)hi;
+#endif
+    }
+
+    // Walk the external pages in runs of address-contiguous tracked pages
+    // with the same registration state; register undecided runs.
+    // fn(i, j, a0, flags) is called for every decided run.
+    template <class Fn>
+    void forExternalRuns(size_t committed, Fn&& fn) {
+        constexpr size_t kMaxRun = 4096;  // 16 MiB per ioctl (mmap_lock hold)
+        size_t i = vm_->contigPages();
+        while (i < committed) {
+            const uintptr_t a0 = reinterpret_cast<uintptr_t>(vm_->pageAddress(i));
+            if (!a0 || states_->get(i) == PageState::EMPTY) { ++i; continue; }
+            const bool decided = ext_wp_[i] != 0;
+            size_t j = i + 1;
+            while (j < committed && j - i < kMaxRun &&
+                   reinterpret_cast<uintptr_t>(vm_->pageAddress(j)) == a0 + (j - i) * kPageSize &&
+                   states_->get(j) != PageState::EMPTY && (ext_wp_[j] != 0) == decided)
+                ++j;
+            const uint8_t f = decided ? ext_wp_[i] : registerExternalRun(i, j, a0);
+            fn(i, j, a0, f, !decided);
+            i = j;
+        }
+    }
+
+    // Soft-dirty mode (no async uffd-wp, e.g. arm64 6.8) with uffd on:
+    // register external runs for MISSING faults only. Write tracking stays
+    // soft-dirty (readSoftDirty); runs another uffd owns count as written.
+    void registerExternalNoWp(size_t committed) {
+#ifdef __linux__
+        if (!ext_wp_ || !uffd_mode_ || committed <= vm_->contigPages()) return;
+        forExternalRuns(committed, [&](size_t i, size_t j, uintptr_t, uint8_t f, bool fresh) {
+            if (fresh || (f & kExtForeign))
+                for (size_t k = i; k < j; ++k) accessed_[k].store(true, std::memory_order_relaxed);
+        });
+#else
+        (void)committed;
+#endif
+    }
+
     void scanExternalWritten(size_t committed) {
 #ifdef __linux__
         if (!ext_wp_) return;
-        constexpr size_t kMaxRun = 4096;  // 16 MiB per ioctl (mmap_lock READ hold)
         constexpr size_t kVec = 256;
         struct page_region vec[kVec];
         auto markAll = [&](size_t lo, size_t hi) {
             for (size_t k = lo; k < hi; ++k) accessed_[k].store(true, std::memory_order_relaxed);
         };
-        size_t i = vm_->contigPages();
-        while (i < committed) {
-            const uintptr_t a0 = reinterpret_cast<uintptr_t>(vm_->pageAddress(i));
-            if (!a0 || states_->get(i) == PageState::EMPTY) { ++i; continue; }
-            size_t j = i + 1;
-            bool registered = ext_wp_[i] == 1;
-            while (j < committed && j - i < kMaxRun &&
-                   reinterpret_cast<uintptr_t>(vm_->pageAddress(j)) == a0 + (j - i) * kPageSize &&
-                   states_->get(j) != PageState::EMPTY) {
-                registered = registered && ext_wp_[j] == 1;
-                ++j;
-            }
-            const uint64_t len = (j - i) * kPageSize;
-            if (!registered) {
-                struct uffdio_register reg{};
-                reg.range.start = a0;
-                reg.range.len = len;
-                reg.mode = UFFDIO_REGISTER_MODE_WP;
-                if (ioctl(uffd_, UFFDIO_REGISTER, &reg) == 0)
-                    for (size_t k = i; k < j; ++k) ext_wp_[k] = 1;
-                // Unknown write history this tick either way.
-                markAll(i, j);
-                i = j;
-                continue;
-            }
-            uint64_t start = a0;
-            const uint64_t end = a0 + len;
-            while (start < end) {
-                struct pm_scan_arg a{};
-                a.size = sizeof(a);
-                a.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
-                a.start = start;
-                a.end = end;
-                a.vec = reinterpret_cast<uintptr_t>(vec);
-                a.vec_len = kVec;
-                // Match pages that were written OR are not present. A
-                // never-touched page of a big reservation (mimalloc maps 1 GiB
-                // arenas MAP_NORESERVE) holds nothing to save; "compressing"
-                // it would only turn the app's first touch into a SIGSEGV +
-                // mprotect round trip. Both count as not-cold.
-                a.category_inverted = PAGE_IS_PRESENT;
-                a.category_anyof_mask = PAGE_IS_WRITTEN | PAGE_IS_PRESENT;
-                a.return_mask = PAGE_IS_WRITTEN | PAGE_IS_PRESENT;
-                const long n = ioctl(pagemap_fd_, PAGEMAP_SCAN, &a);
-                if (n < 0) {
-                    // Registration lost (range remapped / unmapped): re-register
-                    // next tick, count as written now.
-                    for (size_t k = i; k < j; ++k) ext_wp_[k] = 0;
-                    markAll(i, j);
-                    break;
+        forExternalRuns(committed, [&](size_t i, size_t j, uintptr_t a0, uint8_t f, bool fresh) {
+            // Just registered, failed, or owned by another uffd: unknown
+            // write history this tick / never compress.
+            if (fresh || !(f & kExtWp)) { markAll(i, j); return; }
+            const uint64_t end = a0 + static_cast<uint64_t>(j - i) * kPageSize;
+            // Two passes. (1) Written pages, re-protected (WP_MATCHING) as
+            // in the arena scan. Only present pages may match: for a matched
+            // empty PTE the kernel installs a uffd-wp marker, so a reclaimed
+            // (MISSING) page would no longer be a plain empty PTE. (2) No
+            // write-protect: pages not present or mapping the zero page. A
+            // never-touched page of a big reservation (mimalloc maps 1 GiB
+            // arenas MAP_NORESERVE; registration maps the untouched part to
+            // the zero page) holds nothing to save. Both count as not-cold.
+            for (int pass = 0; pass < 2; ++pass) {
+                uint64_t start = a0;
+                while (start < end) {
+                    struct pm_scan_arg a{};
+                    a.size = sizeof(a);
+                    a.start = start;
+                    a.end = end;
+                    a.vec = reinterpret_cast<uintptr_t>(vec);
+                    a.vec_len = kVec;
+                    if (pass == 0) {
+                        a.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+                        a.category_mask = PAGE_IS_WRITTEN | PAGE_IS_PRESENT;
+                        a.return_mask = PAGE_IS_WRITTEN;
+                    } else {
+                        a.category_inverted = PAGE_IS_PRESENT;
+                        a.category_anyof_mask = PAGE_IS_PRESENT | PAGE_IS_PFNZERO;
+                        a.return_mask = PAGE_IS_PRESENT | PAGE_IS_PFNZERO;
+                    }
+                    const long n = ioctlRaw(pagemap_fd_, PAGEMAP_SCAN, &a);
+                    if (n < 0) {
+                        // Range unmapped / remapped under us: count as written
+                        // now; the interposer's detach settles the pages.
+                        markAll(i, j);
+                        return;
+                    }
+                    for (long r = 0; r < n; ++r) {
+                        const size_t lo = i + (vec[r].start - a0) / kPageSize;
+                        const size_t hi = i + (vec[r].end - a0) / kPageSize;
+                        markAll(lo, hi < j ? hi : j);
+                    }
+                    if (a.walk_end <= start) break;
+                    start = a.walk_end;
                 }
-                for (long r = 0; r < n; ++r) {
-                    const size_t lo = i + (vec[r].start - a0) / kPageSize;
-                    const size_t hi = i + (vec[r].end - a0) / kPageSize;
-                    markAll(lo, hi < j ? hi : j);
-                }
-                if (a.walk_end <= start) break;
-                start = a.walk_end;
             }
-            i = j;
-        }
+        });
 #else
         (void)committed;
 #endif
@@ -5511,8 +5832,14 @@ private:
                 // Written (soft-dirty, bit 55) or neither present (63) nor
                 // swapped (62): a never-touched page of a reservation has
                 // nothing to compress (see scanExternalWritten).
+                // A uffd-registered page that is present but not exclusively
+                // mapped (bit 56) is the zero page registration mapped in,
+                // or shared copy-on-write with a fork child, which
+                // UFFDIO_MOVE refuses: nothing to reclaim either way.
+                const bool shared_uffd = ext_wp_ && (ext_wp_[i] & kExtMiss) &&
+                                         (entry & (1ULL << 63)) && !(entry & (1ULL << 56));
                 if (got == sizeof(entry) &&
-                    ((entry & (1ULL << 55)) || !(entry & (3ULL << 62)))) {
+                    ((entry & (1ULL << 55)) || !(entry & (3ULL << 62)) || shared_uffd)) {
                     accessed_[i].store(true, std::memory_order_relaxed);
                 }
             }
@@ -6413,7 +6740,24 @@ private:
         }
 #endif
         left += sweepProtectedActive(committed);
+        if (left == 0) unregisterAllExternal(committed);
         return left;
+    }
+
+    // Inert: drop every external uffd registration (all pages are plain
+    // resident memory by now), so smash's uffd no longer covers any app page.
+    // Re-enabling registers the runs again on first sight.
+    void unregisterAllExternal(size_t committed) {
+        if (!ext_wp_ || committed <= vm_->contigPages()) return;
+        UnregRun ur{this};
+        for (size_t i = vm_->contigPages(); i < committed; ++i) {
+            const uint8_t f = ext_wp_[i];
+            if (!f) continue;
+            const uintptr_t a = reinterpret_cast<uintptr_t>(vm_->pageAddress(i));
+            if (a && (f & (kExtMiss | kExtWp))) ur.add(a);
+            if (f & kExtMiss) ext_uffd_pages_.fetch_sub(1, std::memory_order_relaxed);
+            ext_wp_[i] = 0;
+        }
     }
 
     // A batched Phase 3 mprotect(PROT_READ) can land on a page a concurrent
@@ -6549,6 +6893,7 @@ private:
             if (store_) store_->trim();
             return;
         }
+        if (fork_unprotect_.load(std::memory_order_relaxed)) unprotectAfterFork();
         // Time-budget recompute is cheap (~144-4600 buckets sorted) and only
         // runs every kBudgetRecomputeEveryTicks ticks. When the budget knob
         // is unset this still runs but the inner loop short-circuits to the
@@ -6717,6 +7062,7 @@ private:
         if (softdirty) {
             scanned = scanWrittenPages(committed);
             if (!scanned) readSoftDirty(0, committed);
+            if (!scanned) registerExternalNoWp(committed);
         }
 #ifndef __linux__
         if (committed > vm_->contigPages()) markNonResidentExternal(committed);
@@ -7333,6 +7679,7 @@ public:
         // and unconditional init keeps pointer-null checks out of fault path.
         deferred_pending_ = bootstrapArray<std::atomic<bool>>(max_pages);
         ext_wp_ = bootstrapArray<uint8_t>(max_pages);  // demand-zero; external pages only
+        if (const char* e = std::getenv("SMASH_EXT_UFFD")) cfg_ext_uffd_ = e[0] != '0';
         deferred_queue_tick_ = bootstrapArray<uint32_t>(max_pages);
 
         // Per-bucket recompression EMA table (kNumArenas × kNumClasses entries).
@@ -7830,6 +8177,11 @@ public:
             (void)!write(2, msg, sizeof(msg) - 1);
         }
         uffdInit();
+        // Auto-enabled external tracking stays on if uffd init failed after
+        // the probe succeeded (pages may already be tracked; the classic path
+        // handles them as with SMASH_TRACK_EXTERNAL=1); record why.
+        if (!uffd_mode_ && vm::g_te_why.load(std::memory_order_acquire) == vm::kTeAutoUffd)
+            vm::g_te_why.store(vm::kTeAutoUffdFailed, std::memory_order_release);
         if (cfg_start_disabled_ && !ks_disabled_.load(std::memory_order_relaxed)) {
             setReason(safety::kReasonStartup, nullptr);
             ks_disabled_.store(true, std::memory_order_release);
@@ -8059,10 +8411,20 @@ public:
             size_t ext_c = 0;
             for (size_t i = contig; i < total; ++i)
                 if (self->states_->get(i) == PageState::COMPRESSED) ++ext_c;
+            // uffd = tracked pages reclaimed through userfaultfd (no VMA
+            // splits); busy = runs another uffd owns (never compressed);
+            // vmas = /proc/self/maps lines now.
             n = smash::safe_snprintf(buf, sizeof(buf),
-                "[smash stats] external live=%zu cpages=%zu slots_hw=%zu\n",
+                "[smash stats] external %s live=%zu cpages=%zu slots_hw=%zu uffd=%zu busy=%llu "
+                "regfail=%llu unshare=%llu vmas=%ld\n",
+                vm::teReason(),
                 self->vm_->externalLivePages(), ext_c,
-                total > contig ? total - contig : size_t{0});
+                total > contig ? total - contig : size_t{0},
+                self->ext_uffd_pages_.load(std::memory_order_relaxed),
+                (unsigned long long)self->ext_reg_busy_.load(std::memory_order_relaxed),
+                (unsigned long long)self->ext_reg_fail_.load(std::memory_order_relaxed),
+                (unsigned long long)self->uffd_unshare_.load(std::memory_order_relaxed),
+                readVmaCount());
             if (n > 0) (void)!write(2, buf, (size_t)n);
         }
 
@@ -9429,6 +9791,7 @@ public:
         char a[32], b[32], c[32];
         put("[smash report] pid=%d ran %.1f s  profile=%s mode=%s tracking=%s cold-timeout=%.0f s\n",
             pid, ran, smashProfileName(getSmashProfile()), modeName(), trackingName(), cold);
+        put("[smash report]   external mappings (SMASH_TRACK_EXTERNAL): %s\n", vm::teReason());
         fmtBytes(a, sizeof(a), peak_kb * 1024);
         fmtBytes(c, sizeof(c), cur_kb * 1024);
         put("[smash report]   RSS: peak %s, at exit %s\n", a, c);
@@ -9637,6 +10000,35 @@ public:
         return cold;
     }
 
+    // A MISSING fault (SIGBUS) on a page that is no longer tracked but still
+    // inside a range smash registered with its uffd: an app thread touched a
+    // page in the short window between untracking (munmap / mprotect /
+    // mremap / mlock detach) and UFFDIO_UNREGISTER, or between a discard
+    // madvise and its zero-fill. The page holds nothing smash owns: map the
+    // zero page, exactly what the kernel would have done unregistered.
+    // ZEROPAGE fails (ENOENT) on memory not registered with smash's uffd, so
+    // an app's own SIGBUS still reaches the app.
+    bool strayExternalMissing(uintptr_t addr) {
+#ifdef __linux__
+        if (!uffd_mode_ || vm::faultSignal() != SIGBUS || ext_uffd_ever_ == 0) return false;
+        void* page = reinterpret_cast<void*>(addr & ~(uintptr_t{kPageSize} - 1));
+        struct uffdio_zeropage z{};
+        z.range.start = reinterpret_cast<uintptr_t>(page);
+        z.range.len = kPageSize;
+        if (syscall(SYS_ioctl, uffd_, UFFDIO_ZEROPAGE, &z) == 0) return true;
+        if (errno == EAGAIN) return true;  // retry the access
+        if (errno == EEXIST && wp_scan_) {  // a wp marker left by a zap
+            uffdWp(page, false);
+            z.zeropage = 0;
+            return syscall(SYS_ioctl, uffd_, UFFDIO_ZEROPAGE, &z) == 0 || errno == EEXIST;
+        }
+        return false;
+#else
+        (void)addr;
+        return false;
+#endif
+    }
+
     bool handleFault(uintptr_t addr) {
         // Health accounting for the watchdog / SLO controller / kill-switch
         // status: relaxed counters, plus clock_gettime (async-signal-safe)
@@ -9651,7 +10043,7 @@ public:
     }
 
     bool handleFaultImpl(uintptr_t addr) {
-        if (!vm_->contains(addr)) return false;
+        if (!vm_->contains(addr)) return strayExternalMissing(addr);
 
         size_t page_idx = vm_->pageIndex(addr);
 
@@ -10033,15 +10425,51 @@ public:
         ~DetachGate() { t->ext_detach_inflight_.fetch_sub(1, std::memory_order_seq_cst); }
     };
 
+    // Pages leaving tracking whose range is registered with smash's uffd
+    // (kRestore: mprotect / mremap / MAP_FIXED / mlock / sigaltstack /
+    // madvise(WIPEONFORK...) / an app's own UFFDIO_REGISTER) are unregistered
+    // after the detach, before the app's syscall: an untracked page left
+    // registered for MISSING faults would turn the app's next madvise
+    // (DONTNEED) into a kernel-mode EFAULT trap. Address-contiguous runs, one
+    // UFFDIO_UNREGISTER each (no page lock held).
+    struct UnregRun {
+        CompressorThread* t;
+        uintptr_t lo = 0, hi = 0;
+        void add(uintptr_t a) {
+            if (hi == a) { hi += kPageSize; return; }
+            flush();
+            lo = a; hi = a + kPageSize;
+        }
+        void flush() {
+            if (hi > lo) t->uffdUnregister(lo, hi - lo);
+            lo = hi = 0;
+        }
+        ~UnregRun() { flush(); }
+    };
+    void uffdUnregister(uintptr_t lo, size_t len) {
+#ifdef __linux__
+        if (uffd_ < 0) return;
+        struct uffdio_range r{};
+        r.start = lo;
+        r.len = len;
+        (void)syscall(SYS_ioctl, uffd_, UFFDIO_UNREGISTER, &r);
+#else
+        (void)lo; (void)len;
+#endif
+    }
+
     size_t detachExternalRange(uintptr_t start, uintptr_t end, ExtDetach mode) {
         if (!vm_ || !states_ || !locks_) return 0;
         DetachGate gate(this);
         const size_t contig = vm_->contigPages();
+        UnregRun ur{this};
         size_t n = 0;
         for (uintptr_t p = start; p < end; p += kPageSize) {
             size_t idx = vm_->pageIndex(p);
             if (idx == 0 || idx < contig) continue;  // not an external page
-            if (detachExternalPage(p, idx, mode)) ++n;
+            uint8_t reg = 0;
+            if (detachExternalPage(p, idx, mode, &reg)) ++n;
+            if (mode == ExtDetach::kRestore && (reg & (kExtMiss | kExtWp))) ur.add(p);
         }
         return n;
     }
@@ -10050,16 +10478,47 @@ public:
     size_t detachAllExternal() {
         if (!vm_ || !states_ || !locks_) return 0;
         DetachGate gate(this);
+        UnregRun ur{this};
         size_t n = 0;
         const size_t end = vm_->committedPages();
         for (size_t idx = vm_->contigPages(); idx < end; ++idx) {
             const uintptr_t a = reinterpret_cast<uintptr_t>(vm_->pageAddress(idx));
-            if (a && detachExternalPage(a, idx, ExtDetach::kRestore)) ++n;
+            uint8_t reg = 0;
+            if (a && detachExternalPage(a, idx, ExtDetach::kRestore, &reg)) ++n;
+            if (reg & (kExtMiss | kExtWp)) ur.add(a);
         }
         return n;
     }
 
-    bool detachExternalPage(uintptr_t addr, size_t idx, ExtDetach mode) {
+    // After a discard madvise (DONTNEED / FREE converted to DONTNEED) of
+    // tracked pages registered for MISSING faults: map the now-empty PTEs to
+    // the zero page, so a kernel-mode access (read() into the purged extent)
+    // sees what an unregistered mapping would: zeros, not EFAULT. An app
+    // access in the meantime takes the SIGBUS path (ACTIVE: zero-fill).
+    void refillExternalRange(uintptr_t start, uintptr_t end) {
+#ifdef __linux__
+        if (!vm_ || uffd_ < 0 || !ext_wp_ || ext_uffd_pages_.load(std::memory_order_relaxed) == 0) return;
+        const size_t contig = vm_->contigPages();
+        uintptr_t lo = 0, hi = 0;
+        for (uintptr_t p = start; p < end; p += kPageSize) {
+            const size_t idx = vm_->pageIndex(p);
+            const bool miss = idx >= contig && idx != 0 && (ext_wp_[idx] & kExtMiss);
+            if (miss && hi == p) { hi += kPageSize; continue; }
+            if (hi > lo) vm::uffdZeroFillRange(lo, hi);
+            lo = hi = 0;
+            if (miss) { lo = p; hi = p + kPageSize; }
+        }
+        if (hi > lo) vm::uffdZeroFillRange(lo, hi);
+#else
+        (void)start; (void)end;
+#endif
+    }
+
+    // *reg_out: the page's uffd registration flags as it leaves tracking
+    // (kRestore / kUnmap), read after the untrack so a run registration
+    // racing this detach (which validates tracking under the VmRegion track
+    // lock) is either seen here or fails its check.
+    bool detachExternalPage(uintptr_t addr, size_t idx, ExtDetach mode, uint8_t* reg_out = nullptr) {
         for (;;) {
             locks_->lock(idx);
             if (vm_->pageIndex(addr) != idx) {  // concurrently untracked
@@ -10089,11 +10548,17 @@ public:
             resetExternalPageMeta(idx);
             if (mode == ExtDetach::kPurge) {
                 if (st == PageState::COMPRESSED) {
-                    // PROT_NONE, blob gone: make it accessible. If that fails
-                    // (VMA cap) the next access takes the ACTIVE fault path,
-                    // which restores PROT_RW; the app's madvise has dropped
-                    // the old bytes by then either way.
-                    (void)makeResidentPageWritable(idx, reinterpret_cast<void*>(addr));
+                    // Blob gone: make it accessible. A uffd-reclaimed page is
+                    // MISSING with its protection untouched; the caller's
+                    // madvise + refill (or the SIGBUS path) maps it to zero.
+                    // A PROT_NONE one gets RW back; if that fails (VMA cap)
+                    // the next access takes the ACTIVE fault path, which
+                    // restores PROT_RW; the app's madvise has dropped the old
+                    // bytes by then either way.
+                    if (!uffdPage(idx) || prot_none_[idx]) {
+                        if (makeResidentPageWritable(idx, reinterpret_cast<void*>(addr)) && prot_none_)
+                            prot_none_[idx] = 0;
+                    }
                 }
                 if (st != PageState::ACTIVE_MONITORING && st != PageState::EMPTY)
                     states_->set(idx, PageState::ACTIVE);
@@ -10101,7 +10566,15 @@ public:
                 return true;
             }
             states_->set(idx, PageState::EMPTY);
-            vm_->untrackExternalPage(addr, /*recycle=*/true);
+            vm_->untrackExternalPage(addr, /*recycle=*/false);
+            if (ext_wp_) {
+                const uint8_t f = ext_wp_[idx];
+                if (reg_out) *reg_out = f;
+                if (f & kExtMiss) ext_uffd_pages_.fetch_sub(1, std::memory_order_relaxed);
+                ext_wp_[idx] = 0;
+            }
+            if (prot_none_) prot_none_[idx] = 0;
+            vm_->recycleExternalSlot(idx);
             locks_->unlock(idx);
             return true;
         }
@@ -10109,7 +10582,9 @@ public:
 
     // Per-page history reset for an external slot that is being purged or
     // recycled: the next contents (or the next page given this index) must
-    // not inherit the old page's coldness, thrash count or tier.
+    // not inherit the old page's coldness, thrash count or tier. (The uffd
+    // registration flags, ext_wp_, describe the mapping, not the contents:
+    // a purge keeps them; the untrack path clears them.)
     void resetExternalPageMeta(size_t i) {
         if (page_tier_) page_tier_[i] = kTierNone;
         if (shadow_tick_) shadow_tick_[i] = 0;
@@ -10121,7 +10596,6 @@ public:
         if (migrate_count_) migrate_count_[i] = 0;
         if (probed_) probed_[i] = 0;
         if (write_clean_streak_) write_clean_streak_[i] = 0;
-        if (ext_wp_) ext_wp_[i] = 0;
     }
 
     void releaseCompressedPages(size_t start_page, size_t num_pages) {

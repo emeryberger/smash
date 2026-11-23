@@ -37,6 +37,9 @@ smash_add_test(test_slab test_slab.cpp)
 # VM region test (no LZ4 dependency)
 smash_add_test(test_vm_region test_vm_region.cpp)
 
+# Thread-exit alternate-stack release leaves no registered (dangling) stack
+smash_add_test(test_altstack_release test_altstack_release.cpp)
+
 # SpillStore test (file-backed very-cold blob storage; no codec dependency)
 smash_add_test(test_spill_store test_spill_store.cpp)
 
@@ -514,6 +517,75 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# SMASH_TRACK_EXTERNAL unset = auto: external mappings are compressed iff
+# smash reclaims through userfaultfd. Linux: expectation detected (is smash's
+# uffd open), plus SMASH_UFFD=0 -> off; macOS: off. Both modes. --unset keeps
+# the TE-forced matrix from overriding the setting under test.
+add_executable(te_auto_test te_auto_test.cpp)
+set_target_properties(te_auto_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(te_auto_test PRIVATE ${CMAKE_DL_LIBS})
+if(APPLE)
+  set(_te_pre "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "MallocNanoZone=0")
+  set(_te_cases "off|")
+else()
+  set(_te_pre "LD_PRELOAD=$<TARGET_FILE:smash>")
+  set(_te_cases "detect|" "off|SMASH_UFFD=0")
+endif()
+foreach(lo 0 1)
+  foreach(c ${_te_cases})
+    string(REPLACE "|" ";" _parts "${c}")
+    list(GET _parts 0 _expect)
+    list(LENGTH _parts _np)
+    set(_extra "")
+    set(_name test_te_auto)
+    if(_np GREATER 1)
+      list(GET _parts 1 _extra)
+    endif()
+    if(_extra)
+      set(_name test_te_auto_uffd_off)
+    endif()
+    if(lo)
+      set(_name ${_name}_large_only)
+    endif()
+    add_test(NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env --unset=SMASH_TRACK_EXTERNAL ${_te_pre} "SMASH_LARGE_ONLY=${lo}"
+        "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1" ${_extra}
+        $<TARGET_FILE:te_auto_test> ${_expect})
+    set_tests_properties(${_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endforeach()
+endforeach()
+
+# io_uring fixed buffers (pinned pages) under SMASH_TRACK_EXTERNAL=1: a
+# pinned page must never be reclaimed out from under the kernel (uffd MOVE
+# refuses it), and liburing's io_uring_register_buffers of a compressed
+# buffer must succeed (libsmash untracks it first). Linux, both modes.
+if(NOT APPLE)
+  add_executable(iouring_pin_test iouring_pin_test.cpp)
+  set_target_properties(iouring_pin_test PROPERTIES CXX_STANDARD 20)
+  find_library(SMASH_LIBURING uring)
+  find_path(SMASH_LIBURING_INC liburing.h)
+  set(_iouring_cases pin)
+  if(SMASH_LIBURING AND SMASH_LIBURING_INC)
+    target_compile_definitions(iouring_pin_test PRIVATE SMASH_TEST_LIBURING=1)
+    target_include_directories(iouring_pin_test PRIVATE ${SMASH_LIBURING_INC})
+    target_link_libraries(iouring_pin_test PRIVATE ${SMASH_LIBURING})
+    list(APPEND _iouring_cases liburing)
+  endif()
+  foreach(lo 0 1)
+    foreach(c ${_iouring_cases})
+      set(_name test_iouring_${c})
+      if(lo)
+        set(_name ${_name}_large_only)
+      endif()
+      add_test(NAME ${_name}
+        COMMAND ${CMAKE_COMMAND} -E env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=${lo}"
+          "SMASH_TRACK_EXTERNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+          $<TARGET_FILE:iouring_pin_test> ${c})
+      set_tests_properties(${_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+  endforeach()
+endif()
+
 # Linux uffd mode: pages UFFDIO_MOVE refuses (here: shared copy-on-write with
 # a fork child) must still be reclaimed, via the classic path. Both modes.
 if(NOT APPLE)
@@ -530,7 +602,7 @@ if(NOT APPLE)
       COMMAND ${CMAKE_COMMAND} -E env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=${lo}"
         "SMASH_UFFD=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
         $<TARGET_FILE:move_refused_test>)
-    set_tests_properties(${_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    set_tests_properties(${_name} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
   endforeach()
 endif()
 
@@ -938,3 +1010,15 @@ function(add_peak_fill_test test_name large_only)
 endfunction()
 add_peak_fill_test(test_peak_fill 0)             # full mode
 add_peak_fill_test(test_peak_fill_large_only 1)  # large-only mode
+
+# SMASH_TEST_FORCE_TRACK_EXTERNAL=ON: run every test with
+# SMASH_TRACK_EXTERNAL=1 in its environment (the "TE-forced" CI matrix).
+# Preloaded tests pass it on to the program under test; a test that sets
+# SMASH_TRACK_EXTERNAL itself (cmake -E env) keeps its own value.
+option(SMASH_TEST_FORCE_TRACK_EXTERNAL "Run every test with SMASH_TRACK_EXTERNAL=1" OFF)
+if(SMASH_TEST_FORCE_TRACK_EXTERNAL)
+  get_property(_smash_all_tests DIRECTORY PROPERTY TESTS)
+  foreach(_t ${_smash_all_tests})
+    set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "SMASH_TRACK_EXTERNAL=1")
+  endforeach()
+endif()

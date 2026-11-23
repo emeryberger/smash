@@ -1438,6 +1438,10 @@ public:
                 }
             }
             log_time("slabs_init");
+            // SMASH_TRACK_EXTERNAL unset: on iff the compressor will reclaim
+            // through userfaultfd. Decided before the VmRegion is published,
+            // so no mapping can have been registered yet.
+            vm::teDecide(compressor_.uffdReclaimPlanned());
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
             g_smash_page_states_for_external = &page_states_;
@@ -1450,6 +1454,7 @@ public:
                 +[](uintptr_t start, uintptr_t end, int mode) -> size_t {
                     auto& c = s_external_self_->compressor_;
                     if (mode == 3) return c.detachAllExternal();  // ext::kRestoreAll
+                    if (mode == 4) { c.refillExternalRange(start, end); return 0; }  // ext::kRefill
                     return c.detachExternalRange(
                         start, end, static_cast<CompressorThread::ExtDetach>(mode));
                 },
@@ -1463,8 +1468,7 @@ public:
             // registered external page as in-bounds. Gated: only loosen the
             // guard when tracking is actually on. (lookupIdx is a lock-free
             // hash read → async-signal-safe.)
-            if (std::getenv("SMASH_TRACK_EXTERNAL") &&
-                std::getenv("SMASH_TRACK_EXTERNAL")[0] == '1') {
+            if (vm::teEnabled()) {
                 vm::setExternalPageCheck(+[](uintptr_t addr) -> bool {
                     auto* r = g_smash_vm_region;
                     return r && r->contains(addr);

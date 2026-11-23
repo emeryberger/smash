@@ -12,8 +12,14 @@
 // concurrent decompress faults against compression, frees and kill-switch drains.
 // Any mismatch, a decompression failure, or (toggle mode) a page still
 // compressed after smash_disable() returned 0 fails the run.
+//
+// External memory (exercised when run with SMASH_TRACK_EXTERNAL=1): a second
+// cold set mapped directly with mmap, read the same way, and per-worker
+// mmap'd chunks managed like a bundled allocator's extents (map + fill,
+// check, madvise(MADV_DONTNEED) then expect zeros, refill, munmap).
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -45,6 +51,8 @@ std::atomic<uint64_t> g_ops{0}, g_toggles{0}, g_drained_from{0};
 
 constexpr size_t kColdBytes = 32u << 20;
 unsigned char* g_cold;
+constexpr size_t kExtColdBytes = 16u << 20;
+unsigned char* g_ext_cold;  // mmap'd directly: external memory
 
 uint64_t xorshift(uint64_t& s) {
     s ^= s << 13; s ^= s >> 7; s ^= s << 17;
@@ -66,6 +74,47 @@ bool checkObj(const unsigned char* p, size_t n, uint64_t seed) {
 
 struct Slot { unsigned char* p; size_t n; uint64_t seed; };
 
+// A worker's mmap'd extent: state 0 = unmapped, 1 = filled, 2 = purged (zero).
+struct Extent { unsigned char* p; uint64_t seed; int state; };
+constexpr size_t kExtentBytes = 256u << 10;
+void extentOp(Extent& e, uint64_t& r) {
+    if (e.state == 0) {
+        void* m = mmap(nullptr, kExtentBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) { g_fail.fetch_add(1); return; }
+        e.p = static_cast<unsigned char*>(m);
+        e.seed = xorshift(r);
+        fillObj(e.p, kExtentBytes, e.seed);
+        e.state = 1;
+        return;
+    }
+    if (e.state == 2) {
+        // Linux: DONTNEED'd anonymous memory reads zero. macOS keeps the old
+        // bytes or zeros, page by page.
+        for (size_t j = 0; j < kExtentBytes; j += 509) {
+#ifdef __linux__
+            const bool ok = e.p[j] == 0;
+#else
+            const bool ok = e.p[j] == 0 || e.p[j] == patByte(e.seed, j);
+#endif
+            if (!ok) { g_fail.fetch_add(1); fprintf(stderr, "FAIL: purged extent byte %zu is neither zero nor old data\n", j); break; }
+        }
+        fillObj(e.p, kExtentBytes, e.seed);
+        e.state = 1;
+        return;
+    }
+    if (!checkObj(e.p, kExtentBytes, e.seed)) {
+        g_fail.fetch_add(1);
+        fprintf(stderr, "FAIL: extent mismatch\n");
+    }
+    if (xorshift(r) % 2) {
+        madvise(e.p, kExtentBytes, MADV_DONTNEED);
+        e.state = 2;
+    } else {
+        munmap(e.p, kExtentBytes);
+        e.state = 0;
+    }
+}
+
 size_t pickSize(uint64_t& r) {
     const uint64_t k = xorshift(r) % 100;
     if (k < 70) return 16 + xorshift(r) % 1009;
@@ -77,6 +126,8 @@ void* worker(void* arg) {
     uint64_t r = reinterpret_cast<uint64_t>(arg) | 1;
     constexpr int kSlots = 384;
     Slot* slots = static_cast<Slot*>(calloc(kSlots, sizeof(Slot)));
+    constexpr int kExtents = 16;
+    Extent ext[kExtents] = {};
     while (!g_stop.load(std::memory_order_relaxed)) {
         const int i = static_cast<int>(xorshift(r) % kSlots);
         Slot& s = slots[i];
@@ -112,7 +163,13 @@ void* worker(void* arg) {
                 g_fail.fetch_add(1);
                 fprintf(stderr, "FAIL: cold set byte %zu\n", off);
             }
+            const size_t eo = (xorshift(r) % (kExtColdBytes / 4096)) * 4096 + xorshift(r) % 4096;
+            if (g_ext_cold[eo] != patByte(9, eo)) {
+                g_fail.fetch_add(1);
+                fprintf(stderr, "FAIL: external cold set byte %zu\n", eo);
+            }
         }
+        if (op % 16 == 1) extentOp(ext[xorshift(r) % kExtents], r);
         g_ops.fetch_add(1, std::memory_order_relaxed);
         // Randomized timing: mostly busy, sometimes idle long enough for the
         // compressor to reclaim this thread's objects.
@@ -129,6 +186,13 @@ void* worker(void* arg) {
             free(slots[i].p);
         }
     free(slots);
+    for (Extent& e : ext) {
+        if (e.state == 1 && !checkObj(e.p, kExtentBytes, e.seed)) {
+            g_fail.fetch_add(1);
+            fprintf(stderr, "FAIL: final extent mismatch\n");
+        }
+        if (e.state) munmap(e.p, kExtentBytes);
+    }
     return nullptr;
 }
 
@@ -190,6 +254,10 @@ int main(int argc, char** argv) {
 
     g_cold = static_cast<unsigned char*>(malloc(kColdBytes));
     fillObj(g_cold, kColdBytes, 7);
+    g_ext_cold = static_cast<unsigned char*>(mmap(nullptr, kExtColdBytes, PROT_READ | PROT_WRITE,
+                                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (g_ext_cold == MAP_FAILED) { fprintf(stderr, "FAIL: mmap\n"); return 1; }
+    fillObj(g_ext_cold, kExtColdBytes, 9);
 
     pthread_t th[64];
     const int n = nthreads > 64 ? 64 : nthreads;
@@ -214,6 +282,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; ++i) pthread_join(th[i], nullptr);
     if (toggle) pthread_join(tt, nullptr);
     if (!checkObj(g_cold, kColdBytes, 7)) { fprintf(stderr, "FAIL: cold set\n"); g_fail.fetch_add(1); }
+    if (!checkObj(g_ext_cold, kExtColdBytes, 9)) { fprintf(stderr, "FAIL: external cold set\n"); g_fail.fetch_add(1); }
     g_status(&s);
     if (s.decompress_failures) {
         fprintf(stderr, "FAIL: %llu decompression failures\n", s.decompress_failures);

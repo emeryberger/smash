@@ -41,6 +41,8 @@
 #include <sys/resource.h>
 #include <sys/xattr.h>
 #include <sys/mman.h>
+#include <linux/userfaultfd.h>
+#include <linux/types.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -1524,12 +1526,38 @@ SMASH_VISIBLE int mlockall(int flags) {
 // madvise: allocators purge freed extents with DONTNEED / FREE. Drop smash's
 // blob for those pages first, or a later access would decompress stale data
 // over memory the allocator believes is zero (jemalloc's calloc fast path).
+//
+// Pages smash reclaims through its userfaultfd stay registered for MISSING
+// faults, where an empty PTE turns a kernel-mode access into EFAULT: after a
+// discard the purged pages are mapped to the zero page (refill), and
+// MADV_FREE on them becomes MADV_DONTNEED (a lazily freed page the kernel
+// reclaims later would become such an empty PTE at an unknowable time;
+// DONTNEED is a valid implementation of FREE's contract).
 SMASH_VISIBLE int madvise(void* addr, size_t len, int advice) {
     // Direct syscall (glibc's madvise is a bare syscall wrapper): no dlsym
     // resolution window in which the call could fail.
     auto* vm = smash::g_smash_vm_region;
-    if (vm && addr && len && smash::ext::discardAdvice(advice))
-        smash::ext::detachRange(vm, addr, len, smash::ext::kPurge);
+    if (!vm || !addr || !len) return static_cast<int>(syscall(SYS_madvise, addr, len, advice));
+    if (smash::ext::discardAdvice(advice)) {
+        const size_t tracked = smash::ext::detachRange(vm, addr, len, smash::ext::kPurge);
+        int adv = advice;
+#ifdef MADV_FREE
+        if (tracked && advice == MADV_FREE && smash::vm::g_uffd_fd >= 0) adv = MADV_DONTNEED;
+#endif
+        const int rc = static_cast<int>(syscall(SYS_madvise, addr, len, adv));
+        if (tracked) smash::ext::refillRange(vm, addr, len);
+        return rc;
+    }
+    if (smash::ext::untrackAdvice(advice))
+        smash::ext::detachRange(vm, addr, len, smash::ext::kRestore);
+    if (smash::ext::populateAdvice(advice) && vm->externalLivePages()) {
+        // Prefaulting a compressed page fails (EFAULT for a uffd-MISSING one,
+        // ENOMEM for PROT_NONE): the app asked for the range to be resident,
+        // so decompress its tracked pages first (a read faults them in).
+        const uintptr_t end = smash::ext::pageUp(addr, len);
+        for (uintptr_t p = smash::ext::pageDown(addr); p < end; p += smash::kPageSize)
+            if (vm->contains(p)) (void)*reinterpret_cast<volatile const char*>(p);
+    }
     return static_cast<int>(syscall(SYS_madvise, addr, len, advice));
 }
 
@@ -1581,6 +1609,80 @@ SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int
         else smash::ext::registerRange(vm, old_addr, old_size);  // unchanged
     }
     return ret;
+}
+
+// ioctl: an application that uses userfaultfd itself (live migration,
+// GC barriers, checkpointing) registers its ranges with UFFDIO_REGISTER.
+// A range smash's own uffd already covers would fail that with EBUSY, and a
+// range smash compresses the classic way would have its pages dropped under
+// the app's MISSING handler. Untrack (restore, unregister) the range first;
+// the app owns it from then on. (A REGISTER that comes first makes smash's
+// own registration fail with EBUSY: never compressed, see
+// registerExternalRun.) Raw syscall: no dlsym, and smash's own ioctls use
+// SYS_ioctl directly, so they never come through here.
+SMASH_VISIBLE int ioctl(int fd, unsigned long req, ...) {
+    va_list ap;
+    va_start(ap, req);
+    void* arg = va_arg(ap, void*);
+    va_end(ap);
+    if (req == UFFDIO_REGISTER && arg && fd != smash::vm::g_uffd_fd) {
+        auto* vm = smash::g_smash_vm_region;
+        const auto* r = static_cast<const uffdio_register*>(arg);
+        if (vm && r->range.len)
+            smash::ext::detachRange(vm, reinterpret_cast<void*>(r->range.start),
+                                    static_cast<size_t>(r->range.len), smash::ext::kRestore);
+    }
+    return static_cast<int>(syscall(SYS_ioctl, fd, req, arg));
+}
+
+// liburing fixed buffers: IORING_REGISTER_BUFFERS pins the pages
+// (FOLL_LONGTERM) and the kernel then reads and writes the pinned frames
+// directly, with no access through the app's page tables. A pinned page
+// smash later reclaims the classic way (PROT_NONE + MADV_DONTNEED) drops
+// the app's mapping while the kernel keeps writing the old frame: I/O
+// completions vanish. (The uffd path refuses pinned pages: UFFDIO_MOVE
+// fails with EBUSY on a maybe-DMA-pinned folio, and the shadow copy is
+// discarded.) Registering a range that holds a compressed page fails with
+// EFAULT. So untrack (restore, unregister) every registered buffer first.
+// liburing makes the io_uring_register syscall itself (no libc wrapper), so
+// only these exported entry points can be seen, and only when liburing is a
+// shared library. Versioned like liburing's own symbols, so references
+// bound to LIBURING_2.x resolve here.
+namespace {
+void untrackIovecs(const struct iovec* iov, unsigned nr) {
+    auto* vm = smash::g_smash_vm_region;
+    if (!vm || !iov) return;
+    for (unsigned k = 0; k < nr; ++k)
+        if (iov[k].iov_base && iov[k].iov_len)
+            smash::ext::detachRange(vm, iov[k].iov_base, iov[k].iov_len, smash::ext::kRestore);
+}
+void* liburingNext(const char* name, const char* ver) { return dlvsym(RTLD_NEXT, name, ver); }
+}  // namespace
+
+struct io_uring;
+SMASH_VISIBLE int io_uring_register_buffers(struct io_uring* ring, const struct iovec* iov, unsigned nr) {
+    using fn_t = int (*)(struct io_uring*, const struct iovec*, unsigned);
+    static fn_t real = reinterpret_cast<fn_t>(liburingNext("io_uring_register_buffers", "LIBURING_2.0"));
+    if (!real) return -ENOSYS;
+    untrackIovecs(iov, nr);
+    return real(ring, iov, nr);
+}
+SMASH_VISIBLE int io_uring_register_buffers_tags(struct io_uring* ring, const struct iovec* iov,
+                                                 const __u64* tags, unsigned nr) {
+    using fn_t = int (*)(struct io_uring*, const struct iovec*, const __u64*, unsigned);
+    static fn_t real = reinterpret_cast<fn_t>(liburingNext("io_uring_register_buffers_tags", "LIBURING_2.1"));
+    if (!real) return -ENOSYS;
+    untrackIovecs(iov, nr);
+    return real(ring, iov, tags, nr);
+}
+SMASH_VISIBLE int io_uring_register_buffers_update_tag(struct io_uring* ring, unsigned off,
+                                                       const struct iovec* iov, const __u64* tags,
+                                                       unsigned nr) {
+    using fn_t = int (*)(struct io_uring*, unsigned, const struct iovec*, const __u64*, unsigned);
+    static fn_t real = reinterpret_cast<fn_t>(liburingNext("io_uring_register_buffers_update_tag", "LIBURING_2.1"));
+    if (!real) return -ENOSYS;
+    untrackIovecs(iov, nr);
+    return real(ring, off, iov, tags, nr);
 }
 
 } // extern "C"

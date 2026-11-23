@@ -177,6 +177,20 @@ probe() {
     env "$@" LD_PRELOAD="$lib" SMASH_BANNER=1 "$t" 2>&1
 }
 
+# Whether memory the program maps itself (SMASH_TRACK_EXTERNAL) is compressed:
+# explicit setting, or (unset) on iff userfaultfd reclaim is available ($1).
+te_note() {
+    case "${SMASH_TRACK_EXTERNAL-}" in
+        1) note "external mappings (mmap/sbrk, bundled allocators): compressed (SMASH_TRACK_EXTERNAL=1)" ;;
+        ?*) note "external mappings (mmap/sbrk, bundled allocators): not compressed (SMASH_TRACK_EXTERNAL=$SMASH_TRACK_EXTERNAL)" ;;
+        *) case "$1" in
+               on) note "external mappings (mmap/sbrk, bundled allocators): compressed by default here (userfaultfd reclaim; SMASH_TRACK_EXTERNAL=0 to opt out)" ;;
+               off) note "external mappings (mmap/sbrk, bundled allocators): not compressed by default here (no userfaultfd reclaim; SMASH_TRACK_EXTERNAL=1 opts in)" ;;
+               *) note "external mappings: on iff userfaultfd reclaim is available (could not tell)" ;;
+           esac ;;
+    esac
+}
+
 cmd_doctor() {
     doctor_fail=0
     echo "smash doctor ($SMASH_LAUNCHER_VERSION)"
@@ -204,14 +218,15 @@ cmd_doctor() {
             note "$(csrutil status 2>/dev/null | head -n 1 | sed "s/\.$//"); DYLD_INSERT_LIBRARIES is stripped for /usr/bin, /bin, /System binaries"
         fi
         note "page tracking: mprotect (userfaultfd is Linux-only)"
+        te_note off
         [ $doctor_fail = 0 ]; return
     fi
     # Linux: userfaultfd tracking (Linux 6.8+, UFFDIO_MOVE)
     uline=$(printf '%s\n' "$out" | grep 'userfaultfd mode on\|SMASH_UFFD' | head -n 1)
     case "$uline" in
-        *"mode on"*) ok "userfaultfd tracking available (${uline#\[smash\] })" ;;
-        "") note "userfaultfd: no report from the probe" ;;
-        *) wrn "userfaultfd tracking unavailable, mprotect fallback is used: ${uline#\[smash\] }" ;;
+        *"mode on"*) ok "userfaultfd tracking available (${uline#\[smash\] })"; te_note on ;;
+        "") note "userfaultfd: no report from the probe"; te_note unknown ;;
+        *) wrn "userfaultfd tracking unavailable, mprotect fallback is used: ${uline#\[smash\] }"; te_note off ;;
     esac
     if [ -r /proc/sys/vm/unprivileged_userfaultfd ]; then
         note "vm.unprivileged_userfaultfd=$(cat /proc/sys/vm/unprivileged_userfaultfd) (smash asks for user-mode-only faults, which do not need it)"

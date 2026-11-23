@@ -23,10 +23,10 @@ class Smash < Formula
   # On each release, bump url to the new tag and sha256 to the value the
   # publish job writes to its step summary ("Source tarball sha256"), or use
   # `brew bump-formula-pr --url=<tarball>`. Never hand-enter a guessed hash.
-  # v0.1.2-alpha: sha256 from the publish job summary, matched by an
+  # v0.1.3-alpha: sha256 from the publish job summary, matched by an
   # independent download.
-  url "https://github.com/emeryberger/smash/archive/refs/tags/v0.1.2-alpha.tar.gz"
-  sha256 "7029e8201131ad4fb46b4079f4de3f1d485977b35ea9ccbe4445d6aadfe0e49c"
+  url "https://github.com/emeryberger/smash/archive/refs/tags/v0.1.3-alpha.tar.gz"
+  sha256 "87d11856197fb00a479567d2c22c11abcbc6738c16f045886648fe654bff08f3"
   license "Apache-2.0"
   head "https://github.com/emeryberger/smash.git", branch: "master"
 
